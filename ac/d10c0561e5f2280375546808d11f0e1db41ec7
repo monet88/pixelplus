@@ -1,0 +1,19 @@
+docs/spec/research/gemini-auth-mode-capability-evidence.md
+  s_00f8901db412f0::t_32ff1764554941 1-373
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "acd10c0561e5f2280375546808d11f0e1db41ec7",
+  "prompts": {},
+  "sessions": {
+    "s_00f8901db412f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3e922272b088fde7",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
