@@ -1,0 +1,19 @@
+docs/spec/research/web-to-api-compliance-risk-evidence.md
+  s_bbb55aaeaa4d94::t_d7c830b604f0d4 1-494
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "087b48d94de78734187f4d4ecca669dd9679736d",
+  "prompts": {},
+  "sessions": {
+    "s_bbb55aaeaa4d94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3b7916e7440d4ed5",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
