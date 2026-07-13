@@ -1,0 +1,19 @@
+docs/spec/research/chatgpt-auth-mode-capability-evidence.md
+  s_7db0ccbd91e372::t_87b79cc1fd0e2d 1-282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "6a3d5799d585074c4f8a10455f795bb33d4e6ff8",
+  "prompts": {},
+  "sessions": {
+    "s_7db0ccbd91e372": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7e210dc419bb888b",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
