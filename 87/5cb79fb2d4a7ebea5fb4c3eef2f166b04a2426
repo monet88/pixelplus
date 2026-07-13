@@ -1,0 +1,19 @@
+docs/spec/research/grok-auth-mode-capability-evidence.md
+  s_90edc6c7ed05bc::t_5a364b87685010 1-441
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "875cb79fb2d4a7ebea5fb4c3eef2f166b04a2426",
+  "prompts": {},
+  "sessions": {
+    "s_90edc6c7ed05bc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aba992c55ba1644bb",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
