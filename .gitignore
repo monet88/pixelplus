@@ -1,0 +1,38 @@
+# Local upstream repositories
+.ref/
+
+# Local agent and code-intelligence state
+.codegraph/
+.codex/
+.claude/settings.local.json
+.claude/worktrees/
+
+# Secrets and local runtime data
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+auths/
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Go artifacts
+bin/
+dist/
+coverage.out
+*.test
+*.prof
+
+# Node/UXP artifacts
+node_modules/
+coverage/
+*.log
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
