@@ -1,0 +1,29 @@
+CONTEXT.md
+  s_7db0ccbd91e372::t_f04890060eee06 58-78
+docs/spec/tenant-ownership-authorization-invariants.md
+  s_bbb55aaeaa4d94::t_6be871def01d91 1-428
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "f613fc477cd5014a2aba41818d8c5ae2a44fcf22",
+  "prompts": {},
+  "sessions": {
+    "s_7db0ccbd91e372": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7e210dc419bb888b",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_bbb55aaeaa4d94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3b7916e7440d4ed5",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
