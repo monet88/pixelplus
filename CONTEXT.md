@@ -55,4 +55,24 @@ Các Auth Mode ban đầu là:
 
 ## Capability Snapshot
 
-Kết quả kiểm chứng capability của một Provider Account tại một thời điểm, bao gồm các thao tác và model account thực sự được phép sử dụng. Capability Snapshot không phải tuyên bố capability tĩnh của Provider hoặc Adapter.
+Kết quả kiểm chứng capability của một Provider Account tại một thời điểm, bao gồm các thao tác và model account thực sự được phép sử dụng. Capability Snapshot không phải tuyên bố capability tĩnh của Provider hoặc Adapter. Capability Snapshot thuộc Tenant của Provider Account tương ứng và không được dùng ngoài Tenant đó.
+
+## Security Principal
+
+Danh tính bảo mật của một request Public API đã xác thực, gồm `tenant_id` của Tenant sở hữu Client API Key và `client_api_key_id` của Client API Key đó. Mọi quyết định authorization của request phải dựa trên Security Principal này; client không được tự chỉ định Tenant khác.
+
+## Asset
+
+Đối tượng dữ liệu ảnh (input, mask hoặc output) do đúng một Tenant sở hữu trong gateway. Asset không được đọc, ghi hoặc tham chiếu chéo Tenant.
+
+## Render Job
+
+Đơn vị công việc bền vững cho image generation, edit hoặc inpaint, do đúng một Tenant sở hữu. Worker chỉ được thực thi Render Job bằng Provider Account, Provider Credential và Asset cùng Tenant với job.
+
+## Routing Policy
+
+Cấu hình do Tenant khai báo để chọn, ưu tiên hoặc fallback giữa các Provider Account thuộc chính Tenant đó. Routing Policy không được đưa Provider Account của Tenant khác vào candidate set.
+
+## Normative ownership spec
+
+Các invariant sở hữu và authorization chuẩn nằm tại `docs/spec/tenant-ownership-authorization-invariants.md`.
