@@ -303,7 +303,7 @@ pending_probe ──fail──► reauth_required | disabled*** | draft****
 |---|---|---|
 | Success | `pending_probe` | Material stored (or already stored from exchange) |
 | Failure (first connect) | remain `draft` or return to `draft` | Prefer **not** retaining invalid material; if retained for support, still non-usable and redacted |
-| Failure (reauth) | remain `reauth_required` (or prior non-active state) | Prior good version remains until a new version fully activates (see §4.9 dual-version rule) |
+| Failure (reauth) | remain the prior state — `reauth_required`, `revoked`, `disabled`, **or `active`** for a planned rotate on the previous valid version (never demote a still-usable `active` account because new material failed shape validation; matches §4.13 `active` × validate-fail = no state change) | Prior good version remains until a new version fully activates (see §4.9 dual-version rule) |
 
 **MUST NOT** set `active` on validation success alone.
 
@@ -487,8 +487,8 @@ An account is **usable** for routing and new execution if and only if **all** ho
 
 1. `lifecycle_state == active`
 2. Auth Mode is currently **execution-enabled** for the deployment (not killed; not `prohibited`; `gated`/`experimental` gates still satisfied, including required risk ack for gated modes)
-3. Operational health is not in a hard-block set: MVP hard-block = `auth_expired`, `provider_banned`, `challenged` (until cleared by successful reauth/probe policy), and any #17 extension that marks non-routable
-4. Current `credential_version` has passed required validation + required probe (including satisfaction via §4.8 rule 3 inheritance or cost-minimal post-refresh probe; a version bump alone never satisfies this item)
+3. Operational health is not in a hard-block set: MVP hard-block = `auth_expired`, `provider_banned`, `challenged` (until cleared by successful reauth/probe policy), and any #17 extension that marks non-routable. (`unknown` is intentionally **not** in this set: a genuinely usable `active` account cannot carry `unknown` health because item 4 requires a probe success that sets health to `healthy`/`degraded` — see §4.6 rule 4 — and every path that could leave `unknown` on an account, §4.8 inheritance and §4.10 enable, excludes `unknown` from the safe path. If an implementation ever observes `active` + `unknown`, treat it as a defect and fail closed, not as usable.)
+4. Current `credential_version` has passed required validation + required probe (including satisfaction via §4.8 rule 3 inheritance or cost-minimal post-refresh probe; a version bump alone never satisfies this item). Because a successful required probe sets health ≠ `unknown` (§4.6 rule 4), satisfying this item guarantees item 3 is not evaluated against a stale `unknown`.
 5. Credential is not vault-revoked
 6. Client API Key scope/allowlist allows the account when the caller is a Public API principal (#8) — N/A for pure system jobs that already act under the account’s `tenant_id`
 7. Capability Snapshot requirements for the requested operation are satisfied when the action is capability-bearing (#10) — checked at request time; not a durable lifecycle field. When **durable items 1–5** fail, any prior snapshot for this account is **non-authorizing** for new work even if its TTL has not expired (invalidation semantics refined in #10). Failure of request-time item 6 (key scope/allowlist) alone MUST NOT invalidate the snapshot for other principals or system paths.
