@@ -1,0 +1,43 @@
+TODOS.md
+  s_a00675103007f0::t_c329bac2b3a7fc 1-225
+CLAUDE.md
+  s_98d12562c65164::t_083d852284d18b 1-117
+docs/agents/domain.md
+  s_42c98b791aa495::t_21dbedc29b37d0 1-37
+docs/agents/issue-tracker.md
+  s_42c98b791aa495::t_a8bd817c8b2a60 1-45
+docs/agents/triage-labels.md
+  s_42c98b791aa495::t_c7aa5890badc48 1-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "2307fe1a0525f617f3274794c7cced63a449bb2e",
+  "prompts": {},
+  "sessions": {
+    "s_42c98b791aa495": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "017f8cce-3b52-48be-9be0-cac6b4140bf9",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_98d12562c65164": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "59ee18bd-0390-4bcc-8cf3-06726f093c62",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_a00675103007f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7da1c192-e922-41f6-a0d8-0ae57afd6df9",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
