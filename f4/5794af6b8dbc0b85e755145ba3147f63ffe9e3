@@ -1,0 +1,19 @@
+.gitignore
+  s_be805435dfda66::t_5b3ca0225f645e 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "f45794af6b8dbc0b85e755145ba3147f63ffe9e3",
+  "prompts": {},
+  "sessions": {
+    "s_be805435dfda66": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "957acf7b-c3cd-42d8-ab96-d0f3db6a9e79",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
