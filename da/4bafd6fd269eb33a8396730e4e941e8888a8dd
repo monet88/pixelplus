@@ -1,0 +1,21 @@
+CONTEXT.md
+  s_75d6be98f5291a::t_2e1db9884d822d 62,99-102
+docs/spec/capability-snapshot-and-model-availability-semantics.md
+  s_75d6be98f5291a::t_7c096e3114de02 1-525
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "da4bafd6fd269eb33a8396730e4e941e8888a8dd",
+  "prompts": {},
+  "sessions": {
+    "s_75d6be98f5291a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6b3809f-d8d0-437d-aed9-6caa0de68bd6",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
