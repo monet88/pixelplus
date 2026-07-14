@@ -159,13 +159,28 @@ Operators of any deployment that includes one or more Auth Modes MUST:
 
 Signals below are **product-binding**. Thresholds for KS-2 and FG-5 are **product-chosen conservative defaults** (not measured ban rates from Providers; those remain G-10 / unverified in #2). Operators MAY tighten thresholds. Operators MUST NOT loosen them without closing **D-NUMERIC-TUNE** with a recorded product exception.
 
+Named threshold constants (implementation and later issues MUST cite these IDs, not invent parallel magic numbers):
+
+| Constant ID | Default value | Used by |
+|---|---|---|
+| `KS-2-CHALLENGE-RATE` | 70% | KS-2 |
+| `KS-2-WINDOW` | 30 minutes continuous | KS-2 |
+| `KS-2-MIN-ATTEMPTS` | 50 | KS-2 |
+| `KS-3-BAN-COUNT` | 3 distinct Provider Accounts | KS-3 |
+| `KS-3-WINDOW` | 24 hours | KS-3 |
+| `FG-5-CHALLENGE-RATE` | 40% | FG-5 |
+| `FG-5-WINDOW` | 15 minutes | FG-5 |
+| `FG-5-MIN-ATTEMPTS` | 20 | FG-5 |
+| `REOPEN-CHALLENGE-SOAK` | 60 minutes continuous below FG-5 with ≥ 20 healthy attempts | R1 after KS-2 / FG-5 class kills |
+| `REOPEN-BAN-SOAK` | 24 hours with zero new KS-3-class bans for the Auth Mode | R1 after KS-3 class kills |
+
 #### 3.5.1 Kill-switch triggers (disable Auth Mode)
 
 | ID | Observable signal | Default action | Typical scope |
 |---|---|---|---|
 | **KS-1** | Provider publishes or clarifies policy that **unambiguously** bans the Adapter’s access method for that Auth Mode | Immediate Auth Mode kill; status demotion toward `prohibited` or keep `prohibited` | Named Auth Mode |
-| **KS-2** | Challenge/bot-interstitial rate ≥ **70%** of attempts over a continuous **30-minute** window **and** absolute attempts ≥ **50** for that Auth Mode | Auto-disable Auth Mode; require human reopen | Auth Mode (often Web Adapter) |
-| **KS-3** | ≥ **3** distinct Tenant Provider Accounts under the same Auth Mode enter permanent ban / credential-revoked-by-provider health within **24 hours**, and traffic is correlated with Gateway egress or protocol path | Suspend Auth Mode; incident review | Auth Mode, region, or egress class |
+| **KS-2** | Challenge/bot-interstitial rate ≥ `KS-2-CHALLENGE-RATE` over continuous `KS-2-WINDOW` **and** absolute attempts ≥ `KS-2-MIN-ATTEMPTS` for that Auth Mode | Auto-disable Auth Mode; require human reopen per §3.5.5 | Auth Mode (often Web Adapter) |
+| **KS-3** | ≥ `KS-3-BAN-COUNT` distinct Tenant Provider Accounts under the same Auth Mode enter permanent ban / credential-revoked-by-provider health within `KS-3-WINDOW`, and traffic is correlated with Gateway egress or protocol path | Suspend Auth Mode; incident review | Auth Mode, region, or egress class |
 | **KS-4** | Formal legal notice, cease-and-desist, or ToS enforcement communication naming the product or method | Global or named-surface disable within incident SLA | Global or named Auth Mode |
 | **KS-5** | Protocol break such that continued operation requires **new** reverse engineering of private APIs or anti-bot systems | Disable affected Web Auth Mode; reopen only after product re-decision | Web Auth Mode |
 | **KS-6** | Credential class invalidated (cookie family revoked, OAuth client disallowed, issuer refuses tokens) with no documented safe replacement | Disable Auth Mode until replacement path is re-specified | Auth Mode |
@@ -178,7 +193,7 @@ Signals below are **product-binding**. Thresholds for KS-2 and FG-5 are **produc
 | **FG-2** | Only OAuth/CLI sibling is inside envelope; Web sibling is experimental/prohibited | Ship and enable OAuth path independently; never silent-fallback to Web |
 | **FG-3** | Tenant Provider contract class unknown (consumer vs business) when a feature assumes business/API rights | Deny the business-only feature; do not assume Enterprise rights |
 | **FG-4** | Dual-regime identity incomplete (e.g. Grok SSO issuer xAI vs X still ambiguous for a credential type) | Gate that credential subtype until mapping verified |
-| **FG-5** | Challenge rate ≥ **40%** over **15 minutes** with ≥ **20** attempts | Auto-cooldown: reduce concurrency, pause new connections for Auth Mode, alert operator |
+| **FG-5** | Challenge rate ≥ `FG-5-CHALLENGE-RATE` over `FG-5-WINDOW` with ≥ `FG-5-MIN-ATTEMPTS` attempts | Auto-cooldown: reduce concurrency, pause new connections for Auth Mode, alert operator |
 
 #### 3.5.3 Measurement requirements
 
@@ -202,6 +217,30 @@ Cause → effect:
 3. That is the required **Adapter path pause** for M. A separate “pause Adapter binary while Auth Mode stays allowed” control is optional later ops detail; it MUST NOT re-enable a killed or `prohibited` Auth Mode.
 
 Per-account cooldown (one Provider Account unhealthy while siblings on the same Auth Mode still run) remains allowed and is owned by health/routing issues (#11/#17). That is not an Auth Mode status change.
+
+#### 3.5.5 Reopen after Auth Mode kill (observable checklist)
+
+Reopening a killed Auth Mode is **never automatic**. Gateway MUST keep the Auth Mode unregistered until an operator records a reopen decision. The following checklist is product-binding for **operational** kills (KS-2, KS-3, KS-6 with a known fix path, OP-G1 operational incidents). Policy/legal kills (KS-1, KS-4, KS-5, and status transitions toward `prohibited`) additionally require the product/counsel bar in the Auth Mode card and §8.
+
+| Step | ID | Observable signal required before enable | Who |
+|---|---|---|---|
+| 1 | **R0** | Incident note names the kill ID (KS-*/OP-G*), root-cause class, and the Auth Mode. Kill switch remains **off**. | Operator |
+| 2 | **R1** | Root-cause class is closed with an **observable** fix evidence matching the kill: see table below. | Operator / implementer |
+| 3 | **R2** | Controlled **reauth/probe suite** for that Auth Mode succeeds: at least one healthy probe path completes credential validation **without** challenge/bot-interstitial classification (or without the kill-class error that fired). Probe is non-billable where product policy allows; otherwise uses a designated lab Tenant Account. | Operator |
+| 4 | **R3** | Operator performs a **signed config change** (or equivalent audited enable action) that turns the Auth Mode feature flag / kill switch back on. Audit log MUST record actor, timestamp, Auth Mode, prior kill ID, and R1/R2 evidence references. | Operator |
+| 5 | **R4** | Soak: for challenge-class kills, challenge rate stays below `FG-5-CHALLENGE-RATE` for `REOPEN-CHALLENGE-SOAK`; for ban-class kills, no new KS-3-class ban for `REOPEN-BAN-SOAK`. Breach during soak re-kills (return to OP-G1). | Operator / automated health |
+
+**R1 fix-evidence by kill class (concrete):**
+
+| Prior kill | Minimum R1 evidence (observable) |
+|---|---|
+| **KS-2** / severe **FG-5** | Egress/protocol change deployed **or** challenge classifier false-positive fixed **or** concurrency/backoff change shipped; plus dry-run probe sample showing challenge rate under `FG-5-CHALLENGE-RATE` on ≥ `FG-5-MIN-ATTEMPTS` attempts in lab. |
+| **KS-3** | Retry/hammer path fixed (no duplicate non-idempotent storms) **or** bad egress class removed **or** poisoned account set disabled; zero new permanent-ban transitions on remaining healthy accounts during a 1-hour controlled probe window. |
+| **KS-6** | Replacement credential class or OAuth client id is configured; lab probe obtains a fresh token and completes one authenticated request on the documented surface. |
+| **OP-G1** (manual / security) | Written clear of the operational defect (e.g. redaction bug patched and verified by log-fixture test). |
+| **KS-1 / KS-4 / KS-5** | Not operational reopen. Requires product owner decision + evidence refresh (#2) as in the Auth Mode card. |
+
+**Promotion** from `gated` → `allowed` is **not** a reopen-after-kill. It still requires the deferred IDs in §8 for that Auth Mode.
 
 ---
 
@@ -239,7 +278,7 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Recovery / reopen** | Human product owner + refreshed #2 OpenAI section. Reopen to `gated` only if OpenAI publishes an official programmatic consumer-web path **or** counsel clears residual extract/reverse-eng theory **and** challenge rates stay below FG-5 for a defined soak. Otherwise remain `experimental` or demote to `prohibited`. |
 | **Deferred** | Counsel on “agent of account owner” vs credential-sharing (G-4); quantitative ban rates (G-10). |
 
-**Cause → effect example.** Lab enables ChatGPT Web Access for one internal Tenant. Challenge rate hits 75% over 40 minutes with 80 attempts → KS-2 auto-disables the Auth Mode → new chat/image attempts return Auth Mode disabled → reopen requires human review, not automatic cool-down alone.
+**Cause → effect example.** Lab enables ChatGPT Web Access for one internal Tenant. Challenge rate hits 75% over 40 minutes with 80 attempts (≥ `KS-2-CHALLENGE-RATE` / `KS-2-WINDOW` / `KS-2-MIN-ATTEMPTS`) → KS-2 auto-disables the Auth Mode → new chat/image attempts return Auth Mode disabled → reopen requires §3.5.5 R0–R4 (including challenge soak under `REOPEN-CHALLENGE-SOAK`), not automatic cool-down alone.
 
 ### 5.2 ChatGPT Codex OAuth — `gated`
 
@@ -253,7 +292,7 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Operator obligations** | Feature flag default off until deployment opts in. Require Tenant acknowledgement of residual ToS/ban risk at connection (#9). Enforce single-Tenant ownership (#6). Support reauth/refresh failure as first-class health. Do not run multi-account “pool rental” features. |
 | **Security impact** | Accepts vault custody of OAuth refresh/access tokens and related account ids. Leak = Codex/ChatGPT-acting credential compromise. Narrower reverse-eng risk than Web Access if Adapter stays on documented Codex surfaces. |
 | **Kill criteria** | KS-1 if OpenAI disallows third-party storage/use of Codex tokens for SaaS agents (ties to G-8). KS-3 ban clusters. KS-4 legal notice. KS-6 if OAuth client revoked. KS-2/KS-5 only if Adapter drifts into private web/anti-bot paths. Adapter path pause follows §3.5.4. |
-| **Recovery / reopen** | After kill: fix root cause, re-probe, human enable. Promotion to `allowed` blocked until D-OAI-TOKEN (G-8) and D-COMM are resolved. |
+| **Recovery / reopen** | After kill: complete §3.5.5 checklist (R0–R4). For KS-6 (OAuth client revoked): R1 = replacement client/path configured; R2 = lab probe obtains token and one authenticated Codex request without auth-class failure. For KS-3: R1 = retry/egress root cause fixed; R2/R4 ban soak under `REOPEN-BAN-SOAK`. Enable only via R3 signed config change. Promotion to `allowed` blocked until D-OAI-TOKEN (G-8) and D-COMM are resolved. |
 | **Deferred** | G-8 third-party SaaS custody of Codex OAuth tokens; commercial fee characterization; multi-account-per-Tenant load balancing policy. |
 
 **Cause → effect example.** Tenant B acknowledges gate and connects Codex OAuth. OpenAI revokes the OAuth client id used by the Adapter (KS-6) → Auth Mode kill → existing Provider Accounts marked reauth-required / unusable → no execution until replacement client path is specified and gates re-passed.
@@ -287,7 +326,7 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Operator obligations** | Feature flag + Tenant ack. Record OAuth client identity. On token refresh failure, mark account reauth-required. Re-check G-2 when Google publishes product-specific terms. |
 | **Security impact** | Accepts OAuth refresh custody (high, usually narrower than full browser session). Accepts residual uncertainty of Antigravity-named terms until G-2 closed. |
 | **Kill criteria** | KS-1 if Google disallows this OAuth client class for SaaS agents. KS-3/KS-4/KS-6 standard. KS-5 if implementation abandons documented surfaces for private web reverse eng. Adapter path pause follows §3.5.4. |
-| **Recovery / reopen** | Human enable after root-cause fix. Promotion to `allowed` blocked on D-ANTIGRAVITY-TERMS (G-2) and D-COMM. |
+| **Recovery / reopen** | After kill: complete §3.5.5 checklist (R0–R4). For KS-6: R1 = replacement Google OAuth client/path configured; R2 = lab probe refreshes token and completes one `v1internal` authenticated call without auth-class failure. For KS-3: ban soak under `REOPEN-BAN-SOAK`. Enable only via R3 signed config change. MUST NOT reopen by falling back to Gemini Web Cookie (FG-2). Promotion to `allowed` blocked on D-ANTIGRAVITY-TERMS (G-2) and D-COMM. |
 | **Deferred** | G-2 product-specific Antigravity terms; multi-project pooling policy. |
 
 **Cause → effect example.** Deployment enables Antigravity OAuth for paying Tenants under gate. Google changes OAuth client policy to disallow the registered client (KS-6) → kill switch → Tenants see reauth/disabled mode → operators must not “fix” by switching those accounts to Web Cookie automatically (FG-2 / Auth Mode independence).
@@ -321,7 +360,7 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Operator obligations** | Feature flag + Tenant ack. Track OAuth refresh health. If implementation routes some calls to `api.x.ai`, still treat this Auth Mode as Grok xAI OAuth — not a separate Official API Adapter product promise unless a future issue expands scope. |
 | **Security impact** | Accepts OAuth token custody. Accepts residual Enterprise competitive-clause and lease/time-share interpretation risk under gates. |
 | **Kill criteria** | KS-1 if xAI disallows third-party SaaS use of the Grok CLI OAuth client. KS-3/KS-4/KS-6 standard. Using Web SSO as a “backup” path is forbidden, not a recovery method. Adapter path pause follows §3.5.4. |
-| **Recovery / reopen** | Human enable after fix. Promotion to `allowed` blocked on D-COMM and D-XAI-COMPETE. |
+| **Recovery / reopen** | After kill: complete §3.5.5 checklist (R0–R4). For KS-3 (ban cluster / retry storm): R1 = retry ownership or egress defect fixed with test/fixture evidence; R2 = controlled probe on remaining healthy accounts; R4 = `REOPEN-BAN-SOAK` with zero new KS-3-class bans. For KS-6: R1 = replacement xAI/Grok OAuth client path; R2 = token + one authenticated CLI/API call. Enable only via R3 signed config change. MUST NOT reopen via Grok Web SSO. Promotion to `allowed` blocked on D-COMM and D-XAI-COMPETE. |
 | **Deferred** | Commercial fee characterization vs time-sharing; competitive-clause counsel; multi-account-per-Tenant balancing. |
 
 **Cause → effect example.** Three Tenant accounts on Grok xAI OAuth are permanently banned within 12 hours after a bad retry storm (KS-3) → Auth Mode suspended → cooldown alone is insufficient; operator must fix retry ownership (#16/#17 dependencies) before reopen.
