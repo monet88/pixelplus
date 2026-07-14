@@ -1,0 +1,29 @@
+CLAUDE.md
+  s_7ab28ba7f0dbe3::t_ce757aa99dc378 72-74,76-78
+CONTEXT.md
+  s_7ab28ba7f0dbe3::t_e64726d5edee38 74,82,106,110,114
+docs/spec/asset-exchange-authorization-and-retention-lifecycle.md
+  s_7ab28ba7f0dbe3::t_5b2655c9d71dd7 32,54,101-103,126,143,221,226-231,235-236,248-249,254-259,267,313-315,347-350,354-358,362-364,378-379,393,396,420-421,438
+docs/spec/chat-execution-and-streaming-lifecycle.md
+  s_7ab28ba7f0dbe3::t_be450bbd576cf6 19,28,67-68,75,81,89,93-95,114-119,123-126,131,176,178-181,189,209-210,224-225,230-232,239,246-251,269-271,276-280,288,290,297,321,324,341,345-352,356-359,363-370,374-376,382,386,389-397,405,410,434-435,437
+docs/spec/client-api-key-lifecycle-and-admission-controls.md
+  s_7ab28ba7f0dbe3::t_57dfd4527e49f9 435,442-444,624,662,668
+docs/spec/tenant-scoped-routing-fallback-affinity-leases.md
+  s_7ab28ba7f0dbe3::t_bea66b7a8052e3 225-226,247-251,261,372,401,414,418-420,424-425,437
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "ab919ec9a99f726e611833cdeec93ca3df5dc4b5",
+  "prompts": {},
+  "sessions": {
+    "s_7ab28ba7f0dbe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77f6f098-0966-48be-abdb-a20ac054f65a",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
