@@ -1,0 +1,29 @@
+CONTEXT.md
+  s_b796aef1e7df4b::t_22de4ebed42ff9 82
+docs/spec/tenant-scoped-routing-fallback-affinity-leases.md
+  s_316f092233856d::t_3eb7a66a89499c 96,139,222
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "f0a68dee591156cfd6615d12c8484aecda1bda54",
+  "prompts": {},
+  "sessions": {
+    "s_316f092233856d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe9e531e-1ef8-4efb-a379-357896cd466b",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_b796aef1e7df4b": {
+      "agent_id": {
+        "tool": "github-copilot",
+        "id": "43b9e876-f7b4-4b48-b982-7400aa99aabe",
+        "model": "gpt-4.1"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
