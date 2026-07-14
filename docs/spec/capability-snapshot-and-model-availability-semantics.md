@@ -112,7 +112,7 @@ Exactly these five are the first-class capability-bearing operations every snaps
 | **`chat_streaming`** | Incremental token/event streaming chat | Real vs **synthetic** streaming diverges by mode: Gemini Web Cookie simulates SSE by chunking a full body (#4), Gemini Antigravity is true SSE (#4). Routing MUST see this as a separate capability, not a flag |
 | **`image_generation`** | Text-to-image generation | Web vs OAuth image surfaces diverge (#3 web `image_gen` conversation vs Codex `image_generation` tool); entitlement-gated |
 | **`image_edit`** | Edit an existing image with a prompt (± reference images) | Distinct upstream path and entitlement from generation (#3/#5) |
-| **`inpaint`** | Masked region edit (Photoshop-style mask semantics) | First-class in this product (parent #1); **`unsupported`** on all Gemini/Grok modes in evidence, client-composite only on ChatGPT Web (#3–#5). MUST be its own token so the gateway never silently degrades a mask request into a plain edit |
+| **`inpaint`** | Masked region edit (Photoshop-style mask semantics) | First-class in this product (parent #1); **`unsupported`** on all Gemini/Grok modes in evidence; offerable only on the two ChatGPT modes — client-composite mask on ChatGPT Web, stronger mask field on ChatGPT Codex (#3–#5). MUST be its own token so the gateway never silently degrades a mask request into a plain edit |
 
 `chat_streaming` is a **separate operation**, not a modifier on `chat`, precisely so a snapshot can say "chat yes, real streaming no / synthetic only" without lying (#4 Gemini Web).
 
@@ -270,9 +270,12 @@ Each capability fact (operation-level and model-level) carries a provenance so r
 | `reference_learned` | Learned from `.ref/*` reverse-engineering only | `conditionally_supported` |
 | `upstream_verified` | Confirmed against official upstream product/docs surface | up to `verified` |
 | `live_probe` | Confirmed by a live authenticated probe on **this** account | up to `verified` |
-| hybrid (e.g. `reference_learned+upstream_verified`) | Mixed; record both | governed by the weaker for runtime trust |
+| hybrid (e.g. `reference_learned+upstream_verified`) | Mixed; record both | if hybrid **includes** `live_probe` on this account, the live-probe class governs (up to `verified` for the probed fact); otherwise governed by the weaker non-probe class for runtime trust |
 
-Rule: a fact whose only evidence class is `reference_learned` MUST NOT be recorded as `verified` (§4.2). Live-probe on the actual account is what upgrades trust for that account.
+Rules:
+1. A fact whose only evidence class is `reference_learned` MUST NOT be recorded as `verified` (§4.2).
+2. Live-probe on the actual account is what upgrades trust for that account — a hybrid that includes `live_probe` is not capped by any weaker co-recorded class for the probed fact.
+3. Hybrid without `live_probe` (e.g. `reference_learned+upstream_verified`) is capped by the weaker class so docs/upstream confirmation alone cannot outrank a live account probe.
 
 ### 7.2 Probe surface identifier
 
