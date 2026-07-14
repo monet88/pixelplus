@@ -122,10 +122,11 @@ Support may receive **safe diagnostic context** that the owning Tenant already c
 | **Routing Policy object** | Exactly one Tenant | Tenant-scoped policy documents / bindings | Owning Tenant | Owning Tenant | Applied only when selecting candidates inside that Tenant | Owning Tenant update/delete | Candidate set MUST be subset of Tenant’s Provider Accounts |
 | **Quota / admission counter** | Exactly one Tenant (and optionally subdivided by Client API Key or Provider Account of same Tenant) | Counters never aggregate across Tenants | System on use | Owning Tenant aggregate views only | Charged only to owning Tenant resources | Reset/adjust only within Tenant policy (#8) | Exhaustion of Tenant A MUST NOT affect Tenant B |
 | **Request / execution log metadata** | Exactly one Tenant of the Security Principal or job owner | Correlated by request id | System | Owning Tenant safe views; operators only safe classes | N/A | Retention per data lifecycle (#15) | MUST NOT store Provider Credential or raw Client API Key |
+| **Idempotency Record** | Exactly one Tenant of the Security Principal that submitted the key | One logical record per `(tenant_id, client_api_key_id or scope, idempotency_key)` | System on first accepted request | Owning Tenant diagnostics only (safe views) | Replay only for same-Tenant principal and matching request fingerprint | Expiry/delete per idempotency TTL policy (#16/#20) | Cross-Tenant replay of the same key MUST NOT hit another Tenant’s record (see §5.2 A7) |
 
 ### 3.1 Immutability of ownership
 
-Once created, `tenant_id` on Client API Key, Provider Account, Provider Credential, Asset, Render Job, Capability Snapshot, Routing Policy object, and quota counters is **immutable**. There is no “transfer ownership to another Tenant” operation in MVP. Migration products, if ever needed, are a new design that must still avoid dual ownership windows.
+Once created, `tenant_id` on Client API Key, Provider Account, Provider Credential, Asset, Render Job, Capability Snapshot, Routing Policy object, quota counters, and Idempotency Records is **immutable**. There is no “transfer ownership to another Tenant” operation in MVP. Migration products, if ever needed, are a new design that must still avoid dual ownership windows.
 
 ### 3.2 Attachment rules
 
@@ -299,7 +300,7 @@ Exact canonical error codes are deferred to #16, but the **status-class and non-
 
 ## 8. Core invariants (normative checklist)
 
-1. **I-TENANT-BOUNDARY** — Tenant is the sole ownership boundary for Client API Key, Provider Account, Provider Credential, Asset, Render Job, Capability Snapshot, Routing Policy objects, and quota counters.
+1. **I-TENANT-BOUNDARY** — Tenant is the sole ownership boundary for Client API Key, Provider Account, Provider Credential, Asset, Render Job, Capability Snapshot, Routing Policy objects, quota counters, and Idempotency Records.
 2. **I-SINGLE-OWNER** — Each of those resources has exactly one `tenant_id`, immutable after creation.
 3. **I-PRINCIPAL** — Every authenticated Public API request resolves exactly one Security Principal `(tenant_id, client_api_key_id)` from one Client API Key; that principal cannot be overridden by client-supplied Tenant fields.
 4. **I-BYOA** — Execution may use a Provider Account only when `account.tenant_id == principal.tenant_id` (workers: `== job.tenant_id`).
