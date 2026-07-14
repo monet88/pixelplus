@@ -1,0 +1,21 @@
+docs/spec/asset-exchange-authorization-and-retention-lifecycle.md
+  s_ac03de9be6adf4::t_908a76405aa5ff 248
+docs/spec/chat-execution-and-streaming-lifecycle.md
+  s_ac03de9be6adf4::t_8c6e9e828570c2 197-199,220,251,264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "d034e4ab70fc7fab368559a50a7977a6d207a704",
+  "prompts": {},
+  "sessions": {
+    "s_ac03de9be6adf4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "60ba1a17-6020-429c-941b-ad7a9baea3ee",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
