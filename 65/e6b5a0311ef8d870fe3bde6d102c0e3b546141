@@ -1,0 +1,19 @@
+docs/spec/auth-mode-risk-envelope-and-kill-criteria.md
+  s_8e7b9d93552afe::t_69cc1ad3e59fe2 458
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "65e6b5a0311ef8d870fe3bde6d102c0e3b546141",
+  "prompts": {},
+  "sessions": {
+    "s_8e7b9d93552afe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9682a5c6-0b1c-4c46-acf6-27c7ef7521a8",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
