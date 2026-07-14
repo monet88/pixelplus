@@ -245,7 +245,7 @@ Rules:
 Rules:
 
 1. Caps are **per Tenant** and isolated (#6 `I-QUOTA-SCOPE`): Tenant A hitting its storage cap MUST NOT affect Tenant B's capacity.
-2. `byte_size` counts toward `L-TENANT-ASSET-BYTES` from successful store until expiry/deletion reclaims it; count toward `L-TENANT-ASSET-COUNT` likewise.
+2. `byte_size` counts toward `L-TENANT-ASSET-BYTES` from successful store until **logical deletion** (`deleted_at` set, §5.4) or **expiry** (`expires_at` passed, §5.3) — cap headroom is reclaimed **immediately** at that lifecycle transition, not deferred to physical byte reclamation (which lags per #15/#17). Count toward `L-TENANT-ASSET-COUNT` likewise. This mirrors retrievability, which also stops **at** `expires_at`/`deleted_at` regardless of reclamation lag (§5.3 rule 2, §5.4 rule 3), so a Tenant that deletes Assets to free space is unblocked at once.
 3. A new **upload** that would exceed either cap is rejected at intake with a canonical **storage-cap class** (`storage_cap_exceeded`, 4xx/insufficient-storage per #16), distinct from the per-request 413 size class (#8 §7.7) and from admission `quota_exhausted` (#8 §7.5). Remediation: delete Assets or wait for expiry reclamation.
 4. `output` Asset creation by a Render Job is governed by the same caps; #14 defines whether an over-cap Tenant's job fails at output placement or the client must free space first — this document locks that output storage **counts** and is **capped**, not that it is exempt.
 5. Caps use effective limit hierarchy consistent with #8 §7.1 (`min(platform, tenant, override?)`); numbers are `D-ASSET-CAP-TUNE`-reopenable without changing the cap semantics.

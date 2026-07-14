@@ -194,7 +194,9 @@ Chat account resolution (X2) uses the #11 precedence ladder verbatim: **P0 candi
 
 1. A **streaming session** MAY acquire an **account lease** (#11 §5.2): the lease binds the whole stream to **exactly one** account for its duration so the Gateway does not hop accounts mid-stream (#11 §5.2 rule 1 explicitly names a chat stream).
 2. The lease is acquired from the candidate set under P1–P4 at stream start; it cannot be acquired on a non-usable/foreign account (#11 §5.2 rule 2).
-3. If a durable #9 §5.1 items 1–5 gate fails for the leased account **mid-stream** (disable/revoke/delete/reauth_required/hard-block health/vault-revoke), the lease is **void for new work** immediately (#11 §5.4). The in-flight stream that cannot be aborted upstream MAY finish on the old account (#11 §5.4, #8 §4.5 residual), but **no new step/turn** admits on the voided lease; a new turn re-resolves via §5.1.
+3. If a durable #9 §5.1 items 1–5 gate fails for the leased account **mid-stream**, the lease is **void for new work** immediately (#11 §5.4) and **no new step/turn** admits on the voided lease; a new turn re-resolves via §5.1. The fate of the **in-flight** stream depends on the failure kind:
+   - **Soft/administrative loss** (disable, reauth_required, hard-block health): the credential material is still physically usable, so an in-flight stream that cannot be aborted upstream MAY finish on the old account (#11 §5.4, #8 §4.5 residual).
+   - **Hard credential/account loss** (delete, revoke, vault-revoke): the credential or account no longer exists or is inaccessible, so the stream cannot physically continue — it MUST terminate `failed` immediately (a cancel attempt SHOULD still run where cancelable; §6.6).
 4. A lease does **not** create extra concurrency budget (#11 §5.2 rule 5, #8 §7.4): the stream still holds exactly one chat concurrency slot.
 
 ### 5.4 Fallback during chat
@@ -215,7 +217,7 @@ For each way a chat execution can end early, this section states **(a)** whether
 1. A client MAY cancel an in-flight chat (explicit cancel request, or by closing a stream it opened; §6.3 covers pure transport disconnect).
 2. On cancel, the Gateway **MUST attempt to abort** the upstream execution when the Auth Mode/Adapter supports abort (cancelable). This mirrors #8 `I-CANCEL-ON-REVOKE` and parent #1 story 31 ("ngừng tiêu quota khi người dùng dừng").
 3. **Cancelable upstream:** abort is attempted; the terminal outcome is `canceled`; the concurrency slot releases **on cancel completion** (#8 §7.4); token quota is reconciled to **actual tokens consumed so far** (§6.5).
-4. **Non-cancelable upstream** (an already-committed generation the Provider will not abort): the Gateway stops streaming to the client and emits terminal `canceled`, but the upstream MAY run to its natural end. The Gateway MUST NOT claim the upstream was aborted when it was not — the honest statement is "client cancel observed; upstream residual may complete" (mirrors #8 §4.5 in-flight residual). Quota reconciles to whatever the upstream actually consumed (§6.5), which MAY exceed tokens streamed to the client.
+4. **Non-cancelable upstream** (an already-committed generation the Provider will not abort): the Gateway stops streaming to the client and emits terminal `canceled`, but the upstream MAY run to its natural end. The Gateway MUST NOT claim the upstream was aborted when it was not — the honest statement is "client cancel observed; upstream residual may complete" (mirrors #8 §4.5 in-flight residual). The Gateway MUST **drain the upstream connection in the background** to its natural end rather than discarding it, because only the drained final usage lets it reconcile quota to what the upstream actually consumed (§6.5), which MAY exceed tokens streamed to the client. Discarding the connection would leave quota reconciled to an under-count.
 5. Cancel is **idempotent**: a second cancel on an already-terminal execution is a success no-op, not an error.
 
 ### 6.3 Client disconnect
@@ -246,7 +248,7 @@ Consumes #8 §7.4/§7.5:
 ### 6.6 Cancel-on-revoke and account loss
 
 - If the admitting **Client API Key is revoked** mid-execution, #8 `I-CANCEL-ON-REVOKE` applies: the Gateway MUST attempt cancel of the cancelable in-flight chat and release the slot on cancel completion (§6.2). No new admission is minted for the revoked material (#8 §4.5).
-- If the **serving account** becomes non-usable mid-execution (#9 durable gate), §5.3 rule 3 applies: lease void for new work; in-flight non-cancelable stream MAY finish; a cancel attempt SHOULD still run where cancelable.
+- If the **serving account** becomes non-usable mid-execution (#9 durable gate), §5.3 rule 3 applies: lease void for new work; the in-flight stream's fate depends on the failure kind — soft/administrative loss MAY finish on the old account, hard credential/account loss (delete/revoke/vault-revoke) MUST terminate `failed`; a cancel attempt SHOULD still run where cancelable.
 
 ---
 
@@ -259,7 +261,7 @@ Chat generation is **non-idempotent** at the Provider: re-sending the same promp
 ### 7.2 Single retry boundary (normative)
 
 1. **Exactly one layer owns chat re-attempts: the Gateway execution layer.** The Adapter MUST NOT independently re-run a full chat generation on its own timer, and the HTTP transport layer MUST NOT auto-retry a chat `POST` that may have already reached upstream. Full canonical retry-ownership across all operations is #16; this document locks the chat rule.
-2. A chat execution re-attempt is permitted **only** when the Gateway can prove the prior attempt did **not** commit an upstream generation — i.e. the failure occurred **before X4 upstream execution began** (pre-upstream: X1 capability, X2 routing, X3 decrypt, or a connection failure before the Provider accepted the request). These are safe to retry because no generation/side effect exists yet.
+2. A chat execution re-attempt is permitted **only** when the Gateway can prove the prior attempt did **not** commit an upstream generation — i.e. the failure occurred **before X4 upstream execution began** (pre-upstream: X1 capability, X2 routing, X3 decrypt, or a connection failure **before any request payload bytes were transmitted** — e.g. during DNS resolution or TCP/TLS handshake). Once payload transmission has begun, the Gateway cannot prove the Provider did not accept or start executing the request, so the attempt is treated as **possibly-committed** (rule 3), not retryable. These pre-payload failures are safe to retry because no generation/side effect exists yet.
 3. Once **X4 has begun** (the Provider may have started generating, especially once any `delta`/partial output exists), the execution is treated as **possibly-committed** and MUST NOT be automatically retried by the Gateway. The terminal outcome is `failed`; re-attempt is a **new client-initiated request** the client chooses to make, subject to §7.3 idempotency.
 4. **Routing fallback (#11 P5) is not a content re-emission.** Fallback selects a different account for a **pre-upstream** or transient-unavailable primary (#11 §6.4); it does not re-run a generation that already produced client-visible content (§5.4). Fallback and retry are bounded and ordered (#11 §6.6): the chain is walked once, terminating in a fail-closed rejection.
 
