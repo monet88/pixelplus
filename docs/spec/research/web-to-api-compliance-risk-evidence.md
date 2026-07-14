@@ -263,7 +263,7 @@ Every conclusion below uses:
 | **Protective measures / rate limits** | AUP: disrupting/interfering/unauthorized access including circumventing rate limits/restrictions or protective measures and safety mitigations; bypassing systems or protective measures. | **high** | |
 | **Commercial facilitation of violations** | AUP: “Providing services that encourage others to violate these Terms, including by operating websites offering violative outputs from our Services in exchange for payment.” | **high** | Directly relevant to a paid SaaS that industrially produces outputs via non-compliant access. |
 | **Enterprise-style resale language (consumer still under AUP)** | Enterprise ToS (for API/business) separately forbids sell/rent/lease/time sharing — shows commercial posture; consumer path is already constrained by AUP bots/resell language. | **medium** for cross-reading | Do not apply Enterprise ToS wholesale to pure consumer accounts. |
-| **Challenge / ban (technical)** | `.ref/grok2api` models independent Web SSO vs Build OAuth pools, cooldown/fault switching, SSO non-refresh expiry — operational evidence of credential fragility and health states. | **medium** technical | Not legal permission. |
+| **Challenge / ban (technical)** | `.ref/grok2api` models independent Web SSO vs Grok xAI OAuth pools, cooldown/fault switching, SSO non-refresh expiry — operational evidence of credential fragility and health states. | **medium** technical | Not legal permission. |
 
 **Sources (checked 2026-07-14):**
 
@@ -359,7 +359,7 @@ These are **observable triggers for operators and for #7 decisioning**. They are
 | ID | Trigger | Action |
 |---|---|---|
 | RR-1 | Any Rank A/B policy effective-date change for OpenAI, Google, or xAI | Re-read changed sections; diff automation/credential/resale clauses |
-| RR-2 | New official CLI/OAuth product terms for Codex, Antigravity, or Grok Build | Add product-specific annex; possibly lower/higher risk than parent family |
+| RR-2 | New official CLI/OAuth product terms for Codex, Antigravity, or Grok xAI | Add product-specific annex; possibly lower/higher risk than parent family |
 | RR-3 | Provider launches first-party API that cannibalizes a Web Access capability | Reassess necessity of Web Adapter |
 | RR-4 | Material enforcement campaign in industry (mass bans) | Update challenge/ban annex with operational signals (still not legal proof) |
 | RR-5 | Counsel opinion or insurer questionnaire requires jurisdiction-specific analysis | Escalate beyond this research note |
@@ -425,9 +425,9 @@ Use only to design health/cooldown/kill signals; **not** compliance permission.
 | Reference | Relevant Auth Modes | Observed challenge / fragility signals |
 |---|---|---|
 | `.ref/chatgpt2api` | ChatGPT Web Access; some Codex image paths | Cloudflare interception; FlareSolverr clearance; PoW, Turnstile, Sentinel utilities; account token invalidation; rate-limit account cooling; disclaimer of ban risk |
-| `.ref/CLIProxyAPI` | ChatGPT Codex OAuth; Gemini Antigravity OAuth; Grok OAuth/CLI | Multi-account load balancing patterns; OAuth login flows; protocol translators — shows industry operates OAuth/CLI bridges, not legal cover |
+| `.ref/CLIProxyAPI` | ChatGPT Codex OAuth; Gemini Antigravity OAuth; Grok xAI OAuth | Multi-account load balancing patterns; OAuth login flows; protocol translators — shows industry operates OAuth/CLI bridges, not legal cover |
 | `.ref/gemini-web-to-api` | Gemini Web Cookie | Cookie pair `__Secure-1PSID` / `__Secure-1PSIDTS`; refresh interval; explicit ToS non-affiliation warning |
-| `.ref/grok2api` | Grok Web SSO; Grok xAI/Build OAuth | Split pools; SSO non-auto-refresh; cooldown and fault switching; credential encryption at rest |
+| `.ref/grok2api` | Grok Web SSO; Grok xAI OAuth | Split pools; SSO non-auto-refresh; cooldown and fault switching; credential encryption at rest |
 
 ---
 
