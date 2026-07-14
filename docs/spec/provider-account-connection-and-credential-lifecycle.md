@@ -112,7 +112,7 @@ Cause → effect:
 | **Reauthentication** | Human-mediated submission of replacement Provider Credential material for an **existing** `provider_account_id`. |
 | **Lifecycle state** | Durable account state governing connection and credential ops (`draft`, `pending_validation`, `pending_probe`, `active`, `reauth_required`, `disabled`, `revoked`, `deleted`). |
 | **Operational health** | Orthogonal runtime signal (`healthy`, `degraded`, `auth_expired`, `challenged`, `quota_exhausted`, `rate_limited`, `protocol_drift`, `provider_banned`, `unknown`). Does not replace lifecycle state; see §6. |
-| **Remediation class** | Stable guidance category returned to the Tenant (e.g. `submit_credential`, `complete_oauth`, `reauthenticate`, `wait_cooldown`, `contact_operator`, `auth_mode_unavailable`). Exact Public API code strings are #16. |
+| **Remediation class** | Stable guidance category returned to the Tenant. Canonical tokens (this document): `submit_credential`, `complete_oauth`, `reauthenticate`, `ack_risk`, `enable_account`, `wait_provider_cooldown`, `contact_operator`, `auth_mode_unavailable`, `delete_and_recreate`. Exact Public API error **code strings** remain #16. |
 | **Risk acknowledgement** | Explicit Tenant accept of residual ToS/ban/custody themes required by #7 for `gated` (and stronger lab warnings for `experimental`). |
 | **Auth Mode kill / feature gate** | Platform-level block from #7 OP-G1 / KS-* / FG-* that forbids new connections and/or new executions for that Auth Mode. |
 
@@ -230,15 +230,16 @@ pending_probe ──fail──► reauth_required | disabled*** | draft****
 
 ### 4.2 Global transition rules
 
-1. **Usability gate (I-USABLE-GATE):** An account becomes usable (`lifecycle_state=active` **and** not blocked by §5.2) **only** after:
+1. **Activation preconditions (subset of I-USABLE-GATE):** Transition into `lifecycle_state=active` is allowed **only** after:
    - required validation success for the current `credential_version`, **and**
    - required probe success for that same `credential_version`, **and**
    - Auth Mode is product-connectable for this deployment/Tenant per #7 (not `prohibited`; `gated` needs flag+ack; `experimental` only in lab profile).
+   Full **usable-for-routing/execution** conjunction is defined once in **§5.1 (`I-USABLE-GATE`)** and includes hard-block health, vault-revoked, and request-time scope/capability checks.
 2. **No skip:** Create MUST NOT jump directly to `active` in a single write that bypasses validation+probe, even if the client sends a “trust me” flag.
 3. **Auth Mode immutability:** `auth_mode` never changes. Wrong mode → delete and create a new account (or create a second account).
 4. **Tenant immutability:** `tenant_id` never changes (#6).
 5. **Idempotency:** Disable/revoke/delete/reauth-start operations are idempotent at the product level (second call does not re-enable secrets or flip state backwards unexpectedly).
-6. **Fail closed on Auth Mode kill:** If OP-G1 / KS-* disables the Auth Mode, new creates fail closed; existing `active` accounts become non-usable for execution (see §5.2) even if `lifecycle_state` remains `active` until a reconciler moves them to `disabled` or `reauth_required` as appropriate.
+6. **Fail closed on Auth Mode kill:** If OP-G1 / KS-* disables the Auth Mode, new creates fail closed. Existing accounts become **non-usable for execution immediately** (§5.1 item 2: Auth Mode not execution-enabled). Kill-switch reconciler MUST move formerly `active` accounts to durable `disabled` (operational kill / OP-G1) or `reauth_required` (KS-6 credential-class invalidation and similar auth-class kills) without waiting for the next Tenant action, so lifecycle state does not advertise a still-connected account after kill. Until that write lands, execution gates still fail closed on the Auth Mode flag alone.
 7. **No silent cross-mode recovery:** Refresh/reauth stays on the same Auth Mode (#7 §6.3).
 
 ### 4.3 Create
@@ -354,10 +355,10 @@ Observable effects when activated:
 
 **Rules:**
 
-1. Refresh decrypts current material, performs Auth-Mode refresh grant, writes **new** material as `credential_version+1` (or same version with rotated fields — implementation choice), updates `credential_expires_at` / `last_refresh_at`.
-2. Refresh success **keeps** `active` (or restores from a transient in-flight only state); it is not a new activation ceremony.
+1. Refresh decrypts current material, performs Auth-Mode refresh grant, writes **new** material under a **new** `credential_version` (monotone +1; no silent same-version overwrite of rotated secret fields — keeps audit and dual-version cutover aligned with §4.9), updates `credential_expires_at` / `last_refresh_at`.
+2. Refresh success from `active` **keeps** `lifecycle_state=active` (it is not a new activation ceremony and does not re-open draft/pending_*). Metadata and `credential_version` update; account remains subject to §5.1.
 3. Refresh failure that is **permanent auth class** (invalid_grant, refresh_token_reused, revoked client, 401 without recovery) → `lifecycle_state=reauth_required`, health `auth_expired`, usable=false.
-4. Refresh failure that is **transient** → keep state, health `degraded`/`unknown`, backoff (#17); do not hammer (#7 KS-3 interaction).
+4. Refresh failure that is **transient** → keep lifecycle state, health `degraded`/`unknown`, backoff (#17); do not hammer (#7 KS-3 interaction).
 5. Concurrent refresh MUST be singleflight per `(tenant_id, provider_account_id)` (research: Codex/xAI refresh_token reuse risk).
 6. Refresh MUST NOT switch Auth Mode or Tenant.
 7. Audit: `provider_credential.refreshed` without material.
@@ -374,6 +375,7 @@ Observable effects when activated:
 **Triggers:**
 
 - `lifecycle_state=reauth_required`
+- `lifecycle_state=revoked` (explicit prior revoke; recovery is reauth with a new credential version, not “enable”)
 - Tenant-initiated credential rotate while `active`/`disabled` (planned rotation)
 - Operator instruction after challenge/ban recovery where credential was invalidated
 
@@ -381,9 +383,9 @@ Observable effects when activated:
 
 1. Authorize `accounts.manage` + ownership.
 2. Enforce Auth Mode still connectable (#7); if `prohibited`/killed → fail closed.
-3. For `gated`, prior risk ack may still be valid if `risk_ack_version` current; if risk themes version bumps, re-ack REQUIRED before new material becomes usable.
-4. Accept material (direct or OAuth restart).
-5. Validate → probe → only then `active` (or back to `disabled` if Tenant wants to remain disabled: credential may update while state stays `disabled` until enable).
+3. For `gated`, prior risk ack may still be valid if `risk_ack_version` current; if risk themes version bumps, re-ack (`ack_risk`) REQUIRED before new material becomes **usable** (§5.1 / #7 §6.1 “stored as usable” = activation/usable, not merely encrypted vault write of intake material).
+4. Accept material (direct or OAuth restart). Vault **MAY** write ciphertext during intake/`pending_*` for crash safety; that write alone MUST NOT satisfy §5.1.
+5. Validate → probe → only then `active` (or back to `disabled` if Tenant wants to remain disabled: credential may update while state stays `disabled` until enable). From `revoked`, successful reauth activation is the only product path back to `active`.
 6. **Dual-version rule (MVP locked):** During reauth, previous credential version remains the only decrypt source for in-flight executions until the new version reaches `active` (or until revoke). When new version activates, previous version is vault-revoked and MUST NOT decrypt for new work. No long dual-valid window for **new** admissions after activation of the new version (aligns with #8 rotate immediacy spirit for secrets).
 
 **MUST NOT** create a second Provider Account solely because reauth occurred.
@@ -442,44 +444,46 @@ Observable effects when activated:
 
 ### 4.13 Transition matrix (summary)
 
-| From \ Event | submit OK | validate fail | probe OK | probe auth-fail | silent refresh fail permanent | disable | enable | revoke | reauth activate | delete |
-|---|---|---|---|---|---|---|---|---|---|---|
-| draft | pending_validation / pending_probe | draft | active* | draft / reauth_required | — | disabled | — | revoked | — | deleted |
-| pending_validation | — | draft / reauth_required | — | — | — | disabled | — | revoked | — | deleted |
-| pending_probe | — | — | active* | reauth_required | — | disabled | — | revoked | — | deleted |
-| active | reauth path | — | active (re-probe) | reauth_required | reauth_required | disabled | — | revoked | active | deleted |
-| reauth_required | pending_validation | reauth_required | active* | reauth_required | — | disabled | — | revoked | active | deleted |
-| disabled | optional reauth store | disabled | disabled or active on enable path | reauth_required | — | disabled | pending_probe / active | revoked | disabled/active | deleted |
-| revoked | reauth only | revoked | — | — | — | — | — | revoked | active (via reauth) | deleted |
-| deleted | — | — | — | — | — | — | — | — | — | deleted |
+| From \ Event | submit OK | validate fail | probe OK | probe auth-fail | silent refresh success | silent refresh fail permanent | disable | enable | revoke | reauth activate | delete |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| draft | pending_validation / pending_probe | draft | — (must be pending_probe first) | — | — | — | disabled | — | revoked | — | deleted |
+| pending_validation | — | draft / reauth_required | — | — | — | — | disabled | — | revoked | — | deleted |
+| pending_probe | — | — | active* | reauth_required | — | — | disabled | — | revoked | — | deleted |
+| active | reauth path → pending_validation | — | active (re-probe) | reauth_required | active (version++) | reauth_required | disabled | — | revoked | active | deleted |
+| reauth_required | pending_validation | reauth_required | active* | reauth_required | — | — | disabled | — | revoked | active | deleted |
+| disabled | optional reauth store | disabled | disabled or active on enable path | reauth_required | — | — | disabled | pending_probe / active* | revoked | disabled/active* | deleted |
+| revoked | reauth → pending_validation | revoked | — | — | — | — | — | — | revoked | active* | deleted |
+| deleted | — | — | — | — | — | — | — | — | — | — | deleted |
 
-\* `active` only if §4.2 usability gate fully satisfied (including risk ack and Auth Mode connectable).
+\* `active` only if §4.2 activation preconditions and full §5.1 `I-USABLE-GATE` can hold after the transition (including risk ack and Auth Mode connectable).
 
 ---
 
 ## 5. Usability rules
 
-### 5.1 Definition of usable
+### 5.1 Definition of usable (`I-USABLE-GATE` — authoritative)
 
 An account is **usable** for routing and new execution if and only if **all** hold:
 
 1. `lifecycle_state == active`
-2. Auth Mode is currently **execution-enabled** for the deployment (not killed; not `prohibited`; `gated`/`experimental` gates still satisfied)
+2. Auth Mode is currently **execution-enabled** for the deployment (not killed; not `prohibited`; `gated`/`experimental` gates still satisfied, including required risk ack for gated modes)
 3. Operational health is not in a hard-block set: MVP hard-block = `auth_expired`, `provider_banned`, `challenged` (until cleared by successful reauth/probe policy), and any #17 extension that marks non-routable
 4. Current `credential_version` has passed required validation + required probe
 5. Credential is not vault-revoked
-6. Client API Key scope/allowlist allows the account (#8)
-7. Capability Snapshot requirements for the requested operation are satisfied (#10) — checked at request time, not part of lifecycle state
+6. Client API Key scope/allowlist allows the account when the caller is a Public API principal (#8) — N/A for pure system jobs that already act under the account’s `tenant_id`
+7. Capability Snapshot requirements for the requested operation are satisfied when the action is capability-bearing (#10) — checked at request time; not a durable lifecycle field
+
+Items 1–5 are **account-durable** gates. Items 6–7 are **request-time** gates that cannot make a non-`active` account usable.
 
 ### 5.2 Non-usable must fail before Adapter execution
 
 If an account is selected explicitly but not usable:
 
-- Same-Tenant policy deny → **403-class** with remediation class (e.g. `reauthenticate`, `account_disabled`)
+- Same-Tenant policy deny → **403-class** with remediation class (e.g. `reauthenticate`, `enable_account`, `ack_risk`)
 - Foreign/unknown id → **404-class** (#6)
 - Auth Mode unavailable / prohibited → fail closed with `auth_mode_unavailable` (same-Tenant) without leaking whether another Tenant has such accounts
 
-**MUST NOT** call upstream with a non-usable account “to see if it still works” as a substitute for the connection probe state machine, except for explicit Tenant-triggered re-probe or system health probes that still cannot mark usable without §4.2.
+**MUST NOT** call upstream with a non-usable account “to see if it still works” as a substitute for the connection probe state machine, except for explicit Tenant-triggered re-probe or system health probes that still cannot mark usable without §5.1.
 
 ### 5.3 Concrete cause → effect examples
 
@@ -508,7 +512,7 @@ If an account is selected explicitly but not usable:
 
 1. Deployment enables ChatGPT Codex OAuth flag.
 2. Tenant starts connect without risk acknowledgement.
-3. Credential MUST NOT become usable; activation blocked; remediation `risk_acknowledgement_required`.
+3. Credential MUST NOT become usable; activation blocked; remediation `ack_risk`.
 
 #### Example E — Prohibited mode
 
@@ -830,22 +834,23 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 
 1. **I-ACCOUNT-TENANT** — Every Provider Account has exactly one immutable `tenant_id`.
 2. **I-ACCOUNT-AUTHMODE** — Every Provider Account has exactly one immutable `auth_mode`.
-3. **I-CREDENTIAL-BIND** — Provider Credential attaches to exactly one Provider Account of the same Tenant; never retargeted across Tenants or Auth Modes.
-4. **I-USABLE-GATE** — Usable only when `active` + validation+probe success for current credential version + Auth Mode execution-enabled + not hard-blocked health + not vault-revoked.
-5. **I-NO-ACTIVE-ON-FAIL** — Validation failure or required probe failure MUST NOT yield usable/active success.
-6. **I-NO-WEB-OAUTH-MIX** — Web Access and OAuth/CLI Access lifecycles never share one Provider Account or silent recovery path.
-7. **I-REFRESH-MODE-CORRECT** — Silent refresh uses only the Auth Mode’s issuer/client/credential class; singleflight per account.
-8. **I-REAUTH-SAME-ID** — Reauth preserves `provider_account_id`, Tenant, and Auth Mode.
-9. **I-DISABLE-NONUSE** — Disabled accounts are non-usable for new execution.
-10. **I-REVOKE-NONUSE** — Revoked credentials cannot decrypt for execution; account not usable until new version activates.
-11. **I-DELETE-TERMINAL** — Deleted accounts are not-found for product APIs; credentials shredded/deleted per vault policy.
-12. **I-RISK-GATE** — `prohibited` unconnectable; `gated` needs flag+ack; `experimental` lab-only.
-13. **I-REDACT-CREDENTIAL** — Provider Credential material never appears in responses, logs, metrics, audit, or operator metadata.
-14. **I-NON-ENUM-ACCOUNT** — Foreign Provider Account ids yield 404-class non-enumeration (#6).
-15. **I-SCOPE-MANAGE** — Connection mutations require `accounts.manage`; default inference keys lack it.
-16. **I-NO-CHALLENGE-SOLVER-PRODUCT** — Challenge health does not authorize shipping anti-bot bypass product features (#7).
-17. **I-PROBE-MINIMAL** — Required probes are auth-proving and cost-minimal; not full billable renders.
-18. **I-FAIL-CLOSED-KILL** — Auth Mode kill/feature gate stops new connections and executions for that mode.
+3. **I-CREDENTIAL-BIND** — As locked in #6: a Provider Credential is usable only for its attached Provider Account and only on same-Tenant authorized paths; never shared or retargeted across Tenants. This document does not redefine that id.
+4. **I-CREDENTIAL-AUTHMODE-BIND** — Provider Credential `auth_mode` MUST match its Provider Account `auth_mode`; material MUST NOT be retargeted across Auth Modes or accounts.
+5. **I-USABLE-GATE** — Authoritative definition in §5.1: `active` + Auth Mode execution-enabled (incl. risk ack) + not hard-blocked health + validation+probe success for current credential version + not vault-revoked + request-time scope/allowlist (when applicable) + request-time capability (when capability-bearing).
+6. **I-NO-ACTIVE-ON-FAIL** — Validation failure or required probe failure MUST NOT yield usable/active success.
+7. **I-NO-WEB-OAUTH-MIX** — Web Access and OAuth/CLI Access lifecycles never share one Provider Account or silent recovery path.
+8. **I-REFRESH-MODE-CORRECT** — Silent refresh uses only the Auth Mode’s issuer/client/credential class; singleflight per account; success bumps `credential_version` and stays `active` when already `active`.
+9. **I-REAUTH-SAME-ID** — Reauth preserves `provider_account_id`, Tenant, and Auth Mode; valid from `reauth_required` and `revoked` (and planned rotate from `active`/`disabled`).
+10. **I-DISABLE-NONUSE** — Disabled accounts are non-usable for new execution.
+11. **I-REVOKE-NONUSE** — Revoked credentials cannot decrypt for execution; account not usable until new version activates via reauth.
+12. **I-DELETE-TERMINAL** — Deleted accounts are not-found for product APIs; credentials shredded/deleted per vault policy.
+13. **I-RISK-GATE** — `prohibited` unconnectable; `gated` needs flag+`ack_risk`; `experimental` lab-only.
+14. **I-REDACT-CREDENTIAL** — Provider Credential material never appears in responses, logs, metrics, audit, or operator metadata.
+15. **I-NON-ENUM-ACCOUNT** — Foreign Provider Account ids yield 404-class non-enumeration (#6).
+16. **I-SCOPE-MANAGE** — Connection mutations require `accounts.manage`; default inference keys lack it.
+17. **I-NO-CHALLENGE-SOLVER-PRODUCT** — Challenge health does not authorize shipping anti-bot bypass product features (#7).
+18. **I-PROBE-MINIMAL** — Required probes are auth-proving and cost-minimal; not full billable renders.
+19. **I-FAIL-CLOSED-KILL** — Auth Mode kill/feature gate stops new connections and executions for that mode; reconciler MUST move former `active` accounts to `disabled` or `reauth_required` per §4.2 rule 6.
 
 ---
 
@@ -896,7 +901,8 @@ An ADR **would** be warranted if product later introduced:
 
 | Id | Meaning |
 |---|---|
-| `I-USABLE-GATE` | Normative usability conjunction in §5.1 / §4.2 |
+| `I-USABLE-GATE` | Authoritative usability conjunction in §5.1 (activation subset in §4.2) |
+| `I-CREDENTIAL-AUTHMODE-BIND` | Credential cannot cross Auth Modes/accounts (§15) |
 | `D-CODEX-APIKEY-MODE` | Reopen if API-key Codex login becomes its own Auth Mode |
 | `D-REAUTH-GRACE` | Reopen if long dual-valid reauth window desired |
 | `D-PROBE-RATE` | Reopen for numeric per-Tenant probe budgets |
