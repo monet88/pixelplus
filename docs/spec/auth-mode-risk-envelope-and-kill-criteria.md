@@ -455,7 +455,7 @@ When #2 is refreshed (RR-*), owners MUST diff automation/credential/resale claus
 |---|---|---|
 | All six Auth Modes have individual status and rationale (not Provider-level only) | **Met** | §4 matrix + §5 cards |
 | Each status links to evidence and states assumptions still in force | **Met** | Each §5 card Evidence + Assumptions |
-| Kill criteria and recovery described with observable signals | **Met** | §3.5 + per-card Kill/Recovery |
+| Kill criteria and recovery described with observable signals | **Met** | §3.5.1–§3.5.5 (KS/FG + reopen R0–R4) + per-card Kill/Recovery |
 | Deferred decisions have dependency and reopen triggers | **Met** | §8 |
 | Specification only; no Gateway implementation | **Met** | §1.2 |
 | Downstream constraints for UX/routing/adapters recorded | **Met** | §6–§7 |
