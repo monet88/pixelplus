@@ -1,0 +1,21 @@
+CONTEXT.md
+  s_92a86f0fd39f24::t_86b16f9819d547 23-24,68-71,91-94
+docs/spec/client-api-key-lifecycle-and-admission-controls.md
+  s_92a86f0fd39f24::t_342e9780629533 1-691
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "89b2a537981c546286daa227b48e75c488648422",
+  "prompts": {},
+  "sessions": {
+    "s_92a86f0fd39f24": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "024b970e-e38f-4478-90b0-83e09db4df3c",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
