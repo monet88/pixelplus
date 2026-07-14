@@ -1,0 +1,19 @@
+.gitattributes
+  s_ac03de9be6adf4::t_eb216079ef3b83 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "212a46994879f451aebaef0ea4f6982095999470",
+  "prompts": {},
+  "sessions": {
+    "s_ac03de9be6adf4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "60ba1a17-6020-429c-941b-ad7a9baea3ee",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
