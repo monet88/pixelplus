@@ -127,7 +127,7 @@ API key secrets are high-entropy. Offline brute-force of a 256-bit secret is not
 - Verify: recompute HMAC and compare in constant time.
 - Store alongside `hash_version` so pepper/algorithm rotation is possible.
 
-**Pepper compromise impact:** offline verification of captured hashes becomes possible for anyone who also obtains the hash table. Mitigation: pepper in HSM/KMS, hash-table access control, optional dual-pepper verify during rotation, and mandatory revoke-all on suspected pepper leak (operator runbook — not coded here).
+**Pepper compromise impact:** with a **256-bit CSPRNG secret**, offline brute-force recovery of the secret from `secret_hash` remains computationally infeasible even if both the hash table and pepper leak. Pepper is still defense-in-depth: it prevents an attacker who only obtains hashes (no pepper) from running offline HMAC checks against guessed or recycled low-entropy material, supports hash-version rotation, and keeps verify tied to platform secret custody. Mitigation on suspected pepper leak: rotate pepper (`hash_version`), dual-pepper verify window, hash-table access control, and operator revoke-all runbook (not coded here).
 
 **Rejected for Client API Key secrets:** password-style interactive KDF as the *only* verifier when it would make legitimate RPM targets impractical. Implementations MAY add a memory-hard KDF **in addition** only if they still meet admission latency budgets; they MUST NOT replace constant-time verify with early-exit compares.
 
@@ -219,7 +219,7 @@ Ordered pipeline (normative):
 2. **Parse** product prefix and public locator. Failure → **401**.
 3. **Load** key record by public locator.
 4. If no row **or** `status != active` **or** hash verify fails → **401**.  
-   These three cases MUST be **observably indistinguishable** to the client (same status class and non-differentiating body shape). Timing SHOULD be mitigated toward constant work for known locators; unknown locator MAY use a dummy verify.
+   These three cases MUST be **observably indistinguishable** to the client (same status class and non-differentiating body shape). Timing SHOULD be mitigated toward constant work for known locators; unknown locator SHOULD use a dummy verify.
 5. Build Security Principal `(tenant_id, client_api_key_id)`.
 6. Continue to **scope** then **admission** (§6–§7).
 
@@ -255,9 +255,10 @@ Alternative product flow “create new key + revoke old” remains valid and is 
 
 **In-flight residual window (honest bound):**
 
-- Revoke does **not** guarantee instant kill of work **already admitted** (in-flight chat stream, worker already executing a Render Job).
-- Implementations SHOULD cancel cancelable in-flight work when the admitting `client_api_key_id` is revoked (#12 / #14 refine cancellation).
-- Security claim of this issue: **no new admission** after budget; residual is documented, not denied.
+- Revoke does **not** by itself prove that already-admitted work has finished.
+- Implementations **MUST attempt** to cancel cancelable in-flight work (chat streams, cancelable jobs) whose admitting `client_api_key_id` was revoked, releasing concurrency slots on cancel completion (#12 / #14 refine protocols and best-effort limits).
+- Non-cancelable residual (for example an upstream render that cannot be aborted) MAY continue until natural terminal state; it MUST NOT mint a new principal or new A6 accept for the revoked material.
+- Security claim of this issue: **no new admission** after budget; cancel-on-revoke is mandatory attempt, not a silent best-effort footnote.
 
 ### 4.6 List / get / update metadata
 
@@ -287,11 +288,11 @@ MVP locks behavior, not full identity product design:
 
 Scopes only **narrow** actions inside the owning Tenant (#6).
 
-| Dimension | Type | Empty / omitted means |
-|---|---|---|
-| **operations** | set of operation ids | Invalid at rest; create MUST write an explicit set (default grant below) |
-| **model_allowlist** | set of model ids | All models otherwise visible via Tenant Capability Snapshots |
-| **provider_account_allowlist** | set of same-Tenant Provider Account ids | All accounts eligible under Routing Policy |
+| Dimension | Type | Omitted / null means | Explicit empty set `[]` means |
+|---|---|---|---|
+| **operations** | set of operation ids | Invalid at rest; create MUST write an explicit set (default grant below) | Invalid at rest — a key MUST retain at least one operation or be revoked |
+| **model_allowlist** | set of model ids | All models otherwise visible via Tenant Capability Snapshots | **Deny all** model-bearing operations (**403-class**), even if `chat.completions` / `images.*` remain in operations |
+| **provider_account_allowlist** | set of same-Tenant Provider Account ids | All accounts eligible under Routing Policy | **Deny all** explicit affinity and implicit routing candidates for this key (**403-class** for same-Tenant policy deny; foreign ids still **404-class**) |
 
 ### 5.2 Operation ids (MVP vocabulary)
 
@@ -339,8 +340,14 @@ Cause → effect: a leaked default inference key cannot mint new keys or reconne
 After authn, for the target operation:
 
 1. If operation id ∉ key.operations → **403-class** (same-Tenant forbidden).
-2. If model_allowlist is non-empty and requested model ∉ list → **403-class**.
-3. If provider_account_allowlist is non-empty and explicit affinity account ∉ list → **403-class** (not 404 — the account may still be “owned” but denied by key policy).  
+2. **model_allowlist:**
+   - omitted/null → no extra model filter beyond Capability Snapshot;
+   - explicit `[]` → deny every model-bearing request (**403-class**);
+   - non-empty → requested model MUST be ∈ list, else **403-class**.
+3. **provider_account_allowlist:**
+   - omitted/null → all same-Tenant accounts allowed by Routing Policy;
+   - explicit `[]` → deny account selection for this key (**403-class**);
+   - non-empty → explicit affinity account MUST be ∈ list, else **403-class** (same-Tenant policy deny, not existence oracle).
    If the account id is foreign/unknown to the Tenant, #6 **404-class** still wins (ownership check before or combined so foreign ids do not become 403 oracles).
 4. Scopes never override ownership: a scope cannot authorize Tenant B resources.
 
@@ -360,11 +367,11 @@ After a Security Principal is established, Gateway MUST evaluate admission in th
 | Step | Check | Failure class | Execution side effects |
 |---|---|---|---|
 | A0 | Authn (principal) | **401** | None |
-| A1 | Scope / allowlists | **403-class** | None |
-| A2 | Request-size limits | **413-class** for every size violation (known `Content-Length` over max, or buffered bytes over max on chunked/unknown length). Framing/syntax errors that are **not** size violations remain **400** and are not size outcomes. | Partial body discard only |
-| A3 | Rate limit (RPM / burst) | **429-class** `rate_limit` | May count toward rate window (§7.3) |
+| A1 | Scope / allowlists / ownership on named ids | **403-class** same-Tenant policy deny; **404-class** foreign/unknown Tenant-scoped ids (#6) | None |
+| A2 | Request-size limits | **413-class** for every size violation (known `Content-Length` over max, or buffered bytes over max on chunked/unknown length). Framing/syntax errors that are **not** size violations remain **400** and are not size outcomes. | Partial body discard only; authenticated size rejects SHOULD count toward Tenant RPM (§7.3) |
+| A3 | Rate limit (RPM / burst) | **429-class** `rate_limit` | Counts toward rate window (§7.3) |
 | A4 | Concurrency limit | **429-class** `concurrency_limit` | No slot held |
-| A5 | Quota (anti-abuse units) | **429-class** `quota_exhausted` | No full unit debit for reject (§7.5) |
+| A5 | Quota (anti-abuse units) | **429-class** `quota_exhausted` | No daily quota debit for reject (§7.5) |
 | A6 | Accept for execution | — | Concurrency slot acquired; quota reservation rules apply |
 
 **MUST NOT** call Provider Adapters, decrypt Provider Credentials, or enqueue durable Render Jobs before A6 success.
@@ -396,46 +403,63 @@ These are **product-chosen conservative defaults**, reopenable without rewriting
 |---|---|---|
 | `L-TENANT-RPM` | 60 requests / minute | Rate |
 | `L-TENANT-BURST` | 20 | Rate burst token bucket |
-| `L-TENANT-CHAT-CONCURRENCY` | 5 in-flight chat requests | Concurrency |
-| `L-TENANT-JOB-CONCURRENCY` | 3 non-terminal active Render Jobs | Concurrency |
+| `L-TENANT-CHAT-CONCURRENCY` | 5 in-flight chat requests | Concurrency (Tenant ceiling) |
+| `L-TENANT-JOB-CONCURRENCY` | 3 non-terminal active Render Jobs | Concurrency (Tenant ceiling) |
+| `L-KEY-CHAT-CONCURRENCY` | inherit Tenant; if unset, effective key share still counts under Tenant ceiling | Concurrency (per-key subdivision; default partition by `client_api_key_id` for slot accounting) |
 | `L-TENANT-REQ-DAY` | 10_000 requests / UTC day | Quota |
 | `L-TENANT-CHAT-TOKEN-DAY` | 2_000_000 estimated tokens / UTC day | Quota |
 | `L-TENANT-IMAGE-JOB-DAY` | 200 job creates / UTC day | Quota |
+| `L-CHAT-MAX-TOKENS-PER-REQ` | 8_192 | Quota reservation cap per chat request |
 | `L-JSON-BODY-MAX` | 2 MiB | Request-size |
 | `L-ASSET-UPLOAD-MAX` | 20 MiB | Request-size |
 | `R-REVOKE-PROP` | 5 seconds | Revocation cache bound |
 | `L-AUTH-FAIL-IP-RPM` | 60 failed auth / minute / IP | Abuse |
-| `L-AUTH-FAIL-LOCATOR-RPM` | 20 failed auth / minute / public_locator | Abuse |
+| `L-AUTH-FAIL-IP-LOCATOR-RPM` | 20 failed auth / minute / `(source_ip, public_locator)` | Abuse (primary locator throttle) |
 
 Per-key overrides default to **inherit** (no extra tightening). Platform caps MAY be equal to these defaults in single-tenant lab deploys.
 
 ### 7.3 Rate limit semantics
 
-- Counts **requests that passed A0 (authenticated)** and reached the rate checker, including those later rejected for concurrency/quota/size **if** size was already known. Unauthenticated failures use abuse counters (§8), not Tenant RPM.
+- Counts **requests that passed A0 (authenticated)** and reached the rate checker, including those later rejected for concurrency/quota/**size** (including authenticated **413-class** size rejects). Unauthenticated failures use abuse counters (§8), not Tenant RPM.
+- If size is enforced before the rate counter is touched in the implementation hot path, the implementation MUST still attribute authenticated size rejects to the Tenant/key RPM window (or an equivalent authenticated abuse counter with the same effective cap).
 - Algorithm: token bucket or sliding window is an implementation choice; observable MUST include a retryable **429-class** with stable error class `rate_limit` (#16 names the code string).
 - OpenAI-compatible rate headers SHOULD be emitted when practical: limit, remaining, reset.
 - Streaming chat: counts as **one** request at admission, not per SSE event.
 
 ### 7.4 Concurrency semantics
 
-Two independent Tenant (and optional per-key) counters:
+Two independent counter families (Tenant ceiling + per-key subdivision):
 
 | Counter | Acquired | Released |
 |---|---|---|
-| Chat in-flight | A6 accept of chat completion | Terminal response fully sent, client disconnect handled, or cancel completed |
+| Chat in-flight | A6 accept of chat completion | Terminal response fully sent, client disconnect handled, cancel completed, or cancel-on-revoke completed |
 | Active Render Jobs | A6 accept of job create | Job reaches terminal state (completed / failed / canceled) per #14 |
 
-Reject at A4 → **429-class** `concurrency_limit` (distinct class from `rate_limit` so clients can back off differently).
+Rules:
+
+1. **Tenant ceiling** remains `L-TENANT-CHAT-CONCURRENCY` / `L-TENANT-JOB-CONCURRENCY`.
+2. Implementations **MUST** account in-flight chat (and SHOULD account jobs) **per `client_api_key_id`** as well as under the Tenant ceiling so one leaked key cannot alone pin the entire Tenant chat concurrency budget by default. Effective admit requires both key subdivision and Tenant ceiling to have capacity (`effective` still respects §7.1 hierarchy).
+3. Reject at A4 → **429-class** `concurrency_limit` (distinct class from `rate_limit` so clients can back off differently).
+4. On revoke, cancel-on-revoke (§4.5) MUST release chat slots when cancel completes.
 
 ### 7.5 Quota semantics (anti-abuse, not billing)
 
 MVP quota units:
 
 1. **Requests / day** — +1 at A6 accept.
-2. **Estimated chat tokens / day** — reserve at A6 using input size + `max_tokens` (or product default cap); reconcile after completion when actual usage known; never leave unbounded under-admission if counters are unavailable (§7.6).
+2. **Estimated chat tokens / day** — reserve at A6 using:
+
+   ```text
+   reserve = input_tokens_estimate + min(requested_max_tokens_or_product_default, L-CHAT-MAX-TOKENS-PER-REQ)
+   ```
+
+   - If the client supplies `max_tokens` (or equivalent) **above** `L-CHAT-MAX-TOKENS-PER-REQ`, Gateway MUST reject before reserve with **400-class** (invalid request parameter) or clamp only when product policy explicitly documents clamp; default is **reject**.
+   - Reconcile after completion when actual usage known; never leave unbounded under-admission if counters are unavailable (§7.6).
 3. **Image job creates / day** — +1 at A6 accept of job create. Output-placement retries that do **not** create a new upstream render MUST NOT consume another image-job quota unit (#14).
 
-**Admission rejection (A1–A5)** MUST NOT full-debit daily request/token/job quota.
+**Admission rejection (A1–A5)** MUST NOT debit daily request/token/job quota.
+
+**Durable asset storage / count caps** (total bytes or object count retained for a Tenant) are **not** numbered here; #13 MUST define them. Until #13 lands, operators MUST NOT treat per-request `L-ASSET-UPLOAD-MAX` as a substitute for Tenant storage anti-abuse.
 
 Provider-side quota/rate signals are **execution** outcomes: they update Provider Account health/cooldown (#17) and map to canonical errors (#16). They do **not** replace Client API Key admission controls and MUST NOT debit another Tenant.
 
@@ -472,8 +496,11 @@ If rate, concurrency, quota, or revocation state backends are unavailable:
 | Signal | Control |
 |---|---|
 | Failures per source IP | `L-AUTH-FAIL-IP-RPM` → **429-class** or temporary soft-block without confirming whether a locator exists |
-| Failures per public_locator | `L-AUTH-FAIL-LOCATOR-RPM` → same |
+| Failures per `(source_ip, public_locator)` | `L-AUTH-FAIL-IP-LOCATOR-RPM` → same class; **primary** locator-aware throttle |
+| Failures per `public_locator` alone (any IP) | MUST NOT hard-lockout a locator platform-wide solely from distributed wrong-secret attempts. Implementations MAY apply mild global slowdown/telemetry for a locator under extreme volume, but a client presenting the **correct** secret from a non-abusive IP MUST still authenticate subject only to IP and `(IP, locator)` budgets |
 | Valid auth + repeated A1/A2 violations | MAY auto-revoke or disable key after operator-configured threshold; emit audit `client_api_key.abuse_revoked` |
+
+Cause → effect: an attacker who scraped `public_locator` from logs can burn fail-auth attempts from many IPs; without the rule above they could deny the legitimate key owner. Binding the tight locator budget to **`(source_ip, public_locator)`** stops that cross-IP lockout while still rate-limiting single-IP stuffing.
 
 Responses MUST NOT become an oracle for “this locator exists but secret is wrong” vs “unknown” beyond what §4.3 already allows; throttle messages stay generic.
 
@@ -506,11 +533,12 @@ else:
 | Condition | Phase | HTTP-oriented class | Debit rate? | Hold concurrency? | Debit daily quota? | Adapter / vault decrypt? |
 |---|---|---|---|---|---|---|
 | Missing/invalid/revoked key | A0 | **401** | abuse counters only | no | no | no |
-| Insufficient scope / allowlist | A1 | **403-class** | optional authz metric | no | no | no |
-| Body/asset too large (size max exceeded) | A2 | **413-class** only | no Tenant RPM required | no | no | no |
+| Insufficient scope / allowlist (same Tenant) | A1 | **403-class** | optional authz metric | no | no | no |
+| Foreign/unknown Tenant-scoped id | A1 | **404-class** | optional authz metric | no | no | no |
+| Body/asset too large (size max exceeded) | A2 | **413-class** only | SHOULD count Tenant RPM | no | no | no |
 | Tenant/key RPM exceeded | A3 | **429-class** `rate_limit` | counts in window | no | no | no |
 | Concurrency exceeded | A4 | **429-class** `concurrency_limit` | may already have counted RPM | no | no | no |
-| Daily quota exhausted | A5 | **429-class** `quota_exhausted` | may already have counted RPM | no | no full debit | no |
+| Daily quota exhausted | A5 | **429-class** `quota_exhausted` | may already have counted RPM | no | no | no |
 | Capability unsupported (pre-exec) | post-A5 capability gate | **4xx** capability class (#10/#16) | per rate rules if admitted past A3 | no if rejected before A6 | no | no |
 | Provider rate / quota / challenge / auth expiry / timeout / protocol drift | execution | canonical runtime errors (#16/#17) | already counted at A6 | yes until release | reservation/reconcile per §7.5 | yes, same-Tenant only |
 | Worker crash after job admitted | execution | job failure states (#14) | already counted | until terminal | job unit already counted | possible |
@@ -533,7 +561,7 @@ else:
 2. Tenant owner revokes key at t=0; API returns success.
 3. At t=3s (< `R-REVOKE-PROP`), edge has refreshed revocation → attacker’s next chat request gets **401**.
 4. No new Adapter call is made for that attacker request.
-5. A chat stream admitted at t=−1s MAY still finish or be canceled best-effort; it MUST NOT be used to mint a new principal after revoke.
+5. A chat stream admitted at t=−1s MUST have cancel attempted; if still non-cancelable upstream, it MAY finish but MUST NOT mint a new principal or new A6 accept after revoke.
 
 #### Example B — Rate vs Provider rate
 
@@ -594,21 +622,26 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 10. Exceed RPM → **429-class `rate_limit`**; Adapter calls = 0.
 11. Exceed chat concurrency → **429-class `concurrency_limit`**; Adapter calls = 0.
 12. Exceed image job day quota → **429-class `quota_exhausted`**; no job row accepted.
-13. Oversized JSON body → **413-class**.
+13. Oversized JSON body → **413-class**; authenticated size rejects count toward Tenant RPM.
 14. Oversized asset upload → **413-class**.
 15. Tenant A exhaustion does not change Tenant B remaining counters.
-16. Admission rejects do not full-debit daily quota units.
+16. Admission rejects do not debit daily quota units.
 17. Limit backend outage → fail closed (no allow-all).
+18. `max_tokens` above `L-CHAT-MAX-TOKENS-PER-REQ` rejected before reserve; reserve uses the min cap.
+19. Explicit empty `model_allowlist` denies model-bearing ops (**403-class**); omitted allowlist does not.
+20. One active key at chat concurrency cap does not by itself block a second key of the same Tenant from admitting while Tenant ceiling still has capacity (per-key subdivision).
 
 ### 11.4 Abuse and redaction
 
-18. Failed auth flood from IP hits `L-AUTH-FAIL-IP-RPM` without confirming key existence beyond §4.3.
-19. Logs/metrics for the above cases contain `client_api_key_id` or public_locator at most, never full material.
-20. Revoked key cannot read own or foreign resources (**401** only).
+21. Failed auth flood from one IP hits `L-AUTH-FAIL-IP-RPM` / `L-AUTH-FAIL-IP-LOCATOR-RPM` without confirming key existence beyond §4.3.
+22. Distributed wrong-secret attempts against a scraped `public_locator` from many IPs do **not** hard-lockout a correct secret from a clean IP.
+23. Logs/metrics for the above cases contain `client_api_key_id` or public_locator at most, never full material.
+24. Revoked key cannot read own or foreign resources (**401** only).
+25. Revoke triggers cancel attempt for cancelable in-flight chat; slots release on cancel completion.
 
 ### 11.5 Phase boundary
 
-21. Injected Provider failure only occurs on tests that passed A6; admission-only tests assert zero Adapter invocations and zero Provider Credential decrypts.
+26. Injected Provider failure only occurs on tests that passed A6; admission-only tests assert zero Adapter invocations and zero Provider Credential decrypts.
 
 ---
 
@@ -622,14 +655,16 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 6. **I-AUTH-FAIL-401** — Missing, malformed, unknown, wrong-secret, and revoked material all yield **401** without Tenant resource access.
 7. **I-REVOKE-BOUNDED-CACHE** — Positive auth decisions MUST NOT outlive `R-REVOKE-PROP` (5s default); unbounded active-key cache is forbidden.
 8. **I-ROTATE-IMMEDIATE** — Rotate invalidates previous secret immediately (no MVP dual-valid grace).
-9. **I-SCOPE-NARROW** — Scopes only narrow same-Tenant actions; default grant excludes `keys.manage`.
+9. **I-SCOPE-NARROW** — Scopes only narrow same-Tenant actions; default grant excludes `keys.manage`; explicit empty model/account allowlists mean deny-all for that dimension.
 10. **I-ADMIT-ORDER** — Authn → scope → size → rate → concurrency → quota → accept; no Adapter/job side effects before accept.
 11. **I-LIMIT-HIERARCHY** — `effective = min(platform, tenant, key_override?)`; key cannot exceed Tenant ceiling.
-12. **I-LIMIT-ISOLATION** — Rate/concurrency/quota counters never shared across Tenants.
+12. **I-LIMIT-ISOLATION** — Rate/concurrency/quota counters never shared across Tenants; chat concurrency is also subdivided by `client_api_key_id` under the Tenant ceiling.
 13. **I-ADMIT-VS-EXEC** — Admission rejections are distinct from Provider/execution failures; clients can tell `rate_limit` / `concurrency_limit` / `quota_exhausted` classes apart from runtime Provider errors.
-14. **I-NO-OPEN-PROXY** — No unauthenticated inference; abuse throttles apply to auth failures.
+14. **I-NO-OPEN-PROXY** — No unauthenticated inference; abuse throttles apply to auth failures without global locator lockout from foreign IPs.
 15. **I-REDACT-KEY** — Full material and secret hash never appear in logs, metrics labels, or non-one-time API responses.
 16. **I-FAIL-CLOSED-LIMITS** — Unavailable revocation or limit state does not fail open.
+17. **I-RESERVE-CAP** — Chat token reservation at admission is capped by `L-CHAT-MAX-TOKENS-PER-REQ`.
+18. **I-CANCEL-ON-REVOKE** — Revoke MUST attempt cancel of cancelable in-flight work for that key and release concurrency when cancel completes.
 
 ---
 
@@ -641,10 +676,10 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 | Provider Account connection UX | #9 | `accounts.*` scopes only |
 | Capability gate details | #10 | Pre-Adapter; not a rate limit |
 | Routing policy shape | #11 | `routing.*` scopes; allowlists still same-Tenant |
-| Chat cancel on revoke best-effort | #12 | Residual in-flight window documented |
-| Asset retention & dimension validation | #13 | Upload max size here |
+| Chat cancel protocol details after revoke | #12 | MUST attempt cancel; residual non-cancelable window documented |
+| Asset retention, dimension validation, **Tenant durable storage/count caps** | #13 | Per-request upload max here; total storage anti-abuse **required** in #13 |
 | Job terminal states & output retry quota | #14 | Job concurrency + job/day units |
-| Pepper/KMS storage mechanics | #15 | Pepper secrecy class; HMAC default |
+| Pepper/KMS storage mechanics | #15 | Pepper secrecy class; HMAC default; 256-bit offline-crack infeasibility |
 | Provider health / cooldown | #17 | Execution phase only |
 | Commercial billing | parent Out of Scope | Anti-abuse quota ≠ invoice |
 | Rotate grace window | reopen `D-ROTATE-GRACE` | Immediate invalidate is MVP |
@@ -681,14 +716,16 @@ No new ADR. Client API Key ownership and principal formation were product-locked
 | `R-REVOKE-PROP` | 5s max positive auth cache / revocation propagation budget |
 | `L-TENANT-RPM` | 60 / min |
 | `L-TENANT-BURST` | 20 |
-| `L-TENANT-CHAT-CONCURRENCY` | 5 |
-| `L-TENANT-JOB-CONCURRENCY` | 3 |
+| `L-TENANT-CHAT-CONCURRENCY` | 5 Tenant ceiling |
+| `L-TENANT-JOB-CONCURRENCY` | 3 Tenant ceiling |
+| `L-KEY-CHAT-CONCURRENCY` | Per-key chat subdivision under Tenant ceiling (default partition by key) |
 | `L-TENANT-REQ-DAY` | 10_000 / UTC day |
 | `L-TENANT-CHAT-TOKEN-DAY` | 2_000_000 est. tokens / UTC day |
 | `L-TENANT-IMAGE-JOB-DAY` | 200 / UTC day |
+| `L-CHAT-MAX-TOKENS-PER-REQ` | 8_192 reservation/request cap |
 | `L-JSON-BODY-MAX` | 2 MiB |
 | `L-ASSET-UPLOAD-MAX` | 20 MiB |
 | `L-AUTH-FAIL-IP-RPM` | 60 / min / IP |
-| `L-AUTH-FAIL-LOCATOR-RPM` | 20 / min / locator |
+| `L-AUTH-FAIL-IP-LOCATOR-RPM` | 20 / min / `(IP, locator)` |
 | `D-NUMERIC-TUNE` | Reopen id for changing numeric defaults without semantic rewrite |
 | `D-ROTATE-GRACE` | Reopen id if dual-valid rotate is ever desired |
