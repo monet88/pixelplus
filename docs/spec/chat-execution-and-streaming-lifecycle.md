@@ -16,7 +16,7 @@
 
 ### 1.1 Scope
 
-This specification locks the **canonical chat execution lifecycle** — from an admitted Public API chat request to a terminal outcome — for both **non-streaming** and **streaming** responses, so a client observes **one Provider-independent contract** regardless of which Auth Mode or Provider Account served the request.
+This specification locks the **canonical chat execution lifecycle** — from an admitted Public API chat request through its client and accounting terminal moments — for both **non-streaming** and **streaming** responses, so a client observes **one Provider-independent contract** regardless of which Auth Mode or Provider Account served the request.
 
 It codifies parent #1 user stories 28–36 and consumes the ownership boundary (#6), admission pipeline (#8), usability gate (#9 `I-USABLE-GATE`), capability gate (#10, including the **real-vs-synthetic streaming** distinction), and routing/affinity/lease precedence (#11).
 
@@ -25,7 +25,7 @@ This is **specification work**; it does **not** implement the Gateway, Adapter, 
 It covers:
 
 1. The **request-to-terminal lifecycle** phases and where chat sits relative to admission (#8 A6) and routing (#11).
-2. **Non-streaming** canonical response shape (logical) and its single terminal outcome.
+2. **Non-streaming** canonical response shape (logical) and its single client-terminal outcome.
 3. **Streaming** canonical event ordering, the terminal event set, and the guarantee that terminal semantics do not leak Provider-specific framing.
 4. **Cancellation, client disconnect, and timeout**: whether upstream execution continues or is aborted, and the **quota/concurrency** consequence of each.
 5. **Conversation affinity** and **account lease** for chat, consuming #11 precedence.
@@ -64,21 +64,21 @@ Downstream issues **MUST** preserve every decision here. They may add fields, ti
 | Topic | Already locked | This document adds |
 |---|---|---|
 | Admission vs execution | Authn→scope→size→rate→concurrency→quota→A6 accept; chat = one request at admission, not per SSE event (#8 §6, §7.3) | The execution phases **after** A6 and their terminal semantics |
-| Concurrency slot lifetime | Chat slot acquired at A6; released on terminal response fully sent, disconnect handled, cancel completed, or cancel-on-revoke completed (#8 §7.4) | The exact terminal events / disconnect / timeout that release the slot |
-| Token quota reservation | Reserve at A6, reconcile after completion (#8 §7.5) | Reconcile on every terminal outcome incl. cancel/disconnect/timeout |
+| Concurrency slot lifetime | Chat occupancy acquired at A6 under both Tenant and key counters; surviving upstream work retains both until accounting terminal (#8 §7.4) | The exact client/accounting terminal events and residual tracking state |
+| Token quota reservation | Reserve at A6, reconcile after completion (#8 §7.5) | Reconcile at accounting terminal for every outcome; retain reservation across non-cancelable residual work |
 | Usability + capability gate | `I-USABLE-GATE` + capability reject-before-upstream (#9 §5.1, #10 §9) | Chat/`chat_streaming` capability checked before Adapter call; synthetic-streaming honesty |
 | Routing / lease / affinity | Precedence P0–P5; lease binds a streaming session; affinity is soft (#11 §4–§5) | How a chat turn acquires affinity and a stream acquires a lease |
 | Cancel-on-revoke | Revoke MUST attempt cancel of cancelable in-flight chat (#8 §4.5, `I-CANCEL-ON-REVOKE`) | The cancel protocol and its quota effect |
 
 ### 1.5 Decision unit
 
-**One chat execution = one admitted Public API chat request (one Security Principal, one requested model, streaming or not) resolved to exactly one Provider Account (#11) and driven to exactly one terminal outcome, with at most one canonical terminal signal to the client.**
+**One chat execution = one admitted Public API chat request (one Security Principal, one requested model, streaming or not) resolved to exactly one Provider Account (#11), driven to exactly one client-terminal outcome and one accounting terminal, with at most one canonical terminal signal to the client.**
 
 Cause → effect:
 
 1. A non-streaming request that succeeds returns **one** canonical response with a terminal `finish` classification; a client never has to parse Provider-specific end markers.
 2. A streaming request emits an **ordered** sequence of content events followed by **exactly one** terminal event (`completed` / `canceled` / `failed`); no content follows the terminal event, and no second terminal event is emitted.
-3. A client that disconnects mid-stream causes a **defined** outcome (attempt cancel; release slot; reconcile quota) rather than a silently orphaned upstream generation billing forever.
+3. A client that disconnects mid-stream causes a **defined** outcome: attempt cancel, emit no more client events, and release concurrency only when upstream stops; surviving work may move to bounded residual tracking but retains its original Tenant+key occupancy until accounting reconciliation — never silently orphan upstream generation or mint replacement capacity.
 
 ---
 
@@ -86,11 +86,13 @@ Cause → effect:
 
 | Term | Meaning in this document |
 |---|---|
-| **Chat execution** | The post-admission (#8 A6) processing of one chat request against one routed Provider Account (#11) until a terminal outcome. |
+| **Chat execution** | The post-admission (#8 A6) processing of one chat request against one routed Provider Account (#11) through its client and accounting terminal moments. |
 | **Non-streaming response** | A single canonical response body delivered once, carrying the full assistant message and a terminal `finish_class`. |
 | **Streaming response** | An ordered sequence of canonical **stream events** delivered incrementally, ending in exactly one terminal event. |
 | **Stream event** | A canonical incremental unit (`open`, `delta`, `heartbeat`, terminal). Provider-specific framing is normalized into these before the client sees them (#10 §3.1 governs whether real or synthetic). |
-| **Terminal outcome** | The single final classification of a chat execution: `completed`, `canceled`, `failed`, or `timed_out`. This is the **internal** outcome vocabulary for reconciliation/remediation; on the wire it maps onto the three terminal **events** (§4.3) — `timed_out` always emits the `failed` terminal event/finish class with a distinct timeout remediation class (§6.4), never a fourth wire signal. |
+| **Client terminal outcome** | The single final classification visible to the client: `completed`, `canceled`, `failed`, or `timed_out`. On the wire it maps onto the three terminal **events** (§4.3) — `timed_out` emits `failed` with a timeout remediation class (§6.4), never a fourth wire signal. |
+| **Accounting terminal** | The point at which upstream work has stopped or naturally completed and final usage has been reconciled. Usually coincides with the client terminal; it occurs later when a non-cancelable upstream continues as residual work (§6.5). It emits no second client terminal event. |
+| **Residual hold** | A bounded, same-Tenant tracking state for non-cancelable upstream work after the client terminal. It preserves quota reservation and the original Tenant+`client_api_key_id` concurrency occupancy until X6; it is not a second concurrency pool and does not mint replacement capacity (§6.5). |
 | **Synthetic streaming** | A stream the Provider does not natively deliver token-by-token; the Adapter chunks a buffered full body (Gemini Web Cookie, #10 §3.1/§4.3). Canonically still ordered + terminal, but MUST NOT be advertised as real token latency. |
 | **Cancellation** | A client- or system-initiated request to stop an in-flight chat execution before natural completion. |
 | **Client disconnect** | The client transport closes (TCP/HTTP2 stream reset, browser close) before a terminal outcome is delivered. |
@@ -109,22 +111,24 @@ A chat request that reached **A6 accept** (#8 §6) proceeds through these phases
 | Phase | What happens | Owner |
 |---|---|---|
 | **X0 Admitted** | A6 accept succeeded: concurrency slot held, token reservation made (#8 §7.4/§7.5) | #8 |
-| **X1 Capability gate** | Resolve op (`chat` or `chat_streaming`) + model `m` against the routed-candidate snapshot; reject before upstream if `unsupported`/`unverified`/not-`fresh`/model-unavailable (#10 §9). Streaming request on a **synthetic-only** mode honored only per §4.4 | #10 (consumed) |
-| **X2 Account resolution** | Resolve exactly one usable, capability-satisfied same-Tenant account via #11 precedence (P0–P5); acquire affinity/lease per §5 | #11 (consumed) |
-| **X3 Credential decrypt** | Decrypt the resolved account's credential on the same-Tenant authorized path only (#6 §5.3 rule 3) | #6/#15 |
-| **X4 Upstream execution** | Adapter calls the Provider; normalize response/stream into canonical shape (§4) | this doc |
-| **X5 Terminal** | Deliver exactly one terminal outcome; release concurrency slot; reconcile token quota (§6.5) | this doc + #8 |
+| **X1 Route and select** | Build the #11 candidate set for the requested `op`+model (including C0–C5 capability/health filters), apply P1–P5, resolve exactly one same-Tenant account, and acquire affinity/lease per §5 | #11 (consumed) |
+| **X2 Selected-account gate** | Reaffirm the selected account's current usability and `op`+model Capability Snapshot immediately before credential access; reject if unsupported/unverified/not-fresh/model-unavailable. Synthetic-only streaming is governed by §4.4 | #9/#10 (consumed) |
+| **X3 Credential decrypt** | Decrypt the selected account's credential on the same-Tenant authorized path only (#6 §5.3 rule 3) | #6/#15 |
+| **X4 Upstream execution** | Atomically claim idempotency (§7.3), then Adapter calls the Provider and normalizes response/stream into canonical shape (§4) | this doc |
+| **X5 Client terminal** | Deliver at most one client terminal outcome; release concurrency only if upstream stopped, otherwise move bookkeeping to residual tracking while retaining the original Tenant+key occupancy (§6.5) | this doc + #8 |
+| **X6 Accounting terminal** | When upstream work is definitively over, reconcile final token usage and release the original Tenant+key concurrency occupancy plus any residual tracking state exactly once; normally coincides with X5 | this doc + #8 |
 
 Cause → effect:
 
-1. Capability gate (X1) runs **before** account credential decrypt (X3) where it can be known from the routed candidate's snapshot, so an `unsupported`/`stale` op wastes no vault decrypt or Adapter call (#10 §9, `I-CAP-REJECT-BEFORE-UPSTREAM`).
-2. Because #11 already filtered the candidate set by capability (C4) and health (C5), X2 resolves an account already known offerable for `op`+`m`; X1 is the request-time reaffirmation on the resolved account (#10 §9.1 item 1).
-3. A failure in X1–X3 is **pre-upstream** (no Adapter call, no quota debit beyond the released reservation); a failure in X4 is an **execution/runtime** failure (#8 §9.1) with its own terminal class.
+1. X1 can evaluate capability because it constructs candidates from each account's snapshot before selecting one; there is no check against an account that has not yet been resolved.
+2. X2 reaffirms the chosen account immediately before decrypt, so a snapshot/usability change between candidate construction and execution fails closed with zero Adapter calls (#9 `I-USABLE-GATE`, #10 `I-CAP-REJECT-BEFORE-UPSTREAM`).
+3. Failures in X1–X3 and an idempotency-claim loss before the Adapter call are **pre-upstream**: release this request's slot/reservation and make no Provider call. X4 failures are classified by proof of non-commit (§7.2), not merely by phase name.
+4. X5 and X6 are the same transition unless a non-cancelable upstream survives the client terminal; in that case X5 moves bookkeeping to bounded residual tracking without freeing Tenant/key concurrency, and X6 performs final reconciliation and one-time release without emitting another client event (§6.5).
 
 ### 3.2 Streaming vs non-streaming branch
 
 - The client selects streaming per the OpenAI-compatible request (schema/field is #18/#20). The **operation token** differs: non-streaming → `chat`; streaming → `chat_streaming` (#10 §3.1). The capability gate (X1) MUST check the operation the client actually requested.
-- A request for `chat_streaming` on an account whose snapshot classifies streaming as `unsupported`/`unverified` is rejected before upstream (X1); it MUST NOT be silently served as non-streaming (that would be a capability lie, parent #1 story 22).
+- A request for `chat_streaming` for which X1 finds no eligible account, or whose selected account fails X2 reaffirmation, is rejected before upstream; it MUST NOT be silently served as non-streaming (that would be a capability lie, parent #1 story 22).
 - A request for `chat_streaming` on a **synthetic-only** mode (Gemini Web Cookie, #10 §4.3) is governed by §4.4.
 
 ---
@@ -169,12 +173,12 @@ Hard rules:
 
 ### 4.5 Terminal outcome ↔ finish class mapping
 
-| Terminal outcome | Streaming terminal event | Non-streaming `finish_class` | Concurrency slot | Token quota |
+| Terminal outcome | Streaming terminal event | Non-streaming `finish_class` | Concurrency occupancy | Token quota |
 |---|---|---|---|---|
-| Natural completion | `completed` | `stop` / `length` / `content_filter` | released | reconcile actual (§6.5) |
-| Client/system cancel | `canceled` | `canceled` | released on cancel completion | reconcile partial (§6.5) |
-| Runtime failure | `failed` | `failed` | released | reconcile partial/zero (§6.5) |
-| Timeout | `failed` (+ timeout remediation, §6.4) | `failed` (+ timeout remediation) | released | reconcile partial (§6.5) |
+| Natural completion | `completed` | `stop` / `length` / `content_filter` | released at X6 (normally X5) | reconcile actual (§6.5) |
+| Client/system cancel | `canceled` | `canceled` | release if upstream stopped; otherwise retain Tenant+key occupancy through residual tracking to X6 (§6.5) | final at accounting terminal |
+| Runtime failure | `failed` | `failed` | release if no upstream survives; otherwise retain Tenant+key occupancy to X6 | final at accounting terminal |
+| Timeout | `failed` (+ timeout remediation, §6.4) | `failed` (+ timeout remediation) | release if upstream stopped; otherwise retain Tenant+key occupancy to X6 (§6.5) | final at accounting terminal |
 
 ---
 
@@ -182,7 +186,7 @@ Hard rules:
 
 ### 5.1 Consuming #11 precedence
 
-Chat account resolution (X2) uses the #11 precedence ladder verbatim: **P0 candidate gate → P1 explicit selection → P2 lease → P3 affinity → P4 policy → P5 fallback** (#11 §4.1). This document does not re-derive it; it states how chat **populates** affinity and leases.
+Chat account resolution (X1) uses the #11 precedence ladder verbatim: **P0 candidate gate → P1 explicit selection → P2 lease → P3 affinity → P4 policy → P5 fallback** (#11 §4.1). This document does not re-derive it; it states how chat **populates** affinity and leases.
 
 ### 5.2 Conversation affinity (soft, P3)
 
@@ -202,7 +206,8 @@ Chat account resolution (X2) uses the #11 precedence ladder verbatim: **P0 candi
 ### 5.4 Fallback during chat
 
 - Fallback (P5) is **opt-in, fail-closed** (#11 §6.5, `I-ROUTE-FALLBACK-OPTIN`): a chat request only fails over to a second account when Tenant policy declares an ordered chain, the target is same-Tenant, the Auth Mode is policy-permitted, and capability matches `op`+`m` (#11 §6). This satisfies parent #1 story 35 (no surprise account/Auth-Mode switch).
-- **Mid-stream fallback is not silent re-emission.** Once `delta` content has been sent to the client on a stream, the Gateway MUST NOT transparently restart generation on a fallback account and concatenate a second attempt into the same stream (that would duplicate/garble output). If the leased account fails after content was emitted, the stream terminates `failed`; any retry is governed by the retry boundary (§7) as a **new** execution the client can choose to make.
+- **Fallback shares the proof-of-non-commit boundary in §7.2.** It may select another account only when the Gateway has authoritative evidence that the prior account did not accept a generation. A Provider `rate_limited`/`quota_exhausted` response is fallback-safe only when that Adapter's documented response semantics prove non-commit; an HTTP status alone is insufficient.
+- **Mid-stream fallback is not silent re-emission.** Once an attempt is possibly committed — whether or not a `delta` reached the client — the Gateway MUST NOT restart generation on a fallback account. The stream terminates `failed`; any later attempt is a new client decision governed by §7.3.
 
 ---
 
@@ -216,34 +221,34 @@ For each way a chat execution can end early, this section states **(a)** whether
 
 1. A client MAY cancel an in-flight chat (explicit cancel request, or by closing a stream it opened; §6.3 covers pure transport disconnect).
 2. On cancel, the Gateway **MUST attempt to abort** the upstream execution when the Auth Mode/Adapter supports abort (cancelable). This mirrors #8 `I-CANCEL-ON-REVOKE` and parent #1 story 31 ("ngừng tiêu quota khi người dùng dừng").
-3. **Cancelable upstream:** abort is attempted; the terminal outcome is `canceled`; the concurrency slot releases **on cancel completion** (#8 §7.4); token quota is reconciled to **actual tokens consumed so far** (§6.5).
-4. **Non-cancelable upstream** (an already-committed generation the Provider will not abort): the Gateway stops streaming to the client and emits terminal `canceled`, but the upstream MAY run to its natural end. The Gateway MUST NOT claim the upstream was aborted when it was not — the honest statement is "client cancel observed; upstream residual may complete" (mirrors #8 §4.5 in-flight residual). The Gateway MUST **drain the upstream connection in the background** to its natural end rather than discarding it, because only the drained final usage lets it reconcile quota to what the upstream actually consumed (§6.5), which MAY exceed tokens streamed to the client. Discarding the connection would leave quota reconciled to an under-count.
+3. **Cancelable upstream:** abort is attempted; the terminal outcome is `canceled`; the concurrency occupancy releases **only when cancel completion confirms upstream stopped** (#8 §7.4); token quota is reconciled to **actual tokens consumed so far** (§6.5).
+4. **Non-cancelable upstream** (an already-committed generation the Provider will not abort): the Gateway stops client delivery and emits terminal `canceled`, but the upstream MAY run to its natural end. The Gateway MUST NOT claim it was aborted. It MUST drain the upstream under the bounded residual protocol (§6.5): retain the token reservation and the original Tenant+`client_api_key_id` concurrency occupancy, move bookkeeping to a same-Tenant residual hold only if residual tracking capacity is atomically available, and reconcile at the later accounting terminal. If transfer cannot acquire tracking capacity, the original request state remains held until drain completes; neither path frees capacity for another A6 accept.
 5. Cancel is **idempotent**: a second cancel on an already-terminal execution is a success no-op, not an error.
 
 ### 6.3 Client disconnect
 
-1. A pure transport disconnect (client closes the connection without an explicit cancel) is treated as an **implicit cancel** of that execution: the Gateway detects the closed transport and follows §6.2 (attempt abort if cancelable; release slot; reconcile quota).
-2. Disconnect MUST NOT leave a concurrency slot pinned indefinitely: the slot releases when the Gateway observes the disconnect and completes its cancel attempt (bounded by a detection/timeout class, #17).
-3. Disconnect of a **non-streaming** request behaves the same: if the client is gone before the single response is delivered, the Gateway attempts abort and reconciles quota; the response is simply undeliverable.
+1. A pure transport disconnect (client closes the connection without an explicit cancel) is treated as an **implicit cancel** of that execution: the Gateway detects the closed transport and follows §6.2, including the same abort attempt and stopped-vs-residual tracking disposition while Tenant+key occupancy remains held for surviving upstream work.
+2. Disconnect detection and the cancel attempt are bounded by timeout classes (#17), but a surviving upstream remains capacity- and quota-accounted under §6.5 until X6; a cleanup timeout MUST NOT turn it into untracked work.
+3. Disconnect of a **non-streaming** request behaves the same: if the client is gone before the single response is delivered, the Gateway attempts abort and applies §6.5; the response is simply undeliverable.
 4. Disconnect does **not** by itself invalidate the account, lease, or affinity for other requests (#11 §5.4 request-time gates only); it terminates this one execution.
 
 ### 6.4 Timeout
 
 1. The Gateway enforces named **timeout classes** (numeric #17) on chat execution — at minimum a first-token/response-start budget and an overall-execution budget. Exact names/values are #17; this document locks that timeouts are **bounded and observable**.
 2. On timeout, the Gateway **MUST attempt to abort** the upstream (like cancel) and deliver a terminal outcome: streaming → terminal `failed` carrying a **timeout remediation class** (distinct from a generic failure so clients can back off/retry per §7); non-streaming → canonical error with the timeout class.
-3. Timeout releases the concurrency slot and reconciles token quota to actual consumption (§6.5).
+3. Timeout applies the same tracking and accounting rules as cancel: release occupancy immediately only when upstream stopped; otherwise move to bounded residual tracking or retain the original request state while keeping Tenant+key occupancy until accounting terminal (§6.5).
 4. A timeout is a **runtime/execution** outcome (post-A6), not an admission `rate_limit`/`quota_exhausted` (#8 §9); it MUST be classifiable as such (#16).
 
 ### 6.5 Quota and concurrency reconciliation (normative)
 
 Consumes #8 §7.4/§7.5:
 
-1. **Concurrency slot** (acquired at A6) is released on **every** terminal outcome: `completed`, `canceled`, `failed`, `timed_out`, and on disconnect after the cancel attempt completes. A stuck upstream MUST NOT pin the slot past the abort/detection timeout class (#17).
-2. **Token quota** reserved at A6 (`reserve = input_estimate + min(requested_max, L-CHAT-MAX-TOKENS-PER-REQ)`, #8 §7.5) is **reconciled** at terminal to actual usage:
-   - Natural completion → reconcile to actual input+output tokens.
-   - Cancel / disconnect / timeout / partial failure → reconcile to tokens **actually consumed** (which includes upstream residual for non-cancelable work, §6.2 rule 4). The Gateway MUST NOT silently over-refund a cancel that still cost upstream tokens, and MUST NOT keep the full reservation when far fewer tokens were used.
-3. Reconciliation debits only same-Tenant counters (#6 `I-QUOTA-SCOPE`, #8 §7.1). A cancel/disconnect/timeout on Tenant A never affects Tenant B.
-4. **Streaming counts as one request** at admission (#8 §7.3), not per event; reconciliation adjusts **tokens**, not the request count.
+1. **Two terminal moments:** X5 is client-facing; X6 is accounting-facing. They coincide when upstream completed or abort was confirmed. A non-cancelable residual may pass X5 while remaining accounting-active until X6; X6 emits no client event.
+2. **State transfer, not capacity release, at X5:** when upstream stopped, release the A6 Tenant and originating-`client_api_key_id` chat occupancy. When upstream continues, both occupancies remain held until X6. The Gateway MAY atomically move bookkeeping to a same-Tenant residual state bounded by `L-TENANT-CHAT-RESIDUAL`; that limit bounds how many occupied executions use residual tracking, not extra execution capacity. If residual tracking is full, retain the original request state. No path releases first or admits replacement work while the prior upstream survives.
+3. **Quota reservation remains held** for residual work. Reconcile the A6 reservation at X6 to final actual input+output usage, including tokens consumed after X5. Never over-refund at client terminal. If final usage cannot be obtained after bounded drain/recovery, fail closed for anti-abuse accounting: retain the full reservation (or a platform-configured conservative debit no smaller than known usage) and emit an operator-visible accounting fault; never assume zero.
+4. A drain/recovery deadline (#17) bounds resource cleanup, but reaching it does not authorize an optimistic quota refund. At X6 or bounded recovery settlement, release the original Tenant+key concurrency occupancy and residual tracking state exactly once.
+5. Reconciliation and residual tracking are same-Tenant and remain charged to the originating `client_api_key_id` (#6 `I-QUOTA-SCOPE`, #8 §7.1/§7.4). Tenant A never consumes Tenant B's counters, and one key cannot shed occupancy onto another key by disconnecting.
+6. **Streaming counts as one request** at admission (#8 §7.3), not per event; reconciliation adjusts tokens, not request count.
 
 ### 6.6 Cancel-on-revoke and account loss
 
@@ -261,16 +266,18 @@ Chat generation is **non-idempotent** at the Provider: re-sending the same promp
 ### 7.2 Single retry boundary (normative)
 
 1. **Exactly one layer owns chat re-attempts: the Gateway execution layer.** The Adapter MUST NOT independently re-run a full chat generation on its own timer, and the HTTP transport layer MUST NOT auto-retry a chat `POST` that may have already reached upstream. Full canonical retry-ownership across all operations is #16; this document locks the chat rule.
-2. A chat execution re-attempt is permitted **only** when the Gateway can prove the prior attempt did **not** commit an upstream generation — i.e. the failure occurred **before X4 upstream execution began** (pre-upstream: X1 capability, X2 routing, X3 decrypt, or a connection failure **before any request payload bytes were transmitted** — e.g. during DNS resolution or TCP/TLS handshake). Once payload transmission has begun, the Gateway cannot prove the Provider did not accept or start executing the request, so the attempt is treated as **possibly-committed** (rule 3), not retryable. These pre-payload failures are safe to retry because no generation/side effect exists yet.
-3. Once **X4 has begun** (the Provider may have started generating, especially once any `delta`/partial output exists), the execution is treated as **possibly-committed** and MUST NOT be automatically retried by the Gateway. The terminal outcome is `failed`; re-attempt is a **new client-initiated request** the client chooses to make, subject to §7.3 idempotency.
-4. **Routing fallback (#11 P5) is not a content re-emission.** Fallback selects a different account for a **pre-upstream** or transient-unavailable primary (#11 §6.4); it does not re-run a generation that already produced client-visible content (§5.4). Fallback and retry are bounded and ordered (#11 §6.6): the chain is walked once, terminating in a fail-closed rejection.
+2. A re-attempt is permitted only when the Gateway has **authoritative proof of non-commit**: no request payload bytes were transmitted, or an Adapter-classified Provider response explicitly guarantees that no generation was accepted/created. DNS/TCP/TLS failures before payload are safe examples. An HTTP status, missing response, timeout, reset, or absence of client-visible deltas is not proof by itself.
+3. Once payload transmission begins without such proof, the attempt is **possibly committed** and MUST NOT be automatically retried. The client receives `failed`; any later attempt is a new client-initiated request subject to §7.3.
+4. **Routing fallback (#11 P5) is a re-attempt under the same rule.** A transient `rate_limited`/`quota_exhausted` primary may fall back only if Adapter semantics prove non-commit for that response. Otherwise fail closed. Retry and fallback share one bounded chain walked once; neither can bypass the other by changing layers or accounts.
 
 ### 7.3 Idempotency for accepted requests
 
 1. Chat requests MAY carry an **idempotency key**; the record is scoped `(tenant_id, client_api_key_id-or-scope, idempotency_key)` (#6 §3 Idempotency Record). HTTP header shape is #20.
-2. A **replay** of the same idempotency key by the same-Tenant principal with a **matching request fingerprint** MUST return the **prior outcome** (or its safe status), not launch a second upstream generation. This is the concrete defense against duplicate non-idempotent execution.
-3. A replay by a **different Tenant** MUST NOT read the first Tenant's record or result (#6 §5.2 A7); it is treated as that Tenant's own key space.
-4. Idempotency-record TTL/expiry is #16/#20; this document requires only that within the record's life, a matching replay does not duplicate execution.
+2. Before any X4 Adapter call, the Gateway MUST atomically claim that scope+key with the request fingerprint. The claim has at least `in_progress` and `terminal` states; exactly one claimant may own upstream execution.
+3. A concurrent or later request with a matching fingerprint MUST NOT call upstream. If the claim is `in_progress`, it waits within a bounded class or receives a safe in-progress status; if `terminal`, it returns the prior outcome or safe status. A different fingerprint on the same scoped key returns a canonical idempotency-conflict class (#16/#20), never reuses or overwrites the first execution.
+4. A request that loses the atomic claim releases its own A6 slot/reservation exactly once. Claim recovery after owner crash MUST preserve at-most-one committed generation: an uncertain/possibly-committed claim is not stolen for automatic re-execution.
+5. A replay by a **different Tenant** MUST NOT read the first Tenant's record or result (#6 §5.2 A7); it is treated as that Tenant's own key space.
+6. Idempotency-record TTL/expiry is #16/#20; within its life, sequential and concurrent duplicates cannot launch another generation.
 
 ### 7.4 Retryability signaling (client-facing)
 
@@ -278,16 +285,16 @@ Terminal failures carry a **retryability class** so a client retries correctly (
 
 | Failure kind | Example source | Client guidance |
 |---|---|---|
-| Pre-upstream transient | X2/X3 transient, connect-before-upstream | Safe to retry (no generation committed) |
+| Proven non-commit transient | X1–X3 or X4 with authoritative no-commit proof | Safe for Gateway retry/fallback |
 | Rate/quota (admission) | #8 A3/A5 | Back off; not a Provider error (#8 §9.3) |
-| Provider rate / cooldown | #9 §6 `rate_limited`/`quota_exhausted` | Wait for reset hint; MAY fall back if policy permits (#11 §6.4) |
+| Provider rate / cooldown | #9 §6 `rate_limited`/`quota_exhausted` | MAY fall back only with authoritative no-commit proof; otherwise wait/fail closed |
 | Auth expiry / challenge | #9 hard-block health | `reauthenticate`; not a blind retry |
 | Timeout | §6.4 | Retry as a **new** request; do not assume prior committed or not — idempotency key recommended |
 | Possibly-committed runtime failure | X4 after start / partial deltas | **Not auto-retried**; client decides; idempotency key prevents duplicate if it does |
 
 ### 7.5 No duplicate-execution invariant
 
-- The combination of §7.2 (single boundary, no retry once possibly-committed) and §7.3 (idempotency replay returns prior outcome) guarantees: **a single accepted chat request MUST NOT cause more than one committed upstream generation** unless the client explicitly issues a new request without an idempotency key. This is the AC4 guarantee.
+- The combination of §7.2 (one proof-of-non-commit boundary for retry and fallback) and §7.3 (atomic idempotency claim) guarantees: **one accepted/idempotently identified chat request cannot cause more than one committed upstream generation**, including under concurrent duplicates. A deliberate new request without the same idempotency key is a new execution.
 
 ---
 
@@ -311,9 +318,10 @@ All chat paths obey #6:
 | Emit content after terminal / two terminal events | Corrupt client rendering; ambiguous completion state |
 | Silent account hop mid-stream | Continuity break; possible cross-mode capability mismatch (#11 lease) |
 | No cancel on disconnect | Orphaned upstream generation bills quota forever; pinned concurrency slot (DoS on own Tenant budget) |
+| Release slot/reservation while non-cancelable residual continues unbounded | Cancel amplification; quota bypass; background-work DoS |
 | Over-refund cancel that still cost upstream tokens | Quota accounting bypass / cost abuse |
 | Auto-retry a possibly-committed generation | Duplicate billing; duplicate side effects (parent #1 story 33) |
-| Ignore idempotency replay | Duplicate non-idempotent execution |
+| Non-atomic idempotency claim/replay | Concurrent duplicate non-idempotent execution |
 | Serve synthetic streaming as real | Latency/UX promises the mode cannot keep (#10 §3.1) |
 | Cross-Tenant idempotency replay | Leak prior Tenant's chat result (#6 A7) |
 | Cross-Tenant account in routing/affinity/lease | Confused deputy; foreign quota/credential abuse (#6, #11) |
@@ -330,57 +338,63 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 2. A streaming success emits `open` → `delta`* → exactly one `completed`; concatenated deltas reconstruct the message; no content after terminal.
 3. A streaming runtime failure after some deltas emits terminal `failed`; the client can tell the message is incomplete without a Provider marker.
 4. Synthetic-streaming mode (Gemini Web Cookie) emits the same `open`→`delta`*→terminal ordering; capability marks it synthetic; no token-latency promise.
-5. `chat_streaming` on an `unsupported`/`unverified`-streaming account is rejected before upstream (X1); it is **not** silently served as non-streaming; Adapter executions = 0.
+5. X1 excludes non-offerable accounts and X2 reaffirms the selected snapshot; unsupported/unverified streaming is rejected before upstream and never silently downgraded; Adapter executions = 0.
 
 ### 10.2 Cancellation, disconnect, timeout (AC2)
 
-6. Client cancel of a cancelable execution → terminal `canceled`; upstream abort attempted; concurrency slot released on cancel completion; token quota reconciled to actual.
-7. Cancel of a non-cancelable execution → terminal `canceled` to client; upstream residual honestly accounted; quota reconciled to real upstream consumption (may exceed streamed tokens).
-8. Client disconnect mid-stream → implicit cancel; slot released within detection/timeout class; quota reconciled; no indefinite slot pin.
-9. Timeout → terminal `failed` with a distinct timeout remediation class (not admission `rate_limit`/`quota_exhausted`); slot released; quota reconciled.
-10. Cancel is idempotent; a second cancel on a terminal execution is a success no-op.
-11. Cancel/disconnect/timeout on Tenant A does not change Tenant B counters.
+6. Client cancel of a cancelable execution → terminal `canceled`; upstream abort attempted; concurrency occupancy released only when cancel completion confirms upstream stopped; token quota reconciled to actual.
+7. Cancel of a non-cancelable execution → one client terminal, optional atomic move to bounded residual tracking (or original request state retained), with the original Tenant+key occupancy and reservation still held until accounting terminal; X6 releases each exactly once.
+8. Whether residual tracking has capacity or is exhausted, cancel/disconnect/timeout cannot free Tenant/key concurrency while upstream survives; a new A6 request is rejected when those retained occupancies keep a limit full.
+9. Client disconnect mid-stream → implicit cancel with the same stopped-vs-residual accounting; no untracked work or indefinite unbounded drain.
+10. Timeout → terminal `failed` with a distinct timeout remediation class and the same residual protocol when abort is unconfirmed.
+11. Missing final Provider usage settles conservatively and emits an accounting fault; it never refunds as zero.
+12. Cancel is idempotent; a second cancel on a client-terminal execution emits no second terminal and creates/releases no second hold.
+13. Cancel/disconnect/timeout on Tenant A does not change Tenant B counters or residual capacity; the surviving execution remains charged to Tenant A and its originating key until X6.
 
 ### 10.3 Affinity and lease (AC3)
 
-12. A multi-turn conversation prefers the prior account (affinity) within the window; when that account leaves the candidate set, the next turn falls through to policy, never to a foreign or cross-mode account.
-13. A streaming session holds a lease pinning one account for the stream duration; the Gateway does not hop accounts mid-stream.
-14. A durable #9 items 1–5 failure on the leased account voids the lease for new turns immediately; a non-cancelable in-flight stream MAY finish; a new turn re-resolves.
-15. Fallback occurs only with an opt-in policy chain, same-Tenant, permitted Auth Mode, capability-matched; otherwise fail closed (#11 NF-*). Mid-stream content is never transparently re-emitted on a fallback account.
+14. A multi-turn conversation prefers the prior account (affinity) within the window; when that account leaves the candidate set, the next turn falls through to policy, never to a foreign or cross-mode account.
+15. A streaming session holds a lease pinning one account for the stream duration; the Gateway does not hop accounts mid-stream.
+16. A durable #9 items 1–5 failure on the leased account voids the lease for new turns immediately; a non-cancelable in-flight stream MAY finish; a new turn re-resolves.
+17. Fallback occurs only with an opt-in policy chain, same-Tenant, permitted Auth Mode, capability-matched, and proof of non-commit for any attempted primary; otherwise fail closed. Mid-stream or possibly-committed content is never re-emitted on another account.
 
 ### 10.4 Retry boundary and idempotency (AC4)
 
-16. A pre-upstream failure (X1–X3 / connect-before-upstream) MAY be retried by the Gateway execution layer; a possibly-committed failure (X4 started / partial deltas) is **not** auto-retried.
-17. Only the Gateway execution layer re-attempts chat; Adapter/transport auto-retry of a possibly-committed generation is a conformance fail.
-18. A replay of the same idempotency key (same Tenant, matching fingerprint) returns the prior outcome and launches **zero** additional upstream generations.
-19. A cross-Tenant replay of an idempotency key does not read the first Tenant's result (#6 A7).
-20. A single accepted request never produces more than one committed upstream generation absent an explicit new client request.
+18. Gateway retry and #11 fallback both require authoritative proof of non-commit; payload transmission without such proof is possibly committed even if no delta was observed.
+19. A Provider `rate_limited` response permits fallback only when Adapter semantics prove no generation was accepted; status code alone is insufficient.
+20. Only the Gateway execution layer re-attempts chat; Adapter/transport retry of a possibly-committed generation is a conformance fail.
+21. Two concurrent requests with the same scoped idempotency key and fingerprint yield one atomic claimant and exactly one upstream generation; the loser waits/gets in-progress and releases its own A6 resources.
+22. Same key with a different fingerprint returns idempotency conflict and never overwrites/joins the first request.
+23. Owner crash with an uncertain claim does not permit claim stealing into a second automatic execution.
+24. A terminal replay returns the prior outcome with zero additional generations; cross-Tenant replay cannot read it (#6 A7).
+25. A single accepted/idempotently identified request never produces more than one committed upstream generation.
 
 ### 10.5 Ownership and scope
 
-21. Foreign `provider_account_id` in explicit selection → 404-class; zero Adapter call; zero decrypt.
-22. Chat requires an inference scope (`chat.completions`, #8 §5.2); a key lacking it → 403-class before upstream.
-23. Safe execution metadata never includes credential material or foreign-Tenant existence.
+26. Foreign `provider_account_id` in explicit selection → 404-class; zero Adapter call; zero decrypt.
+27. Chat requires an inference scope (`chat.completions`, #8 §5.2); a key lacking it → 403-class before upstream.
+28. Safe execution metadata never includes credential material or foreign-Tenant existence.
 
 ---
 
 ## 11. Core invariants (normative checklist)
 
-1. **I-CHAT-CANON-TERMINAL** — Every chat execution reaches exactly one terminal outcome (`completed`/`canceled`/`failed`, timeout→`failed`); non-streaming carries one `finish_class`, streaming emits exactly one terminal event with no content after it (AC1).
+1. **I-CHAT-CANON-TERMINAL** — Every chat execution reaches exactly one client-terminal outcome (`completed`/`canceled`/`failed`, timeout→`failed`) and one accounting terminal; non-streaming carries one `finish_class`, streaming emits exactly one terminal event with no content after it, and accounting emits no second client event (AC1).
 2. **I-CHAT-STREAM-ORDER** — Streaming events are `open` (once) → ordered `delta`* (+ `heartbeat`) → exactly one terminal event; no reordering that breaks reconstruction; no second terminal event.
 3. **I-CHAT-PROVIDER-INDEPENDENT** — Canonical response/stream shape and terminal semantics never leak Provider-specific framing/end markers (parent #1 story 29/30).
 4. **I-CHAT-STREAM-CLASS-HONEST** — Real vs synthetic streaming (#10 §3.1) is honored; a `chat_streaming` request is never silently downgraded to non-streaming, and synthetic is never advertised as real token latency.
-5. **I-CHAT-CAP-BEFORE-UPSTREAM** — `chat`/`chat_streaming`+model is capability-checked on the resolved account before Adapter execution and vault decrypt (#10 §9); unsupported/unverified/stale/model-unavailable fails closed pre-upstream.
+5. **I-CHAT-CAP-BEFORE-UPSTREAM** — X1 constructs capability-filtered candidates and selects an account; X2 reaffirms that selected account before Adapter execution and vault decrypt. Unsupported/unverified/stale/model-unavailable fails closed.
 6. **I-CHAT-LEASE** — A streaming session binds to exactly one same-Tenant account via a #11 lease for its duration; the Gateway does not hop accounts mid-stream; the lease voids for new work on durable #9 items 1–5 failure (#11 §5.4).
 7. **I-CHAT-AFFINITY** — Conversation affinity is a soft #11 preference that yields when its account leaves the candidate set; it never crosses Tenants or Auth Modes.
-8. **I-CHAT-CANCEL** — Cancellation and client disconnect attempt upstream abort where cancelable, deliver terminal `canceled`, release the concurrency slot on cancel completion, and reconcile token quota to actual consumption (AC2); cancel is idempotent.
-9. **I-CHAT-DISCONNECT-BOUNDED** — A disconnect never pins a concurrency slot indefinitely; the slot releases within a bounded detection/timeout class after the cancel attempt.
-10. **I-CHAT-TIMEOUT** — Timeouts are bounded, observable, attempt upstream abort, terminate `failed` with a distinct timeout remediation class, release the slot, and reconcile quota; a timeout is a runtime outcome, not an admission reject (AC2).
-11. **I-CHAT-QUOTA-RECONCILE** — The A6 token reservation is reconciled to actual consumption on every terminal outcome (incl. cancel/disconnect/timeout, including non-cancelable upstream residual); reconciliation is same-Tenant only (#6/#8).
-12. **I-CHAT-RETRY-BOUNDARY** — Exactly one layer (Gateway execution) may re-attempt chat, and only when the prior attempt was pre-upstream; a possibly-committed execution is not auto-retried; Adapter/transport auto-retry of a committed generation is forbidden (AC4).
-13. **I-CHAT-IDEMPOTENT** — A matching same-Tenant idempotency-key replay returns the prior outcome and launches zero additional generations; cross-Tenant replay cannot read the prior result (#6 A7).
-14. **I-CHAT-NO-DUPLICATE-EXEC** — A single accepted chat request MUST NOT cause more than one committed upstream generation absent an explicit new client request (AC4).
-15. **I-CHAT-OWNERSHIP** — Account resolution/affinity/lease/fallback stay within `principal.tenant_id`; foreign ids are 404-class; decrypt is gated by the resolved account; no ambient authority (#6, #11).
+8. **I-CHAT-CANCEL** — Cancellation/disconnect attempts abort and emits one client terminal; if upstream survives, slot disposition and accounting follow the bounded residual protocol; cancel is idempotent.
+9. **I-CHAT-RESIDUAL-BOUNDED** — Non-cancelable work may move atomically to same-Tenant residual tracking only within `L-TENANT-CHAT-RESIDUAL`, but always retains its original Tenant and `client_api_key_id` concurrency occupancy until X6; otherwise the original request state remains held. Residual tracking is not additional execution capacity, and client terminal never mints a replacement slot.
+10. **I-CHAT-DISCONNECT-BOUNDED** — Disconnect detection and drain/recovery use bounded classes; cleanup timeout never authorizes an optimistic quota refund.
+11. **I-CHAT-TIMEOUT** — Timeouts are observable, attempt abort, terminate client-facing `failed`, and use the same residual/accounting protocol when abort is unconfirmed.
+12. **I-CHAT-QUOTA-RECONCILE** — The A6 reservation remains until accounting terminal and reconciles to final actual usage including residual; unavailable final usage settles conservatively, same-Tenant only.
+13. **I-CHAT-RETRY-BOUNDARY** — Gateway retry and routing fallback share authoritative proof of non-commit; a possibly-committed attempt is never automatically re-run by any layer/account.
+14. **I-CHAT-IDEMPOTENT** — An atomic scoped claim before upstream gives one executor; matching concurrent/sequential duplicates never call upstream, fingerprint mismatch conflicts, and cross-Tenant replay cannot read the result.
+15. **I-CHAT-NO-DUPLICATE-EXEC** — A single accepted/idempotently identified chat request MUST NOT cause more than one committed upstream generation absent a deliberate new request.
+16. **I-CHAT-OWNERSHIP** — Account resolution/affinity/lease/fallback stay within `principal.tenant_id`; foreign ids are 404-class; decrypt is gated by the resolved account; no ambient authority (#6, #11).
 
 ---
 
@@ -388,12 +402,12 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 
 | Topic | Issue | Constraint retained here |
 |---|---|---|
-| Numeric timeout classes, heartbeat interval, retry/backoff budgets, disconnect-detection window | #17 | Named classes + bounded/observable behavior locked here; #17 tunes numbers, not the fail-closed/terminal rules |
+| Numeric timeout classes, heartbeat interval, retry/backoff budgets, disconnect/drain windows, residual-tracking limit | #17 | Named classes + bounded/observable behavior locked here; #17 tunes tracking numbers, not retained Tenant/key occupancy, atomic state transfer, or conservative settlement |
 | Canonical error code strings / problem+json / finish_class strings | #16 | Terminal-outcome, finish, remediation, retryability **classes** locked here |
 | SSE field names, JSON event schema, OpenAPI chat paths, HTTP idempotency header | #18 / #20 | Logical events, ordering, idempotency scope locked here |
 | Full cross-operation retry ownership (chat + image + job) | #16 | Chat retry boundary + single-owner rule locked here |
 | Image / Render Job execution lifecycle | #13 / #14 | Chat (sync/stream text) scope only; durable image jobs elsewhere |
-| Idempotency-record TTL / expiry | #16 / #20 | Replay-returns-prior-outcome within record life locked here |
+| Idempotency-record TTL / expiry and wire conflict/in-progress shape | #16 / #20 | Atomic claim, fingerprint conflict, uncertain-claim no-steal, and zero duplicate execution locked here |
 | Tool calling / multi-modal chat inputs streaming | reopen `D-CHAT-TOOLS` | MVP: canonical text delta ordering; secondary ops `unverified` (#10 §3.2) |
 | `stale`-grace or resumable streams after disconnect | reopen `D-CHAT-RESUME` | MVP: disconnect = implicit cancel, no resume |
 
@@ -417,9 +431,10 @@ An ADR **would** be warranted if the product later introduced:
 | Id | Meaning |
 |---|---|
 | `AFFINITY-WINDOW-CLASS` / `LEASE-TTL-CLASS` | Owned by #11 (§5); chat consumes them; numeric #17 |
-| Timeout classes (first-token, overall-execution), heartbeat interval, disconnect-detection window | Named here; numeric #17 |
+| Timeout classes (first-token, overall-execution), heartbeat interval, disconnect/drain windows | Named here; numeric #17 |
+| `L-TENANT-CHAT-RESIDUAL` | Same-Tenant cap on executions represented in residual tracking; it grants no concurrency beyond retained `L-TENANT-CHAT-CONCURRENCY` and originating-key occupancy; numeric #17 |
 | `finish_class` values (`stop`/`length`/`content_filter`/`canceled`/`failed`) | Logical here; strings #16/#18 |
-| Terminal outcomes (`completed`/`canceled`/`failed`/`timed_out`) | Logical here; strings #16/#18 |
+| Client terminal outcomes (`completed`/`canceled`/`failed`/`timed_out`) + accounting terminal | Logical here; strings #16/#18; accounting terminal is not a second wire event |
 | `I-CANCEL-ON-REVOKE` | Owned by #8 §4.5; chat cancel consumes it |
 | `I-USABLE-GATE` | Owned by #9 §5.1; chat consumes it (X1/X2) |
 | Capability status / offerable / streaming class | Owned by #10; chat consumes offerable + streaming class |

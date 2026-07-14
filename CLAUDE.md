@@ -69,7 +69,13 @@ The agent may reach for these when the task fits; user may also invoke them.
 ### Rules
 
 - Skip steps that do not reduce meaningful uncertainty or risk.
+- Use `/to-spec` and `/to-tickets` for work that spans sessions (or after `/wayfinder` clears decisions), not after every grill.
+- Prefer `/grill-with-docs` over bare `/grilling` when the repository has `CONTEXT.md`.
+- Keep discovery, decisions, planning, implementation, and review as distinct phases; do not compact or break context mid-phase. Use `/handoff` when a fresh context is needed.
 - Record the base branch or commit before implementation.
+- Work one unblocked implementation ticket per fresh context; do not implement a foggy `/wayfinder` frontier ticket.
+- Do not AFK-implement issues labeled `needs-triage`, `needs-info`, or `ready-for-human`.
+- Do not run `/triage` on tickets produced by `/to-tickets`; triage only incoming raw issues/PRs.
 - Prefer existing test seams over creating new ones.
 - Treat tickets as vertical, independently verifiable slices.
 - `/wayfinder` resolves decisions; `/to-tickets` creates implementation work.

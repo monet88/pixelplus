@@ -29,7 +29,7 @@ It covers:
 3. **Tenant ownership enforcement** on create, reference, retrieve, and delete, including cross-Tenant reference in a job/request.
 4. **Retention, expiry, and deletion**: when an output Asset stops being downloadable, and how deletion behaves.
 5. **Non-enumeration**: a cross-Tenant (or unknown) Asset identifier yields a safe, non-existence-confirming failure.
-6. **Tenant durable storage / object-count caps** (explicitly delegated to this issue by #8 §7.5).
+6. **Tenant durable storage / object-count caps** (explicitly delegated to this issue by #8 §7.5), including atomic reservation under concurrent upload/output placement.
 
 ### 1.2 Non-goals
 
@@ -51,6 +51,7 @@ Downstream issues **MUST** preserve every decision here. They may add fields, ti
 - Silently downgrade an `inpaint` request by dropping/ignoring the mask (#10 §9.1).
 - Serve an output Asset after its retention window has expired or after deletion (§5).
 - Treat per-request `L-ASSET-UPLOAD-MAX` (#8) as a substitute for the Tenant durable storage cap this issue defines (§6).
+- Enforce a storage cap with a non-atomic read-then-store sequence that concurrent creates can overrun (§6.1).
 
 ### 1.3 Normative language
 
@@ -97,7 +98,9 @@ Cause → effect:
 | **Retention class** | A named lifetime budget after which an output Asset is no longer downloadable; numeric value is #17-tunable (§5.2). |
 | **Expiry** | The moment an Asset passes its retention window and becomes non-retrievable (canonical "gone"). |
 | **Deletion** | Tenant- or system-initiated removal of an Asset before or at expiry; terminal for retrieval. |
-| **Storage cap** | The Tenant durable total-bytes / object-count ceiling for retained Assets (§6), distinct from the per-request upload size limit (#8). |
+| **Asset tombstone** | Minimal same-Tenant lifecycle record retained for `ASSET-TOMBSTONE-TTL-CLASS` after delete/expiry so retries can distinguish an own prior Asset from an identifier unknown in that Tenant without retaining image bytes or exposing it cross-Tenant (§5.4). |
+| **Storage reservation** | Tenant-scoped bytes+object-count hold acquired atomically before durable Asset creation and converted to committed usage or released exactly once (§6.1). |
+| **Storage cap** | The Tenant durable total-bytes / object-count ceiling over committed plus reserved Assets (§6), distinct from the per-request upload size limit (#8). |
 
 ---
 
@@ -120,6 +123,7 @@ Cause → effect:
 | `retention_class` | yes | Named retention budget (§5.2); derived from kind + product policy |
 | `expires_at` | when applicable | Derived `created_at` + retention class; the moment retrieval stops (§5) |
 | `deleted_at` | when deleted | Set on delete; retrieval behaves as not-found afterward (§5.4) |
+| `tombstone_until` | after delete/expiry | Internal lifecycle bound for minimal same-Tenant tombstone; not image metadata and not exposed cross-Tenant (§5.4) |
 
 **MUST NOT** store on the Asset row or any Public API projection:
 
@@ -136,7 +140,7 @@ Cause → effect:
 ### 3.3 Immutability
 
 - Asset content bytes are immutable after create. An `image_edit`/`inpaint` result is a **new** `output` Asset, not a mutation of the input (parent #1 mask fidelity; keeps the input reproducible and auditable).
-- `tenant_id`, `asset_id`, and `kind` are immutable. Only lifecycle fields (`expires_at`, `deleted_at`) transition.
+- `tenant_id`, `asset_id`, and `kind` are immutable. Only lifecycle fields (`expires_at`, `deleted_at`, `tombstone_until`) transition.
 
 ---
 
@@ -214,20 +218,22 @@ Rules:
 1. On or after `expires_at`, retrieve/download of the Asset returns a canonical **`gone`/not-found** outcome (410-class or 404-class per #16; MVP intent: distinguishable "expired" remediation where the Tenant owned it, but never a foreign-existence oracle — see §5.5).
 2. Expiry MUST NOT serve partial or stale bytes; the storage backend SHOULD reclaim the bytes at/after expiry (reclamation timing is #15/#17, but retrievability stops **at** `expires_at` regardless of reclamation lag).
 3. Listing own Assets MUST NOT include expired Assets as retrievable; an expired entry MAY appear as a tombstone status to the owning Tenant but MUST NOT be downloadable.
+4. Expiry creates the same minimal same-Tenant tombstone and one-time storage-usage release as explicit deletion (§5.4/§6.1); a cleanup retry MUST NOT release cap usage twice.
 
 ### 5.4 Deletion behavior
 
 1. **Who:** owning Tenant principal with `assets.write` (#8 §5.2), or a same-Tenant retention/cleanup job.
-2. A foreign/unknown `asset_id` on delete → **404-class** (#6); no cross-Tenant delete, no existence confirmation.
-3. Delete sets `deleted_at`, makes the Asset immediately non-retrievable, and schedules byte reclamation (#15). Subsequent retrieve/list behaves as **not-found** for that id.
-4. Delete is **idempotent**: deleting an already-deleted/expired Asset is a success no-op, not an error.
-5. **Referential effect:** deleting an `input`/`mask` Asset that an in-flight Render Job still needs is governed by #14 (the job fails safely or uses an already-captured copy); this document requires only that a deleted Asset is not newly referenceable and that deletion does not cascade across Tenants.
-6. Deleting an `output` Asset does not refund the image-job quota already consumed to produce it (#8 §7.5, #14): retention/deletion is a storage lifecycle, not an execution refund.
+2. A foreign/unknown `asset_id` on delete → **404-class** (#6); no cross-Tenant delete, no existence confirmation. Resolution is scoped by `(principal.tenant_id, asset_id)`, including tombstones.
+3. The first delete atomically sets `deleted_at`, makes the Asset immediately non-retrievable, releases committed storage usage exactly once (§6.1), creates a minimal same-Tenant tombstone, and schedules byte reclamation (#15). Subsequent retrieve/list behaves as **not-found** for that id.
+4. **Bounded idempotency:** while the own tombstone exists (`ASSET-TOMBSTONE-TTL-CLASS`, numeric #17), deleting that already-deleted/expired Asset is a success no-op: it neither releases usage again nor schedules a second destructive action. The tombstone retains only ownership/id/lifecycle timestamps needed for this decision, not image bytes, dimensions, checksum, or other content metadata.
+5. After `tombstone_until`, the tombstone MAY be purged. A later delete then behaves exactly like any identifier unknown in that Tenant (404-class). The API MUST NOT promise unbounded delete replay without an idempotency key; #20 MAY add such a key but cannot weaken the tombstone-window guarantee.
+6. **Referential effect:** deleting an `input`/`mask` Asset that an in-flight Render Job still needs is governed by #14 (the job fails safely or uses an already-captured copy); this document requires only that a deleted Asset is not newly referenceable and that deletion does not cascade across Tenants.
+7. Deleting an `output` Asset does not refund the image-job quota already consumed to produce it (#8 §7.5, #14): retention/deletion is a storage lifecycle, not an execution refund.
 
 ### 5.5 Retention/deletion and non-enumeration
 
-- A retrieve of an expired/deleted **own** Asset MAY carry a Tenant-facing remediation hint (`asset_expired` / `asset_deleted`) because the Tenant owned it. A retrieve of a **foreign/unknown** id MUST return the plain non-enumerating not-found (#6) — the two paths MUST NOT be observably distinguishable in a way that reveals a foreign Asset ever existed.
-- Expiry/deletion timing MUST NOT become a side channel for foreign existence (a foreign id is not-found immediately and identically regardless of any real Asset's lifecycle).
+- A retrieve of an expired/deleted **own** Asset MAY carry a Tenant-facing remediation hint (`asset_expired` / `asset_deleted`) while its same-Tenant tombstone exists. A retrieve of a **foreign/unknown** id MUST return the plain non-enumerating not-found (#6); lookup is Tenant-scoped so no caller can distinguish a foreign live Asset, foreign tombstone, or globally unknown id.
+- Tombstone presence, expiry, and purge MUST NOT become a cross-Tenant existence or timing oracle. After own-tombstone purge, the id is unknown in that Tenant and receives the same 404-class outcome as any other unknown id.
 
 ---
 
@@ -239,16 +245,18 @@ Rules:
 
 | Cap id | Dimension | MVP default (`D-ASSET-CAP-TUNE`; #17 may retune) |
 |---|---|---|
-| `L-TENANT-ASSET-BYTES` | Total retained Asset bytes per Tenant | **5 GiB** |
-| `L-TENANT-ASSET-COUNT` | Total retained non-expired Asset objects per Tenant | **10_000 objects** |
+| `L-TENANT-ASSET-BYTES` | Total committed + reserved Asset bytes per Tenant | **5 GiB** |
+| `L-TENANT-ASSET-COUNT` | Total committed + reserved Asset objects per Tenant | **10_000 objects** |
 
 Rules:
 
 1. Caps are **per Tenant** and isolated (#6 `I-QUOTA-SCOPE`): Tenant A hitting its storage cap MUST NOT affect Tenant B's capacity.
-2. `byte_size` counts toward `L-TENANT-ASSET-BYTES` from successful store until **logical deletion** (`deleted_at` set, §5.4) or **expiry** (`expires_at` passed, §5.3) — cap headroom is reclaimed **immediately** at that lifecycle transition, not deferred to physical byte reclamation (which lags per #15/#17). Count toward `L-TENANT-ASSET-COUNT` likewise. This mirrors retrievability, which also stops **at** `expires_at`/`deleted_at` regardless of reclamation lag (§5.3 rule 2, §5.4 rule 3), so a Tenant that deletes Assets to free space is unblocked at once.
-3. A new **upload** that would exceed either cap is rejected at intake with a canonical **storage-cap class** (`storage_cap_exceeded`, 4xx/insufficient-storage per #16), distinct from the per-request 413 size class (#8 §7.7) and from admission `quota_exhausted` (#8 §7.5). Remediation: delete Assets or wait for expiry reclamation.
-4. `output` Asset creation by a Render Job is governed by the same caps; #14 defines whether an over-cap Tenant's job fails at output placement or the client must free space first — this document locks that output storage **counts** and is **capped**, not that it is exempt.
-5. Caps use effective limit hierarchy consistent with #8 §7.1 (`min(platform, tenant, override?)`); numbers are `D-ASSET-CAP-TUNE`-reopenable without changing the cap semantics.
+2. Cap enforcement uses Tenant-scoped **committed + reserved** bytes and object count. Before an upload or output placement becomes durable, the Gateway MUST atomically verify `committed + reserved + candidate <= effective_limit` for both dimensions and acquire that reservation in the same transaction/linearizable operation. A read-then-store sequence is non-conforming.
+3. A successful store converts its reservation to committed usage exactly once. Validation/store/output-placement failure releases the reservation exactly once. Crash recovery MUST settle abandoned reservations conservatively and MUST NOT admit new storage by forgetting an uncertain reservation; unavailable reservation state fails closed.
+4. `byte_size` and one object count as committed until **logical deletion** (`deleted_at` set, §5.4) or **expiry** (`expires_at` passed, §5.3). That lifecycle transition atomically releases committed bytes/count exactly once and creates/updates the tombstone; retrying cleanup cannot release twice. Headroom returns immediately, independent of later physical byte reclamation (#15/#17). Tombstones do not count as retained Asset bytes/objects.
+5. A new **upload** whose atomic reservation would exceed either cap is rejected with canonical `storage_cap_exceeded` (4xx/insufficient-storage per #16), distinct from per-request 413 (#8 §7.7) and admission `quota_exhausted` (#8 §7.5). Remediation: delete Assets or wait for expiry.
+6. `output` Asset creation by a Render Job uses the same reservation protocol; #14 defines the job outcome/retry around failed output placement, but no output is exempt and retry MUST reuse or reacquire capacity without double-counting.
+7. Caps use effective limit hierarchy consistent with #8 §7.1 (`min(platform, tenant, override?)`); numbers are `D-ASSET-CAP-TUNE`-reopenable without changing the cap semantics.
 
 ### 6.2 Cap vs per-request size vs admission quota (distinct)
 
@@ -256,7 +264,7 @@ Rules:
 |---|---|---|---|
 | Per-request upload size | #8 §7.7 | Single upload > `L-ASSET-UPLOAD-MAX` | **413-class** |
 | Daily image-job/request quota | #8 §7.5 | Requests/jobs per day | **429-class** `quota_exhausted` |
-| **Durable storage cap** | **this issue** | Total retained bytes/objects per Tenant | `storage_cap_exceeded` (this issue) |
+| **Durable storage cap** | **this issue** | Committed + reserved bytes/objects per Tenant | `storage_cap_exceeded` (this issue) |
 
 These are independent: a Tenant can be under RPM and per-request size yet over its storage cap, and vice versa.
 
@@ -302,7 +310,9 @@ All asset paths obey #6:
 | Silent inpaint→edit downgrade (mask dropped) | Mask fidelity loss; wrong edit region; broken product promise (#10 §9.1) |
 | Accept non-image content as image | Payload smuggling / decoder exploit surface |
 | Serve output after expiry/deletion | Data retained past policy; privacy/retention violation |
-| Unbounded storage per Tenant | Cost amplification / storage DoS (why #8 delegated the cap here) |
+| Unbounded or non-atomic storage cap | Concurrent overrun; cost amplification / storage DoS (why #8 delegated the cap here) |
+| Double release on delete/expiry retry | False headroom permits storage beyond the configured cap |
+| Purging tombstones while promising unbounded delete idempotency | Lost-response retry changes from success to 404 with no defined boundary |
 | Distinguishable expired-own vs foreign not-found | Foreign existence side channel (#6) |
 | Mutable Asset content | Loss of reproducibility/audit; ambiguous edit provenance |
 | Delete cascading across Tenants | Cross-Tenant data destruction |
@@ -334,21 +344,24 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 
 12. An `output` Asset is downloadable within `RETAIN-OUTPUT`; after `expires_at`, retrieve returns canonical `gone`/not-found and serves no bytes.
 13. Expired own Asset is absent from retrievable listing; no stale bytes served.
-14. Delete makes the Asset immediately non-retrievable; subsequent get is not-found; delete is idempotent.
-15. Deleting an output does not refund image-job quota (#8/#14).
-16. Retention window start for output is job-produce time, not request-submit time.
+14. Delete makes the Asset immediately non-retrievable and releases committed storage once; a repeated delete during `ASSET-TOMBSTONE-TTL-CLASS` is a success no-op with no second release/action.
+15. After own-tombstone purge, delete returns the same 404-class as an identifier unknown in that Tenant; foreign/unknown behavior remains indistinguishable.
+16. Deleting an output does not refund image-job quota (#8/#14).
+17. Retention window start for output is job-produce time, not request-submit time.
 
 ### 10.4 Storage caps (AC — #8 §7.5)
 
-17. Upload that would exceed `L-TENANT-ASSET-BYTES` or `L-TENANT-ASSET-COUNT` → `storage_cap_exceeded`, distinct from 413 and from `quota_exhausted`.
-18. Tenant A over its storage cap does not reduce Tenant B's storage capacity.
-19. Expiry/deletion reclaims cap headroom for the same Tenant.
+18. Upload that would exceed `L-TENANT-ASSET-BYTES` or `L-TENANT-ASSET-COUNT` → `storage_cap_exceeded`, distinct from 413 and from `quota_exhausted`.
+19. Two concurrent uploads/output placements near the cap cannot both pass a stale read: atomic reservations keep committed+reserved usage within both limits.
+20. Store failure releases one reservation; success converts it once; crash/uncertain reservation fails closed until conservatively settled.
+21. Concurrent/repeated expiry or delete releases committed headroom exactly once; tombstones consume neither Asset bytes nor object count.
+22. Tenant A over its storage cap does not reduce Tenant B's storage capacity.
 
 ### 10.5 Non-enumeration and scope (AC4)
 
-20. Foreign vs unknown `asset_id` are observably indistinguishable (both 404-class); no relationship/dimension detail of a foreign Asset leaks.
-21. Expired-own vs foreign not-found do not form a foreign-existence side channel.
-22. Key with only `assets.read` cannot upload/delete (403-class); foreign id still 404-class regardless of scope.
+23. Foreign vs unknown `asset_id` are observably indistinguishable (both 404-class); no relationship/dimension/tombstone detail of a foreign Asset leaks.
+24. Expired/deleted-own tombstone lookup never reveals foreign existence; after own-tombstone purge the id behaves as unknown.
+25. Key with only `assets.read` cannot upload/delete (403-class); foreign id still 404-class regardless of scope.
 
 ---
 
@@ -362,8 +375,8 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 6. **I-ASSET-IMMUTABLE** — Asset content bytes are immutable; an edit/inpaint produces a new `output` Asset, not a mutation of the input.
 7. **I-ASSET-RETENTION-BOUNDED** — Every Asset has a bounded, named retention class; an output stops being downloadable at `expires_at`; retention is never unbounded by default (#17 tunes numbers, not the obligation).
 8. **I-ASSET-EXPIRY-GONE** — After expiry or deletion, retrieve/download serves no bytes and returns a canonical gone/not-found; expired/deleted Assets are not retrievable in listings.
-9. **I-ASSET-DELETE-IDEMPOTENT** — Delete is idempotent and same-Tenant only; a foreign id is 404-class; deletion never cascades across Tenants.
-10. **I-ASSET-STORAGE-CAP** — Tenant durable storage is bounded by `L-TENANT-ASSET-BYTES` and `L-TENANT-ASSET-COUNT`; over-cap uploads/outputs get `storage_cap_exceeded`, isolated per Tenant, distinct from per-request 413 and admission `quota_exhausted` (fulfills #8 §7.5 delegation).
+9. **I-ASSET-DELETE-IDEMPOTENT** — Delete is same-Tenant and idempotent during `ASSET-TOMBSTONE-TTL-CLASS`; the first transition releases storage once, repeats are no-ops, foreign/unknown ids are 404-class, and post-purge own ids become unknown.
+10. **I-ASSET-STORAGE-CAP** — Tenant durable storage is bounded over committed+reserved bytes/count by an atomic Tenant-scoped reservation protocol; concurrent uploads/outputs cannot overrun the cap, transitions settle exactly once, and failures fail closed (fulfills #8 §7.5).
 11. **I-ASSET-SIZE-DISTINCT** — Raw-byte size (413-class, #8), content validation (this issue), and storage cap (this issue) are distinct canonical outcomes; one is never relabeled as another.
 12. **I-ASSET-SCOPE** — Upload/delete require `assets.write`; read/list/download/reference require `assets.read`; foreign ids are 404-class before any scope-based 403 (#8 §5.4).
 13. **I-ASSET-REDACT** — Asset bytes never appear in logs/metrics; foreign `asset_id`s are never logged as existing; Asset rows never become a Provider Credential / Client API Key sink.
@@ -377,10 +390,10 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 |---|---|---|
 | Render Job state machine, progress, cancel, worker recovery, output-placement retry | #14 | Asset kinds + ownership + validation + retention locked here; #14 connects input→job→output without re-owning Asset rules |
 | Exact supported media-type set, pixel min/max, mask scaling rule | #17 / #18 | Canonical validation **outcomes** + image↔mask relationship semantics locked here |
-| Numeric retention windows, storage-cap numbers, reclamation timing | #17 | Named retention classes + required cap dimensions + MVP defaults locked here (`D-ASSET-CAP-TUNE`) |
+| Numeric retention/tombstone windows, storage-cap numbers, reclamation/reservation-recovery timing | #17 | Named classes + required cap dimensions + atomic reservation/one-time release locked here (`D-ASSET-CAP-TUNE`) |
 | At-rest encryption, retention legal hold, cryptographic shred | #15 | Ownership, redaction, and deletion **moments** locked here |
 | Canonical error code strings / 410-vs-404 for expiry / problem+json | #16 | Status/remediation **classes** + non-enumeration locked here |
-| Multipart wire format, JSON schema, OpenAPI asset paths, HTTP caching headers | #18 / #20 | Logical fields + semantics locked here |
+| Multipart wire format, JSON schema, OpenAPI asset paths, HTTP caching/idempotency headers | #18 / #20 | Logical fields + bounded tombstone delete-idempotency semantics locked here |
 | Asset dedupe / content-addressed storage optimization | reopen `D-ASSET-DEDUPE` | MVP: `checksum` recorded; dedupe not required, must not break per-Tenant isolation |
 | Resumable / chunked large uploads | reopen `D-ASSET-CHUNK` | MVP: single-request upload under `L-ASSET-UPLOAD-MAX` |
 
@@ -404,7 +417,8 @@ An ADR **would** be warranted if the product later introduced:
 | Id | Meaning |
 |---|---|
 | `RETAIN-OUTPUT` / `RETAIN-INPUT` / `RETAIN-EPHEMERAL` | Named retention classes (§5.2); numbers #17-tunable |
-| `L-TENANT-ASSET-BYTES` / `L-TENANT-ASSET-COUNT` | Tenant durable storage caps (§6); MVP 5 GiB / 10_000 objects |
+| `ASSET-TOMBSTONE-TTL-CLASS` | Bounded same-Tenant delete/expiry tombstone window (§5.4); numeric #17 |
+| `L-TENANT-ASSET-BYTES` / `L-TENANT-ASSET-COUNT` | Tenant durable storage caps over committed+reserved usage (§6); MVP 5 GiB / 10_000 objects |
 | `storage_cap_exceeded` | Canonical over-storage-cap outcome (§6), distinct from 413 and `quota_exhausted` |
 | Validation classes (`unsupported_format`/`invalid_image`/`invalid_dimensions`/`invalid_mask`/`mask_dimension_mismatch`) | Canonical validation outcomes (§4); strings #16/#18 |
 | `L-ASSET-UPLOAD-MAX` | Owned by #8 §7.2 (20 MiB per-request); consumed here |
@@ -421,7 +435,7 @@ An ADR **would** be warranted if the product later introduced:
 |---|---|
 | Input image, mask, format, size and their relationship have canonical validation outcomes | §4, §10.1, `I-ASSET-VALIDATE-EARLY`, `I-ASSET-MASK-FIDELITY`, `I-ASSET-SIZE-DISTINCT` |
 | Create, reference, retrieve and delete enforce Tenant ownership | §3, §7, §8, §10.2, `I-ASSET-TENANT`, `I-ASSET-TENANT-ISO`, `I-ASSET-SCOPE`, `I-ASSET-WORKER-SCOPE` |
-| Retention, expiry and deletion state when output stops being downloadable | §5, §6, §10.3–§10.4, `I-ASSET-RETENTION-BOUNDED`, `I-ASSET-EXPIRY-GONE`, `I-ASSET-DELETE-IDEMPOTENT`, `I-ASSET-STORAGE-CAP` |
+| Retention, expiry and deletion state when output stops being downloadable | §5, §6, §10.3–§10.4, `I-ASSET-RETENTION-BOUNDED`, `I-ASSET-EXPIRY-GONE`, `I-ASSET-DELETE-IDEMPOTENT`, `I-ASSET-STORAGE-CAP` (bounded tombstone + one-time release) |
 | Cross-Tenant identifier returns safe non-enumerating failure | §4.5, §5.5, §8, §10.5, `I-ASSET-NON-ENUM` |
 
 ---

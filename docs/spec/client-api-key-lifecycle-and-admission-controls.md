@@ -432,15 +432,16 @@ Two independent counter families (Tenant ceiling + per-key subdivision):
 
 | Counter | Acquired | Released |
 |---|---|---|
-| Chat in-flight | A6 accept of chat completion | Terminal response fully sent, client disconnect handled, cancel completed, or cancel-on-revoke completed |
+| Chat in-flight | A6 accept of chat completion | Accounting terminal: upstream completed or abort was confirmed; a client terminal/disconnect/cancel alone does not release occupancy while upstream survives (#12 §6.5) |
 | Active Render Jobs | A6 accept of job create | Job reaches terminal state (completed / failed / canceled) per #14 |
 
 Rules:
 
 1. **Tenant ceiling** remains `L-TENANT-CHAT-CONCURRENCY` / `L-TENANT-JOB-CONCURRENCY`.
 2. Implementations **MUST** account in-flight chat (and SHOULD account jobs) **per `client_api_key_id`** as well as under the Tenant ceiling so one leaked key cannot alone pin the entire Tenant chat concurrency budget by default. Effective admit requires both key subdivision and Tenant ceiling to have capacity (`effective` still respects §7.1 hierarchy).
-3. Reject at A4 → **429-class** `concurrency_limit` (distinct class from `rate_limit` so clients can back off differently).
-4. On revoke, cancel-on-revoke (§4.5) MUST release chat slots when cancel completes.
+3. A non-cancelable chat that has reached its client terminal but still runs upstream remains occupied under both the original Tenant ceiling and originating `client_api_key_id` subdivision until #12 accounting terminal. Moving its bookkeeping to a bounded residual state does not create a second concurrency pool or free capacity for another A6 accept.
+4. Reject at A4 → **429-class** `concurrency_limit` (distinct class from `rate_limit` so clients can back off differently).
+5. On revoke, cancel-on-revoke (§4.5) releases chat occupancy only when abort/completion confirms upstream stopped; a surviving non-cancelable execution follows #12 residual accounting without minting replacement capacity.
 
 ### 7.5 Quota semantics (anti-abuse, not billing)
 
@@ -620,7 +621,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 ### 11.3 Admission
 
 10. Exceed RPM → **429-class `rate_limit`**; Adapter calls = 0.
-11. Exceed chat concurrency → **429-class `concurrency_limit`**; Adapter calls = 0.
+11. Exceed chat concurrency → **429-class `concurrency_limit`**; Adapter calls = 0, including when client-terminal residual executions still occupy the Tenant and originating-key counters until accounting terminal (#12).
 12. Exceed image job day quota → **429-class `quota_exhausted`**; no job row accepted.
 13. Oversized JSON body → **413-class**; authenticated size rejects count toward Tenant RPM.
 14. Oversized asset upload → **413-class**.
@@ -658,13 +659,13 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 9. **I-SCOPE-NARROW** — Scopes only narrow same-Tenant actions; default grant excludes `keys.manage`; explicit empty model/account allowlists mean deny-all for that dimension.
 10. **I-ADMIT-ORDER** — Authn → scope → size → rate → concurrency → quota → accept; no Adapter/job side effects before accept.
 11. **I-LIMIT-HIERARCHY** — `effective = min(platform, tenant, key_override?)`; key cannot exceed Tenant ceiling.
-12. **I-LIMIT-ISOLATION** — Rate/concurrency/quota counters never shared across Tenants; chat concurrency is also subdivided by `client_api_key_id` under the Tenant ceiling.
+12. **I-LIMIT-ISOLATION** — Rate/concurrency/quota counters never shared across Tenants; chat concurrency is also subdivided by `client_api_key_id` under the Tenant ceiling, and client-terminal residual work retains both occupancies until #12 accounting terminal.
 13. **I-ADMIT-VS-EXEC** — Admission rejections are distinct from Provider/execution failures; clients can tell `rate_limit` / `concurrency_limit` / `quota_exhausted` classes apart from runtime Provider errors.
 14. **I-NO-OPEN-PROXY** — No unauthenticated inference; abuse throttles apply to auth failures without global locator lockout from foreign IPs.
 15. **I-REDACT-KEY** — Full material and secret hash never appear in logs, metrics labels, or non-one-time API responses.
 16. **I-FAIL-CLOSED-LIMITS** — Unavailable revocation or limit state does not fail open.
 17. **I-RESERVE-CAP** — Chat token reservation at admission is capped by `L-CHAT-MAX-TOKENS-PER-REQ`.
-18. **I-CANCEL-ON-REVOKE** — Revoke MUST attempt cancel of cancelable in-flight work for that key and release concurrency when cancel completes.
+18. **I-CANCEL-ON-REVOKE** — Revoke MUST attempt cancel of cancelable in-flight work for that key and release concurrency only when cancel completion confirms upstream stopped; surviving work remains accounted under #12.
 
 ---
 
