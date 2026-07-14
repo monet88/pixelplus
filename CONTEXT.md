@@ -71,7 +71,7 @@ Tập kiểm tra có thứ tự tại Public API boundary sau khi xác thực Cl
 
 ## Asset
 
-Đối tượng dữ liệu ảnh (input, mask hoặc output) do đúng một Tenant sở hữu trong gateway. Asset không được đọc, ghi hoặc tham chiếu chéo Tenant.
+Đối tượng dữ liệu ảnh bất biến (kind `input`, `mask` hoặc `output`) do đúng một Tenant sở hữu trong gateway. `tenant_id`, `asset_id` và `kind` bất biến; content bytes không đổi sau create (edit/inpaint tạo `output` Asset mới, không mutate input). Asset chỉ được đọc, liệt kê, tải, tham chiếu và xóa **trong** Tenant sở hữu; output không bao giờ vượt Tenant. Cross-Tenant hoặc unknown `asset_id` trả 404-class non-enumerating (không xác nhận tồn tại, không lộ dimension/relationship của Asset lạ); job tham chiếu Asset lạ fail trước khi enqueue. Upload validate canonical (format/decodability, pixel dimensions, quan hệ image↔mask) trước upstream; mask không bao giờ bị âm thầm drop để hạ inpaint→image_edit. Mỗi Asset có retention class có giới hạn (`RETAIN-OUTPUT`/`RETAIN-INPUT`/`RETAIN-EPHEMERAL`); sau `expires_at` hoặc delete thì không còn tải được (canonical gone/not-found), delete idempotent và same-Tenant. Storage per Tenant bị chặn bởi `L-TENANT-ASSET-BYTES`/`L-TENANT-ASSET-COUNT` (khác per-request `L-ASSET-UPLOAD-MAX` và admission quota). Chi tiết validation, ownership, retention/expiry/deletion, storage cap và non-enumeration nằm tại `docs/spec/asset-exchange-authorization-and-retention-lifecycle.md`.
 
 ## Render Job
 
@@ -104,3 +104,11 @@ Capability taxonomy (chat, streaming, image generation, image edit, inpaint), ca
 ## Normative Tenant-scoped routing, fallback, affinity and lease spec
 
 Candidate set construction (ownership → key allowlist → usability → risk → capability → routable health), selection precedence ladder (explicit selection → lease → affinity → policy routing → fallback), account lease và affinity semantics, điều kiện fallback (same-Tenant, Auth Mode được policy cho phép, capability khớp `op`+model), tập tuyệt đối không fallback cùng failure semantics fail-closed non-enumerating, và Routing Policy logical fields nằm tại `docs/spec/tenant-scoped-routing-fallback-affinity-leases.md`.
+
+## Normative Chat execution and streaming lifecycle spec
+
+Vòng đời chat non-streaming và streaming từ admitted request tới terminal outcome (phases X0 admitted → X1 capability gate → X2 account resolution → X3 credential decrypt → X4 upstream execution → X5 terminal), canonical terminal semantics độc lập Provider (`finish_class`, thứ tự streaming `open`→`delta`*→một terminal duy nhất, heartbeat, honesty real vs synthetic streaming), streaming session lease (hard) và affinity (soft), cancellation/client-disconnect/timeout với upstream abort + slot release + token-quota reconcile, retry boundary một tầng pre-upstream (không auto-retry khi possibly-committed) và idempotency replay trả prior outcome nằm tại `docs/spec/chat-execution-and-streaming-lifecycle.md`.
+
+## Normative Asset exchange, authorization and retention lifecycle spec
+
+Canonical validation input image/mask (format/decodability, dimensions, quan hệ image↔mask, không drop mask để hạ inpaint→image_edit), enforcement Tenant ownership cho create/reference/retrieve/list/delete, retention class và expiry/deletion (thời điểm output không còn tải được, delete idempotent same-Tenant), per-Tenant storage cap (`L-TENANT-ASSET-BYTES`/`L-TENANT-ASSET-COUNT`) tách khỏi per-request upload cap và admission quota, và cross-Tenant/unknown identifier trả 404-class non-enumerating (job tham chiếu Asset lạ fail trước enqueue) nằm tại `docs/spec/asset-exchange-authorization-and-retention-lifecycle.md`.
