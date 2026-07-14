@@ -6,6 +6,7 @@
 .codex/
 .claude/
 .agents
+.scratch/
 
 # Secrets and local runtime data
 .env
