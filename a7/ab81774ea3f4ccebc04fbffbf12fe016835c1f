@@ -1,0 +1,29 @@
+.gitignore
+  s_75d6be98f5291a::t_5146907cce9deb 40
+CLAUDE.md
+  s_d7044c7619e8f5::t_8b93ea038175fe 31,49,51-54,56,58-67,69,71-72,75-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "a7ab81774ea3f4ccebc04fbffbf12fe016835c1f",
+  "prompts": {},
+  "sessions": {
+    "s_75d6be98f5291a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6b3809f-d8d0-437d-aed9-6caa0de68bd6",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_d7044c7619e8f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a1d9b570e650acb05",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
