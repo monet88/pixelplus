@@ -79,7 +79,7 @@ Tập kiểm tra có thứ tự tại Public API boundary sau khi xác thực Cl
 
 ## Routing Policy
 
-Cấu hình do Tenant khai báo để chọn, ưu tiên hoặc fallback giữa các Provider Account thuộc chính Tenant đó. Routing Policy không được đưa Provider Account của Tenant khác vào candidate set.
+Cấu hình do Tenant khai báo để chọn, ưu tiên hoặc fallback giữa các Provider Account thuộc chính Tenant đó. Routing Policy không được đưa Provider Account của Tenant khác vào candidate set. Candidate set được dựng theo thứ tự lọc ownership → key allowlist → usability (#9 `I-USABLE-GATE`) → risk (#7) → capability (#10 offerable) → routable health, và precedence giải quyết là explicit selection → lease → affinity → policy routing → fallback. Fallback là opt-in fail-closed: chỉ chạy khi Tenant policy khai báo chuỗi fallback có thứ tự, chỉ giữa các account/Auth Mode cùng Tenant được policy cho phép và có capability khớp đúng `op`+model; các trường hợp tuyệt đối không fallback (cross-Tenant, explicit pin, không policy, cross-mode không khai báo, prohibited/experimental/gated-chưa-ack, capability unsupported/model-unavailable/stale, candidate set rỗng) phải fail closed và không enumerate account của Tenant khác. Account lease gắn một đơn vị công việc vào đúng một account trong suốt vòng đời của nó; affinity là preference mềm; cả hai không bao giờ vượt qua usability/capability và bị void ngay khi durable §5.1 items 1–5 của account fail. Chi tiết candidate construction, precedence ladder, affinity/lease, fallback và no-fallback semantics nằm tại `docs/spec/tenant-scoped-routing-fallback-affinity-leases.md`.
 
 ## Normative ownership spec
 
@@ -100,3 +100,7 @@ Journey kết nối Provider Account (create, credential submission, validation,
 ## Normative Capability Snapshot and model availability spec
 
 Capability taxonomy (chat, streaming, image generation, image edit, inpaint), capability status, model availability theo observed slug, cấu trúc Capability Snapshot (provenance, `verified_at`, freshness), TTL/invalidation/refresh triggers (entitlement, credential, protocol drift) và enforcement từ chối operation unsupported/stale trước upstream execution nằm tại `docs/spec/capability-snapshot-and-model-availability-semantics.md`.
+
+## Normative Tenant-scoped routing, fallback, affinity and lease spec
+
+Candidate set construction (ownership → key allowlist → usability → risk → capability → routable health), selection precedence ladder (explicit selection → lease → affinity → policy routing → fallback), account lease và affinity semantics, điều kiện fallback (same-Tenant, Auth Mode được policy cho phép, capability khớp `op`+model), tập tuyệt đối không fallback cùng failure semantics fail-closed non-enumerating, và Routing Policy logical fields nằm tại `docs/spec/tenant-scoped-routing-fallback-affinity-leases.md`.
