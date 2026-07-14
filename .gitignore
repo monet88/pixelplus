@@ -4,8 +4,8 @@
 # Local agent and code-intelligence state
 .codegraph/
 .codex/
-.claude/settings.local.json
-.claude/worktrees/
+.claude/
+.agents
 
 # Secrets and local runtime data
 .env

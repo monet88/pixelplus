@@ -1,0 +1,8 @@
+{
+  "includeIgnored": [
+    ".ref/chatgpt2api/",
+    ".ref/CLIProxyAPI/",
+    ".ref/gemini-web-to-api/",
+    ".ref/grok2api/"
+  ]
+}
