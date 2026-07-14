@@ -10,11 +10,11 @@ Một dịch vụ AI upstream mà gateway kết nối. Các Provider ban đầu 
 
 ## Provider Account
 
-Một kết nối do đúng một Tenant sở hữu tới một Provider, đại diện cho danh tính và hạn mức sử dụng của người dùng tại Provider đó.
+Một kết nối do đúng một Tenant sở hữu tới một Provider, đại diện cho danh tính và hạn mức sử dụng của người dùng tại Provider đó. Mỗi Provider Account gắn đúng một Auth Mode bất biến và mang lifecycle state quan sát được (`draft`, `pending_validation`, `pending_probe`, `active`, `reauth_required`, `disabled`, `revoked`, `deleted`). Account chỉ **usable** cho routing/execution khi `active`, đã qua required validation + required probe cho `credential_version` hiện tại, Auth Mode còn execution-enabled theo risk envelope, credential chưa bị vault-revoke, và không bị operational health hard-block. Chi tiết journey (create, submit, validate, probe, activation, refresh, reauthentication, disable, revoke, delete), usability gate và remediation nằm tại `docs/spec/provider-account-connection-and-credential-lifecycle.md`.
 
 ## Provider Credential
 
-Dữ liệu bí mật chứng minh gateway được phép hành động qua một Provider Account. Provider Credential không đồng nghĩa với Provider Account và không được dùng chéo Tenant.
+Dữ liệu bí mật chứng minh gateway được phép hành động qua một Provider Account. Provider Credential không đồng nghĩa với Provider Account và không được dùng chéo Tenant. Material được vault tách khỏi metadata account; Public API response, log, metric label và operator metadata không được chứa plaintext credential. Silent refresh chỉ khi Auth Mode/credential class hỗ trợ; Web Access và OAuth/CLI Access không trộn lifecycle trên cùng một account. Chi tiết class theo sáu Auth Mode, dual-version reauth cutover và redaction nằm tại `docs/spec/provider-account-connection-and-credential-lifecycle.md`.
 
 ## Client API Key
 
@@ -92,3 +92,7 @@ Quyết định risk envelope, acceptable-use boundary, operator obligation và 
 ## Normative Client API Key and admission spec
 
 Lifecycle Client API Key (create, one-time display, authenticate, scope, rotate, revoke), hashing/storage, admission controls (rate, concurrency, quota, request-size), abuse controls và ranh giới admission vs execution nằm tại `docs/spec/client-api-key-lifecycle-and-admission-controls.md`.
+
+## Normative Provider Account connection and Provider Credential lifecycle spec
+
+Journey kết nối Provider Account (create, credential submission, validation, probe, activation, refresh, reauthentication, disable, revoke, delete), usability gate, khác biệt lifecycle sáu Auth Mode (Web vs OAuth/CLI không trộn), remediation class và redaction Provider Credential nằm tại `docs/spec/provider-account-connection-and-credential-lifecycle.md`.
