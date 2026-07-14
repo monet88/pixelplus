@@ -1,0 +1,19 @@
+CONTEXT.md
+  s_316f092233856d::t_5daca313bf3d92 82,103-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "92fbe4bbd276077960e09f858a1cc15f615cfdb7",
+  "prompts": {},
+  "sessions": {
+    "s_316f092233856d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fe9e531e-1ef8-4efb-a379-357896cd466b",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
