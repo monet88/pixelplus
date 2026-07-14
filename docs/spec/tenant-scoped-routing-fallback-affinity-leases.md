@@ -93,7 +93,7 @@ Cause → effect:
 | **Account lease** | A stronger, explicit hold binding a unit of work (e.g. a multi-step Render Job or a streaming session) to exactly one Provider Account for a **lease TTL class**, so mid-work the Gateway does not switch accounts under it. §5.2. |
 | **Fallback** | Selecting a **second** candidate account after a first choice is unavailable/failed, only within the Tenant-permitted set and with matching capability. §6. |
 | **No-fallback case** | A condition under which the Gateway MUST NOT try another account and MUST fail closed with a stable class. §7. |
-| **Transient vs durable unavailability** | Transient = short backoff class (`rate_limited`, some `degraded`); durable = usability/capability kill (#9 §5.1 items 1–5 fail, `unsupported`, `stale`/`invalid`). Only transient (or Tenant-policy-permitted entitlement) unavailability may trigger fallback; durable kills of the *request's* only pinned account fail closed. §6.3. |
+| **Transient vs durable unavailability** | Transient = short backoff class (`rate_limited`, some `degraded`); durable = usability/capability kill (#9 §5.1 items 1–5 fail, `unsupported`, `stale`/`invalid`). Only transient (or Tenant-policy-permitted entitlement) unavailability may trigger fallback; durable kills of the *request's* only pinned account fail closed. §6.4. |
 
 ---
 
@@ -136,7 +136,7 @@ Given the candidate set from §3, the Gateway resolves the account in this stric
 |---|---|---|
 | **P0** | **Candidate gate** (§3) | If candidate set is empty → fail closed (§7). Nothing below can revive an empty set. |
 | **P1** | **Explicit account selection** | If the client named `provider_account_id = X`: X MUST be in the candidate set. If yes → resolve to X (no other account considered; fallback OFF unless §4.2 rule 4). If X is same-Tenant but not in the candidate set → fail closed with the specific class (§7.2). If X is foreign/unknown → **404-class**. |
-| **P2** | **Active lease** | If an active lease (§5.2) binds this unit of work to account `L` and `L` is still in the candidate set → resolve to `L`. If `L` left the candidate set → lease is void for new work (§5.4); proceed to P3/P4 only if fallback is permitted, else fail closed. |
+| **P2** | **Active lease** | If an active lease (§5.2) binds this unit of work to account `L`: if `L` is still in the candidate set → resolve to `L`. If `L` left the candidate set → lease is void for new work (§5.4); the request MUST NOT fall through to P3 (affinity) or P4 (fresh policy selection) — those would silently pick a different account and bypass the fail-closed fallback opt-in (`I-ROUTE-FALLBACK-OPTIN`). Instead go directly to P5: trigger fallback if §6 permits, else fail closed (§7). |
 | **P3** | **Affinity** | If affinity (§5.1) prefers account `A` (from a prior related request) and `A` is in the candidate set → resolve to `A`. Affinity is a preference, not a hard pin; if `A` is absent, continue. |
 | **P4** | **Policy routing** | Apply Routing Policy ordering/selection (§8) over the remaining candidate set to pick the primary account. |
 | **P5** | **Fallback** | Only if the chosen account (from P1–P4) becomes unavailable in a fallback-eligible way (§6) AND policy permits fallback → pick the next permitted candidate. Otherwise fail closed (§7). |
@@ -219,7 +219,7 @@ Rules:
 
 Fallback (P5) is considered **only** when **all** hold:
 
-1. The primary account (from P1–P4) became **unavailable in a fallback-eligible way** (§6.3), **and**
+1. The primary account (from P1–P4) became **unavailable in a fallback-eligible way** (§6.4), **and**
 2. The Tenant's Routing Policy **explicitly declares** an ordered fallback chain (fallback is **opt-in**, fail-closed by default — no silent auto-failover; §6.5), **and**
 3. For an **explicitly selected** request, §4.2 rule 4 opt-in also holds, **and**
 4. At least one **next** account remains in the candidate set (§3) — i.e. it already passed C0–C5 for this exact `op`+`m`.
