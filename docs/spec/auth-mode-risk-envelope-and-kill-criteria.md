@@ -180,6 +180,17 @@ Signals below are **product-binding**. Thresholds for KS-2 and FG-5 are **produc
 | **FG-4** | Dual-regime identity incomplete (e.g. Grok SSO issuer xAI vs X still ambiguous for a credential type) | Gate that credential subtype until mapping verified |
 | **FG-5** | Challenge rate ≥ **40%** over **15 minutes** with ≥ **20** attempts | Auto-cooldown: reduce concurrency, pause new connections for Auth Mode, alert operator |
 
+#### 3.5.3 Measurement requirements
+
+For KS-2 and FG-5 to be enforceable, Gateway health telemetry MUST be able to count, per Auth Mode:
+
+- attempt starts
+- challenge/bot-interstitial classifications
+- permanent ban / provider-revoked outcomes
+- distinct `provider_account_id` affected
+
+Exact metric names are owned by later observability work; this document locks **what must be countable**.
+
 #### 3.5.4 Auth Mode kill vs Adapter pause
 
 For this product, **Auth Mode is the Adapter registration unit** (`CONTEXT.md`: Auth Mode decides which Adapter may handle the account).
@@ -191,17 +202,6 @@ Cause → effect:
 3. That is the required **Adapter path pause** for M. A separate “pause Adapter binary while Auth Mode stays allowed” control is optional later ops detail; it MUST NOT re-enable a killed or `prohibited` Auth Mode.
 
 Per-account cooldown (one Provider Account unhealthy while siblings on the same Auth Mode still run) remains allowed and is owned by health/routing issues (#11/#17). That is not an Auth Mode status change.
-
-#### 3.5.3 Measurement requirements
-
-For KS-2 and FG-5 to be enforceable, Gateway health telemetry MUST be able to count, per Auth Mode:
-
-- attempt starts
-- challenge/bot-interstitial classifications
-- permanent ban / provider-revoked outcomes
-- distinct `provider_account_id` affected
-
-Exact metric names are owned by later observability work; this document locks **what must be countable**.
 
 ---
 
