@@ -891,7 +891,7 @@ An ADR **would** be warranted if product later introduced:
 | AC (issue #9) | Where satisfied |
 |---|---|
 | Create, credential submission, validation, probe, activation, refresh, reauthentication, disable, revoke and delete all have clear transitions | §4 entire, §4.13 matrix, §14.1–§14.3, §15 |
-| Account does not become usable when credential validation or required probe fails | §4.2 I-USABLE-GATE, §4.5–§4.6, §5, §5.3 A/B, §14.1, I-NO-ACTIVE-ON-FAIL |
+| Account does not become usable when credential validation or required probe fails | §4.2 activation preconditions, §4.5–§4.6, §5.1 `I-USABLE-GATE`, §5.3 A/B, §14.1, I-NO-ACTIVE-ON-FAIL |
 | Differences among six Auth Modes recorded without mixing Web and OAuth/CLI lifecycles | §1.5, §8, §14.4, I-NO-WEB-OAUTH-MIX, I-REFRESH-MODE-CORRECT |
 | Responses and operator metadata do not leak Provider Credential | §3.1–§3.3, §9, §14.5, I-REDACT-CREDENTIAL, #7 OP-G3 |
 
