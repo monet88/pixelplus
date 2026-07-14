@@ -59,7 +59,7 @@ Trạng thái risk envelope (`allowed` / `prohibited` / `experimental` / `gated`
 
 ## Capability Snapshot
 
-Kết quả kiểm chứng capability của một Provider Account tại một thời điểm, bao gồm các thao tác và model account thực sự được phép sử dụng. Capability Snapshot không phải tuyên bố capability tĩnh của Provider hoặc Adapter. Capability Snapshot thuộc Tenant của Provider Account tương ứng và không được dùng ngoài Tenant đó.
+Kết quả kiểm chứng capability của một Provider Account tại một thời điểm, bao gồm các thao tác và model account thực sự được phép sử dụng. Capability Snapshot không phải tuyên bố capability tĩnh của Provider hoặc Adapter. Capability Snapshot thuộc Tenant của Provider Account tương ứng và không được dùng ngoài Tenant đó. Snapshot phân loại năm operation chính (`chat`, `chat_streaming`, `image_generation`, `image_edit`, `inpaint`) theo capability status (`verified`/`conditionally_supported`/`unsupported`/`unverified` từ #3–#5), liệt kê model theo slug **quan sát được** (không phải catalog tĩnh), và mang `verified_at`, freshness (`fresh`/`stale`/`invalid`), TTL class cùng evidence/probe provenance. Snapshot gắn với `credential_version` hiện tại; operation `unsupported`/`unverified` hoặc snapshot không `fresh` bị từ chối trước upstream execution (là item 7 của `I-USABLE-GATE`). Snapshot không bao giờ nâng risk status của Auth Mode và không chứa plaintext credential. Chi tiết taxonomy, model availability, freshness, invalidation và enforcement nằm tại `docs/spec/capability-snapshot-and-model-availability-semantics.md`.
 
 ## Security Principal
 
@@ -96,3 +96,7 @@ Lifecycle Client API Key (create, one-time display, authenticate, scope, rotate,
 ## Normative Provider Account connection and Provider Credential lifecycle spec
 
 Journey kết nối Provider Account (create, credential submission, validation, probe, activation, refresh, reauthentication, disable, revoke, delete), usability gate, khác biệt lifecycle sáu Auth Mode (Web vs OAuth/CLI không trộn), remediation class và redaction Provider Credential nằm tại `docs/spec/provider-account-connection-and-credential-lifecycle.md`.
+
+## Normative Capability Snapshot and model availability spec
+
+Capability taxonomy (chat, streaming, image generation, image edit, inpaint), capability status, model availability theo observed slug, cấu trúc Capability Snapshot (provenance, `verified_at`, freshness), TTL/invalidation/refresh triggers (entitlement, credential, protocol drift) và enforcement từ chối operation unsupported/stale trước upstream execution nằm tại `docs/spec/capability-snapshot-and-model-availability-semantics.md`.
