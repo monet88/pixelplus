@@ -20,6 +20,8 @@ Dữ liệu bí mật chứng minh gateway được phép hành động qua mộ
 
 Credential do gateway cấp cho phần mềm gọi Public API thay mặt một Tenant. Client API Key không phải Provider Credential.
 
+Material dạng bearer `sk-pxp_<public_locator>_<secret>`: secret chỉ hiển thị một lần khi create/rotate, chỉ lưu secret hash (HMAC-SHA-256 với server pepper theo mặc định), không lưu plaintext. `client_api_key_id` là định danh không bí mật dùng cho log/audit. Scope chỉ được thu hẹp quyền trong Tenant sở hữu; revoke có hiệu lực tại Public API boundary với ngân sách cache dương bị chặn (`R-REVOKE-PROP`). Chi tiết lifecycle, hashing, scope, rotation, revocation, rate/concurrency/quota/request-size và abuse controls nằm tại `docs/spec/client-api-key-lifecycle-and-admission-controls.md`.
+
 ## BYOA
 
 Bring Your Own Account. Mỗi request chỉ được sử dụng Provider Account thuộc cùng Tenant với Client API Key đã xác thực request đó.
@@ -63,6 +65,10 @@ Kết quả kiểm chứng capability của một Provider Account tại một t
 
 Danh tính bảo mật của một request Public API đã xác thực, gồm `tenant_id` của Tenant sở hữu Client API Key và `client_api_key_id` của Client API Key đó. Mọi quyết định authorization của request phải dựa trên Security Principal này; client không được tự chỉ định Tenant khác.
 
+## Admission Control
+
+Tập kiểm tra có thứ tự tại Public API boundary sau khi xác thực Client API Key và trước khi request được chấp nhận để thực thi (gọi Adapter, enqueue Render Job, hoặc side effect tương đương). Thứ tự chuẩn: scope → request-size → rate → concurrency → quota → accept. Admission rejection (401/403/413/429-class) khác execution/runtime failure từ Provider hoặc worker. Giới hạn theo hierarchy `min(platform, tenant, key_override?)` và cô lập theo Tenant.
+
 ## Asset
 
 Đối tượng dữ liệu ảnh (input, mask hoặc output) do đúng một Tenant sở hữu trong gateway. Asset không được đọc, ghi hoặc tham chiếu chéo Tenant.
@@ -82,3 +88,7 @@ Các invariant sở hữu và authorization chuẩn nằm tại `docs/spec/tenan
 ## Normative risk envelope spec
 
 Quyết định risk envelope, acceptable-use boundary, operator obligation và kill criteria cho sáu Auth Mode nằm tại `docs/spec/auth-mode-risk-envelope-and-kill-criteria.md`.
+
+## Normative Client API Key and admission spec
+
+Lifecycle Client API Key (create, one-time display, authenticate, scope, rotate, revoke), hashing/storage, admission controls (rate, concurrency, quota, request-size), abuse controls và ranh giới admission vs execution nằm tại `docs/spec/client-api-key-lifecycle-and-admission-controls.md`.
