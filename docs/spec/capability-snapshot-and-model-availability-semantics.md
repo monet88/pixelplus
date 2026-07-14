@@ -138,7 +138,9 @@ An operation being `conditionally_supported` for an account does **not** imply e
 
 ### 4.1 Tokens
 
-The snapshot records one of these per operation (and per model per operation). Meaning is owned by evidence #3–#5; this document only locks recording + enforcement:
+The snapshot records one of these per operation (and per model per operation). Meaning is owned by evidence #3–#5; this document only locks recording + enforcement.
+
+**Legend ↔ field-token mapping (normative):** the evidence legends (#3–#5) write these as prose values `verified` / `conditionally supported` (space) / `unsupported` / `unverified`. This document records them as snake_case **field tokens** — `verified` / `conditionally_supported` / `unsupported` / `unverified` — to match the operation tokens (`chat_streaming`) and stay JSON-field-safe for #18/#20. The mapping is 1:1 and MUST NOT introduce a fifth value or change any legend meaning. `conditionally_supported` ≡ evidence `conditionally supported`.
 
 | Token | Recording meaning | Offerable by default? |
 |---|---|---|
@@ -153,7 +155,7 @@ The snapshot records one of these per operation (and per model per operation). M
 
 - A successful probe MAY move `unverified` → `verified`/`conditionally_supported` for the probed operation+model **only**. It MUST NOT bulk-promote other operations or models.
 - The gateway MUST NOT record `verified` for a capability learned only from reference code; the strongest such status is `conditionally_supported` (#3–#5: "no row is product-`verified` without live probe").
-- A snapshot capability status MUST NOT change the Auth Mode **risk** status (#7 §2.2: "Gateway MUST NOT promote risk status because a probe succeeded"; #7 §7.2).
+- A snapshot capability status MUST NOT change the Auth Mode **risk** status (#7 §2.2: "Gateway MUST NOT promote risk status because a probe succeeded"; #7 §7 item 2).
 
 ### 4.3 Baseline capability facts from evidence (informative starting matrix)
 
