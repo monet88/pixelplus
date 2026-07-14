@@ -28,7 +28,7 @@ Type these. The agent must not invent a substitute pipeline.
 - **`/to-tickets`**: Split a plan or spec into tracer-bullet tickets with blocking edges.
 - **`/implement`**: Build from a ticket or spec. Drives `/tdd` at agreed seams and closes with `/code-review` before commit.
 - **`/wayfinder`**: Map a foggy multi-session effort as decision tickets until the path is clear, then merge onto `/to-spec`.
-- **`/triage`**: Move *incoming* raw issues/PRs through triage labels. Do not triage tickets produced by `/to-tickets`.
+- **`/triage`**: Move _incoming_ raw issues/PRs through triage labels. Do not triage tickets produced by `/to-tickets`.
 - **`/improve-codebase-architecture`**: Scan for deepening opportunities; run on friction or periodically after agent-heavy shipping.
 - **`/handoff`**: Bridge context windows — fork to a fresh session with a handoff file (prototype detours, smart-zone limits).
 
@@ -46,72 +46,39 @@ The agent may reach for these when the task fits; user may also invoke them.
 - **`/diagnosing-bugs`**: Reproduce → minimise → instrument → fix → regression test.
 - **`/resolving-merge-conflicts`**: Resolve merge/rebase by both sides' intent; do not `--abort` merely to avoid the conflict.
 
-## Choose by clarity and size
+### Default Router
 
-### Clear and small
+- **Clear and small:** Implement directly, or use `/tdd` when behavior can be tested through a clear seam.
+- **Unclear and small:** Use `/grill-me`, or `/grill-with-docs` for an existing codebase. Add `/research` or `/prototype` when external facts or design assumptions must be validated, then use `/to-spec` → `/implement`.
+- **Clear and large:** Use `/to-spec` → `/to-tickets` → `/implement`, handling one unblocked ticket per fresh session.
+- **Unclear and large:** Use `/wayfinder` to resolve decision tickets, then `/to-spec` → `/to-tickets` → `/implement`.
 
-`/tdd` or direct implementation  
-→ targeted checks  
-→ `/code-review`  
-→ commit  
+### Special Cases
 
-Prefer `/implement` when work already comes from a ticket or spec. Prefer bare `/tdd` for a single concrete behaviour (do not invent a spec for a tiny fix).
+- **Known bug with a clear reproduction:** `/tdd` → regression test → smallest safe fix.
+- **Unknown, flaky, or performance bug:** `/diagnosing-bugs`.
+- **UI or state-model uncertainty:** `/prototype`.
+- **External API, library, or documentation uncertainty:** `/research`.
+- **Repeated architectural friction:** `/improve-codebase-architecture`, then spec and implement the selected improvement.
+- **Incoming issues or external PRs:** `/triage`.
+- **Reviewing completed work:** `/code-review` against a fixed point and originating spec.
+- **Merge or rebase conflicts:** `/resolving-merge-conflicts`.
+- **Moving work to another session or agent:** `/handoff`.
+- **Unsure which workflow applies:** `/ask-matt`.
 
-### Unclear but small (inside existing repo)
+### Rules
 
-`/grill-with-docs`  
-→ optional `/research` or `/prototype` (bridge with `/handoff` both ways if a fresh session is needed)  
-→ multi-session build?  
-  **NO** → `/implement` in the same context  
-  **YES** → `/to-spec` → `/to-tickets` → `/implement` one unblocked ticket per fresh session  
-
-### Unclear, little/no codebase, multi-session
-
-`/grill-me`  
-→ multi-session build?  
-  **NO** → `/implement` in the same context  
-  **YES** → `/to-spec` → `/to-tickets` → `/implement` one unblocked ticket per fresh session  
-
-If the fog spans many open decisions beyond one grill → `/wayfinder` instead.
-
-### Clear but large
-
-`/to-spec`  
-→ `/to-tickets`  
-→ `/implement` one unblocked ticket per fresh session  
-
-### Unclear and large
-
-`/wayfinder`  
-→ resolve decision tickets  
-→ `/to-spec`  
-→ `/to-tickets`  
-→ `/implement` one unblocked ticket per fresh session  
-
-## Special situations
-
-- Unknown, flaky, or performance bug: `/diagnosing-bugs`
-- Known bug with a clear regression test: `/tdd`
-- UI or state-model uncertainty: `/prototype` (handoff out/back if fresh session)
-- External documentation or API uncertainty: `/research`
-- Repeated architectural friction: `/improve-codebase-architecture`
-- Incoming raw issues or external PRs: `/triage` (never triage `/to-tickets` output)
-- Merge or rebase conflicts: `/resolving-merge-conflicts`
-- Moving work to a fresh session or agent: `/handoff`
-- Unsure which workflow fits: `/ask-matt`
-
-## General rules
-
-- Skip any workflow step that does not reduce meaningful uncertainty or implementation risk.
-- `/to-spec` / `/to-tickets` only when the build spans sessions (or after `/wayfinder` clears) — not after every grill.
-- Keep grill → to-spec → to-tickets in one unbroken context; never compact mid-phase. Start each `/implement` fresh from the ticket. If the window approaches the smart zone (~120k), `/handoff` and continue. Prefer `/handoff` over mid-phase `/compact`; compact only at intentional phase breaks.
-- Prefer `/grill-with-docs` over bare `/grilling` when a codebase and `CONTEXT.md` exist.
-- Do not `/triage` tickets produced by `/to-tickets`; triage only incoming raw issues/PRs.
-- Prefer `/implement` when work comes from a ticket or spec; prefer bare `/tdd` for one concrete behaviour.
-- Record a branch base or commit fixed point before implementation.
+- Skip steps that do not reduce meaningful uncertainty or risk.
+- Use `/to-spec` and `/to-tickets` for work that spans sessions (or after `/wayfinder` clears decisions), not after every grill.
+- Prefer `/grill-with-docs` over bare `/grilling` when the repository has `CONTEXT.md`.
+- Keep discovery, decisions, planning, implementation, and review as distinct phases; do not compact or break context mid-phase. Use `/handoff` when a fresh context is needed.
+- Record the base branch or commit before implementation.
+- Work one unblocked implementation ticket per fresh context; do not implement a foggy `/wayfinder` frontier ticket.
+- Do not AFK-implement issues labeled `needs-triage`, `needs-info`, or `ready-for-human`.
+- Do not run `/triage` on tickets produced by `/to-tickets`; triage only incoming raw issues/PRs.
 - Prefer existing test seams over creating new ones.
 - Treat tickets as vertical, independently verifiable slices.
-- Work one implementation ticket per fresh context; pick unblocked (blockers done) tickets, not foggy wayfinder frontier tickets, once on the main ship flow.
-- Keep discovery, decisions, planning, implementation, and review as separate phases.
-- Do not let prototypes, debugging instrumentation, or speculative abstractions enter production code.
-- Do not AFK-implement issues labelled `needs-triage`, `needs-info`, or `ready-for-human`.
+- `/wayfinder` resolves decisions; `/to-tickets` creates implementation work.
+- Keep prototypes and temporary debugging instrumentation out of production.
+- Record unrelated discoveries as separate issues instead of expanding scope.
+- `/implement` should use TDD at agreed seams, run relevant checks, and finish with `/code-review`.

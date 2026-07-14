@@ -222,7 +222,8 @@ Fallback (P5) is considered **only** when **all** hold:
 1. The primary account (from P1–P4) became **unavailable in a fallback-eligible way** (§6.4), **and**
 2. The Tenant's Routing Policy **explicitly declares** an ordered fallback chain (fallback is **opt-in**, fail-closed by default — no silent auto-failover; §6.5), **and**
 3. For an **explicitly selected** request, §4.2 rule 4 opt-in also holds, **and**
-4. At least one **next** account remains in the candidate set (§3) — i.e. it already passed C0–C5 for this exact `op`+`m`.
+4. At least one **next** account remains in the candidate set (§3) — i.e. it already passed C0–C5 for this exact `op`+`m`, **and**
+5. If the primary was already attempted upstream, the owning operation's retry contract authorizes another attempt. For non-idempotent chat, #12 requires authoritative proof that the prior Provider attempt did not accept/create a generation; status/error class alone is insufficient.
 
 ### 6.2 What fallback MAY move between
 
@@ -243,9 +244,11 @@ A fallback target MUST satisfy capability for the **exact requested `op`+`m`** (
 
 | Primary account became… | Source | Fallback eligible? |
 |---|---|---|
-| `rate_limited` (transient provider rate) | #9 §6 | **Yes**, if policy permits — short backoff, try next permitted candidate |
-| `degraded` (partial, non-auth) | #9 §6 | **Yes** with caution, if policy permits and capability still offerable |
-| `quota_exhausted` for the op (temporary, reset hint) | #9 §6, #10 §8.1 | **Policy-dependent**: MAY fall back to another permitted account; the exhausted account is non-offerable for the op until reset (#10 §8.2) — this is entitlement drift, not reauth |
+| `rate_limited` known before this request sends an upstream payload (for example, active cooldown) | #9 §6 | **Yes**, if policy permits — short backoff, try next permitted candidate |
+| `rate_limited` returned during an upstream attempt | #9 §6 + owning operation retry contract | **Only when the operation permits re-attempt**; non-idempotent chat additionally requires #12 authoritative proof of non-commit. HTTP/error class alone is insufficient |
+| `degraded` (partial, non-auth) | #9 §6 | **Yes** with caution before an attempt, if policy permits and capability still offerable; after an attempt, the owning operation's retry safety also applies |
+| `quota_exhausted` known before this request sends an upstream payload (for example, current entitlement/reset state) | #9 §6, #10 §8.1 | **Policy-dependent**: MAY fall back to another permitted account; the exhausted account is non-offerable for the op until reset (#10 §8.2) — this is entitlement drift, not reauth |
+| `quota_exhausted` returned during an upstream attempt | #9 §6, #10 §8.1 + owning operation retry contract | **Only when the operation permits re-attempt**; non-idempotent chat additionally requires #12 authoritative proof of non-commit |
 | `auth_expired` / `challenged` / `provider_banned` (hard-block) | #9 §6 | Account leaves candidate set (C5); fallback to **other** permitted candidates MAY run, but the request never fails *open* on the dead account |
 | Durable #9 §5.1 items 1–5 fail (disabled/revoked/deleted/reauth_required) | #9 §5.1 | Account leaves candidate set; fallback to other permitted candidates only |
 | `protocol_drift` → capability `invalid` | #9 §6, #10 §8.1 | Affected op non-offerable on that account (C4); fallback to a capability-offerable permitted candidate only |
@@ -255,6 +258,7 @@ A fallback target MUST satisfy capability for the **exact requested `op`+`m`** (
 ### 6.5 No silent fallback (fail-closed default)
 
 - If no Routing Policy fallback chain is declared, the Gateway MUST NOT invent one. A single-account Tenant, or a Tenant that did not opt into fallback, gets a fail-closed rejection when its primary is unavailable (§7), never a surprise account switch (#6 `I-NO-SILENT-CROSS`, #7 §6.3).
+- A health/error token describes availability; it does not by itself prove retry safety. Once an upstream attempt may have committed, fallback MUST fail closed unless the owning operation contract authorizes re-attempt. In particular, chat consumes #12 proof-of-non-commit regardless of `rate_limited`/`quota_exhausted` naming.
 - Circuit-breaking / health degradation MUST NOT replace a Tenant's policy with another Tenant's accounts or a shared pool (#6 §6, #7 OP-G7).
 
 ### 6.6 Fallback bound and loop safety
@@ -365,6 +369,7 @@ All routing paths obey #6:
 | Fallback to `prohibited` mode (Grok Web SSO) | Direct AUP collision (#7 §5.5) |
 | Route to non-usable account | Dead/invalid execution, wasted quota, false success (#9) |
 | Fallback without capability match | Upstream failure, or inpaint silently degraded to edit (mask fidelity loss) (#10) |
+| Post-attempt fallback based only on `rate_limited`/`quota_exhausted` token | Duplicate non-idempotent generation/quota because the primary may already have committed (#12) |
 | Lease/affinity outliving usability | Routing to a revoked/disabled account after kill (#9 `I-SNAPSHOT-NONUSE`) |
 | Silent auto-failover with no policy | Surprise account switch; client loses control; leaked-key lateral use |
 | Fail-open on empty candidate set | Open proxy / cross-Tenant borrow (#6, #8 §7.6) |
@@ -393,7 +398,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 
 ### 11.3 Fallback permitted (AC3)
 
-9. With `fallback_enabled=true` and an ordered chain, a transient `rate_limited` primary falls back to the next permitted same-Tenant candidate that is capability-offerable for the exact op+model.
+9. With `fallback_enabled=true` and an ordered chain, a primary known `rate_limited` before the current request's upstream payload falls back to the next permitted same-Tenant candidate that is capability-offerable for the exact op+model; a `rate_limited` response after an attempt also requires the owning operation's re-attempt authorization (for chat, #12 authoritative proof of non-commit).
 10. Cross-Auth-Mode fallback occurs **only** when policy lists both modes and both are enabled; otherwise NF-XMODE fail-closed.
 11. A fallback target must have model `m` offerable; a target missing `m` is skipped, never silently substituted.
 12. Inpaint request never falls back to a mode where inpaint is `unsupported` and is never downgraded to `image_edit`.
@@ -406,17 +411,18 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 16. NF-PROHIBITED: only alternative is Grok Web SSO / non-lab experimental / gated-without-ack → fail closed `auth_mode_unavailable`.
 17. NF-CAP-UNSUPPORTED / NF-MODEL / NF-STALE: reject before upstream with `capability_unsupported` / `model_unavailable` / `snapshot_stale`; Adapter executions = 0.
 18. NF-EMPTY: empty candidate set → fail closed; failure does not reveal whether another Tenant has a usable account.
+19. NF-REATTEMPT: a chat primary returns `rate_limited`/`quota_exhausted` after payload may have been accepted but the Adapter cannot prove non-commit → fail closed with zero fallback Adapter calls; the status token alone never authorizes a duplicate generation.
 
 ### 11.5 Lifecycle interaction
 
-19. Durable #9 §5.1 items 1–5 failure on a leased/affine account voids the lease / drops affinity for new work immediately, even within lease TTL; in-flight non-cancelable work MAY finish on the old account.
-20. Request-time key-scope failure for one principal does not void a lease held by other principals or system paths.
-21. Fallback walks the chain once and terminates in a fail-closed rejection; no infinite cross-account retry; no extra concurrency/quota beyond the request's reservation (#8).
+20. Durable #9 §5.1 items 1–5 failure on a leased/affine account voids the lease / drops affinity for new work immediately, even within lease TTL; in-flight non-cancelable work MAY finish on the old account.
+21. Request-time key-scope failure for one principal does not void a lease held by other principals or system paths.
+22. Fallback walks the chain once and terminates in a fail-closed rejection; no infinite cross-account retry; no extra concurrency/quota beyond the request's reservation (#8).
 
 ### 11.6 Scope and ownership
 
-22. `routing.manage` required to change policy; default inference key cannot (#8). `routing.read` required to read policy.
-23. Routing failures are classifiable as routing/capability outcomes, distinct from #8 admission rejections and from raw Provider runtime errors.
+23. `routing.manage` required to change policy; default inference key cannot (#8). `routing.read` required to read policy.
+24. Routing failures are classifiable as routing/capability outcomes, distinct from #8 admission rejections and from raw Provider runtime errors.
 
 ---
 
@@ -428,7 +434,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 4. **I-ROUTE-EXPLICIT-PIN** — Explicit account selection pins to one same-Tenant account with fallback OFF unless policy declares a chain and the request opts in; it never overrides C0–C5.
 5. **I-ROUTE-LEASE-SAME-ACCOUNT** — A lease binds one unit of work to exactly one same-Tenant account for its duration; it outranks affinity/policy but never usability/capability, and is void immediately on durable #9 §5.1 items 1–5 failure.
 6. **I-ROUTE-AFFINITY-SOFT** — Affinity is a preference that yields the moment its account leaves the candidate set; it never crosses Auth Modes or Tenants.
-7. **I-ROUTE-FALLBACK-OPTIN** — Fallback runs only when Tenant policy explicitly declares an ordered chain (fail-closed default); no silent auto-failover (#6 `I-NO-SILENT-CROSS`, #7 §6.3).
+7. **I-ROUTE-FALLBACK-OPTIN** — Fallback runs only when Tenant policy explicitly declares an ordered chain (fail-closed default), and a post-attempt account switch also satisfies the owning operation's retry-safety contract; chat requires #12 authoritative proof of non-commit. No silent or status-only auto-failover (#6 `I-NO-SILENT-CROSS`, #7 §6.3).
 8. **I-ROUTE-FALLBACK-SAMETENANT** — Fallback moves only among same-Tenant accounts; never cross-Tenant.
 9. **I-ROUTE-FALLBACK-MODE** — Cross-Auth-Mode fallback only when policy lists both modes and both are product-enabled; never into `prohibited`/non-lab-`experimental`/`gated`-without-ack (#7).
 10. **I-ROUTE-FALLBACK-CAPABILITY** — A fallback target MUST affirm the exact requested op+model as offerable (#10); inpaint never degrades to edit; real streaming never silently becomes synthetic.
