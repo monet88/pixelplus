@@ -1,0 +1,19 @@
+CONTEXT.md
+  s_5e11c6b4cda21e::t_7e74d9e326d2b8 74,107-114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "a06b2cebe898ac5f9e440ded5b6b6e51c27d01e3",
+  "prompts": {},
+  "sessions": {
+    "s_5e11c6b4cda21e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c4ce94b-2dd4-498f-83ae-78f13f970483",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
