@@ -375,7 +375,7 @@ Official Grok Build docs describe browser login and API-key alternative; device-
 | Statsig / experiments | conditionally supported | unverified / absent |
 | entitlement / quota | conditionally supported | conditionally supported |
 | challenge | conditionally supported (anti-bot/CF) | unverified (login human only) |
-| protocol drift | high risk (web reverse) | medium risk (CLI headers + API evolution) |
+| protocol drift | unverified (high risk; web reverse) | unverified (medium risk; CLI headers + API evolution) |
 
 No row is marked product-`verified` without live Provider Account probe. Strongest “reference + official docs” alignment is OAuth/API chat and images under API-key docs; Web remains reverse-engineered.
 
