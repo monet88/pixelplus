@@ -33,9 +33,10 @@ For each Auth Mode it locks:
 2. Acceptable-use boundary for PixelPlus product surfaces
 3. Operator obligations
 4. Security impact acceptance (what residual risk the product accepts)
-5. Kill criteria that must disable the Auth Mode / Adapter path
+5. Kill criteria that must disable the Auth Mode path (and therefore pause that Auth Mode’s Adapter executions and new connections)
 6. Recovery / reopen conditions based on **observable** signals
 7. Assumptions still in force and deferred decisions with reopen triggers
+8. Per-mode **ToS / account-ban residual risk** (severity of policy collision and account-harm residual the product accepts or refuses)
 
 ### 1.2 Non-goals
 
@@ -156,7 +157,7 @@ Operators of any deployment that includes one or more Auth Modes MUST:
 
 ### 3.5 Global kill and feature-gate signal catalog
 
-Signals below are **product-binding**. Thresholds are conservative defaults; operators MAY tighten, MUST NOT loosen without a recorded product exception.
+Signals below are **product-binding**. Thresholds for KS-2 and FG-5 are **product-chosen conservative defaults** (not measured ban rates from Providers; those remain G-10 / unverified in #2). Operators MAY tighten thresholds. Operators MUST NOT loosen them without closing **D-NUMERIC-TUNE** with a recorded product exception.
 
 #### 3.5.1 Kill-switch triggers (disable Auth Mode)
 
@@ -178,6 +179,18 @@ Signals below are **product-binding**. Thresholds are conservative defaults; ope
 | **FG-3** | Tenant Provider contract class unknown (consumer vs business) when a feature assumes business/API rights | Deny the business-only feature; do not assume Enterprise rights |
 | **FG-4** | Dual-regime identity incomplete (e.g. Grok SSO issuer xAI vs X still ambiguous for a credential type) | Gate that credential subtype until mapping verified |
 | **FG-5** | Challenge rate ≥ **40%** over **15 minutes** with ≥ **20** attempts | Auto-cooldown: reduce concurrency, pause new connections for Auth Mode, alert operator |
+
+#### 3.5.4 Auth Mode kill vs Adapter pause
+
+For this product, **Auth Mode is the Adapter registration unit** (`CONTEXT.md`: Auth Mode decides which Adapter may handle the account).
+
+Cause → effect:
+
+1. Kill switch for Auth Mode M fires (KS-* or operator OP-G1).
+2. Composition root MUST stop registering M as Tenant-connectable and MUST refuse new executions that would select Provider Accounts whose Auth Mode is M.
+3. That is the required **Adapter path pause** for M. A separate “pause Adapter binary while Auth Mode stays allowed” control is optional later ops detail; it MUST NOT re-enable a killed or `prohibited` Auth Mode.
+
+Per-account cooldown (one Provider Account unhealthy while siblings on the same Auth Mode still run) remains allowed and is owned by health/routing issues (#11/#17). That is not an Auth Mode status change.
 
 #### 3.5.3 Measurement requirements
 
@@ -218,10 +231,11 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Status** | `experimental` |
 | **Evidence** | #2 §4.2, §4.4, heat map Critical; #3 Web Access surface (chatgpt.com backend, Sentinel/PoW/Turnstile/CF) |
 | **Assumptions in force** | Consumer Terms of Use + Usage Policies govern typical consumer ChatGPT web use (checked 2026-07-14). No public “ChatGPT Web API” for reverse-proxy use. Reference `.ref/chatgpt2api` is research only. |
+| **ToS / account-ban residual risk** | **High.** Programmatic extract + reverse eng + protective-measure clauses stack; CF/challenge storms and session invalidation are expected operational ban/harm signals. Product **refuses** this residual for ordinary production (`experimental` only). |
 | **Acceptable-use boundary** | Lab-only automation of a Tenant-owned ChatGPT web session for product research. MUST NOT be marketed, default-enabled, or offered as ordinary production BYOA connection. MUST NOT include productized challenge solving. |
 | **Operator obligations** | Kill switch default **off**. Enable only in named lab deployments. Record lab purpose. Monitor FG-5/KS-2 challenge rates. No multi-Tenant demo of this mode. |
 | **Security impact** | Accepts temporary custody of web access/session material in lab vault profiles only. Leak = account takeover risk. Blast radius: ChatGPT consumer session. |
-| **Kill criteria** | KS-1 (clarified ban on programmatic extract of this method), KS-2, KS-3, KS-4, KS-5, KS-6 all apply. Any need for new anti-bot reverse eng → KS-5. |
+| **Kill criteria** | KS-1 (clarified ban on programmatic extract of this method), KS-2, KS-3, KS-4, KS-5, KS-6 all apply. Any need for new anti-bot reverse eng → KS-5. Adapter path pause follows §3.5.4. |
 | **Recovery / reopen** | Human product owner + refreshed #2 OpenAI section. Reopen to `gated` only if OpenAI publishes an official programmatic consumer-web path **or** counsel clears residual extract/reverse-eng theory **and** challenge rates stay below FG-5 for a defined soak. Otherwise remain `experimental` or demote to `prohibited`. |
 | **Deferred** | Counsel on “agent of account owner” vs credential-sharing (G-4); quantitative ban rates (G-10). |
 
@@ -234,10 +248,11 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Status** | `gated` |
 | **Evidence** | #2 §4.3–4.4 (official Codex auth docs; residual share/resale); #3 Codex surface (`auth.openai.com`, `/backend-api/codex`, OAuth bundle) |
 | **Assumptions in force** | Codex CLI/IDE/app Sign-in with ChatGPT is an official OAuth/CLI Access path. Consumer ToU still applies when signing in with ChatGPT consumer plans; Business/Enterprise may use Services Agreement. Official surface does **not** auto-authorize multi-Tenant entitlement resale. |
+| **ToS / account-ban residual risk** | **Medium–High.** Lower reverse-eng tension than Web Access; credential non-sharing, resale/lease, plan-contract mismatch, and suspension for Usage Policy breach remain material. Product **conditionally accepts** this residual only behind gates. |
 | **Acceptable-use boundary** | Tenant connects **their own** Codex/ChatGPT OAuth (or documented API-key path if later specified) for that Tenant’s workloads only. One human login MUST NOT be shared across Tenants or unrelated end users. No silent fallback to ChatGPT Web Access (FG-2). |
 | **Operator obligations** | Feature flag default off until deployment opts in. Require Tenant acknowledgement of residual ToS/ban risk at connection (#9). Enforce single-Tenant ownership (#6). Support reauth/refresh failure as first-class health. Do not run multi-account “pool rental” features. |
 | **Security impact** | Accepts vault custody of OAuth refresh/access tokens and related account ids. Leak = Codex/ChatGPT-acting credential compromise. Narrower reverse-eng risk than Web Access if Adapter stays on documented Codex surfaces. |
-| **Kill criteria** | KS-1 if OpenAI disallows third-party storage/use of Codex tokens for SaaS agents (ties to G-8). KS-3 ban clusters. KS-4 legal notice. KS-6 if OAuth client revoked. KS-2/KS-5 only if Adapter drifts into private web/anti-bot paths. |
+| **Kill criteria** | KS-1 if OpenAI disallows third-party storage/use of Codex tokens for SaaS agents (ties to G-8). KS-3 ban clusters. KS-4 legal notice. KS-6 if OAuth client revoked. KS-2/KS-5 only if Adapter drifts into private web/anti-bot paths. Adapter path pause follows §3.5.4. |
 | **Recovery / reopen** | After kill: fix root cause, re-probe, human enable. Promotion to `allowed` blocked until D-OAI-TOKEN (G-8) and D-COMM are resolved. |
 | **Deferred** | G-8 third-party SaaS custody of Codex OAuth tokens; commercial fee characterization; multi-account-per-Tenant load balancing policy. |
 
@@ -250,14 +265,15 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Status** | `experimental` |
 | **Evidence** | #2 §5.2, §5.4 Critical heat; #4 Web Cookie (`__Secure-1PSID*`, bard form protocol, bot-flag anecdotes) |
 | **Assumptions in force** | Gemini Apps under Google ToS + Generative AI Prohibited Use Policy. Cookies are full Google session material, not narrow API keys. Reference `.ref/gemini-web-to-api` disclaims ToS compliance. |
+| **ToS / account-ban residual risk** | **High.** Automation/protective-measure/reverse-eng tension plus observed consumer bot flags. Account restriction on Gemini app is an expected ban-class signal. Product **refuses** ordinary production residual (`experimental` only). |
 | **Acceptable-use boundary** | Lab-only. MUST NOT be ordinary production connection. MUST NOT productize cookie theft, cookie markets, or anti-bot bypass. |
 | **Operator obligations** | Default off. Lab profile only. Treat cookie material as critical secrets. Prefer short-lived lab vault retention. Monitor bot-flag / account-restricted signals as ban-class health. |
 | **Security impact** | **Highest** sensitive-data severity among the six modes: cookie often spans Google account services. Product accepts this **only** in experimental lab custody, not as production default. |
-| **Kill criteria** | KS-1–KS-6. Account-level “automated activity” restrictions correlated with Gateway traffic → count toward KS-3. New reverse eng after HTML/protocol drift → KS-5. |
+| **Kill criteria** | KS-1–KS-6. Account-level “automated activity” restrictions correlated with Gateway traffic → count toward KS-3. New reverse eng after HTML/protocol drift → KS-5. Adapter path pause follows §3.5.4. |
 | **Recovery / reopen** | Same bar as §5.1. Promotion toward `gated` requires either an official narrower credential for the same surface or counsel + security review of cookie custody. |
 | **Deferred** | Endpoint robots.txt mapping (G-3); Workspace managed-account regime (G-9). |
 
-**Cause → effect example.** Lab stores `__Secure-1PSID` for a test account. A metrics redaction bug prints the cookie into logs → security incident → Auth Mode killed (operational KS under OP-G3 breach) and vault entries rotated/deleted per #15 obligations once designed.
+**Cause → effect example.** Lab stores `__Secure-1PSID` for a test account. A metrics redaction bug prints the cookie into logs → security incident under OP-G3 → operator applies OP-G1 kill switch for the Auth Mode and rotates/deletes vault entries per #15 obligations once designed.
 
 ### 5.4 Gemini Antigravity OAuth — `gated`
 
@@ -266,11 +282,12 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Status** | `gated` |
 | **Evidence** | #2 §5.3–5.4 Medium–High with G-2 gap; #4 Antigravity/Cloud Code PA OAuth surface (`cloudcode-pa.googleapis.com`, Google OAuth tokens) |
 | **Assumptions in force** | Adapter stays on documented Google OAuth + Antigravity/Cloud Code developer surfaces, **not** public `generativelanguage.googleapis.com` Official API Adapter (out of MVP). Product-specific Antigravity legal title may still be incomplete (G-2). |
+| **ToS / account-ban residual risk** | **Medium.** Official developer/OAuth posture lowers reverse-eng tension; project suspension for ToS/AUP and quota circumvention remain real. Residual uncertainty from G-2 keeps status below `allowed`. Product **conditionally accepts** under gates. |
 | **Acceptable-use boundary** | Tenant’s own Google OAuth grant for Antigravity/CLI-class surface, used only inside that Tenant. No cross-Tenant token reuse. No silent fallback to Gemini Web Cookie. |
 | **Operator obligations** | Feature flag + Tenant ack. Record OAuth client identity. On token refresh failure, mark account reauth-required. Re-check G-2 when Google publishes product-specific terms. |
 | **Security impact** | Accepts OAuth refresh custody (high, usually narrower than full browser session). Accepts residual uncertainty of Antigravity-named terms until G-2 closed. |
-| **Kill criteria** | KS-1 if Google disallows this OAuth client class for SaaS agents. KS-3/KS-4/KS-6 standard. KS-5 if implementation abandons documented surfaces for private web reverse eng. |
-| **Recovery / reopen** | Human enable after root-cause fix. Promotion to `allowed` blocked on D-ANTIGRIVITY-TERMS (G-2) and D-COMM. |
+| **Kill criteria** | KS-1 if Google disallows this OAuth client class for SaaS agents. KS-3/KS-4/KS-6 standard. KS-5 if implementation abandons documented surfaces for private web reverse eng. Adapter path pause follows §3.5.4. |
+| **Recovery / reopen** | Human enable after root-cause fix. Promotion to `allowed` blocked on D-ANTIGRAVITY-TERMS (G-2) and D-COMM. |
 | **Deferred** | G-2 product-specific Antigravity terms; multi-project pooling policy. |
 
 **Cause → effect example.** Deployment enables Antigravity OAuth for paying Tenants under gate. Google changes OAuth client policy to disallow the registered client (KS-6) → kill switch → Tenants see reauth/disabled mode → operators must not “fix” by switching those accounts to Web Cookie automatically (FG-2 / Auth Mode independence).
@@ -282,10 +299,11 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Status** | `prohibited` |
 | **Evidence** | #2 §6.2–6.4 Critical: AUP prohibits accessing Services through bots/scripts/non-human means by name; also scrape/resell and paid violative services language. #5 documents scripted `grok.com` REST/WS reverse surface. |
 | **Assumptions in force** | Consumer ToS + AUP apply to Grok consumer apps/websites. A scripted Web Adapter is non-human automated access of that surface. Dual-regime X vs xAI issuer mapping may add risk (G-7) but is **not required** to justify prohibition given AUP text. |
+| **ToS / account-ban residual risk** | **Critical / refused.** Automated Web Adapter is in direct AUP tension; account suspension and enforcement language are explicit. Product **does not accept** this residual for any product environment. |
 | **Acceptable-use boundary** | **None** for PixelPlus product. MUST NOT offer Grok Web SSO connection, execution, or capability advertising in product deployments. |
 | **Operator obligations** | Hard disable. Configuration enabling Grok Web SSO in product environments is a policy defect. Do not implement product UX for this mode. If code skeletons exist for research parity, they MUST remain unreachable from product composition roots. |
 | **Security impact** | Product **does not accept** residual AUP collision for automated Grok web access. Credential custody risk is moot while prohibited. |
-| **Kill criteria** | Already at terminal product kill. Any accidental enablement MUST be treated as Sev-1 policy breach and disabled. |
+| **Kill criteria** | Already at terminal product kill. Any accidental enablement MUST be treated as a policy defect under OP-G1 (hard off) and disabled immediately. Adapter path must remain unregistered (§3.5.4). |
 | **Recovery / reopen** | Only if **all** hold: (1) xAI publishes policy or official API that clearly permits the intended access method, or AUP bot/script clauses are revised; (2) #2 Grok section re-researched; (3) human product owner + counsel note recorded; (4) new status chosen explicitly (`experimental` or `gated`, never silent). G-7 issuer mapping must be closed before any non-prohibited status if SSO still involves X-platform tokens. |
 | **Deferred** | None that block the current `prohibited` decision. G-7 remains relevant only on reopen. |
 
@@ -298,11 +316,12 @@ Each card uses the same structure so operators and later issues can apply policy
 | **Status** | `gated` |
 | **Evidence** | #2 §6.3–6.4 Medium–High: Enterprise/API path is intended programmatic integration; still forbids sell/rent/lease/time-sharing and imposes competitive-use limits; AUP still applies. #5 OAuth/CLI surfaces (`auth.x.ai`, CLI chat-proxy, `api.x.ai` media paths). |
 | **Assumptions in force** | Grok xAI OAuth / Grok Build CLI is distinct from consumer web SSO. Official docs describe programmatic chat/image paths for developer/business surfaces. Enterprise time-sharing language constrains multi-Tenant rental designs. |
+| **ToS / account-ban residual risk** | **Medium–High.** Official programmatic path lowers bot/reverse-eng tension vs Web SSO; lease/time-share and competitive clauses plus account-limit circumvention remain material. Termination for AUP/restriction breach is explicit. Product **conditionally accepts** under gates. |
 | **Acceptable-use boundary** | Tenant’s own xAI/Grok OAuth grant for that Tenant’s workloads. No account time-share across Tenants. No silent fallback to Grok Web SSO (forbidden sibling). Do not market as resale of Grok consumer SuperGrok seats. |
 | **Operator obligations** | Feature flag + Tenant ack. Track OAuth refresh health. If implementation routes some calls to `api.x.ai`, still treat this Auth Mode as Grok xAI OAuth — not a separate Official API Adapter product promise unless a future issue expands scope. |
 | **Security impact** | Accepts OAuth token custody. Accepts residual Enterprise competitive-clause and lease/time-share interpretation risk under gates. |
-| **Kill criteria** | KS-1 if xAI disallows third-party SaaS use of the Grok CLI OAuth client. KS-3/KS-4/KS-6 standard. Using Web SSO as a “backup” path is forbidden, not a recovery method. |
-| **Recovery / reopen** | Human enable after fix. Promotion to `allowed` blocked on D-COMM and counsel read of competitive clause (D-XAI-COMPETE). |
+| **Kill criteria** | KS-1 if xAI disallows third-party SaaS use of the Grok CLI OAuth client. KS-3/KS-4/KS-6 standard. Using Web SSO as a “backup” path is forbidden, not a recovery method. Adapter path pause follows §3.5.4. |
+| **Recovery / reopen** | Human enable after fix. Promotion to `allowed` blocked on D-COMM and D-XAI-COMPETE. |
 | **Deferred** | Commercial fee characterization vs time-sharing; competitive-clause counsel; multi-account-per-Tenant balancing. |
 
 **Cause → effect example.** Three Tenant accounts on Grok xAI OAuth are permanently banned within 12 hours after a bad retry storm (KS-3) → Auth Mode suspended → cooldown alone is insufficient; operator must fix retry ownership (#16/#17 dependencies) before reopen.
@@ -365,8 +384,9 @@ These constraints apply to all later implementation issues:
 | **D-COUNSEL-AGENT** | Whether “technical agent of the account owner” mitigates credential-sharing clauses (G-4) | Promotion of any mode to `allowed`; possibly experimental→gated for Web modes | Written counsel note for target launch jurisdictions |
 | **D-COUNSEL-RE** | Enforceability of reverse-engineering prohibitions by jurisdiction (G-5) | Regional launch of experimental Web modes outside pure lab | Counsel + regional launch checklist |
 | **D-OAI-TOKEN** | Whether OpenAI permits third-party SaaS custody of Codex OAuth tokens outside official clients (G-8) | ChatGPT Codex OAuth → `allowed` | OpenAI developer/app policy update or counsel |
-| **D-ANTIGRIVITY-TERMS** | Product-specific Antigravity terms beyond Google APIs / Gemini API family (G-2) | Gemini Antigravity OAuth → `allowed` | Primary-source terms page retrieved and reviewed into #2 annex |
+| **D-ANTIGRAVITY-TERMS** | Product-specific Antigravity terms beyond Google APIs / Gemini API family (G-2) | Gemini Antigravity OAuth → `allowed` | Primary-source terms page retrieved and reviewed into #2 annex |
 | **D-GROK-ISSUER** | Grok SSO token issuer matrix xAI vs X (G-7) | Any future non-prohibited Grok Web status | #5/#2 update with issuer→ToS map |
+| **D-XAI-COMPETE** | Scope and residual risk of xAI Enterprise competitive-product clause for a multi-provider Gateway | Grok xAI OAuth → `allowed` | Counsel read of Enterprise ToS competitive clause against PixelPlus product shape |
 | **D-COMM** | Commercial Gateway fee structure vs “resale/lease/time-sharing” characterization | Marketing claims; possibly `gated`→`allowed` | Product + counsel characterization recorded |
 | **D-MULTI-ACCT** | Multi-account-per-Tenant pooling / load balancing | Routing features that shard load across many consumer accounts | Risk review against resale/lease language + #11 design |
 | **D-REGION** | Regional launch restrictions | Production launch geography | Counsel + enforcement landscape review |
