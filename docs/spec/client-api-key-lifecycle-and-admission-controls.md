@@ -361,7 +361,7 @@ After a Security Principal is established, Gateway MUST evaluate admission in th
 |---|---|---|---|
 | A0 | Authn (principal) | **401** | None |
 | A1 | Scope / allowlists | **403-class** | None |
-| A2 | Request-size limits | **413-class** (or **400** if size unknown and body aborted mid-read with invalid framing) | Partial body discard only |
+| A2 | Request-size limits | **413-class** for every size violation (known `Content-Length` over max, or buffered bytes over max on chunked/unknown length). Framing/syntax errors that are **not** size violations remain **400** and are not size outcomes. | Partial body discard only |
 | A3 | Rate limit (RPM / burst) | **429-class** `rate_limit` | May count toward rate window (§7.3) |
 | A4 | Concurrency limit | **429-class** `concurrency_limit` | No slot held |
 | A5 | Quota (anti-abuse units) | **429-class** `quota_exhausted` | No full unit debit for reject (§7.5) |
@@ -449,8 +449,11 @@ If rate, concurrency, quota, or revocation state backends are unavailable:
 
 ### 7.7 Request-size semantics
 
+**Canonical size-violation outcome:** **413-class** for every request rejected because it exceeds `L-JSON-BODY-MAX`, `L-ASSET-UPLOAD-MAX`, or a stricter documented endpoint max.
+
 - If `Content-Length` is present and exceeds the applicable max → reject with **413-class** without reading the full body.
-- If length is unknown (chunked), abort when buffered bytes exceed max → **413-class**.
+- If length is unknown (chunked), abort when buffered bytes exceed max → **413-class** (same class as Content-Length path; clients MUST NOT need to distinguish transport encoding).
+- Malformed framing, invalid multipart boundaries, or JSON syntax errors that occur **without** exceeding the size max are **400** and are **not** counted as size violations for this AC.
 - JSON inference bodies use `L-JSON-BODY-MAX`.
 - Asset upload endpoints use `L-ASSET-UPLOAD-MAX` (and any stricter image dimension checks from #13 remain additional).
 - Size limits apply **per request**; they are not a substitute for RPM.
@@ -504,7 +507,7 @@ else:
 |---|---|---|---|---|---|---|
 | Missing/invalid/revoked key | A0 | **401** | abuse counters only | no | no | no |
 | Insufficient scope / allowlist | A1 | **403-class** | optional authz metric | no | no | no |
-| Body/asset too large | A2 | **413-class** | no Tenant RPM required | no | no | no |
+| Body/asset too large (size max exceeded) | A2 | **413-class** only | no Tenant RPM required | no | no | no |
 | Tenant/key RPM exceeded | A3 | **429-class** `rate_limit` | counts in window | no | no | no |
 | Concurrency exceeded | A4 | **429-class** `concurrency_limit` | may already have counted RPM | no | no | no |
 | Daily quota exhausted | A5 | **429-class** `quota_exhausted` | may already have counted RPM | no | no full debit | no |
