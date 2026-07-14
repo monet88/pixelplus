@@ -77,7 +77,7 @@ Statuses are **Auth Mode capabilities as PixelPlus may later probe**, not “doe
 | Capability | Status | Evidence summary | Evidence class |
 |---|---|---|---|
 | chat non-streaming | `conditionally supported` | Executor POSTs `Bearer` token to `/v1internal:generateContent` with project + model envelope. Unit tests and pure-Go path exist; live entitlement still required. | reference-learned |
-| chat streaming | `conditionally supported` | Executor POSTs `/v1internal:streamGenerateContent?alt=sse`, scans SSE lines, translates chunks. Tests cover interactions streaming path. Real-time stream is first-class (unlike Web Cookie simulation). | reference-learned |
+| chat streaming | `conditionally supported` | Executor POSTs `/v1internal:streamGenerateContent?alt=sse`, scans SSE lines, translates chunks. Tests cover the interactive streaming path. Real-time stream is first-class (unlike Web Cookie simulation). | reference-learned |
 | image generation | `unverified` | Translators can pass through `inlineData` image parts in model responses, but OpenAI images handlers in CLIProxyAPI route image tools to Codex/xAI/compat models — **not** Antigravity. Official public Gemini API documents image models; that is a **different surface**. Antigravity model catalog may include image-capable IDs for some accounts; not confirmed for this Auth Mode. | reference-learned + official API distinction |
 | image edit | `unverified` | Same as generation: no dedicated Antigravity image-edit path in reference; conversational multimodal edit would require live model that accepts image inputs and returns images. | reference-learned |
 | inpaint | `unsupported` | No mask/inpaint schema in Antigravity executor or translators. | reference-learned |
