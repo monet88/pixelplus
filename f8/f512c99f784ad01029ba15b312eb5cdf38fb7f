@@ -1,0 +1,19 @@
+docs/spec/provider-account-connection-and-credential-lifecycle.md
+  s_be805435dfda66::t_a72996e978fe46 108,141-142,146-147,186,205,218,226,234,236,238,306,330,338,355,360-371,375,410-421,435-437,467,470,476-478,491,494,531-544,797,836,840,844-847,875,878,880-891,899,906,944-945
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "f8f512c99f784ad01029ba15b312eb5cdf38fb7f",
+  "prompts": {},
+  "sessions": {
+    "s_be805435dfda66": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "957acf7b-c3cd-42d8-ab96-d0f3db6a9e79",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
