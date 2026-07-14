@@ -26,6 +26,10 @@ Every capability claim uses exactly one of:
 | **Upstream-verified** | Behavior confirmed from official OpenAI/ChatGPT/Codex documentation fetched 2026-07-14. |
 | **Gap / live-probe needed** | Requires a controlled live probe or fixture capture against a real Provider Account. |
 
+**Hybrid evidence classes.** Tables may combine the primary labels with `+` when two independent evidence classes both apply to the same row (for example `Reference-learned + Upstream-verified`). The left-most label is the dominant evidence class for the Adapter path; the right-hand label notes an additional corroborating class. Hybrid labels do **not** create a fourth primary class and do **not** promote Status to `verified` by themselves.
+
+**Status column rule.** Every Status cell uses exactly one of the four Status legend values (`verified`, `conditionally supported`, `unsupported`, `unverified`). Parenthetical notes and mode-specific splits belong in the Notes / Evidence columns, never inside the Status token.
+
 Parent #1 rule applied: reference repositories are research sources, not automatic production capability claims. Therefore most endpoint-level claims remain `conditionally supported` unless official docs independently confirm the product capability.
 
 ---
@@ -67,7 +71,7 @@ These two Auth Modes must remain independent Provider Account execution surfaces
 | inpaint / mask edit | `conditionally supported` | Reference-learned | `.ref/chatgpt2api/services/protocol/openai_v1_image_edit.py` composites mask alpha into source image before upload; no dedicated upstream mask field in web conversation path | Mask transparency = edit region, opaque = preserve | This is a client-side adaptation. Whether upstream accepts true mask semantics remains live-probe gap |
 | model listing / discovery | `conditionally supported` | Reference-learned | `list_models()` → `/backend-api/models` or `/backend-anon/models`; protocol adds dynamic image aliases from account pool | Model list is account/session dependent | Capability Snapshot must store observed slugs, not static provider catalog |
 | multi-turn / conversation continuity | `conditionally supported` | Reference-learned | SSE emits `conversation_id`; payload supports conversation fields; `delete_conversation`, list recent conversations, find-by-prompt recovery | Continuity depends on reusing conversation_id / history on same Provider Account | Affinity to one Provider Account is required for continuity |
-| cancel / abort | `unverified` | Gap | No dedicated stop/cancel conversation API found in chatgpt2api backend client; only local stream close | Client disconnect stops reading SSE; upstream generation may continue | Live probe needed: does closing HTTP cancel image_gen/chat turn? |
+| cancel / abort | `unverified` | Gap / live-probe needed | No dedicated stop/cancel conversation API found in chatgpt2api backend client; only local stream close | Client disconnect stops reading SSE; upstream generation may continue | Live probe needed: does closing HTTP cancel image_gen/chat turn? |
 | tool / function calling | `conditionally supported` | Reference-learned | SSE docs mention tool roles, `metadata.tool_invoked`, async `image_gen` tasks; not general OpenAI tools API | Tools are ChatGPT-native, not portable function-calling contract | Do not claim OpenAI tools parity for Web Access |
 | file / image input attachment | `conditionally supported` | Reference-learned | `_upload_image` → POST `/backend-api/files`, PUT bytes, POST `.../uploaded`; multimodal parts use `file-service://{file_id}` | Upload failure blocks edit/generate-with-reference | Attachment is web file-service based |
 
@@ -98,7 +102,7 @@ These two Auth Modes must remain independent Provider Account execution surfaces
 | Store shape | `conditionally supported` | Reference-learned | Account record fields observed: `access_token`, optional `refresh_token`, `email`, `user_id`, `type`/`plan`, `status`, `quota`, `restore_at`, `limits_progress`, `default_model_slug`, `source_type` (`web`/`codex`), fingerprint (`oai-device-id`, `oai-session-id`, UA), `proxy`, counters (`success`/`fail`/`invalid_count`), refresh error timestamps | Never expose tokens in Public API |
 | Refresh | `conditionally supported` | Reference-learned | If `refresh_token` present: POST `https://auth.openai.com/oauth/token` with `grant_type=refresh_token`, `client_id=app_2SKx67EdpoN0G6j64rFvigXD` | JWT exp drives refresh need; failures recorded; `app_session_terminated` can trigger password re-login path |
 | Revoke / expiry | `conditionally supported` | Reference-learned | HTTP 401 on backend paths → `InvalidAccessTokenError` / remove invalid token after thresholds | Refresh token reuse/termination errors; invalid_count / last_invalid_at |
-| rt_token refresh | `unsupported` (in current reference feature set) | Reference-learned | feature-status marks `rt_token` refresh as not implemented | Do not depend on session_token/rt_token rotation in MVP without new research |
+| rt_token refresh | `unsupported` | Reference-learned | feature-status marks `rt_token` refresh as not implemented in the current reference feature set | Do not depend on session_token/rt_token rotation in MVP without new research |
 
 **Concrete lifecycle example:**
 
@@ -114,7 +118,7 @@ These two Auth Modes must remain independent Provider Account execution surfaces
 |---|---|---|---|---|
 | Obtain (browser OAuth) | `conditionally supported` | Reference-learned + upstream product | Official: `codex login` browser ChatGPT sign-in; reference: PKCE authorize at `https://auth.openai.com/oauth/authorize`, client_id `app_EMoamEEZ73f0CkXaXp7hrann`, redirect `http://localhost:1455/auth/callback`, scope `openid email profile offline_access` | Browser callback returns code → token exchange |
 | Obtain (device auth) | `conditionally supported` | Reference-learned + upstream product | Official device-auth login; reference: `.../deviceauth/usercode`, poll `.../deviceauth/token`, verify URL `https://auth.openai.com/codex/device` | Device code + poll until authorization_code/code_verifier |
-| Obtain (API key alternative) | `verified` (as official Codex login method) | Upstream-verified | Official docs: sign in with API key for usage-based access; billed on Platform, not ChatGPT plan credits | PixelPlus Auth Mode name is Codex OAuth; API-key path is related but not the same credential class as ChatGPT OAuth bundle |
+| Obtain (API key alternative) | `verified` | Upstream-verified | Official docs: sign in with API key for usage-based access; billed on Platform, not ChatGPT plan credits | Official Codex login method. PixelPlus Auth Mode name is Codex OAuth; API-key path is related but not the same credential class as ChatGPT OAuth bundle |
 | Store shape | `conditionally supported` | Reference-learned + upstream product | Official cache: `~/.codex/auth.json` or OS keyring. Reference storage: `id_token`, `access_token`, `refresh_token`, `account_id`, `email`, `type=codex`, `expired`/`last_refresh`, plan attributes | Store only encrypted in vault; metadata may keep email/account_id/plan_type/expiry |
 | Refresh | `conditionally supported` | Reference-learned + upstream product | Official: Codex refreshes ChatGPT-managed session automatically; on 401 refresh-and-retry; CI guidance says persist refreshed auth.json and avoid concurrent multi-machine reuse. Reference: refresh_token grant to `https://auth.openai.com/oauth/token`, singleflight, retry; detect `refresh_token_reused` | Expiry timestamp; 401; refresh_token_reused |
 | Revoke / logout | `conditionally supported` | Upstream-verified | Official logout clears cached credentials; reseed required if refresh fails | Provider Account becomes reauth-required |
@@ -134,7 +138,8 @@ These two Auth Modes must remain independent Provider Account execution surfaces
 | Gate | Web Access | Codex OAuth | Status | Evidence |
 |---|---|---|---|---|
 | Plan type discovery | `/backend-api/accounts/check/...` → `plan_type`; user-info type free/plus/... | JWT/id_token claims + attributes `plan_type` | `conditionally supported` | chatgpt2api account check; CLIProxy free-plan checks |
-| Image generation product availability | Official ChatGPT Images available across tiers with limits; thinking-images on Plus/Pro/Business | Official Codex is subscription or API-key based | Web product feature: `verified`; mode-specific reverse path: `conditionally supported` | help.openai.com Images in ChatGPT; developers.openai.com/codex/auth |
+| Image generation product availability (official product surface) | Official ChatGPT Images available across tiers with limits; thinking-images on Plus/Pro/Business | Official Codex is subscription or API-key based | `verified` | help.openai.com Images in ChatGPT; developers.openai.com/codex/auth — product availability only, not reverse-path fidelity |
+| Image generation reverse-path fidelity | Web reverse conversation/image_gen path is reference-learned only | Codex image tool injection path is reference-learned | `conditionally supported` | Live BYOA probe still required per Auth Mode |
 | Codex image gate | N/A for pure web path | References restrict Codex image exposure to Plus/Team/Pro; free plan skips image tool injection | `conditionally supported` | chatgpt2api models protocol; CLIProxy `isCodexFreePlanAuth` |
 | Separate quotas for web vs codex image | Same external identity can have separate web and codex image quotas in reference design | Same | `conditionally supported` | chatgpt2api README/feature-status explicitly state separate quotas |
 | API key vs ChatGPT subscription for Codex | N/A | Official: API key uses Platform billing; ChatGPT sign-in uses workspace/plan entitlements | `verified` | developers.openai.com/codex/auth |
@@ -149,20 +154,26 @@ These two Auth Modes must remain independent Provider Account execution surfaces
 | usage_limit_reached | Codex OAuth | `conditionally supported` | Reference-learned | error.type `usage_limit_reached`; `resets_in_seconds` / `resets_at`; treated as cooldown-worthy quota exhaustion |
 | rate_limit_error / rate_limit_exceeded | Codex OAuth | `conditionally supported` | Reference-learned | Transient per-minute style limit; reference intentionally retries rather than long cooldown |
 | model capacity | Codex OAuth | `conditionally supported` | Reference-learned | message contains “selected model is at capacity” → mapped toward 429-class handling |
-| HTTP 429 generic | Both | `unverified` as complete taxonomy | Gap | Need live corpus of web rate-limit bodies |
+| HTTP 429 generic | Both | `unverified` | Gap / live-probe needed | Need live corpus of web rate-limit bodies; taxonomy not complete |
 
 ---
 
 ## 6. Challenge / PoW / captcha / sentinel signals
 
-| Signal | Web Access | Codex OAuth | Status | Evidence |
-|---|---|---|---|---|
-| Sentinel chat-requirements prepare/finalize | Present (`/backend-api/sentinel/chat-requirements/...`) | Not used in Codex executor path | Web: `conditionally supported`; Codex: `unsupported` (for this path) | chatgpt2api `_get_chat_requirements` |
-| Proof-of-work | Required when prepare says `proofofwork.required`; solved via `utils/pow.py` | Not observed | Web: `conditionally supported` | pow seed/difficulty → proof token |
-| Turnstile | Required when prepare provides `turnstile.dx`; solved via `utils/turnstile.py` | Not observed | Web: `conditionally supported` | soft challenge |
-| Arkose | prepare may set `arkose.required`; reference raises not implemented | Not observed | Web: `conditionally supported` as hard blocker if required | Current reference cannot complete Arkose |
-| Cloudflare / bot block | WARP/FlareSolverr support; clearance refresh | Image path comments mention Cloudflare 1010 risk; UA sanitization | Both: `conditionally supported` as operational challenge class | Network/challenge health state |
-| Official challenge contract | Not publicly specified as stable API | N/A | `unverified` as stable protocol | High protocol-drift / ban risk signal for #2/#7, not decided here |
+| Signal | Auth Mode | Status | Evidence |
+|---|---|---|---|
+| Sentinel chat-requirements prepare/finalize | ChatGPT Web Access | `conditionally supported` | Present (`/backend-api/sentinel/chat-requirements/...`); chatgpt2api `_get_chat_requirements` |
+| Sentinel chat-requirements prepare/finalize | ChatGPT Codex OAuth | `unsupported` | Not used in Codex executor path |
+| Proof-of-work | ChatGPT Web Access | `conditionally supported` | Required when prepare says `proofofwork.required`; solved via `utils/pow.py` (seed/difficulty → proof token) |
+| Proof-of-work | ChatGPT Codex OAuth | `unsupported` | Not observed on Codex executor path |
+| Turnstile | ChatGPT Web Access | `conditionally supported` | Required when prepare provides `turnstile.dx`; solved via `utils/turnstile.py` |
+| Turnstile | ChatGPT Codex OAuth | `unsupported` | Not observed on Codex executor path |
+| Arkose | ChatGPT Web Access | `conditionally supported` | prepare may set `arkose.required`; reference raises not implemented → hard blocker if required |
+| Arkose | ChatGPT Codex OAuth | `unsupported` | Not observed on Codex executor path |
+| Cloudflare / bot block | ChatGPT Web Access | `conditionally supported` | WARP/FlareSolverr support; clearance refresh; operational challenge class |
+| Cloudflare / bot block | ChatGPT Codex OAuth | `conditionally supported` | Image path comments mention Cloudflare 1010 risk; UA sanitization |
+| Official challenge contract | ChatGPT Web Access | `unverified` | Not publicly specified as stable API; high protocol-drift / ban risk signal for #2/#7 |
+| Official challenge contract | ChatGPT Codex OAuth | `unverified` | No stable official challenge contract documented for this path |
 
 ---
 
