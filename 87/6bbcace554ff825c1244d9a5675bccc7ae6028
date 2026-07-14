@@ -1,0 +1,21 @@
+CONTEXT.md
+  s_4115905eea4ed3::t_e5c4680a1dce82 13,17,95-98
+docs/spec/provider-account-connection-and-credential-lifecycle.md
+  s_4115905eea4ed3::t_cee4f8def76483 1-916
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "876bbcace554ff825c1244d9a5675bccc7ae6028",
+  "prompts": {},
+  "sessions": {
+    "s_4115905eea4ed3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b48d08ae-2894-4a40-9dbd-9f7eae25dddc",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
