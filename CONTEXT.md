@@ -53,6 +53,8 @@ Các Auth Mode ban đầu là:
 - **Grok Web SSO**: truy cập Grok consumer web bằng Web SSO credential.
 - **Grok xAI OAuth**: truy cập xAI surface bằng xAI OAuth credential.
 
+Trạng thái risk envelope (`allowed` / `prohibited` / `experimental` / `gated`), kill criteria và điều kiện phục hồi của từng Auth Mode nằm tại `docs/spec/auth-mode-risk-envelope-and-kill-criteria.md`. Risk status độc lập với Capability Snapshot.
+
 ## Capability Snapshot
 
 Kết quả kiểm chứng capability của một Provider Account tại một thời điểm, bao gồm các thao tác và model account thực sự được phép sử dụng. Capability Snapshot không phải tuyên bố capability tĩnh của Provider hoặc Adapter. Capability Snapshot thuộc Tenant của Provider Account tương ứng và không được dùng ngoài Tenant đó.
@@ -76,3 +78,7 @@ Cấu hình do Tenant khai báo để chọn, ưu tiên hoặc fallback giữa c
 ## Normative ownership spec
 
 Các invariant sở hữu và authorization chuẩn nằm tại `docs/spec/tenant-ownership-authorization-invariants.md`.
+
+## Normative risk envelope spec
+
+Quyết định risk envelope, acceptable-use boundary, operator obligation và kill criteria cho sáu Auth Mode nằm tại `docs/spec/auth-mode-risk-envelope-and-kill-criteria.md`.
