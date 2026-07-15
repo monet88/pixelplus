@@ -75,7 +75,7 @@ Tập kiểm tra có thứ tự tại Public API boundary sau khi xác thực Cl
 
 ## Render Job
 
-Đơn vị công việc bền vững cho image generation, edit hoặc inpaint, do đúng một Tenant sở hữu. Worker chỉ được thực thi Render Job bằng Provider Account, Provider Credential và Asset cùng Tenant với job.
+Đơn vị công việc bền vững cho image generation, edit hoặc inpaint, do đúng một Tenant sở hữu. Worker chỉ được thực thi Render Job bằng Provider Account, Provider Credential và Asset cùng Tenant với job. Job có state durable `queued` → `running` → `cancel_requested` → terminal `canceled`/`failed`/`completed`; worker claim dùng lease + fencing token, một accepted/idempotently identified job có tối đa một committed/uncertain upstream attempt, và `unknown` commit không bao giờ được coi là non-commit để re-render. `completed` chỉ được công bố sau khi result manifest bất biến đã durable; retrieval/staging/output Asset placement retry dùng manifest + placement key, không chạy lại generation/edit/inpaint. Progress phải phân biệt reported/estimated/unknown; cancellation giữ accounting Tenant+Client API Key đến khi upstream dừng hoặc conservative settlement. Chi tiết state machine, recovery, cancellation, progress, result manifest và output-only retry nằm tại `docs/spec/durable-render-job-and-output-retry-lifecycle.md`.
 
 ## Routing Policy
 
@@ -112,3 +112,7 @@ Vòng đời chat non-streaming và streaming từ admitted request qua X1 route
 ## Normative Asset exchange, authorization and retention lifecycle spec
 
 Canonical validation input image/mask (format/decodability, dimensions, quan hệ image↔mask, không drop mask để hạ inpaint→image_edit), enforcement Tenant ownership cho create/reference/retrieve/list/delete, retention class và expiry/deletion (output ngừng tải đúng lifecycle boundary; delete idempotent trong `ASSET-TOMBSTONE-TTL-CLASS`), atomic per-Tenant storage reservation trên committed+reserved bytes/count (`L-TENANT-ASSET-BYTES`/`L-TENANT-ASSET-COUNT`) tách khỏi per-request upload cap và admission quota, và cross-Tenant/unknown identifier trả 404-class non-enumerating nằm tại `docs/spec/asset-exchange-authorization-and-retention-lifecycle.md`.
+
+## Normative Durable Render Job and output-retry lifecycle spec
+
+Render Job state machine (`queued`, `running`, `cancel_requested`, terminal `canceled`/`failed`/`completed`), atomic idempotent creation, worker lease + fencing/recovery, same-Tenant Provider Account lease, authoritative image-attempt commit boundary (`not_started`/`not_committed`/`committed`/`unknown`), honest progress/cancellation/accounting, immutable result manifest before `completed`, và retrieval/staging/output Asset placement retry dùng stable placement key mà không re-render nằm tại `docs/spec/durable-render-job-and-output-retry-lifecycle.md`.
