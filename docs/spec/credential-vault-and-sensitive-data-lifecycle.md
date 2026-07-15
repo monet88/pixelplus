@@ -258,7 +258,7 @@ The vault MUST NOT infer authorization from a credential handle, `provider_accou
 
 | Purpose | Allowed caller/context | Data that may be released | Required boundary |
 |---|---|---|---|
-| `provider_execution` | Chat X3, image execution, or Render Job worker after #8/#9/#10/#11/#14 gates | Current Provider Credential version for the selected same-Tenant account | One request/job; no cross-account fallback after possible commit |
+| `provider_execution` | Chat X3, image execution, or Render Job worker after #8/#9/#10/#11/#12/#14 gates | Current Provider Credential version for the selected same-Tenant account | One request/job; no cross-account fallback after possible commit |
 | `provider_probe` | Authorized `accounts.manage` action or same-Tenant probe worker | Credential needed for the minimal required probe | Probe scope only; no general account export |
 | `provider_refresh` | Same-Tenant lifecycle worker when `refresh_supported` is true | Current refresh-capable credential | Singleflight per `(tenant_id, provider_account_id)` as #9 requires |
 | `asset_validation` | Same-Tenant upload/reference/job validation | Input/mask bytes needed for canonical validation | Asset scope and retention state apply; no telemetry copy |
