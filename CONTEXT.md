@@ -14,7 +14,19 @@ Một kết nối do đúng một Tenant sở hữu tới một Provider, đại
 
 ## Provider Credential
 
-Dữ liệu bí mật chứng minh gateway được phép hành động qua một Provider Account. Provider Credential không đồng nghĩa với Provider Account và không được dùng chéo Tenant. Material được vault tách khỏi metadata account; Public API response, log, metric label và operator metadata không được chứa plaintext credential. Silent refresh chỉ khi Auth Mode/credential class hỗ trợ; Web Access và OAuth/CLI Access không trộn lifecycle trên cùng một account. Chi tiết class theo sáu Auth Mode, dual-version reauth cutover và redaction nằm tại `docs/spec/provider-account-connection-and-credential-lifecycle.md`.
+Dữ liệu bí mật chứng minh gateway được phép hành động qua một Provider Account. Provider Credential không đồng nghĩa với Provider Account và không được dùng chéo Tenant. Material được vault tách khỏi metadata account; Public API response, log, metric label, trace, audit và operator metadata không được chứa plaintext credential hoặc envelope/bearer material. Credential chỉ được giải mã trên purpose allowlist của cùng-Tenant path (`provider_execution`, `provider_probe`, `provider_refresh` hoặc lifecycle purpose tương ứng) sau khi ownership, lifecycle, version và audit gates pass; `credential_handle` không tự cấp quyền decrypt. `credential_version` (business lifecycle), `crypto_key_version` (envelope protection) và `hash_version` (Client API Key verifier) là ba version độc lập. Rotation/revocation, AAD binding theo Tenant/resource, retention, logical deletion, cryptographic purge, redaction và audit semantics nằm tại `docs/spec/credential-vault-and-sensitive-data-lifecycle.md`; connection journey và Auth Mode class vẫn nằm tại `docs/spec/provider-account-connection-and-credential-lifecycle.md`.
+
+## Credential Vault
+
+Logical boundary lưu encrypted Provider Credential envelope và sensitive-data object theo Tenant/resource binding. Vault không phải shared secret store: ciphertext, wrapped key, handle hay worker identity tự thân không cấp quyền decrypt; audit intent và purpose-bound authorization là điều kiện bắt buộc. Credential Vault cũng định nghĩa boundary mã hóa, key/envelope rotation, fail-closed behavior, redaction, retention và deletion cho prompt, request metadata, Asset bytes, Render Job staging và audit-safe records.
+
+## Sensitive Data Lifecycle
+
+Chính sách phân loại, truy cập, redaction, audit, retention, logical deletion và cryptographic purge cho Secret và Tenant-confidential data. Prompt, request/replay payload, Asset, Render Job staging/result handle và metadata có lifecycle riêng; retention hold có thể trì hoãn physical purge của encrypted evidence nhưng không được khôi phục Public API retrieval, Provider Credential decrypt hoặc execution.
+
+## Retention Hold
+
+Policy record do platform kiểm soát, gắn với `(tenant_id, resource kind/id, data class)` và authority/reason/review window, có thể trì hoãn physical hoặc cryptographic purge của encrypted evidence. Retention Hold không khôi phục Public API retrieval, Asset download, Provider Credential decrypt, execution hoặc storage accounting; Provider Credential hold không bao giờ giữ material ở trạng thái decryptable.
 
 ## Client API Key
 
@@ -96,6 +108,10 @@ Lifecycle Client API Key (create, one-time display, authenticate, scope, rotate,
 ## Normative Provider Account connection and Provider Credential lifecycle spec
 
 Journey kết nối Provider Account (create, credential submission, validation, probe, activation, refresh, reauthentication, disable, revoke, delete), usability gate, khác biệt lifecycle sáu Auth Mode (Web vs OAuth/CLI không trộn), remediation class và redaction Provider Credential nằm tại `docs/spec/provider-account-connection-and-credential-lifecycle.md`.
+
+## Normative Credential Vault and Sensitive-Data Lifecycle spec
+
+Data classification, storage/encryption boundaries, Tenant/resource-bound envelope semantics, purpose-bound decrypt rights, independent credential/crypto/hash versioning, redaction, retention, logical deletion, cryptographic purge, retention holds, audit semantics và fail-closed behavior nằm tại `docs/spec/credential-vault-and-sensitive-data-lifecycle.md`.
 
 ## Normative Capability Snapshot and model availability spec
 
