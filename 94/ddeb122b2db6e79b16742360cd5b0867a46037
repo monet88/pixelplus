@@ -1,0 +1,21 @@
+CONTEXT.md
+  s_f16820bbe938a2::t_0d18166c0c2426 78,112,114
+docs/spec/durable-render-job-and-output-retry-lifecycle.md
+  s_f16820bbe938a2::t_69b68451bfc8a3 1-536
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "94ddeb122b2db6e79b16742360cd5b0867a46037",
+  "prompts": {},
+  "sessions": {
+    "s_f16820bbe938a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eaf1e020-0508-4016-9f28-8b6072df3f05",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
