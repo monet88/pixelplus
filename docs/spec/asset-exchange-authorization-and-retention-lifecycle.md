@@ -8,6 +8,7 @@
 - Related ownership invariants: `docs/spec/tenant-ownership-authorization-invariants.md` (#6)
 - Related risk envelope: `docs/spec/auth-mode-risk-envelope-and-kill-criteria.md` (#7)
 - Related Client API Key / admission: `docs/spec/client-api-key-lifecycle-and-admission-controls.md` (#8)
+- Related vault and sensitive-data lifecycle: `docs/spec/credential-vault-and-sensitive-data-lifecycle.md` (#15)
 - Related connection / credential lifecycle: `docs/spec/provider-account-connection-and-credential-lifecycle.md` (#9)
 - Related Capability Snapshot / model availability: `docs/spec/capability-snapshot-and-model-availability-semantics.md` (#10)
 - Related tenant-scoped routing / fallback / affinity / lease: `docs/spec/tenant-scoped-routing-fallback-affinity-leases.md` (#11)

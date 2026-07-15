@@ -8,6 +8,7 @@
 - Related ownership invariants: `docs/spec/tenant-ownership-authorization-invariants.md` (#6)
 - Related risk envelope: `docs/spec/auth-mode-risk-envelope-and-kill-criteria.md` (#7)
 - Related Client API Key / admission: `docs/spec/client-api-key-lifecycle-and-admission-controls.md` (#8)
+- Related vault and sensitive-data lifecycle: `docs/spec/credential-vault-and-sensitive-data-lifecycle.md` (#15)
 - Evidence inputs (research only; not acceptance by themselves):
   - `docs/spec/research/chatgpt-auth-mode-capability-evidence.md` (#3)
   - `docs/spec/research/gemini-auth-mode-capability-evidence.md` (#4)
