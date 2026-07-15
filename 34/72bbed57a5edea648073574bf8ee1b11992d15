@@ -1,0 +1,19 @@
+docs/spec/credential-vault-and-sensitive-data-lifecycle.md
+  s_5e5d6640c0292a::t_29e5030a5d5848 261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "3472bbed57a5edea648073574bf8ee1b11992d15",
+  "prompts": {},
+  "sessions": {
+    "s_5e5d6640c0292a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b56df85-ce95-43b7-be2b-1ef5a64eea48",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
