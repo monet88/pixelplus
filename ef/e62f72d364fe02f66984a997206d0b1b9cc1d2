@@ -1,0 +1,19 @@
+CONTEXT.md
+  s_67a698c9dfbcfc::t_f6f0ca4c181204 135-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "efe62f72d364fe02f66984a997206d0b1b9cc1d2",
+  "prompts": {},
+  "sessions": {
+    "s_67a698c9dfbcfc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1aa532a8-76de-4ab0-b5bc-a954fba3b289",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
