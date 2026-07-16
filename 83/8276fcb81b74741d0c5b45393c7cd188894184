@@ -1,0 +1,25 @@
+.gitignore
+  s_7aebb8ec9e17b3::t_825007c3fcfc24 40-49
+docs/README.md
+  s_7aebb8ec9e17b3::t_701db3c59ceed6 1-49
+docs/stories/README.md
+  s_7aebb8ec9e17b3::t_fdc5e258978cad 1-46
+docs/stories/backfill-canonical-product-docs.md
+  s_7aebb8ec9e17b3::t_b11dce26f990ea 1-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "838276fcb81b74741d0c5b45393c7cd188894184",
+  "prompts": {},
+  "sessions": {
+    "s_7aebb8ec9e17b3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a46-979f-7593-873c-e849a3f64447",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
