@@ -1,0 +1,19 @@
+.gitignore
+  s_7ab28ba7f0dbe3::t_544154c157303a 50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "19c4c94743756bba80bc3515e4ba490028fb8207",
+  "prompts": {},
+  "sessions": {
+    "s_7ab28ba7f0dbe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77f6f098-0966-48be-abdb-a20ac054f65a",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
