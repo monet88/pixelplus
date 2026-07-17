@@ -1,0 +1,21 @@
+CONTEXT.md
+  s_112fb46786b78b::t_b1d3463024af32 15-42,164-167
+docs/spec/provider-account-health-cooldown-and-operator-controls.md
+  s_112fb46786b78b::t_80ca1b0029f4a7 1-769
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "68f1b3b453a79f907a0500cff62c2b798e73170f",
+  "prompts": {},
+  "sessions": {
+    "s_112fb46786b78b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "844d8673-48bb-4f55-97e9-cb3352906621",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
