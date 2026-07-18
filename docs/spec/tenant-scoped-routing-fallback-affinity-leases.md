@@ -67,7 +67,7 @@ Downstream issues **MUST** preserve every decision here. They may add fields, ti
 | Admission ordering | Authn→scope→size→rate→concurrency→quota→accept; allowlists narrow same-Tenant (#8) | Routing runs after A6 accept; how `provider_account_allowlist` bounds candidates |
 | Usability gate | `I-USABLE-GATE` §5.1 items 1–7 (#9) | Only usable accounts enter the candidate set; lease/affinity cannot bypass it |
 | Capability gate | Offerable = fresh + offerable-status + usable + risk-permitted (#10 §5.3, §9) | Fallback target MUST satisfy capability for the requested op+model |
-| Health classes | 9 tokens; `quota_exhausted`/`rate_limited`/`protocol_drift`… (#9 §6) | Which health degrades a candidate vs triggers fallback vs forbids it |
+| Health model | Canonical #17 Health State + Health Reason, scoped conditions, and legacy #9 normalization | Which matching conditions degrade a candidate vs remove it, without changing Tenant policy |
 
 ### 1.5 Decision unit
 
@@ -93,7 +93,7 @@ Cause → effect:
 | **Account lease** | A stronger, explicit hold binding a unit of work (e.g. a multi-step Render Job or a streaming session) to exactly one Provider Account for a **lease TTL class**, so mid-work the Gateway does not switch accounts under it. §5.2. |
 | **Fallback** | Selecting a **second** candidate account after a first choice is unavailable/failed, only within the Tenant-permitted set and with matching capability. §6. |
 | **No-fallback case** | A condition under which the Gateway MUST NOT try another account and MUST fail closed with a stable class. §7. |
-| **Transient vs durable unavailability** | Transient = short backoff class (`rate_limited`, some `degraded`); durable = usability/capability kill (#9 §5.1 items 1–5 fail, `unsupported`, `stale`/`invalid`). Only transient (or Tenant-policy-permitted entitlement) unavailability may trigger fallback; durable kills of the *request's* only pinned account fail closed. §6.4. |
+| **Transient vs durable unavailability** | Transient = bounded `cooling_down/provider_rate_limited` or some `degraded` conditions; durable = usability/capability kill (#9 §5.1 items 1–5 fail, canonical `expired`/`challenged`/`blocked`, `unsupported`, `stale`/`invalid`). Fallback eligibility still depends on Tenant policy and, after an attempt, operation retry safety. §6.4. |
 
 ---
 
@@ -110,7 +110,7 @@ For a request with Security Principal `(tenant_id, client_api_key_id)`, requeste
 | C2 | **Usability** | account not usable per `I-USABLE-GATE` #9 §5.1 items 1–5 (durable account gates; item 6 is C1, item 7 is C4) | #9 §5.1 |
 | C3 | **Risk** | Auth Mode `prohibited`; `experimental` outside lab; `gated` without flag+ack | #7 §2, §7 |
 | C4 | **Capability** | snapshot does not affirm `op`+`m` as offerable (fresh + offerable-status) | #10 §5.3, §9 |
-| C5 | **Health (routable)** | operational health is a hard-block (`auth_expired`/`provider_banned`/`challenged`) or op-affecting `quota_exhausted` for `op` | #9 §6, #10 §8.2 |
+| C5 | **Health (routable)** | any unresolved #17 condition matching the requested account/operation/model is `blocked`, `expired`, `challenged`, or `cooling_down`; or effective state is `unknown` on an `active` account. `degraded` remains eligible with lower preference under #17. | #17 §§3/5; #9 §5.1 |
 
 An account survives to the candidate set only if it passes C0–C5. The candidate set MAY be empty → the request fails closed (§7).
 
@@ -244,21 +244,21 @@ A fallback target MUST satisfy capability for the **exact requested `op`+`m`** (
 
 | Primary account became… | Source | Fallback eligible? |
 |---|---|---|
-| `rate_limited` known before this request sends an upstream payload (for example, active cooldown) | #9 §6 | **Yes**, if policy permits — short backoff, try next permitted candidate |
-| `rate_limited` returned during an upstream attempt | #9 §6 + owning operation retry contract | **Only when the operation permits re-attempt**; non-idempotent chat additionally requires #12 authoritative proof of non-commit. HTTP/error class alone is insufficient |
-| `degraded` (partial, non-auth) | #9 §6 | **Yes** with caution before an attempt, if policy permits and capability still offerable; after an attempt, the owning operation's retry safety also applies |
-| `quota_exhausted` known before this request sends an upstream payload (for example, current entitlement/reset state) | #9 §6, #10 §8.1 | **Policy-dependent**: MAY fall back to another permitted account; the exhausted account is non-offerable for the op until reset (#10 §8.2) — this is entitlement drift, not reauth |
-| `quota_exhausted` returned during an upstream attempt | #9 §6, #10 §8.1 + owning operation retry contract | **Only when the operation permits re-attempt**; non-idempotent chat additionally requires #12 authoritative proof of non-commit |
-| `auth_expired` / `challenged` / `provider_banned` (hard-block) | #9 §6 | Account leaves candidate set (C5); fallback to **other** permitted candidates MAY run, but the request never fails *open* on the dead account |
+| `cooling_down/provider_rate_limited` known before this request sends an upstream payload | #17 §§5–7 | **Yes**, if policy permits — the matching scope is excluded and the next permitted candidate may be selected |
+| Runtime `provider_rate_limited` during an upstream attempt | #16 + owning operation retry contract | **Only when the operation permits re-attempt**; non-idempotent chat additionally requires #12 authoritative proof of non-commit. Error/status class alone is insufficient |
+| `degraded/*` (partial, non-auth) | #17 §5 | **Yes** with caution before an attempt, if policy permits and capability remains offerable; after an attempt, the owning operation's retry safety also applies |
+| `cooling_down/provider_quota_exhausted` known before this request sends an upstream payload | #17 §§5–7, #10 §8.1 | **Policy-dependent**: MAY fall back to another permitted account; the affected scope remains non-offerable/routable until recovery — this is entitlement/cooldown behavior, not reauth |
+| Runtime `provider_quota_exhausted` during an upstream attempt | #16 + owning operation retry contract | **Only when the operation permits re-attempt**; non-idempotent chat additionally requires #12 authoritative proof of non-commit |
+| `expired/*`, `challenged/challenge_detected`, or `blocked/provider_account_banned` | #17 §§2/5 | Account leaves the candidate set (C5); fallback to **other** permitted candidates MAY run, but the request never fails *open* on the dead account |
 | Durable #9 §5.1 items 1–5 fail (disabled/revoked/deleted/reauth_required) | #9 §5.1 | Account leaves candidate set; fallback to other permitted candidates only |
-| `protocol_drift` → capability `invalid` | #9 §6, #10 §8.1 | Affected op non-offerable on that account (C4); fallback to a capability-offerable permitted candidate only |
+| `degraded/protocol_drift` or `blocked/protocol_drift` invalidates capability | #17 §§6/11, #10 §8.1 | Affected op becomes non-offerable on that account (C4/C5); fallback only to a capability-offerable permitted candidate |
 | **Explicit single-account pin, no policy fallback opt-in** | §4.2 | **No** — fail closed (NF-PIN) |
 | **No permitted next candidate** | §3 | **No** — fail closed (§7) |
 
 ### 6.5 No silent fallback (fail-closed default)
 
 - If no Routing Policy fallback chain is declared, the Gateway MUST NOT invent one. A single-account Tenant, or a Tenant that did not opt into fallback, gets a fail-closed rejection when its primary is unavailable (§7), never a surprise account switch (#6 `I-NO-SILENT-CROSS`, #7 §6.3).
-- A health/error token describes availability; it does not by itself prove retry safety. Once an upstream attempt may have committed, fallback MUST fail closed unless the owning operation contract authorizes re-attempt. In particular, chat consumes #12 proof-of-non-commit regardless of `rate_limited`/`quota_exhausted` naming.
+- A canonical health condition or runtime error describes availability; it does not by itself prove retry safety. Once an upstream attempt may have committed, fallback MUST fail closed unless the owning operation contract authorizes re-attempt. In particular, chat consumes #12 proof-of-non-commit regardless of `provider_rate_limited`/`provider_quota_exhausted` naming.
 - Circuit-breaking / health degradation MUST NOT replace a Tenant's policy with another Tenant's accounts or a shared pool (#6 §6, #7 OP-G7).
 
 ### 6.6 Fallback bound and loop safety
@@ -369,7 +369,7 @@ All routing paths obey #6:
 | Fallback to `prohibited` mode (Grok Web SSO) | Direct AUP collision (#7 §5.5) |
 | Route to non-usable account | Dead/invalid execution, wasted quota, false success (#9) |
 | Fallback without capability match | Upstream failure, or inpaint silently degraded to edit (mask fidelity loss) (#10) |
-| Post-attempt fallback based only on `rate_limited`/`quota_exhausted` token | Duplicate non-idempotent generation/quota because the primary may already have committed (#12) |
+| Post-attempt fallback based only on `provider_rate_limited`/`provider_quota_exhausted` error class | Duplicate non-idempotent generation/quota because the primary may already have committed (#12/#16) |
 | Lease/affinity outliving usability | Routing to a revoked/disabled account after kill (#9 `I-SNAPSHOT-NONUSE`) |
 | Silent auto-failover with no policy | Surprise account switch; client loses control; leaked-key lateral use |
 | Fail-open on empty candidate set | Open proxy / cross-Tenant borrow (#6, #8 §7.6) |
@@ -398,7 +398,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 
 ### 11.3 Fallback permitted (AC3)
 
-9. With `fallback_enabled=true` and an ordered chain, a primary known `rate_limited` before the current request's upstream payload falls back to the next permitted same-Tenant candidate that is capability-offerable for the exact op+model; a `rate_limited` response after an attempt also requires the owning operation's re-attempt authorization (for chat, #12 authoritative proof of non-commit).
+9. With `fallback_enabled=true` and an ordered chain, a primary known `cooling_down/provider_rate_limited` before the current request's upstream payload falls back to the next permitted same-Tenant candidate that is capability-offerable for the exact op+model; a post-attempt `provider_rate_limited` outcome also requires the owning operation's re-attempt authorization (for chat, #12 authoritative proof of non-commit).
 10. Cross-Auth-Mode fallback occurs **only** when policy lists both modes and both are enabled; otherwise NF-XMODE fail-closed.
 11. A fallback target must have model `m` offerable; a target missing `m` is skipped, never silently substituted.
 12. Inpaint request never falls back to a mode where inpaint is `unsupported` and is never downgraded to `image_edit`.
@@ -411,7 +411,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 16. NF-PROHIBITED: only alternative is Grok Web SSO / non-lab experimental / gated-without-ack → fail closed `auth_mode_unavailable`.
 17. NF-CAP-UNSUPPORTED / NF-MODEL / NF-STALE: reject before upstream with `capability_unsupported` / `model_unavailable` / `snapshot_stale`; Adapter executions = 0.
 18. NF-EMPTY: empty candidate set → fail closed; failure does not reveal whether another Tenant has a usable account.
-19. NF-REATTEMPT: a chat primary returns `rate_limited`/`quota_exhausted` after payload may have been accepted but the Adapter cannot prove non-commit → fail closed with zero fallback Adapter calls; the status token alone never authorizes a duplicate generation.
+19. NF-REATTEMPT: a chat primary returns post-A6 `provider_rate_limited`/`provider_quota_exhausted` after payload may have been accepted but the Adapter cannot prove non-commit → fail closed with zero fallback Adapter calls; the error class alone never authorizes a duplicate generation.
 
 ### 11.5 Lifecycle interaction
 

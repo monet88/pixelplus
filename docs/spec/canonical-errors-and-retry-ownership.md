@@ -369,7 +369,7 @@ The following are **not** proof of `not_committed` after payload transmission:
 - timeout, connection reset, DNS/TCP/TLS failure after payload transmission began;
 - missing response body, missing stream delta, absent client progress, or a worker/process crash;
 - an Adapter exception that does not carry an authoritative Provider non-acceptance guarantee;
-- a routing or health token such as `rate_limited`, `quota_exhausted`, `degraded`, or `protocol_drift` by itself.
+- a canonical health condition such as `cooling_down/provider_rate_limited`, `cooling_down/provider_quota_exhausted`, `degraded/*`, or `degraded|blocked/protocol_drift`, or its corresponding runtime error code, by itself.
 
 A status code can be part of authoritative proof only when the Adapter's documented contract establishes that the Provider could not have accepted the operation. The status string alone is never sufficient.
 
@@ -507,19 +507,21 @@ A capability or routing rejection that is known before A6 MUST NOT be mislabeled
 
 ### 8.2 Provider health mapping
 
-Provider Account health remains the #9 vocabulary. Canonical errors map it without changing ownership:
+Provider Account health uses #17 canonical Health State + Health Reason. Canonical errors map the effective matching condition without changing lifecycle, routing, or retry ownership:
 
-| #9 health | Canonical runtime/preflight mapping | Default account effect |
+| #17 canonical condition | Canonical runtime/preflight mapping | Default account effect |
 |---|---|---|
-| `healthy` | no error | remains routable subject to other gates |
-| `degraded` | `upstream_unavailable`, `provider_rejected`, or another operation-specific code | may remain routable under #11/#17 policy |
-| `auth_expired` | pre-upstream `account_not_usable`; post-A6 `provider_auth_expired` | reauth path; non-routable when #9 gate fails |
-| `challenged` | `provider_challenged` | non-routable; no challenge solver |
-| `quota_exhausted` | pre-A6 account gate or post-A6 `provider_quota_exhausted` | cooldown/entitlement handling; never Client API Key quota |
-| `rate_limited` | pre-A6 routing/cooldown or post-A6 `provider_rate_limited` | bounded cooldown; no reauth by default |
-| `protocol_drift` | `upstream_protocol_drift` | capability invalidation/operator path |
-| `provider_banned` | `provider_banned` | non-routable; operator/reauth policy |
-| `unknown` | `account_not_usable`, `snapshot_stale`, or dependency/integrity code according to stage | fail closed where the owning gate requires certainty |
+| `healthy/*` | no error | remains routable subject to other gates |
+| `degraded/*` except protocol drift | `upstream_unavailable`, `provider_rejected`, or another operation-specific code | may remain routable with lower preference under #11/#17 policy |
+| `expired/credential_expired` or `expired/credential_rejected` | pre-upstream `account_not_usable`; post-A6 `provider_auth_expired` | reauth path; non-routable |
+| `challenged/challenge_detected` | `provider_challenged` | non-routable; no challenge solver |
+| `cooling_down/provider_quota_exhausted` | pre-A6 account/routing gate or post-A6 `provider_quota_exhausted` | scoped cooldown/entitlement handling; never Client API Key quota |
+| `cooling_down/provider_rate_limited` | pre-A6 routing/cooldown or post-A6 `provider_rate_limited` | scoped bounded cooldown; no reauth by default |
+| `degraded/protocol_drift` or `blocked/protocol_drift` | `upstream_protocol_drift` | affected capability invalidation/operator path; blocked form is non-routable |
+| `blocked/provider_account_banned` | `provider_banned` | non-routable; operator/lifecycle recovery |
+| `unknown/initial_unprobed` | `account_not_usable`, `snapshot_stale`, or dependency/integrity code according to stage | fail closed where the owning gate requires certainty |
+
+Earlier #9 single-token labels are normalized through #17 §2.1 before this mapping. They are not a second canonical error or health vocabulary.
 
 ### 8.3 Redaction order
 
@@ -586,7 +588,7 @@ Exact HTTP/OpenAPI/SSE harness arrives with #18–#20. These are required observ
 
 14. A Provider rate limit after A6 produces `provider_rate_limited`, not `rate_limit`; a Provider quota signal produces `provider_quota_exhausted`, not admission `quota_exhausted`.
 15. Provider auth expiry, challenge, ban, rejection, timeout, unavailability, and protocol drift map to distinct canonical codes and safe remediation classes.
-16. A Provider `rate_limited` or `quota_exhausted` token permits fallback only when the owning operation proves `not_committed` and #11 policy allows it.
+16. A post-A6 Provider `provider_rate_limited` or `provider_quota_exhausted` outcome permits fallback only when the owning operation proves `not_committed` and #11 policy allows it; the corresponding persisted health condition is `cooling_down/provider_rate_limited` or `cooling_down/provider_quota_exhausted`.
 17. A timeout, reset, missing response, missing delta, or HTTP status after payload transmission produces `commit_status=unknown` unless the Adapter has authoritative non-commit proof.
 18. Auth expiry/challenge/protocol drift errors never include raw Provider HTML, challenge content, headers, URL query parameters, or secret material.
 

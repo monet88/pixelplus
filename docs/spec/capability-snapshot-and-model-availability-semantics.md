@@ -67,7 +67,7 @@ Downstream issues **MUST** preserve every decision here. They may add fields, ti
 | Snapshot non-use | `I-SNAPSHOT-NONUSE` on durable §5.1 items 1–5 fail (#9) | TTL-driven `stale`/`invalid` in addition to durable-gate kill |
 | Risk status | `allowed`/`gated`/`experimental`/`prohibited`; orthogonal to capability (#7) | Reaffirms orthogonality; snapshot never moves risk |
 | Capability status meaning | `verified`/`conditionally_supported`/`unsupported`/`unverified` (#3–#5) | Records the token per operation + per model in a snapshot |
-| Operational health | 9 tokens incl. `protocol_drift`, `quota_exhausted` (#9 §6) | Which health classes invalidate vs merely degrade a snapshot |
+| Operational health | Canonical #17 Health State + Health Reason with scoped conditions | Which matching conditions invalidate vs merely degrade a snapshot |
 | Model catalog | Observed slugs, not static (#3–#5) | Model-availability sub-record and observed-slug rule |
 
 ### 1.5 Decision unit
@@ -206,7 +206,7 @@ A model+operation pair is **offerable** to a client iff **all**:
 2. The per-model operation status is in the offerable set (`verified` / `conditionally_supported`) — §4.1.
 3. The Provider Account is **usable** per #9 §5.1 `I-USABLE-GATE` (this document does not restate that conjunction).
 4. The Auth Mode is risk-permitted for this deployment/Tenant (#7): not `prohibited`; `gated` needs flag+ack; `experimental` lab-only.
-5. Not currently entitlement/quota-blocked (§8 `entitlement_drift`, or operational health `quota_exhausted` for the affected op).
+5. No matching `cooling_down/provider_quota_exhausted` condition or `entitlement_drift` blocks the model/operation (§8).
 
 Offerable is **derived**, never a stored authority that can outlive its inputs. A client-facing model list (#18/#20) is the set of offerable pairs.
 
@@ -225,7 +225,7 @@ Offerable is **derived**, never a stored authority that can outlive its inputs. 
 Cause → effect (the hard vs soft split):
 
 1. A snapshot verified 2×TTL ago with no drift signal is `stale`: the gateway does not *trust* it for new work, but it is not evidence of breakage — the fix is a cheap re-probe, and the prior facts MAY seed the new probe.
-2. A snapshot whose account was just `disabled`/`revoked` (#9), or whose upstream returned `protocol_drift`, is `invalid`: the facts are known-bad, re-probe is mandatory, and no grace applies.
+2. A snapshot whose account was just `disabled`/`revoked` (#9), or whose canonical health became `degraded|blocked/protocol_drift`, is `invalid`: the facts are known-bad, re-probe is mandatory, and no grace applies.
 
 MVP locks **`stale` = non-authorizing** for capability-bearing ops (fail-closed). A dual "grace window" where `stale` still authorizes low-risk ops is deferred (`D-SNAPSHOT-GRACE`).
 
@@ -293,25 +293,25 @@ Provenance and probe identifiers are **non-secret** metadata. A snapshot payload
 
 | Trigger class | Fires when | Effect on snapshot |
 |---|---|---|
-| **`entitlement_drift`** | Plan/tier/quota change: image quota exhausted with reset (`chatgpt`), `QUOTA_EXHAUSTED`/`SERVICE_DISABLED` (`gemini`), tier downgrade / weekly-credit exhaustion (`grok`), free-plan image tool absence (`chatgpt`) | Affected operation/model → non-offerable; snapshot `stale`/`invalid` for those facts; re-probe to reclassify. Quota-with-reset is temporary (health `quota_exhausted`), not `reauth` |
+| **`entitlement_drift`** | Plan/tier/quota change: image quota exhausted with reset (`chatgpt`), `QUOTA_EXHAUSTED`/`SERVICE_DISABLED` (`gemini`), tier downgrade / weekly-credit exhaustion (`grok`), free-plan image tool absence (`chatgpt`) | Affected operation/model → non-offerable; snapshot `stale`/`invalid` for those facts; re-probe to reclassify. Quota-with-reset is temporary (`cooling_down/provider_quota_exhausted`), not `reauth` |
 | **`credential_change`** | `credential_version` bump via refresh/reauth (#9 §4.8/§4.9), or credential revoke | Snapshot bound to the old version is superseded; MUST NOT authorize new-version work without re-probe or #9 §4.8 rule 3 inheritance |
-| **`protocol_drift`** | Upstream shape/schema change: SSE/patch schema, model-slug rename, HTML key rename (`SNlM0e`), Statsig signer drift, request-envelope rename (#3–#5 drift tables). Maps to #9 operational health `protocol_drift` | Affected capability/model facts → `invalid`; MUST re-probe; MAY degrade the operation until a probe re-verifies |
+| **`protocol_drift`** | Upstream shape/schema change: SSE/patch schema, model-slug rename, HTML key rename (`SNlM0e`), Statsig signer drift, request-envelope rename (#3–#5 drift tables). Maps to canonical Health Reason `protocol_drift` with state `degraded` or qualified `blocked` under #17 | Affected capability/model facts → `invalid`; MUST re-probe; MAY degrade/block the operation according to #17 |
 | **`explicit_purge`** | Operator/Tenant/vault explicit invalidation, or #9 durable-gate failure (`I-SNAPSHOT-NONUSE`) | Snapshot `invalid` immediately; non-authorizing regardless of TTL |
 | **`ttl_expiry`** | `fresh_until` elapsed with no other trigger | Snapshot `stale`; re-probe path |
 
-### 8.2 Health-class mapping (which health invalidates vs degrades)
+### 8.2 Health-condition mapping (which health invalidates vs degrades)
 
-Consumes #9 §6 operational-health tokens; #10 does not add tokens:
+Consumes #17 canonical Health State + Health Reason; #10 does not add health tokens:
 
-| Operational health (#9) | Effect on snapshot capability |
+| Canonical matching health condition | Effect on snapshot capability |
 |---|---|
-| `healthy` | No effect |
-| `degraded` | Facts recorded/kept under `TTL-DEGRADED`; SHOULD re-probe sooner; MAY keep offering `conditionally_supported` ops with caution (#11) |
-| `auth_expired`, `provider_banned`, `challenged` | Durable hard-block (#9 §5.1 item 3) → account non-usable → snapshot **non-authorizing** (`I-SNAPSHOT-NONUSE`); typically drives `reauth_required` |
-| `quota_exhausted` | `entitlement_drift` for affected ops; temporary; models non-offerable until reset hint |
-| `rate_limited` | Transient; short backoff (#17); does **not** invalidate capability facts |
-| `protocol_drift` | `protocol_drift` trigger (§8.1) → affected facts `invalid` |
-| `unknown` | Not sufficient to offer; treat affected facts as needing (re)probe |
+| `healthy/*` | No effect |
+| `degraded/*` except protocol drift | Facts recorded/kept under `TTL-DEGRADED`; SHOULD re-probe sooner; MAY keep offering `conditionally_supported` ops with caution (#11) |
+| `expired/*`, `blocked/provider_account_banned`, `challenged/challenge_detected` | Durable hard-block (#9 §5.1 item 3) → account non-usable → snapshot **non-authorizing** (`I-SNAPSHOT-NONUSE`) |
+| `cooling_down/provider_quota_exhausted` | `entitlement_drift` for affected ops; temporary; models non-offerable until authorized recovery after reset |
+| `cooling_down/provider_rate_limited` | Matching scope is temporarily non-routable under #17; capability facts remain valid unless separate evidence invalidates them |
+| `degraded/protocol_drift` or `blocked/protocol_drift` | `protocol_drift` trigger (§8.1) → affected facts `invalid`; blocked form is also non-routable |
+| `unknown/initial_unprobed` | Not sufficient to offer; treat affected facts as needing (re)probe |
 
 ### 8.3 Immediate non-use precedence
 
@@ -359,7 +359,7 @@ Capability failures return safe guidance (exact error code strings #16). These e
 | `capability_unverified` | operation `unverified` (not probed) | Wait for / trigger probe; do not assume support |
 | `snapshot_stale` | snapshot past TTL | Re-probe (auto or `accounts.manage`); retry after |
 | `model_unavailable` | model not observed / not offerable now | Pick an offerable model; may be entitlement/quota gated |
-| `wait_provider_cooldown` | `quota_exhausted`/`rate_limited` for the op (#9 §7) | Wait until reset hint |
+| `wait_provider_cooldown` | matching `cooling_down/provider_quota_exhausted` or `cooling_down/provider_rate_limited` condition (#17) | Wait until the finite safe recovery time; do not infer reauth |
 | `reauthenticate` | capability blocked by durable hard-block/`reauth_required` (#9) | Run reauth journey (#9 §4.9) |
 | `auth_mode_unavailable` | Auth Mode `prohibited`/flag-off/non-lab (#7/#9) | Choose another Auth Mode |
 
@@ -426,7 +426,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 
 8. `verified_at` + TTL class → `fresh_until`; past it → `stale`; capability-bearing request on `stale` is rejected before upstream with `snapshot_stale` and triggers re-probe.
 9. `credential_version` bump without #9 §4.8 inheritance → prior snapshot superseded; new-version work rejected until re-probe.
-10. `protocol_drift` (health or upstream schema change) → affected facts `invalid`; re-probe required.
+10. `degraded/protocol_drift` or `blocked/protocol_drift` → affected facts `invalid`; re-probe required.
 11. `entitlement_drift` (quota exhausted / tier downgrade / `SERVICE_DISABLED`) → affected model/op non-offerable; temporary quota case restores after reset hint without reauth.
 12. Durable §5.1 items 1–5 fail (`disabled`/`revoked`/`deleted`/`reauth_required`/hard-block) → snapshot non-authorizing immediately even within TTL (`I-SNAPSHOT-NONUSE`); request-time key-scope failure alone does not kill the snapshot for other principals.
 
