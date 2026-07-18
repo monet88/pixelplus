@@ -420,7 +420,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 17. Cancel before commit prevents a new payload; cancel after commit attempts abort/drain and retains original Tenant/key occupancy until accounting terminal.
 18. A non-cancelable upstream cannot free concurrency or refund unknown usage at client cancel; residual capacity is bounded and same-Tenant.
 19. Missing final usage settles conservatively and emits an accounting fault rather than refunding zero.
-20. Retry/fallback after a Provider `rate_limited` or `quota_exhausted` response requires the image attempt's authoritative non-commit proof and Tenant policy; status token alone is insufficient.
+20. Retry/fallback after a post-A6 `provider_rate_limited` or `provider_quota_exhausted` outcome requires the image attempt's authoritative non-commit proof and Tenant policy; error/status class alone is insufficient. Persisted health uses canonical #17 `cooling_down/provider_rate_limited` or `cooling_down/provider_quota_exhausted`.
 
 ### 11.4 Progress and output delivery (AC4)
 

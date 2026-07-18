@@ -187,7 +187,37 @@ The Gateway exposes safe health state, reason, scope, remediation, and finite re
 | `credential_rejected` | `expired` | Provider rejected current credential/authorization |
 | `protocol_drift` | `degraded` or `blocked` | Provider protocol no longer matches Adapter contract; affected capability may become invalid |
 | `provider_account_banned` | `blocked` | Permanent ban/provider revocation evidence for the account |
-| `recovery_probe_failed` | prior state or escalated state | Probe failed without a more specific canonical classification |
+| `recovery_probe_failed` | deterministic from prior state (§2.1) | Probe failed without a more specific canonical classification |
+
+#### 2.1 Legacy health compatibility and generic probe-failure transitions
+
+Health State + Health Reason are the sole canonical persisted, routing, capability, and error-mapping vocabulary after this specification. The earlier #9 single-token health values are compatibility inputs/projections only: implementations MUST normalize them before persistence or gate evaluation, MUST NOT compare them as competing Health States, and MAY retain the source token only as bounded provenance/audit metadata.
+
+| Legacy #9 token | Canonical Health State | Canonical Health Reason / qualification | Canonical scope |
+|---|---|---|---|
+| `unknown` | `unknown` | `initial_unprobed` | `account` |
+| `healthy` | `healthy` | `probe_succeeded` for explicit probe evidence; otherwise `success_window` | `account` |
+| `degraded` | `degraded` | `elevated_error_rate` unless a more specific normalized reason exists | `account` |
+| `auth_expired` | `expired` | `credential_expired` when expiry is evidenced; otherwise `credential_rejected` | `account` |
+| `challenged` | `challenged` | `challenge_detected` | `account` |
+| `rate_limited` | `cooling_down` | `provider_rate_limited` | `account` |
+| `quota_exhausted` | `cooling_down` | `provider_quota_exhausted` | `account` |
+| `protocol_drift` | `degraded` | `protocol_drift`; the legacy token alone is insufficient for `blocked` | `account` |
+| `provider_banned` | `blocked` | `provider_account_banned` | `account` |
+
+The legacy #9 field carried no operation/model scope, so every compatibility conversion above is account-scoped. Narrower scope may be created only from new bounded evidence observed under #17; an implementation MUST NOT infer a narrower scope while migrating a legacy token. For rate/quota, this also enforces the unknown-bucket rule: absent bounded bucket evidence defaults account-wide. Additional §6 rule 5 or §11 evidence may later create a narrower or `blocked/protocol_drift` condition without rewriting the migrated observation.
+
+A generic `recovery_probe_failed` observation is valid only after the Adapter cannot classify a more specific rate, quota, credential, challenge, ban, timeout/unavailable, or protocol outcome. It transitions deterministically from the prior effective state:
+
+| Prior effective state | Result of generic `recovery_probe_failed` |
+|---|---|
+| `cooling_down` | Remain `cooling_down`; renew the same scope under a new condition revision, increment bounded `backoff_level`, and compute a new wait from policy. |
+| `degraded` | Remain `degraded`; add failure evidence. Open cooldown only when the independently defined transient threshold is satisfied. |
+| `unknown` | Remain `unknown` and non-routable; no optimistic admission. |
+| `healthy` | Move to `degraded/recovery_probe_failed`; do not invent Retry-After or claim non-commit. |
+| `challenged`, `expired`, or `blocked` | Retain the hard state; generic probe failure cannot replace or clear its authorized recovery path. |
+
+A more specific normalized observation always wins over this table. The same input facts therefore produce one state transition independent of implementation layout.
 
 4. Administrative states such as Tenant disable, drain, quarantine, and Auth Mode kill are not Health Reasons. They retain separate authority and observable fields.
 5. Capability status is not a Health Reason. Protocol/quota observations may invalidate capability evidence through #10, but the Capability Snapshot remains independently authoritative.
@@ -290,7 +320,7 @@ blocked > expired > challenged > cooling_down > degraded > healthy > unknown
 8. Exactly one recovery permit is granted per condition revision by default.
 9. A successful authorized recovery resolves only the matching condition/revision.
 10. A repeated matching rate/quota failure increments bounded `backoff_level` and renews the condition.
-11. A more specific auth/challenge/ban/protocol outcome replaces timer recovery with its canonical state and remediation.
+11. A more specific auth/challenge/ban/protocol outcome replaces timer recovery with its canonical state and remediation. An otherwise unclassified recovery-probe failure follows §2.1: for a cooldown it renews the same scoped condition with bounded progressive backoff and cannot silently escalate or recover.
 12. Jitter is deterministic for the account/scope/condition revision so distributed workers do not synchronize but retries remain testable.
 
 ### 8. Numeric health policy classes
@@ -378,6 +408,7 @@ Additional rules:
 | Protocol drift, narrow | `degraded` or `blocked` at affected scope | Invalidate affected capability evidence | Affected operation/model non-offerable |
 | Protocol drift requiring new reverse engineering | `blocked` evidence | Trigger #7 KS-5 decision/kill | Surface/Auth Mode execution stops |
 | Timeout/unavailable before side effect | Renew transient condition according to policy | None | Retry/fallback only if #16 owner authorizes |
+| Generic unclassified recovery-probe failure | Follow the deterministic prior-state matrix in §2.1; cooldown renews, degraded/unknown/hard states retain their defined class, healthy becomes degraded | None | Never becomes optimistic routing evidence and never authorizes retry/fallback |
 | Timeout/unknown after possible commit | Health observation recorded without claiming non-commit | Existing operation recovery only | No automatic fallback/retry based on health |
 | Probe dependency/audit/vault failure | No optimistic health change | Fail closed; operator/dependency remediation | No execution |
 
@@ -464,8 +495,8 @@ Additional rules:
    - Provider runtime rate/quota outcomes remain `provider_rate_limited` / `provider_quota_exhausted`;
    - auth/challenge/ban/protocol outcomes remain their #16 codes.
 2. Exact HTTP header and JSON encoding are #18/#20. This specification locks logical timing semantics.
-3. `retry_after_seconds` is emitted only when every blocking matching condition is time-waitable and the earliest safe retry is finite.
-4. It is computed at response time as the ceiling of seconds until the latest `retry_not_before` among matching waitable gates, with minimum `1`.
+3. A finite retry delay is included in the logical terminal or management outcome only when every blocking matching condition is time-waitable and the earliest safe retry is finite.
+4. Its logical value at response time is the ceiling, in seconds, from response time until the latest `retry_not_before` among matching waitable gates, with a minimum of one second. #18/#20 choose the JSON field, HTTP header, and exact encoding.
 5. A non-time gate (`expired`, `challenged`, `blocked`, lifecycle disabled/revoked/deleted/reauth-required, quarantine, or Auth Mode kill) suppresses timer guidance and emits its canonical remediation.
 6. `degraded` alone does not require Retry-After.
 7. `retry_after_class` for both Provider runtime rate-limit and quota-exhaustion waits remains the #16 token `provider_cooldown`. Health Reason, affected scope, validated reset metadata, and authorized management/audit projections distinguish rate from quota without creating a second public retry class.
@@ -594,6 +625,7 @@ Adapter-specific safe probes are exercised through contract fixtures behind this
    - late success cannot erase newer hard failure;
    - old credential-version success is ignored;
    - rate/quota renews cooldown;
+   - generic `recovery_probe_failed` follows every §2.1 prior-state branch deterministically, including renewing the same cooldown without silent escalation;
    - auth/challenge/ban/protocol outcomes transition correctly.
 7. **Probe safety contracts**
    - each enabled Auth Mode has a permitted fixture path;

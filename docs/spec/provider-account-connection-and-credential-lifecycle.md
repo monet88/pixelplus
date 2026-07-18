@@ -112,7 +112,7 @@ Cause → effect:
 | **Silent refresh** | System-initiated credential renewal **without** Tenant re-entry of secrets, only when the Auth Mode credential class supports it (typically OAuth refresh_token). |
 | **Reauthentication** | Human-mediated submission of replacement Provider Credential material for an **existing** `provider_account_id`. |
 | **Lifecycle state** | Durable account state governing connection and credential ops (`draft`, `pending_validation`, `pending_probe`, `active`, `reauth_required`, `disabled`, `revoked`, `deleted`). |
-| **Operational health** | Orthogonal runtime signal (`healthy`, `degraded`, `auth_expired`, `challenged`, `quota_exhausted`, `rate_limited`, `protocol_drift`, `provider_banned`, `unknown`). Does not replace lifecycle state; see §6. |
+| **Operational health** | Orthogonal #17 model represented by canonical Health State (`unknown`, `healthy`, `degraded`, `cooling_down`, `challenged`, `expired`, `blocked`) plus Health Reason and scope. Earlier single tokens such as `auth_expired`, `rate_limited`, and `provider_banned` are compatibility aliases normalized by #17 §2.1; they are not stored or compared as canonical states. Does not replace lifecycle state; see §6. |
 | **Remediation class** | Stable guidance category returned to the Tenant. Canonical tokens (this document): `submit_credential`, `complete_oauth`, `reauthenticate`, `ack_risk`, `enable_account`, `wait_provider_cooldown`, `contact_operator`, `auth_mode_unavailable`, `delete_and_recreate`. Exact Public API error **code strings** remain #16. |
 | **Risk acknowledgement** | Explicit Tenant accept of residual ToS/ban/custody themes required by #7 for `gated` (and stronger lab warnings for `experimental`). |
 | **Auth Mode kill / feature gate** | Platform-level block from #7 OP-G1 / KS-* / FG-* that forbids new connections and/or new executions for that Auth Mode. |
@@ -130,7 +130,7 @@ Cause → effect:
 | `provider` | yes | `chatgpt` \| `gemini` \| `grok` (product family label; **not** the risk unit) |
 | `auth_mode` | yes | Exactly one of the six initial Auth Modes; **immutable** after create |
 | `lifecycle_state` | yes | See §4 |
-| `operational_health` | yes | See §6; default `unknown` until first successful probe or classified failure |
+| `operational_health` | yes | Canonical #17 Health State summary; default `unknown` until first successful probe or classified failure. Active Scoped Health Conditions retain Health Reason and scope under #17. |
 | `label` | no | Tenant-visible name |
 | `external_subject_hint` | no | Non-secret label only (email local-part hash, masked email, account_id public form). MUST NOT be raw cookie/token |
 | `plan_type_hint` | no | Last observed non-secret plan/tier string from probe |
@@ -330,7 +330,7 @@ pending_probe ──fail──► reauth_required | disabled*** | draft****
 3. Probe **MUST** classify failures into operational health + remediation (§6–§7).
 4. Probe success + activation preconditions (§4.2) → transition to `active`, set `last_activated_at`, `last_probed_at`, `probe_satisfied_version = credential_version`, health typically `healthy` (or `degraded` if probe succeeded with partial capability — still may be usable if product defines minimum bar; MVP minimum bar = auth success + Auth Mode still connectable). Full usable conjunction remains §5.1.
 5. Probe failure → **MUST NOT** transition to `active`. Typical transitions:
-   - auth class → `reauth_required` (+ health `auth_expired` or `challenged`)
+   - auth class → `reauth_required` (+ health `expired/credential_expired`, `expired/credential_rejected`, or `challenged/challenge_detected` according to evidence)
    - transient → stay `pending_probe` with health `unknown`/`degraded` and retry policy (#17)
    - Auth Mode unavailable → non-usable + remediation `auth_mode_unavailable`
 
@@ -365,7 +365,7 @@ Observable effects when activated:
      - **(a) Inheritance (default for full OAuth `refresh_token` grant success):** all of: previous version was already probe-satisfied for §5.1 item 4; operational health at refresh start was **neither** in the hard-block set (§5.1 item 3) **nor** `unknown` (same exclusion set as §4.10 enable re-probe); refresh response did not signal auth-class failure or entitlement demotion that requires re-classification. Implementations MUST record that the new version is probe-satisfied (e.g. `probe_satisfied_version = credential_version`, optional audit `probe_inherited_from = prior_version`). `last_probed_at` MAY remain the prior successful probe time when inheritance applies.
      - **(b) Cost-minimal probe (required when (a) does not apply):** companion-cookie/session re-derive without a full refresh-token grant; health was hard-block or `unknown` at refresh start; refresh response indicates entitlement/auth re-classification; or the Auth Mode table marks post-refresh probe required. Until that probe succeeds for the new version, either keep the previous version as the only decrypt source for new work (short dual-version cutover, same spirit as §4.9) **or** treat the account as non-usable for new work — **MUST NOT** mark the new version probe-satisfied, and **MUST NOT** decrypt the new version for new admissions, until (a) or (b) holds.
    - **Prior-version non-use after cutover:** Once the new version is cut over (inheritance or probe success), the previous vault version MUST NOT decrypt for **new** admissions (in-flight work may finish on the old version). Aligns with §4.9 spirit for rotate immediacy.
-4. Refresh failure that is **permanent auth class** (invalid_grant, refresh_token_reused, revoked client, 401 without recovery) → `lifecycle_state=reauth_required`, health `auth_expired`, usable=false.
+4. Refresh failure that is **permanent auth class** (invalid_grant, refresh_token_reused, revoked client, 401 without recovery) → `lifecycle_state=reauth_required`, health `expired/credential_rejected` (or `expired/credential_expired` when expiry is evidenced), usable=false.
 5. Refresh failure that is **transient** → keep lifecycle state, health `degraded`/`unknown`, backoff (#17); do not hammer (#7 KS-3 interaction).
 6. Concurrent refresh MUST be singleflight per `(tenant_id, provider_account_id)` (research: Codex/xAI refresh_token reuse risk). This is a **security correctness** requirement of the credential lifecycle (prevents concurrent refresh_token use), not an optional Gateway performance tuning knob. There is no second singleflight key.
 7. Refresh MUST NOT switch Auth Mode or Tenant.
@@ -411,7 +411,7 @@ Observable effects when activated:
 3. **Capability Snapshot non-use:** While `disabled`, any Capability Snapshot previously published for this account MUST NOT authorize new routing/execution. Snapshot schema/TTL/explicit purge is #10; this document requires **immediate non-use** whenever **durable** §5.1 items 1–5 fail (including disable/revoke/delete/`reauth_required`). Request-time item 6 (key scope) or item 7 alone MUST NOT account-globally kill snapshots for other principals.
 4. Enable (Tenant): only if credential still present and not vault-revoked, and Auth Mode still connectable (#7). Before the account may return to usable/`active`, a **required probe for the current `credential_version`** MUST run when **any** of the following hold:
    - `probe_satisfied_version` is missing or `< credential_version` (do **not** use `last_probed_at` alone — §4.8 inheritance may leave wall-clock `last_probed_at` older while still probe-satisfied), **or**
-   - operational health is `auth_expired` / `provider_banned` / `challenged` / `unknown`, **or**
+   - operational health has a matching canonical hard state (`expired`, `blocked`, `challenged`) or `unknown`, **or**
    - `credential_expires_at` is in the past when known, **or**
    - account has been disabled longer than the **enable re-probe TTL** (MVP default **24 hours** from `disabled_at`; numeric tuning may move under #17 without weakening “stale disable must re-probe”).
    
@@ -488,7 +488,7 @@ An account is **usable** for routing and new execution if and only if **all** ho
 
 1. `lifecycle_state == active`
 2. Auth Mode is currently **execution-enabled** for the deployment (not killed; not `prohibited`; `gated`/`experimental` gates still satisfied, including required risk ack for gated modes)
-3. Operational health is not in a hard-block set: MVP hard-block = `auth_expired`, `provider_banned`, `challenged` (until cleared by successful reauth/probe policy), and any #17 extension that marks non-routable. (`unknown` is intentionally **not** in this set: a genuinely usable `active` account cannot carry `unknown` health because item 4 requires a probe success that sets health to `healthy`/`degraded` — see §4.6 rule 4 — and every path that could leave `unknown` on an account, §4.8 inheritance and §4.10 enable, excludes `unknown` from the safe path. If an implementation ever observes `active` + `unknown`, treat it as a defect and fail closed, not as usable.)
+3. Operational health has no matching non-routable #17 condition: `expired`, `blocked`, `challenged`, or `cooling_down` at the requested scope. `degraded` may remain routable under #17/#11. (`unknown` is intentionally handled as an invariant defect: a genuinely usable `active` account cannot carry `unknown` because item 4 requires current probe satisfaction. If an implementation ever observes `active` + `unknown`, fail closed rather than route.)
 4. Current `credential_version` has passed required validation + required probe (including satisfaction via §4.8 rule 3 inheritance or cost-minimal post-refresh probe; a version bump alone never satisfies this item). Because a successful required probe sets health ≠ `unknown` (§4.6 rule 4), satisfying this item guarantees item 3 is not evaluated against a stale `unknown`.
 5. Credential is not vault-revoked
 6. Client API Key scope/allowlist allows the account when the caller is a Public API principal (#8) — N/A for pure system jobs that already act under the account’s `tenant_id`
@@ -518,7 +518,7 @@ If an account is selected explicitly but not usable:
 #### Example B — Probe failure never activates
 
 1. Material validates locally; probe returns 401.
-2. State → `reauth_required`, health `auth_expired`.
+2. State → `reauth_required`, health `expired/credential_rejected`.
 3. No Capability Snapshot is published as “verified usable”.
 4. Account remains non-usable until reauth + probe success.
 
@@ -559,26 +559,28 @@ If an account is selected explicitly but not usable:
 
 ## 6. Operational health (orthogonal to lifecycle)
 
-### 6.1 Health vocabulary (MVP)
+### 6.1 Canonical health vocabulary
 
-| Health | Meaning | Typical effect on usable `active` account |
-|---|---|---|
-| `healthy` | Recent success; no blocking signal | Routable |
-| `degraded` | Partial issues (elevated errors, partial capability) | May remain routable with caution (#11) |
-| `auth_expired` | Credential auth class failure | **Non-routable**; drive `reauth_required` |
-| `challenged` | Bot/challenge interstitial class | **Non-routable** until cleared; no productized solver (#7) |
-| `quota_exhausted` | Provider quota exhausted with known reset | Temporarily non-routable for affected ops (#11/#17) |
-| `rate_limited` | Transient provider rate limit | Short backoff; not reauth |
-| `protocol_drift` | Unexpected upstream protocol | Degrade/disable path; operator |
-| `provider_banned` | Permanent ban / provider-revoked account signal | **Non-routable**; often disable + incident |
-| `unknown` | No successful classification yet | Not sufficient alone for first-time usable |
+#17 owns the canonical Health State + Health Reason model, scoped conditions, precedence, and compatibility normalization. This lifecycle specification consumes that model; it does not define a parallel single-token state machine.
+
+| Canonical #17 condition | Typical effect on usable `active` account |
+|---|---|
+| `healthy/*` | Routable when every other gate passes |
+| `degraded/*` | May remain routable with lower preference under #11/#17 |
+| `cooling_down/provider_rate_limited` or `cooling_down/provider_quota_exhausted` | Non-routable only for the matching account/operation/model scope until authorized half-open recovery succeeds |
+| `challenged/challenge_detected` | Hard non-routable; no productized solver (#7) |
+| `expired/credential_expired` or `expired/credential_rejected` | Hard non-routable; drive `reauth_required` |
+| `blocked/protocol_drift` or `blocked/provider_account_banned` | Hard non-routable; operator/lifecycle recovery |
+| `unknown/initial_unprobed` | Insufficient for first-time usability; `active + unknown` fails closed as an invariant defect |
+
+Legacy values from earlier revisions normalize through #17 §2.1 (`auth_expired` → `expired/credential_*`, `rate_limited` → `cooling_down/provider_rate_limited`, `quota_exhausted` → `cooling_down/provider_quota_exhausted`, `provider_banned` → `blocked/provider_account_banned`, and legacy `protocol_drift` → `degraded/protocol_drift`; additional evidence may later escalate it to `blocked/protocol_drift`). They MUST NOT be persisted or compared as canonical Health States.
 
 ### 6.2 Interaction rules
 
 1. Health updates **MUST NOT** by themselves set `lifecycle_state=active`.
-2. Auth-class health (`auth_expired`, many `challenged` cases, `provider_banned`) **MUST** clear usability and SHOULD transition lifecycle toward `reauth_required` or `disabled`.
-3. Quota/rate health does **not** require reauth.
-4. Exact cooldown timers and circuit breakers are #17; this document only locks the **classes** and that they cannot override #6/#7/# usability gates.
+2. Canonical hard health states (`expired`, `challenged`, `blocked`) **MUST** clear usability and SHOULD transition lifecycle toward the recovery state required by the specific reason, such as `reauth_required` for credential expiry/rejection or `disabled`/quarantine for ban evidence.
+3. Rate/quota cooldown does **not** require reauth.
+4. Exact cooldown timers, scopes, probes, and circuit breakers are #17; this document only locks lifecycle interaction and that health cannot override #6/#7/usability gates.
 
 ---
 
@@ -590,11 +592,11 @@ Returned as safe guidance (exact error code strings #16):
 |---|---|---|
 | `submit_credential` | draft / validation failed first connect | Submit correct material for Auth Mode |
 | `complete_oauth` | device/browser flow pending | Complete provider consent |
-| `reauthenticate` | `reauth_required` / auth_expired | Run reauth journey |
+| `reauthenticate` | `reauth_required` / `expired/credential_expired` / `expired/credential_rejected` | Run reauth journey |
 | `ack_risk` | gated/experimental ack missing or stale | Accept risk themes (#7 §6.2) |
 | `enable_account` | disabled by Tenant | Enable + pass probe if required |
-| `wait_provider_cooldown` | quota/rate health | Wait until reset hint |
-| `contact_operator` | protocol_drift, auth mode killed, banned cluster | Operator / support safe diagnostics |
+| `wait_provider_cooldown` | `cooling_down/provider_rate_limited` or `cooling_down/provider_quota_exhausted` | Wait until the finite safe retry time, then recover through #17 half-open semantics |
+| `contact_operator` | `degraded|blocked/protocol_drift`, Auth Mode killed, or `blocked/provider_account_banned` | Operator / support safe diagnostics |
 | `auth_mode_unavailable` | prohibited / flag off / non-lab experimental | Choose another Auth Mode |
 | `delete_and_recreate` | Auth Mode mismatch / irrecoverable row | Delete account; create new with correct mode |
 

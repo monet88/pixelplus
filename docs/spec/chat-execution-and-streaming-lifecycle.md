@@ -206,7 +206,7 @@ Chat account resolution (X1) uses the #11 precedence ladder verbatim: **P0 candi
 ### 5.4 Fallback during chat
 
 - Fallback (P5) is **opt-in, fail-closed** (#11 §6.5, `I-ROUTE-FALLBACK-OPTIN`): a chat request only fails over to a second account when Tenant policy declares an ordered chain, the target is same-Tenant, the Auth Mode is policy-permitted, and capability matches `op`+`m` (#11 §6). This satisfies parent #1 story 35 (no surprise account/Auth-Mode switch).
-- **Fallback shares the proof-of-non-commit boundary in §7.2.** It may select another account only when the Gateway has authoritative evidence that the prior account did not accept a generation. A Provider `rate_limited`/`quota_exhausted` response is fallback-safe only when that Adapter's documented response semantics prove non-commit; an HTTP status alone is insufficient.
+- **Fallback shares the proof-of-non-commit boundary in §7.2.** It may select another account only when the Gateway has authoritative evidence that the prior account did not accept a generation. A post-A6 `provider_rate_limited`/`provider_quota_exhausted` outcome is fallback-safe only when that Adapter's documented response semantics prove non-commit; an HTTP status alone is insufficient. The corresponding persisted health condition is canonical #17 `cooling_down/provider_rate_limited` or `cooling_down/provider_quota_exhausted`.
 - **Mid-stream fallback is not silent re-emission.** Once an attempt is possibly committed — whether or not a `delta` reached the client — the Gateway MUST NOT restart generation on a fallback account. The stream terminates `failed`; any later attempt is a new client decision governed by §7.3.
 
 ---
@@ -268,7 +268,7 @@ Chat generation is **non-idempotent** at the Provider: re-sending the same promp
 1. **Exactly one layer owns chat re-attempts: the Gateway execution layer.** The Adapter MUST NOT independently re-run a full chat generation on its own timer, and the HTTP transport layer MUST NOT auto-retry a chat `POST` that may have already reached upstream. Full canonical retry-ownership across all operations is #16; this document locks the chat rule.
 2. A re-attempt is permitted only when the Gateway has **authoritative proof of non-commit**: no request payload bytes were transmitted, or an Adapter-classified Provider response explicitly guarantees that no generation was accepted/created. DNS/TCP/TLS failures before payload are safe examples. An HTTP status, missing response, timeout, reset, or absence of client-visible deltas is not proof by itself.
 3. Once payload transmission begins without such proof, the attempt is **possibly committed** and MUST NOT be automatically retried. The client receives `failed`; any later attempt is a new client-initiated request subject to §7.3.
-4. **Routing fallback (#11 P5) is a re-attempt under the same rule.** A transient `rate_limited`/`quota_exhausted` primary may fall back only if Adapter semantics prove non-commit for that response. Otherwise fail closed. Retry and fallback share one bounded chain walked once; neither can bypass the other by changing layers or accounts.
+4. **Routing fallback (#11 P5) is a re-attempt under the same rule.** A transient runtime `provider_rate_limited`/`provider_quota_exhausted` outcome may fall back only if Adapter semantics prove non-commit for that response. Otherwise fail closed. Retry and fallback share one bounded chain walked once; neither can bypass the other by changing layers or accounts.
 
 ### 7.3 Idempotency for accepted requests
 
@@ -287,7 +287,7 @@ Terminal failures carry a **retryability class** so a client retries correctly (
 |---|---|---|
 | Proven non-commit transient | X1–X3 or X4 with authoritative no-commit proof | Safe for Gateway retry/fallback |
 | Rate/quota (admission) | #8 A3/A5 | Back off; not a Provider error (#8 §9.3) |
-| Provider rate / cooldown | #9 §6 `rate_limited`/`quota_exhausted` | MAY fall back only with authoritative no-commit proof; otherwise wait/fail closed |
+| Provider rate / cooldown | #17 `cooling_down/provider_rate_limited` or `cooling_down/provider_quota_exhausted`; post-A6 codes from #16 | MAY fall back only with authoritative no-commit proof; otherwise wait/fail closed |
 | Auth expiry / challenge | #9 hard-block health | `reauthenticate`; not a blind retry |
 | Timeout | §6.4 | Retry as a **new** request; do not assume prior committed or not — idempotency key recommended |
 | Possibly-committed runtime failure | X4 after start / partial deltas | **Not auto-retried**; client decides; idempotency key prevents duplicate if it does |
@@ -361,7 +361,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 ### 10.4 Retry boundary and idempotency (AC4)
 
 18. Gateway retry and #11 fallback both require authoritative proof of non-commit; payload transmission without such proof is possibly committed even if no delta was observed.
-19. A Provider `rate_limited` response permits fallback only when Adapter semantics prove no generation was accepted; status code alone is insufficient.
+19. A post-A6 `provider_rate_limited` response permits fallback only when Adapter semantics prove no generation was accepted; status code alone is insufficient. Its health projection is `cooling_down/provider_rate_limited`.
 20. Only the Gateway execution layer re-attempts chat; Adapter/transport retry of a possibly-committed generation is a conformance fail.
 21. Two concurrent requests with the same scoped idempotency key and fingerprint yield one atomic claimant and exactly one upstream generation; the loser waits/gets in-progress and releases its own A6 resources.
 22. Same key with a different fingerprint returns idempotency conflict and never overwrites/joins the first request.
