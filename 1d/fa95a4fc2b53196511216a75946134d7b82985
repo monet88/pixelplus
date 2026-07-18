@@ -1,0 +1,35 @@
+CONTEXT.md
+  s_4e9058472949f2::t_824d560ef15b01 17
+docs/spec/canonical-errors-and-retry-ownership.md
+  s_4e9058472949f2::t_d092d9cc2b6ac3 372,510,512,514-524,591
+docs/spec/capability-snapshot-and-model-availability-semantics.md
+  s_4e9058472949f2::t_1b3c032b6ce2db 70,209,228,296,298,302,304,306,308-314,362,429
+docs/spec/chat-execution-and-streaming-lifecycle.md
+  s_4e9058472949f2::t_2d06afdbcebe07 209,271,290,364
+docs/spec/durable-render-job-and-output-retry-lifecycle.md
+  s_4e9058472949f2::t_042516c326624e 423
+docs/spec/tenant-scoped-routing-fallback-affinity-leases.md
+  s_4e9058472949f2::t_2ec19c6a3cd917 70,96,113,247-252,254,261,372,401,414
+docs/stories/epics/E01-provider-gateway/US-017-health-spec-review-fixes/design.md
+  s_4e9058472949f2::t_ce915bedb64e09 1-33
+docs/stories/epics/E01-provider-gateway/US-017-health-spec-review-fixes/execplan.md
+  s_4e9058472949f2::t_7b86ced1883cb5 1-52
+docs/stories/epics/E01-provider-gateway/US-017-health-spec-review-fixes/overview.md
+  s_4e9058472949f2::t_176a13d6ec9234 1-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "1dfa95a4fc2b53196511216a75946134d7b82985",
+  "prompts": {},
+  "sessions": {
+    "s_4e9058472949f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8555d3b2-9313-459f-9021-e1f2421cc907",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
