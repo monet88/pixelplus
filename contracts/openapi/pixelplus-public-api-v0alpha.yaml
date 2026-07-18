@@ -1,0 +1,3185 @@
+{
+  "openapi": "3.1.1",
+  "info": {
+    "title": "PixelPlus OpenAI-Compatible Inference Contract (Prototype)",
+    "version": "0.0.0-prototype",
+    "summary": "Non-final tracer bullet for issue #18",
+    "description": "NON-FINAL prototype OpenAPI 3.1.1 artifact for issue #18. jsonSchemaDialect is JSON Schema 2020-12. This is not the final versioned Public API; issue #20 consolidates it with the management contract. Server base is /v1; path keys are relative (no duplicated /v1). Full public routes are documented as /v1/... in operation descriptions. Official OpenAI-compatible baseline surfaces: /v1/models, /v1/chat/completions, /v1/images/generations, /v1/images/edits. PixelPlus adds explicit /v1/images/inpaints, durable render-job, asset, capability metadata, output-delivery retry, and chat cancel surfaces. SSE sequence: open -> delta* (heartbeats allowed) -> exactly one completed|failed|canceled terminal; no post-terminal data; no [DONE] second sentinel; disconnect is implicit cancel; cancellation is not proof upstream stopped; commit-unknown implies no fallback/retry. Image operations are async durable jobs returning 202; completed may contain pending output entries; output placement retry never re-renders.",
+    "license": {
+      "name": "Proprietary"
+    },
+    "x-pixelplus-issue": 18,
+    "x-pixelplus-parent-issue": 1,
+    "x-pixelplus-base-commit": "d1c2830"
+  },
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "servers": [
+    {
+      "url": "/v1",
+      "description": "Public inference API base. Full routes are /v1/..."
+    }
+  ],
+  "tags": [
+    {
+      "name": "Models"
+    },
+    {
+      "name": "Chat"
+    },
+    {
+      "name": "Assets"
+    },
+    {
+      "name": "Images"
+    },
+    {
+      "name": "RenderJobs"
+    }
+  ],
+  "security": [
+    {
+      "ClientApiKey": []
+    }
+  ],
+  "paths": {
+    "/models": {
+      "get": {
+        "operationId": "listModels",
+        "summary": "List models and owner-Tenant capability offers",
+        "description": "Public route: GET /v1/models. Returns OpenAI core model fields plus x_pixelplus.offers with owner-Tenant provider_account_id, operation status, model_slug, offerable, streaming_class where relevant, and snapshot freshness/verified_at. Never provider credential/raw evidence/static provider catalog.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Models"
+        ],
+        "responses": {
+          "200": {
+            "description": "Model list with capability offers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelListResponse"
+                },
+                "examples": {
+                  "ModelListExample": {
+                    "summary": "Offer list",
+                    "value": {
+                      "object": "list",
+                      "data": [
+                        {
+                          "id": "gpt-4o-mini",
+                          "object": "model",
+                          "created": 1720000000,
+                          "owned_by": "pixelplus",
+                          "x_pixelplus": {
+                            "offers": [
+                              {
+                                "provider_account_id": "pa_01JOWNED",
+                                "operation": "chat",
+                                "operation_status": "verified",
+                                "model_slug": "gpt-4o-mini",
+                                "offerable": true,
+                                "freshness": "fresh",
+                                "verified_at": "2026-07-18T00:00:00Z"
+                              },
+                              {
+                                "provider_account_id": "pa_01JOWNED",
+                                "operation": "chat_streaming",
+                                "operation_status": "verified",
+                                "model_slug": "gpt-4o-mini",
+                                "offerable": true,
+                                "streaming_class": "real",
+                                "freshness": "fresh",
+                                "verified_at": "2026-07-18T00:00:00Z"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chat/completions": {
+      "post": {
+        "operationId": "createChatCompletion",
+        "summary": "Create chat completion (stream or non-stream)",
+        "description": "Public route: POST /v1/chat/completions. OpenAI-like model/messages/stream. Optional x_pixelplus routing fields (provider_account_id, allow_fallback). Idempotency-Key header for scoped replay. Does not accept tenant_id. SSE sequence open -> delta* (heartbeats allowed) -> exactly one completed|failed|canceled terminal; no post-terminal data; no [DONE] second sentinel; disconnect is implicit cancel; cancellation is not proof upstream stopped; commit-unknown implies no fallback/retry.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Chat"
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Scoped idempotency key for non-idempotent chat execution."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatCompletionRequest"
+              },
+              "examples": {
+                "NonStream": {
+                  "summary": "Non-stream chat",
+                  "value": {
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                      {
+                        "role": "user",
+                        "content": "Hello"
+                      }
+                    ],
+                    "stream": false,
+                    "x_pixelplus": {
+                      "allow_fallback": true
+                    }
+                  }
+                },
+                "Stream": {
+                  "summary": "Stream chat",
+                  "value": {
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                      {
+                        "role": "user",
+                        "content": "Hello"
+                      }
+                    ],
+                    "stream": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Non-stream success or SSE stream",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCompletionResponse"
+                },
+                "examples": {
+                  "NonStreamSuccess": {
+                    "summary": "Non-stream completed",
+                    "value": {
+                      "id": "chatcmpl_01JEXAMPLE",
+                      "object": "chat.completion",
+                      "created": 1720000000,
+                      "model": "gpt-4o-mini",
+                      "choices": [
+                        {
+                          "index": 0,
+                          "message": {
+                            "role": "assistant",
+                            "content": "Hi!"
+                          },
+                          "finish_reason": "stop"
+                        }
+                      ],
+                      "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 2,
+                        "total_tokens": 10
+                      },
+                      "x_pixelplus": {
+                        "request_id": "req_01JEXAMPLE",
+                        "execution_id": "exec_01JCHAT",
+                        "provider_account_id": "pa_01JOWNED",
+                        "finish_class": "stop"
+                      }
+                    }
+                  }
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatStreamEvent"
+                },
+                "examples": {
+                  "OpenEvent": {
+                    "summary": "open",
+                    "value": {
+                      "type": "open",
+                      "id": "chatcmpl_01JSTREAM",
+                      "model": "gpt-4o-mini",
+                      "created": 1720000001,
+                      "x_pixelplus": {
+                        "request_id": "req_01JSTREAM",
+                        "execution_id": "exec_01JSTREAM"
+                      }
+                    }
+                  },
+                  "DeltaEvent": {
+                    "summary": "delta",
+                    "value": {
+                      "type": "delta",
+                      "id": "chatcmpl_01JSTREAM",
+                      "choices": [
+                        {
+                          "index": 0,
+                          "delta": {
+                            "content": "Hello"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "HeartbeatEvent": {
+                    "summary": "heartbeat",
+                    "value": {
+                      "type": "heartbeat",
+                      "ts": 1720000002
+                    }
+                  },
+                  "CompletedEvent": {
+                    "summary": "completed terminal",
+                    "value": {
+                      "type": "completed",
+                      "id": "chatcmpl_01JSTREAM",
+                      "finish_class": "stop",
+                      "usage": {
+                        "prompt_tokens": 8,
+                        "completion_tokens": 4,
+                        "total_tokens": 12
+                      },
+                      "x_pixelplus": {
+                        "request_id": "req_01JSTREAM",
+                        "execution_id": "exec_01JSTREAM",
+                        "finish_class": "stop"
+                      }
+                    }
+                  },
+                  "FailedEvent": {
+                    "summary": "failed terminal",
+                    "value": {
+                      "type": "failed",
+                      "id": "chatcmpl_01JFAIL",
+                      "finish_class": "failed",
+                      "error": {
+                        "code": "provider_rate_limited",
+                        "category": "execution",
+                        "status_class": "provider_rate",
+                        "retryability": "new_request_only",
+                        "remediation": "wait_provider_cooldown",
+                        "request_id": "req_01JEXAMPLE",
+                        "failure_stage": "upstream_execution",
+                        "operation": "chat_streaming",
+                        "commit_status": "unknown",
+                        "correlation_id": "cor_01JRATE",
+                        "safe_context": {
+                          "commit_certainty": "unknown"
+                        }
+                      },
+                      "x_pixelplus": {
+                        "request_id": "req_01JRATE",
+                        "execution_id": "exec_01JFAIL",
+                        "finish_class": "failed"
+                      }
+                    }
+                  },
+                  "CanceledEvent": {
+                    "summary": "canceled terminal",
+                    "value": {
+                      "type": "canceled",
+                      "id": "chatcmpl_01JCANCEL",
+                      "finish_class": "canceled",
+                      "x_pixelplus": {
+                        "request_id": "req_01JCANCEL",
+                        "execution_id": "exec_01JCANCEL",
+                        "finish_class": "canceled",
+                        "upstream_abort_attempted": true,
+                        "upstream_stop_confirmed": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign/unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency conflict / uncertain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorExecutionPossiblyCommitted": {
+                    "$ref": "#/components/examples/ErrorExecutionPossiblyCommitted"
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Capability / account pre-upstream rejection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorCapabilityUnsupported": {
+                    "$ref": "#/components/examples/ErrorCapabilityUnsupported"
+                  },
+                  "ErrorCapabilityUnverified": {
+                    "$ref": "#/components/examples/ErrorCapabilityUnverified"
+                  },
+                  "ErrorSnapshotStale": {
+                    "$ref": "#/components/examples/ErrorSnapshotStale"
+                  },
+                  "ErrorAccountNotUsable": {
+                    "$ref": "#/components/examples/ErrorAccountNotUsable"
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Distinct Public API admission limits and Provider runtime rate/quota outcomes; codes and failure_stage preserve the pre-A6 versus post-A6 boundary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorRateLimit": {
+                    "$ref": "#/components/examples/ErrorRateLimit"
+                  },
+                  "ErrorConcurrencyLimit": {
+                    "$ref": "#/components/examples/ErrorConcurrencyLimit"
+                  },
+                  "ErrorQuotaExhausted": {
+                    "$ref": "#/components/examples/ErrorQuotaExhausted"
+                  },
+                  "ErrorProviderRateLimitedUnknown": {
+                    "$ref": "#/components/examples/ErrorProviderRateLimitedUnknown"
+                  },
+                  "ErrorProviderQuotaExhausted": {
+                    "$ref": "#/components/examples/ErrorProviderQuotaExhausted"
+                  }
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream/runtime failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorProviderAuthExpired": {
+                    "$ref": "#/components/examples/ErrorProviderAuthExpired"
+                  },
+                  "ErrorProviderChallenged": {
+                    "$ref": "#/components/examples/ErrorProviderChallenged"
+                  },
+                  "ErrorUpstreamProtocolDrift": {
+                    "$ref": "#/components/examples/ErrorUpstreamProtocolDrift"
+                  },
+                  "ErrorExecutionPossiblyCommitted": {
+                    "$ref": "#/components/examples/ErrorExecutionPossiblyCommitted"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chat/executions/{execution_id}/cancel": {
+      "post": {
+        "operationId": "cancelChatExecution",
+        "summary": "Cancel an in-flight chat execution",
+        "description": "Public route: POST /v1/chat/executions/{execution_id}/cancel. Acknowledges cancel_requested/canceled honestly and includes upstream_abort_attempted/upstream_stop_confirmed booleans; never claims stop unless confirmed. Cancellation is not proof upstream stopped. Disconnect is also implicit cancel.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Chat"
+        ],
+        "parameters": [
+          {
+            "name": "execution_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancel acknowledgement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCancelResponse"
+                },
+                "examples": {
+                  "CancelRequested": {
+                    "summary": "Honest cancel_requested",
+                    "value": {
+                      "execution_id": "exec_01JSTREAM",
+                      "cancel_state": "cancel_requested",
+                      "upstream_abort_attempted": true,
+                      "upstream_stop_confirmed": false,
+                      "request_id": "req_01JCANCEL2"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown/foreign execution_id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/assets": {
+      "post": {
+        "operationId": "createAsset",
+        "summary": "Upload input or mask asset",
+        "description": "Public route: POST /v1/assets. Multipart form with kind=input|mask and file. Same-Tenant ownership only.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Assets"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "file"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "input",
+                      "mask"
+                    ]
+                  },
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created asset metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Asset"
+                },
+                "examples": {
+                  "InputAsset": {
+                    "summary": "Input asset",
+                    "value": {
+                      "asset_id": "asset_01JINPUT",
+                      "kind": "input",
+                      "content_type": "image/png",
+                      "byte_size": 1024,
+                      "width": 512,
+                      "height": 512,
+                      "checksum": "sha256:2cf24dba5fb0a30e",
+                      "origin": "uploaded",
+                      "created_at": "2026-07-18T00:00:00Z",
+                      "retention_class": "input_default"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid image/mask",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/assets/{asset_id}": {
+      "get": {
+        "operationId": "getAsset",
+        "summary": "Get same-Tenant asset metadata",
+        "description": "Public route: GET /v1/assets/{asset_id}. Cross-tenant id => resource_not_found.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Assets"
+        ],
+        "parameters": [
+          {
+            "name": "asset_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Asset metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Asset"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown/foreign asset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/assets/{asset_id}/content": {
+      "get": {
+        "operationId": "getAssetContent",
+        "summary": "Download same-Tenant asset bytes",
+        "description": "Public route: GET /v1/assets/{asset_id}/content. Cross-tenant => resource_not_found, zero foreign read.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Assets"
+        ],
+        "parameters": [
+          {
+            "name": "asset_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Asset binary content",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown/foreign/expired asset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/images/generations": {
+      "post": {
+        "operationId": "createImageGeneration",
+        "summary": "Create durable image generation job",
+        "description": "Public route: POST /v1/images/generations. Async durable job returns 202 RenderJob. JSON asset references, not raw provider payloads. Requires model,prompt. operation is immutable image_generation.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Images"
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageGenerationRequest"
+              },
+              "examples": {
+                "Generate": {
+                  "summary": "Generate",
+                  "value": {
+                    "model": "gpt-image-1",
+                    "prompt": "A red cube"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Queued RenderJob",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderJob"
+                },
+                "examples": {
+                  "QueuedGeneration": {
+                    "summary": "Queued generation",
+                    "value": {
+                      "job_id": "job_01JGEN",
+                      "operation": "image_generation",
+                      "model": "gpt-image-1",
+                      "lifecycle_state": "queued",
+                      "state_revision": 0,
+                      "created_at": "2026-07-18T00:00:00Z",
+                      "updated_at": "2026-07-18T00:00:00Z",
+                      "request_id": "req_01JGEN"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign account pin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Capability rejection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorCapabilityUnsupported": {
+                    "$ref": "#/components/examples/ErrorCapabilityUnsupported"
+                  },
+                  "ErrorCapabilityUnverified": {
+                    "$ref": "#/components/examples/ErrorCapabilityUnverified"
+                  },
+                  "ErrorSnapshotStale": {
+                    "$ref": "#/components/examples/ErrorSnapshotStale"
+                  },
+                  "ErrorAccountNotUsable": {
+                    "$ref": "#/components/examples/ErrorAccountNotUsable"
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Provider rate/quota",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorProviderRateLimitedUnknown": {
+                    "$ref": "#/components/examples/ErrorProviderRateLimitedUnknown"
+                  },
+                  "ErrorProviderQuotaExhausted": {
+                    "$ref": "#/components/examples/ErrorProviderQuotaExhausted"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/images/edits": {
+      "post": {
+        "operationId": "createImageEdit",
+        "summary": "Create durable image edit job",
+        "description": "Public route: POST /v1/images/edits. Requires model,prompt,input_asset_id. Returns 202 RenderJob with immutable operation=image_edit.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Images"
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageEditRequest"
+              },
+              "examples": {
+                "Edit": {
+                  "summary": "Edit",
+                  "value": {
+                    "model": "gpt-image-1",
+                    "prompt": "Make it blue",
+                    "input_asset_id": "asset_01JINPUT"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Queued RenderJob",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderJob"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown/foreign input asset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Capability rejection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorCapabilityUnsupported": {
+                    "$ref": "#/components/examples/ErrorCapabilityUnsupported"
+                  },
+                  "ErrorSnapshotStale": {
+                    "$ref": "#/components/examples/ErrorSnapshotStale"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/images/inpaints": {
+      "post": {
+        "operationId": "createImageInpaint",
+        "summary": "Create durable inpaint job",
+        "description": "Public route: POST /v1/images/inpaints. PixelPlus explicit inpaint surface. Requires model,prompt,input_asset_id,mask_asset_id. Returns 202 RenderJob. Mask is never silently dropped.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "Images"
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageInpaintRequest"
+              },
+              "examples": {
+                "Inpaint": {
+                  "summary": "Inpaint",
+                  "value": {
+                    "model": "gpt-image-1",
+                    "prompt": "Remove object",
+                    "input_asset_id": "asset_01JINPUT",
+                    "mask_asset_id": "asset_01JMASK"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Queued RenderJob",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderJob"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown/foreign asset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Capability unsupported for inpaint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorCapabilityUnsupported": {
+                    "$ref": "#/components/examples/ErrorCapabilityUnsupported"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/render-jobs/{job_id}": {
+      "get": {
+        "operationId": "getRenderJob",
+        "summary": "Poll durable render job",
+        "description": "Public route: GET /v1/render-jobs/{job_id}. States queued/running/cancel_requested/canceled/failed/completed with execution phases, progress source, state_revision, and output entries pending|available|expired|failed. asset_id only when available. completed may contain pending output entries.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "RenderJobs"
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Render job status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderJob"
+                },
+                "examples": {
+                  "CompletedPendingOutput": {
+                    "summary": "Completed with pending placement",
+                    "value": {
+                      "job_id": "job_01JRENDER",
+                      "operation": "image_generation",
+                      "model": "gpt-image-1",
+                      "lifecycle_state": "completed",
+                      "state_revision": 4,
+                      "progress": {
+                        "phase": "placing_output",
+                        "value": null,
+                        "source": "unknown",
+                        "updated_at": "2026-07-18T00:01:00Z"
+                      },
+                      "provider_account_id": "pa_01JOWNED",
+                      "output_entries": [
+                        {
+                          "output_entry_id": "out_01",
+                          "delivery_state": "pending"
+                        }
+                      ],
+                      "commit_status": "committed",
+                      "created_at": "2026-07-18T00:00:00Z",
+                      "updated_at": "2026-07-18T00:01:00Z",
+                      "request_id": "req_01JIMG",
+                      "correlation_id": "cor_01JIMG"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown/foreign job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/render-jobs/{job_id}/cancel": {
+      "post": {
+        "operationId": "cancelRenderJob",
+        "summary": "Cancel a render job",
+        "description": "Public route: POST /v1/render-jobs/{job_id}/cancel. Truthful cancel. Cancellation is not proof upstream stopped.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "RenderJobs"
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancel acknowledgement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenderJobCancelResponse"
+                },
+                "examples": {
+                  "CancelRequested": {
+                    "summary": "cancel_requested",
+                    "value": {
+                      "job_id": "job_01JRENDER",
+                      "lifecycle_state": "cancel_requested",
+                      "upstream_abort_attempted": true,
+                      "upstream_stop_confirmed": false,
+                      "state_revision": 5,
+                      "request_id": "req_01JCANCELJOB"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown/foreign job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/render-jobs/{job_id}/outputs/{output_entry_id}/retry": {
+      "post": {
+        "operationId": "retryRenderJobOutput",
+        "summary": "Retry one output placement",
+        "description": "Public route: POST /v1/render-jobs/{job_id}/outputs/{output_entry_id}/retry. Targets one entry and explicitly never re-renders. Output placement retry cannot re-render.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "tags": [
+          "RenderJobs"
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "output_entry_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Placement retry accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputRetryResponse"
+                },
+                "examples": {
+                  "RetryPending": {
+                    "summary": "Retry placement, no re-render",
+                    "value": {
+                      "job_id": "job_01JRENDER",
+                      "output_entry_id": "out_01",
+                      "delivery_state": "pending",
+                      "re_render": false,
+                      "request_id": "req_01JRETRYOUT"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown/foreign job or entry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ClientApiKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "sk-pxp_<public_locator>_<secret>",
+        "description": "Client API Key bearer. Material form sk-pxp_<public_locator>_<secret>. Security Principal is derived server-side; clients MUST NOT supply tenant_id."
+      }
+    },
+    "schemas": {
+      "CanonicalError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "category",
+          "status_class",
+          "retryability",
+          "remediation",
+          "request_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "authentication",
+              "authorization",
+              "admission",
+              "validation",
+              "routing",
+              "capability",
+              "execution",
+              "delivery",
+              "dependency",
+              "internal"
+            ]
+          },
+          "status_class": {
+            "type": "string",
+            "enum": [
+              "unauthorized",
+              "not_found",
+              "forbidden",
+              "invalid_request",
+              "request_size",
+              "rate_limit",
+              "concurrency_limit",
+              "quota",
+              "account_policy",
+              "capability",
+              "routing",
+              "conflict",
+              "provider_rate",
+              "provider_quota",
+              "upstream_auth",
+              "upstream_challenge",
+              "upstream_timeout",
+              "upstream_unavailable",
+              "upstream_protocol",
+              "upstream_rejection",
+              "uncertainty",
+              "gone",
+              "capacity",
+              "dependency",
+              "integrity",
+              "internal",
+              "operation_terminal"
+            ]
+          },
+          "retryability": {
+            "type": "string",
+            "enum": [
+              "not_retryable",
+              "retry_after",
+              "safe_internal_retry",
+              "idempotent_replay",
+              "new_request_only",
+              "operator_action_required"
+            ]
+          },
+          "remediation": {
+            "type": "string",
+            "enum": [
+              "authenticate",
+              "replace_client_api_key",
+              "request_permission",
+              "fix_request",
+              "reduce_payload",
+              "wait_admission",
+              "submit_credential",
+              "complete_oauth",
+              "reauthenticate",
+              "ack_risk",
+              "enable_account",
+              "wait_provider_cooldown",
+              "account_remediation",
+              "provider_remediation",
+              "routing_remediation",
+              "capability_unsupported",
+              "capability_unverified",
+              "snapshot_stale",
+              "model_unavailable",
+              "asset_lifecycle",
+              "delete_assets_or_wait_expiry",
+              "execution_recovery",
+              "retry_same_idempotency_key",
+              "submit_new_request",
+              "contact_operator",
+              "auth_mode_unavailable",
+              "delete_and_recreate",
+              "none"
+            ]
+          },
+          "request_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "correlation_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "chat_streaming",
+              "image_generation",
+              "image_edit",
+              "inpaint",
+              "asset_create",
+              "asset_retrieve",
+              "render_job_status",
+              "render_job_cancel",
+              "output_delivery_retry",
+              "model_list"
+            ]
+          },
+          "failure_stage": {
+            "type": "string",
+            "enum": [
+              "authentication",
+              "authorization",
+              "admission",
+              "request_validation",
+              "routing",
+              "capability",
+              "credential",
+              "asset",
+              "execution",
+              "upstream_preflight",
+              "upstream_execution",
+              "upstream_capture",
+              "cancellation",
+              "recovery",
+              "output_delivery",
+              "dependency",
+              "internal"
+            ]
+          },
+          "retry_after_class": {
+            "type": "string"
+          },
+          "retry_after_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Finite logical wait projection only: ceiling seconds to the latest matching retry_not_before, with a minimum of one second. Omit when a non-time gate (unknown commit, operator action, not_retryable) suppresses wait."
+          },
+          "commit_status": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "not_committed",
+              "committed",
+              "unknown"
+            ]
+          },
+          "idempotency_state": {
+            "type": "string",
+            "enum": [
+              "not_used",
+              "in_progress",
+              "terminal",
+              "conflict",
+              "uncertain"
+            ]
+          },
+          "resource_reference": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "provider_account_id": {
+                "type": "string"
+              },
+              "job_id": {
+                "type": "string"
+              },
+              "asset_id": {
+                "type": "string"
+              },
+              "output_entry_id": {
+                "type": "string"
+              },
+              "execution_id": {
+                "type": "string"
+              }
+            },
+            "description": "Same-Tenant local ids only. MUST be omitted for foreign/unknown identifiers."
+          },
+          "safe_context": {
+            "type": "object",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": "Bounded safe metadata only. Never tenant_id, credentials, prompt/content, raw provider data, or foreign ids."
+          }
+        },
+        "description": "Canonical Public API error envelope from #16. Never exposes tenant_id, raw provider data, credentials, prompt/content, or foreign ids.",
+        "examples": [
+          {
+            "code": "capability_unsupported",
+            "category": "capability",
+            "status_class": "capability",
+            "retryability": "not_retryable",
+            "remediation": "capability_unsupported",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "capability",
+            "operation": "chat_streaming",
+            "correlation_id": "cor_01JCHAT"
+          },
+          {
+            "code": "capability_unverified",
+            "category": "capability",
+            "status_class": "capability",
+            "retryability": "retry_after",
+            "remediation": "capability_unverified",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "capability",
+            "operation": "image_generation",
+            "retry_after_class": "capability_reprobe"
+          },
+          {
+            "code": "snapshot_stale",
+            "category": "capability",
+            "status_class": "capability",
+            "retryability": "retry_after",
+            "remediation": "snapshot_stale",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "capability",
+            "operation": "chat",
+            "retry_after_class": "capability_reprobe"
+          },
+          {
+            "code": "account_not_usable",
+            "category": "routing",
+            "status_class": "account_policy",
+            "retryability": "not_retryable",
+            "remediation": "account_remediation",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "routing",
+            "operation": "chat",
+            "resource_reference": {
+              "provider_account_id": "pa_01JOWNED"
+            }
+          },
+          {
+            "code": "provider_rate_limited",
+            "category": "execution",
+            "status_class": "provider_rate",
+            "retryability": "new_request_only",
+            "remediation": "wait_provider_cooldown",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "upstream_execution",
+            "operation": "chat",
+            "commit_status": "unknown",
+            "correlation_id": "cor_01JRATE",
+            "safe_context": {
+              "commit_certainty": "unknown"
+            }
+          },
+          {
+            "code": "provider_quota_exhausted",
+            "category": "execution",
+            "status_class": "provider_quota",
+            "retryability": "retry_after",
+            "remediation": "wait_provider_cooldown",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "upstream_execution",
+            "operation": "image_generation",
+            "commit_status": "not_committed",
+            "retry_after_class": "provider_cooldown",
+            "retry_after_seconds": 120
+          },
+          {
+            "code": "provider_auth_expired",
+            "category": "execution",
+            "status_class": "upstream_auth",
+            "retryability": "operator_action_required",
+            "remediation": "reauthenticate",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "credential",
+            "operation": "chat",
+            "resource_reference": {
+              "provider_account_id": "pa_01JOWNED"
+            }
+          },
+          {
+            "code": "provider_challenged",
+            "category": "execution",
+            "status_class": "upstream_challenge",
+            "retryability": "operator_action_required",
+            "remediation": "contact_operator",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "upstream_execution",
+            "operation": "chat"
+          },
+          {
+            "code": "upstream_protocol_drift",
+            "category": "execution",
+            "status_class": "upstream_protocol",
+            "retryability": "operator_action_required",
+            "remediation": "contact_operator",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "upstream_execution",
+            "operation": "chat_streaming"
+          },
+          {
+            "code": "execution_possibly_committed",
+            "category": "execution",
+            "status_class": "uncertainty",
+            "retryability": "new_request_only",
+            "remediation": "submit_new_request",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "upstream_execution",
+            "operation": "chat",
+            "commit_status": "unknown",
+            "idempotency_state": "uncertain"
+          },
+          {
+            "code": "resource_not_found",
+            "category": "authorization",
+            "status_class": "not_found",
+            "retryability": "not_retryable",
+            "remediation": "none",
+            "request_id": "req_01JEXAMPLE",
+            "failure_stage": "authorization"
+          }
+        ]
+      },
+      "ChatMessage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "role",
+          "content"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "system",
+              "user",
+              "assistant",
+              "tool"
+            ]
+          },
+          "content": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "required": [
+                    "type"
+                  ],
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ChatXPixelPlus": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider_account_id": {
+            "type": "string",
+            "description": "Optional same-Tenant explicit account pin. Foreign id maps to resource_not_found."
+          },
+          "allow_fallback": {
+            "type": "boolean",
+            "description": "Client opt-in hint; still subject to Tenant Routing Policy and proof-of-non-commit (#11/#12)."
+          },
+          "conversation_id": {
+            "type": "string",
+            "description": "Optional affinity key for multi-turn soft preference (#11)."
+          }
+        },
+        "description": "PixelPlus routing extensions. MUST NOT accept tenant_id."
+      },
+      "ChatCompletionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "model",
+          "messages"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "messages": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/ChatMessage"
+            }
+          },
+          "stream": {
+            "type": "boolean",
+            "default": false
+          },
+          "temperature": {
+            "type": "number"
+          },
+          "max_tokens": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "top_p": {
+            "type": "number"
+          },
+          "n": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "stop": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "user": {
+            "type": "string"
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatXPixelPlus"
+          }
+        },
+        "description": "OpenAI-like chat request. tenant_id is not accepted. Idempotency-Key header scopes replay.",
+        "examples": [
+          {
+            "model": "gpt-4o-mini",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Hello"
+              }
+            ],
+            "stream": false,
+            "x_pixelplus": {
+              "allow_fallback": true
+            }
+          }
+        ]
+      },
+      "ChatUsage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "properties": {
+          "prompt_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "completion_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total_tokens": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ChatSafeMetadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "correlation_id": {
+            "type": "string"
+          },
+          "execution_id": {
+            "type": "string"
+          },
+          "provider_account_id": {
+            "type": "string"
+          },
+          "finish_class": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "length",
+              "content_filter",
+              "canceled",
+              "failed"
+            ]
+          },
+          "streaming_class": {
+            "type": "string",
+            "enum": [
+              "real",
+              "synthetic",
+              "unsupported"
+            ]
+          },
+          "upstream_abort_attempted": {
+            "type": "boolean"
+          },
+          "upstream_stop_confirmed": {
+            "type": "boolean"
+          }
+        },
+        "description": "Server-owned safe metadata only. No raw provider shapes or credentials.",
+        "required": [
+          "request_id",
+          "execution_id"
+        ]
+      },
+      "ChatCompletionChoice": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "message",
+          "finish_reason"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "message": {
+            "$ref": "#/components/schemas/ChatMessage"
+          },
+          "finish_reason": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "length",
+              "content_filter",
+              "canceled",
+              "failed"
+            ]
+          }
+        }
+      },
+      "ChatCompletionResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string",
+            "const": "chat.completion"
+          },
+          "created": {
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "choices": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionChoice"
+            }
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ChatUsage"
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatSafeMetadata"
+          }
+        },
+        "description": "Non-stream OpenAI-like response plus PixelPlus safe metadata. No provider raw shape.",
+        "examples": [
+          {
+            "id": "chatcmpl_01JEXAMPLE",
+            "object": "chat.completion",
+            "created": 1720000000,
+            "model": "gpt-4o-mini",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "Hi!"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 8,
+              "completion_tokens": 2,
+              "total_tokens": 10
+            },
+            "x_pixelplus": {
+              "request_id": "req_01JEXAMPLE",
+              "execution_id": "exec_01JCHAT",
+              "provider_account_id": "pa_01JOWNED",
+              "finish_class": "stop"
+            }
+          }
+        ]
+      },
+      "ChatOpenEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id",
+          "model",
+          "created",
+          "x_pixelplus"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "open"
+          },
+          "id": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "created": {
+            "type": "integer"
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatSafeMetadata"
+          }
+        },
+        "examples": [
+          {
+            "type": "open",
+            "id": "chatcmpl_01JSTREAM",
+            "model": "gpt-4o-mini",
+            "created": 1720000001,
+            "x_pixelplus": {
+              "request_id": "req_01JSTREAM",
+              "execution_id": "exec_01JSTREAM"
+            }
+          }
+        ]
+      },
+      "ChatDeltaChoice": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "delta"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "delta": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "role": {
+                "type": "string",
+                "enum": [
+                  "assistant"
+                ]
+              },
+              "content": {
+                "type": "string"
+              }
+            }
+          },
+          "finish_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ChatDeltaEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "choices"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "delta"
+          },
+          "id": {
+            "type": "string"
+          },
+          "choices": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/ChatDeltaChoice"
+            }
+          }
+        },
+        "description": "OpenAI-compatible choices[].delta content event.",
+        "examples": [
+          {
+            "type": "delta",
+            "id": "chatcmpl_01JSTREAM",
+            "choices": [
+              {
+                "index": 0,
+                "delta": {
+                  "content": "Hello"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ChatHeartbeatEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "heartbeat"
+          },
+          "ts": {
+            "type": "integer"
+          }
+        },
+        "examples": [
+          {
+            "type": "heartbeat",
+            "ts": 1720000002
+          }
+        ]
+      },
+      "ChatCompletedEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "finish_class"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "completed"
+          },
+          "id": {
+            "type": "string"
+          },
+          "finish_class": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "length",
+              "content_filter"
+            ]
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ChatUsage"
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatSafeMetadata"
+          }
+        },
+        "examples": [
+          {
+            "type": "completed",
+            "id": "chatcmpl_01JSTREAM",
+            "finish_class": "stop",
+            "usage": {
+              "prompt_tokens": 8,
+              "completion_tokens": 4,
+              "total_tokens": 12
+            },
+            "x_pixelplus": {
+              "request_id": "req_01JSTREAM",
+              "execution_id": "exec_01JSTREAM",
+              "finish_class": "stop"
+            }
+          }
+        ]
+      },
+      "ChatFailedEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "finish_class",
+          "error"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "failed"
+          },
+          "id": {
+            "type": "string"
+          },
+          "finish_class": {
+            "type": "string",
+            "const": "failed"
+          },
+          "error": {
+            "$ref": "#/components/schemas/CanonicalError"
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatSafeMetadata"
+          }
+        },
+        "examples": [
+          {
+            "type": "failed",
+            "id": "chatcmpl_01JFAIL",
+            "finish_class": "failed",
+            "error": {
+              "code": "provider_rate_limited",
+              "category": "execution",
+              "status_class": "provider_rate",
+              "retryability": "new_request_only",
+              "remediation": "wait_provider_cooldown",
+              "request_id": "req_01JEXAMPLE",
+              "failure_stage": "upstream_execution",
+              "operation": "chat_streaming",
+              "commit_status": "unknown",
+              "correlation_id": "cor_01JRATE",
+              "safe_context": {
+                "commit_certainty": "unknown"
+              }
+            },
+            "x_pixelplus": {
+              "request_id": "req_01JRATE",
+              "execution_id": "exec_01JFAIL",
+              "finish_class": "failed"
+            }
+          }
+        ]
+      },
+      "ChatCanceledEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "finish_class"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "canceled"
+          },
+          "id": {
+            "type": "string"
+          },
+          "finish_class": {
+            "type": "string",
+            "const": "canceled"
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatSafeMetadata"
+          }
+        },
+        "description": "Terminal cancel event. Cancellation is not proof upstream stopped.",
+        "examples": [
+          {
+            "type": "canceled",
+            "id": "chatcmpl_01JCANCEL",
+            "finish_class": "canceled",
+            "x_pixelplus": {
+              "request_id": "req_01JCANCEL",
+              "execution_id": "exec_01JCANCEL",
+              "finish_class": "canceled",
+              "upstream_abort_attempted": true,
+              "upstream_stop_confirmed": false
+            }
+          }
+        ]
+      },
+      "ChatStreamEvent": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ChatOpenEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChatDeltaEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChatHeartbeatEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChatCompletedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChatFailedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChatCanceledEvent"
+          }
+        ],
+        "description": "SSE event payload objects for text/event-stream. Normative sequence: open -> delta* (heartbeats allowed interleaved) -> exactly one of completed|failed|canceled terminal. No post-terminal data. No [DONE] second sentinel. Disconnect is implicit cancel. Cancellation is not proof upstream stopped. commit-unknown implies no fallback/retry."
+      },
+      "ChatCancelResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "execution_id",
+          "cancel_state",
+          "upstream_abort_attempted",
+          "upstream_stop_confirmed"
+        ],
+        "properties": {
+          "execution_id": {
+            "type": "string"
+          },
+          "cancel_state": {
+            "type": "string",
+            "enum": [
+              "cancel_requested",
+              "canceled"
+            ],
+            "description": "Honest acknowledgement only. canceled requires stop confirmed or no future execution."
+          },
+          "upstream_abort_attempted": {
+            "type": "boolean"
+          },
+          "upstream_stop_confirmed": {
+            "type": "boolean",
+            "description": "MUST be false unless stop is confirmed. Cancellation is not proof upstream stopped."
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "examples": [
+          {
+            "execution_id": "exec_01JSTREAM",
+            "cancel_state": "cancel_requested",
+            "upstream_abort_attempted": true,
+            "upstream_stop_confirmed": false,
+            "request_id": "req_01JCANCEL2"
+          }
+        ]
+      },
+      "ModelOffer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider_account_id",
+          "operation",
+          "operation_status",
+          "model_slug",
+          "offerable",
+          "freshness"
+        ],
+        "properties": {
+          "provider_account_id": {
+            "type": "string",
+            "description": "Owner-Tenant Provider Account id only."
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "chat_streaming",
+              "image_generation",
+              "image_edit",
+              "inpaint"
+            ]
+          },
+          "operation_status": {
+            "type": "string",
+            "enum": [
+              "verified",
+              "conditionally_supported"
+            ]
+          },
+          "model_slug": {
+            "type": "string"
+          },
+          "offerable": {
+            "type": "boolean",
+            "const": true,
+            "description": "Client-facing model lists contain only currently offerable pairs."
+          },
+          "streaming_class": {
+            "type": "string",
+            "enum": [
+              "real",
+              "synthetic"
+            ]
+          },
+          "freshness": {
+            "type": "string",
+            "const": "fresh"
+          },
+          "verified_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Snapshot verification timestamp when known."
+          }
+        },
+        "description": "One owner-Tenant offerable model/operation pair: fresh snapshot, verified or conditionally_supported capability, and all usability/risk gates passed."
+      },
+      "ModelObject": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "object",
+          "created",
+          "owned_by",
+          "x_pixelplus"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string",
+            "const": "model"
+          },
+          "created": {
+            "type": "integer"
+          },
+          "owned_by": {
+            "type": "string"
+          },
+          "x_pixelplus": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "offers"
+            ],
+            "properties": {
+              "offers": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ModelOffer"
+                },
+                "description": "Owner-Tenant capability offers only. Never provider credentials, raw evidence, or static provider catalogs.",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      },
+      "ModelListResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "object",
+          "data"
+        ],
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "list"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelObject"
+            }
+          }
+        },
+        "examples": [
+          {
+            "object": "list",
+            "data": [
+              {
+                "id": "gpt-4o-mini",
+                "object": "model",
+                "created": 1720000000,
+                "owned_by": "pixelplus",
+                "x_pixelplus": {
+                  "offers": [
+                    {
+                      "provider_account_id": "pa_01JOWNED",
+                      "operation": "chat",
+                      "operation_status": "verified",
+                      "model_slug": "gpt-4o-mini",
+                      "offerable": true,
+                      "freshness": "fresh",
+                      "verified_at": "2026-07-18T00:00:00Z"
+                    },
+                    {
+                      "provider_account_id": "pa_01JOWNED",
+                      "operation": "chat_streaming",
+                      "operation_status": "verified",
+                      "model_slug": "gpt-4o-mini",
+                      "offerable": true,
+                      "streaming_class": "real",
+                      "freshness": "fresh",
+                      "verified_at": "2026-07-18T00:00:00Z"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "Asset": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "asset_id",
+          "kind",
+          "content_type",
+          "byte_size",
+          "checksum",
+          "origin",
+          "created_at",
+          "retention_class"
+        ],
+        "properties": {
+          "asset_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "input",
+              "mask",
+              "output"
+            ]
+          },
+          "byte_size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "source_job_id": {
+            "type": "string"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "checksum": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Non-secret content digest for integrity and deduplication."
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "uploaded",
+              "generated"
+            ]
+          },
+          "retention_class": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "description": "Same-Tenant Asset metadata. tenant_id remains server-side authority; content is retrieved separately.",
+        "examples": [
+          {
+            "asset_id": "asset_01JINPUT",
+            "kind": "input",
+            "byte_size": 1024,
+            "width": 512,
+            "height": 512,
+            "created_at": "2026-07-18T00:00:00Z",
+            "content_type": "image/png",
+            "checksum": "sha256:2cf24dba5fb0a30e",
+            "origin": "uploaded",
+            "retention_class": "input_default"
+          }
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "origin": {
+                  "const": "generated"
+                }
+              },
+              "required": [
+                "origin"
+              ]
+            },
+            "then": {
+              "required": [
+                "source_job_id"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "source_job_id"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "Progress": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "updated_at"
+        ],
+        "properties": {
+          "phase": {
+            "type": "string"
+          },
+          "value": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "reported",
+              "estimated",
+              "unknown"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "OutputEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "output_entry_id",
+          "delivery_state"
+        ],
+        "properties": {
+          "output_entry_id": {
+            "type": "string"
+          },
+          "delivery_state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "available",
+              "expired",
+              "failed"
+            ]
+          },
+          "asset_id": {
+            "type": "string",
+            "description": "Present only when delivery_state=available."
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "delivery_state": {
+                  "const": "available"
+                }
+              },
+              "required": [
+                "delivery_state"
+              ]
+            },
+            "then": {
+              "required": [
+                "asset_id"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "asset_id"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "RenderJob": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "operation",
+          "lifecycle_state",
+          "state_revision",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "image_generation",
+              "image_edit",
+              "inpaint"
+            ],
+            "description": "Immutable operation class for the job."
+          },
+          "model": {
+            "type": "string"
+          },
+          "lifecycle_state": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "cancel_requested",
+              "canceled",
+              "failed",
+              "completed"
+            ]
+          },
+          "execution_phase": {
+            "type": "string",
+            "enum": [
+              "preflight",
+              "upstream",
+              "capturing_result",
+              "placing_output"
+            ]
+          },
+          "state_revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "progress": {
+            "$ref": "#/components/schemas/Progress"
+          },
+          "provider_account_id": {
+            "type": "string"
+          },
+          "input_asset_id": {
+            "type": "string"
+          },
+          "mask_asset_id": {
+            "type": "string"
+          },
+          "output_entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OutputEntry"
+            }
+          },
+          "commit_status": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "not_committed",
+              "committed",
+              "unknown"
+            ]
+          },
+          "failure": {
+            "$ref": "#/components/schemas/CanonicalError"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "correlation_id": {
+            "type": "string"
+          }
+        },
+        "description": "Durable Render Job. completed means render capture complete; output entries may remain pending. Output placement retry never re-renders.",
+        "examples": [
+          {
+            "job_id": "job_01JRENDER",
+            "operation": "image_generation",
+            "model": "gpt-image-1",
+            "lifecycle_state": "completed",
+            "state_revision": 4,
+            "progress": {
+              "phase": "placing_output",
+              "value": null,
+              "source": "unknown",
+              "updated_at": "2026-07-18T00:01:00Z"
+            },
+            "provider_account_id": "pa_01JOWNED",
+            "output_entries": [
+              {
+                "output_entry_id": "out_01",
+                "delivery_state": "pending"
+              }
+            ],
+            "commit_status": "committed",
+            "created_at": "2026-07-18T00:00:00Z",
+            "updated_at": "2026-07-18T00:01:00Z",
+            "request_id": "req_01JIMG",
+            "correlation_id": "cor_01JIMG"
+          }
+        ]
+      },
+      "ImageGenerationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "model",
+          "prompt"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "n": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "size": {
+            "type": "string"
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatXPixelPlus"
+          }
+        },
+        "description": "JSON asset-reference style generation request. Returns 202 RenderJob.",
+        "examples": [
+          {
+            "model": "gpt-image-1",
+            "prompt": "A red cube"
+          }
+        ]
+      },
+      "ImageEditRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "model",
+          "prompt",
+          "input_asset_id"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "input_asset_id": {
+            "type": "string"
+          },
+          "n": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatXPixelPlus"
+          }
+        },
+        "examples": [
+          {
+            "model": "gpt-image-1",
+            "prompt": "Make it blue",
+            "input_asset_id": "asset_01JINPUT"
+          }
+        ]
+      },
+      "ImageInpaintRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "model",
+          "prompt",
+          "input_asset_id",
+          "mask_asset_id"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1
+          },
+          "input_asset_id": {
+            "type": "string"
+          },
+          "mask_asset_id": {
+            "type": "string"
+          },
+          "n": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "x_pixelplus": {
+            "$ref": "#/components/schemas/ChatXPixelPlus"
+          }
+        },
+        "description": "Inpaint requires mask_asset_id. Mask is never silently dropped to degrade to image_edit.",
+        "examples": [
+          {
+            "model": "gpt-image-1",
+            "prompt": "Remove object",
+            "input_asset_id": "asset_01JINPUT",
+            "mask_asset_id": "asset_01JMASK"
+          }
+        ]
+      },
+      "RenderJobCancelResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "lifecycle_state",
+          "upstream_abort_attempted",
+          "upstream_stop_confirmed"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "lifecycle_state": {
+            "type": "string",
+            "enum": [
+              "cancel_requested",
+              "canceled",
+              "completed",
+              "failed"
+            ]
+          },
+          "upstream_abort_attempted": {
+            "type": "boolean"
+          },
+          "upstream_stop_confirmed": {
+            "type": "boolean"
+          },
+          "state_revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "description": "Truthful cancel acknowledgement. cancel_requested is not proof upstream stopped.",
+        "examples": [
+          {
+            "job_id": "job_01JRENDER",
+            "lifecycle_state": "cancel_requested",
+            "upstream_abort_attempted": true,
+            "upstream_stop_confirmed": false,
+            "state_revision": 5,
+            "request_id": "req_01JCANCELJOB"
+          }
+        ]
+      },
+      "OutputRetryResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "output_entry_id",
+          "delivery_state",
+          "re_render"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "output_entry_id": {
+            "type": "string"
+          },
+          "delivery_state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "available",
+              "expired",
+              "failed"
+            ]
+          },
+          "asset_id": {
+            "type": "string"
+          },
+          "re_render": {
+            "type": "boolean",
+            "const": false,
+            "description": "Always false. Output placement retry never re-renders."
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "description": "Targets one output entry. Explicitly never re-renders generation/edit/inpaint.",
+        "examples": [
+          {
+            "job_id": "job_01JRENDER",
+            "output_entry_id": "out_01",
+            "delivery_state": "pending",
+            "re_render": false,
+            "request_id": "req_01JRETRYOUT"
+          }
+        ]
+      }
+    },
+    "examples": {
+      "ErrorCapabilityUnsupported": {
+        "summary": "capability_unsupported before upstream",
+        "value": {
+          "code": "capability_unsupported",
+          "category": "capability",
+          "status_class": "capability",
+          "retryability": "not_retryable",
+          "remediation": "capability_unsupported",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "capability",
+          "operation": "chat_streaming",
+          "correlation_id": "cor_01JCHAT"
+        }
+      },
+      "ErrorCapabilityUnverified": {
+        "summary": "capability_unverified",
+        "value": {
+          "code": "capability_unverified",
+          "category": "capability",
+          "status_class": "capability",
+          "retryability": "retry_after",
+          "remediation": "capability_unverified",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "capability",
+          "operation": "image_generation",
+          "retry_after_class": "capability_reprobe"
+        }
+      },
+      "ErrorSnapshotStale": {
+        "summary": "snapshot_stale",
+        "value": {
+          "code": "snapshot_stale",
+          "category": "capability",
+          "status_class": "capability",
+          "retryability": "retry_after",
+          "remediation": "snapshot_stale",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "capability",
+          "operation": "chat",
+          "retry_after_class": "capability_reprobe"
+        }
+      },
+      "ErrorAccountNotUsable": {
+        "summary": "account_not_usable",
+        "value": {
+          "code": "account_not_usable",
+          "category": "routing",
+          "status_class": "account_policy",
+          "retryability": "not_retryable",
+          "remediation": "account_remediation",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "routing",
+          "operation": "chat",
+          "resource_reference": {
+            "provider_account_id": "pa_01JOWNED"
+          }
+        }
+      },
+      "ErrorRateLimit": {
+        "summary": "Public API admission rate limit before execution",
+        "value": {
+          "code": "rate_limit",
+          "category": "admission",
+          "status_class": "rate_limit",
+          "retryability": "retry_after",
+          "remediation": "wait_admission",
+          "request_id": "req_01JADMISSIONRATE",
+          "failure_stage": "admission",
+          "operation": "chat",
+          "retry_after_class": "admission_rate_window",
+          "retry_after_seconds": 30
+        }
+      },
+      "ErrorConcurrencyLimit": {
+        "summary": "Public API admission concurrency limit before execution",
+        "value": {
+          "code": "concurrency_limit",
+          "category": "admission",
+          "status_class": "concurrency_limit",
+          "retryability": "retry_after",
+          "remediation": "wait_admission",
+          "request_id": "req_01JADMISSIONCONCURRENCY",
+          "failure_stage": "admission",
+          "operation": "chat",
+          "retry_after_class": "concurrency_release"
+        }
+      },
+      "ErrorQuotaExhausted": {
+        "summary": "Public API admission quota exhausted before execution",
+        "value": {
+          "code": "quota_exhausted",
+          "category": "admission",
+          "status_class": "quota",
+          "retryability": "retry_after",
+          "remediation": "wait_admission",
+          "request_id": "req_01JADMISSIONQUOTA",
+          "failure_stage": "admission",
+          "operation": "image_generation",
+          "retry_after_class": "admission_quota_reset",
+          "retry_after_seconds": 3600
+        }
+      },
+      "ErrorProviderRateLimitedUnknown": {
+        "summary": "provider_rate_limited with unknown commit, new_request_only",
+        "value": {
+          "code": "provider_rate_limited",
+          "category": "execution",
+          "status_class": "provider_rate",
+          "retryability": "new_request_only",
+          "remediation": "wait_provider_cooldown",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "upstream_execution",
+          "operation": "chat",
+          "commit_status": "unknown",
+          "correlation_id": "cor_01JRATE",
+          "safe_context": {
+            "commit_certainty": "unknown"
+          }
+        }
+      },
+      "ErrorProviderQuotaExhausted": {
+        "summary": "provider_quota_exhausted",
+        "value": {
+          "code": "provider_quota_exhausted",
+          "category": "execution",
+          "status_class": "provider_quota",
+          "retryability": "retry_after",
+          "remediation": "wait_provider_cooldown",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "upstream_execution",
+          "operation": "image_generation",
+          "commit_status": "not_committed",
+          "retry_after_class": "provider_cooldown",
+          "retry_after_seconds": 120
+        }
+      },
+      "ErrorProviderAuthExpired": {
+        "summary": "provider_auth_expired",
+        "value": {
+          "code": "provider_auth_expired",
+          "category": "execution",
+          "status_class": "upstream_auth",
+          "retryability": "operator_action_required",
+          "remediation": "reauthenticate",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "credential",
+          "operation": "chat",
+          "resource_reference": {
+            "provider_account_id": "pa_01JOWNED"
+          }
+        }
+      },
+      "ErrorProviderChallenged": {
+        "summary": "provider_challenged",
+        "value": {
+          "code": "provider_challenged",
+          "category": "execution",
+          "status_class": "upstream_challenge",
+          "retryability": "operator_action_required",
+          "remediation": "contact_operator",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "upstream_execution",
+          "operation": "chat"
+        }
+      },
+      "ErrorUpstreamProtocolDrift": {
+        "summary": "upstream_protocol_drift",
+        "value": {
+          "code": "upstream_protocol_drift",
+          "category": "execution",
+          "status_class": "upstream_protocol",
+          "retryability": "operator_action_required",
+          "remediation": "contact_operator",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "upstream_execution",
+          "operation": "chat_streaming"
+        }
+      },
+      "ErrorExecutionPossiblyCommitted": {
+        "summary": "execution_possibly_committed",
+        "value": {
+          "code": "execution_possibly_committed",
+          "category": "execution",
+          "status_class": "uncertainty",
+          "retryability": "new_request_only",
+          "remediation": "submit_new_request",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "upstream_execution",
+          "operation": "chat",
+          "commit_status": "unknown",
+          "idempotency_state": "uncertain"
+        }
+      },
+      "ErrorResourceNotFound": {
+        "summary": "resource_not_found non-enumerating",
+        "value": {
+          "code": "resource_not_found",
+          "category": "authorization",
+          "status_class": "not_found",
+          "retryability": "not_retryable",
+          "remediation": "none",
+          "request_id": "req_01JEXAMPLE",
+          "failure_stage": "authorization"
+        }
+      }
+    }
+  },
+  "x-pixelplus-artifact-status": "prototype"
+}
