@@ -1,0 +1,29 @@
+CONTEXT.md
+  s_656e8cf040ff48::t_d7d862fb6690f6 171-174
+contracts/README.md
+  s_656e8cf040ff48::t_1c15a507955c44 3-26
+contracts/openapi/README.md
+  s_656e8cf040ff48::t_3b61e76b7aac85 1-26
+contracts/openapi/pixelplus-public-api-v0alpha.yaml
+  s_656e8cf040ff48::t_6e528974ca6cf3 1-3185
+docs/spec/openai-compatible-inference-contract.md
+  s_656e8cf040ff48::t_b28dc4bdec566b 1-380
+scripts/validate-openapi-contract.mjs
+  s_656e8cf040ff48::t_1bed80615b7a14 1-798
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "684d18af5cd70f24dd4d4d7bceb88a3367d04e76",
+  "prompts": {},
+  "sessions": {
+    "s_656e8cf040ff48": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6db8b6ab-f480-43e2-94c6-c59ef5ede857",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
