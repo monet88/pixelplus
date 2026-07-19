@@ -1,0 +1,2964 @@
+{
+  "openapi": "3.1.1",
+  "info": {
+    "title": "PixelPlus Provider Account and Capability Management API Prototype",
+    "version": "0.0.0-prototype",
+    "description": "Non-final issue #19 management tracer. It validates representation choices without implementing a Gateway runtime. Domain semantics remain owned by issues #6, #8-#11, and #15-#17; issue #20 owns final unified versioning and compatibility."
+  },
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "x-pixelplus-artifact-status": "prototype",
+  "servers": [
+    {
+      "url": "/v1",
+      "description": "Prototype Public API base"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Provider Accounts"
+    },
+    {
+      "name": "OAuth"
+    },
+    {
+      "name": "Capabilities"
+    },
+    {
+      "name": "Routing"
+    }
+  ],
+  "security": [
+    {
+      "ClientApiKey": []
+    }
+  ],
+  "paths": {
+    "/provider-accounts": {
+      "post": {
+        "operationId": "createProviderAccount",
+        "summary": "Create Provider Account shell",
+        "description": "Creates a draft shell with health unknown/initial_unprobed. It never accepts or returns Provider Credential material and never activates the account on create.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Draft shell created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountOperationResponse"
+                },
+                "example": {
+                  "account": {
+                    "provider_account_id": "pa_demo_02",
+                    "provider": "gemini",
+                    "auth_mode": "gemini_web_cookie",
+                    "label": "Gemini web",
+                    "lifecycle_state": "draft",
+                    "credential": {
+                      "refresh_supported": false
+                    },
+                    "health": {
+                      "summary_state": "unknown",
+                      "conditions": [
+                        {
+                          "scope": {
+                            "kind": "account"
+                          },
+                          "state": "unknown",
+                          "reason": "initial_unprobed",
+                          "credential_version": 0,
+                          "observed_at": "2026-07-18T10:05:00Z",
+                          "remediation": "submit_credential"
+                        }
+                      ]
+                    },
+                    "administrative_controls": {
+                      "drain_state": "off",
+                      "quarantine_state": "off",
+                      "auth_mode_execution_enabled": true
+                    },
+                    "created_at": "2026-07-18T10:05:00Z",
+                    "updated_at": "2026-07-18T10:05:00Z"
+                  },
+                  "request_id": "req_create_01"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorInvalidRequest": {
+                    "$ref": "#/components/examples/ErrorInvalidRequest"
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Auth Mode unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthModeUnavailable": {
+                    "$ref": "#/components/examples/ErrorAuthModeUnavailable"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProviderAccountRequest"
+              },
+              "example": {
+                "provider": "gemini",
+                "auth_mode": "gemini_web_cookie",
+                "label": "Gemini web"
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "listProviderAccounts",
+        "summary": "List Provider Accounts",
+        "description": "Returns only ordinary non-deleted accounts owned by the authenticated Tenant. This read has no vault decrypt purpose and exposes safe lifecycle, scoped health, and administrative control projections only.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderAccountList"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "provider_account_id": "pa_demo_01",
+                      "provider": "chatgpt",
+                      "auth_mode": "chatgpt_web_access",
+                      "label": "Design team web account",
+                      "lifecycle_state": "active",
+                      "credential": {
+                        "version": 2,
+                        "expires_at": "2026-07-19T10:00:00Z",
+                        "refresh_supported": false,
+                        "last_validated_at": "2026-07-18T10:00:01Z",
+                        "last_probed_at": "2026-07-18T10:00:02Z"
+                      },
+                      "health": {
+                        "summary_state": "healthy",
+                        "conditions": [
+                          {
+                            "scope": {
+                              "kind": "account"
+                            },
+                            "state": "healthy",
+                            "reason": "probe_succeeded",
+                            "credential_version": 2,
+                            "observed_at": "2026-07-18T10:00:02Z",
+                            "remediation": "none"
+                          }
+                        ]
+                      },
+                      "administrative_controls": {
+                        "drain_state": "off",
+                        "quarantine_state": "off",
+                        "auth_mode_execution_enabled": true
+                      },
+                      "created_at": "2026-07-18T09:55:00Z",
+                      "updated_at": "2026-07-18T10:00:02Z"
+                    },
+                    {
+                      "provider_account_id": "pa_demo_02",
+                      "provider": "gemini",
+                      "auth_mode": "gemini_web_cookie",
+                      "label": "Gemini web",
+                      "lifecycle_state": "draft",
+                      "credential": {
+                        "refresh_supported": false
+                      },
+                      "health": {
+                        "summary_state": "unknown",
+                        "conditions": [
+                          {
+                            "scope": {
+                              "kind": "account"
+                            },
+                            "state": "unknown",
+                            "reason": "initial_unprobed",
+                            "credential_version": 0,
+                            "observed_at": "2026-07-18T10:05:00Z",
+                            "remediation": "submit_credential"
+                          }
+                        ]
+                      },
+                      "administrative_controls": {
+                        "drain_state": "off",
+                        "quarantine_state": "off",
+                        "auth_mode_execution_enabled": true
+                      },
+                      "created_at": "2026-07-18T10:05:00Z",
+                      "updated_at": "2026-07-18T10:05:00Z"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.read"
+        ]
+      }
+    },
+    "/provider-accounts/{provider_account_id}": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        }
+      ],
+      "get": {
+        "operationId": "getProviderAccount",
+        "summary": "Get Provider Account status",
+        "description": "Returns an owning-Tenant safe account/status projection. Unknown, foreign, and deleted identifiers share resource_not_found. No vault decrypt or Adapter call occurs.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderAccount"
+                },
+                "example": {
+                  "provider_account_id": "pa_demo_01",
+                  "provider": "chatgpt",
+                  "auth_mode": "chatgpt_web_access",
+                  "label": "Design team web account",
+                  "lifecycle_state": "active",
+                  "credential": {
+                    "version": 2,
+                    "expires_at": "2026-07-19T10:00:00Z",
+                    "refresh_supported": false,
+                    "last_validated_at": "2026-07-18T10:00:01Z",
+                    "last_probed_at": "2026-07-18T10:00:02Z"
+                  },
+                  "health": {
+                    "summary_state": "healthy",
+                    "conditions": [
+                      {
+                        "scope": {
+                          "kind": "account"
+                        },
+                        "state": "healthy",
+                        "reason": "probe_succeeded",
+                        "credential_version": 2,
+                        "observed_at": "2026-07-18T10:00:02Z",
+                        "remediation": "none"
+                      }
+                    ]
+                  },
+                  "administrative_controls": {
+                    "drain_state": "off",
+                    "quarantine_state": "off",
+                    "auth_mode_execution_enabled": true
+                  },
+                  "created_at": "2026-07-18T09:55:00Z",
+                  "updated_at": "2026-07-18T10:00:02Z"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.read"
+        ]
+      },
+      "delete": {
+        "operationId": "deleteProviderAccount",
+        "summary": "Delete Provider Account",
+        "description": "Idempotently stops new decrypt/use, revokes then deletes every stored current or pending credential version, and removes the account from ordinary list/get. The delete command itself has no vault decrypt purpose. An internal retention hold may retain unusable encrypted evidence but never restores retrieval, decrypt, or usability.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Account removed from ordinary product visibility; no response body"
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ]
+      }
+    },
+    "/provider-accounts/{provider_account_id}/credentials": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        }
+      ],
+      "post": {
+        "operationId": "submitProviderCredential",
+        "summary": "Submit direct Provider Credential",
+        "description": "Approved direct secret boundary for a pure draft account. The request may carry Provider Credential material once; the response never echoes it. Validation failure occurs before provider_probe, storing material alone never sets active, and later lifecycle states cannot use this endpoint to bypass reauthentication or enable.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Credential accepted and validation completed; account remains non-usable pending probe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountOperationResponse"
+                },
+                "example": {
+                  "account": {
+                    "provider_account_id": "pa_demo_02",
+                    "provider": "gemini",
+                    "auth_mode": "gemini_web_cookie",
+                    "label": "Gemini web",
+                    "lifecycle_state": "pending_probe",
+                    "credential": {
+                      "version": 1,
+                      "refresh_supported": false,
+                      "last_validated_at": "2026-07-18T10:06:00Z"
+                    },
+                    "health": {
+                      "summary_state": "unknown",
+                      "conditions": [
+                        {
+                          "scope": {
+                            "kind": "account"
+                          },
+                          "state": "unknown",
+                          "reason": "initial_unprobed",
+                          "credential_version": 0,
+                          "observed_at": "2026-07-18T10:05:00Z",
+                          "remediation": "submit_credential"
+                        }
+                      ]
+                    },
+                    "administrative_controls": {
+                      "drain_state": "off",
+                      "quarantine_state": "off",
+                      "auth_mode_execution_enabled": true
+                    },
+                    "created_at": "2026-07-18T10:05:00Z",
+                    "updated_at": "2026-07-18T10:06:00Z"
+                  },
+                  "request_id": "req_cred_01"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed credential rejected before probe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorInvalidRequest": {
+                    "$ref": "#/components/examples/ErrorInvalidRequest"
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Direct credential intake requires a pure draft account",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAccountNotUsable": {
+                    "$ref": "#/components/examples/ErrorAccountNotUsable"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectCredentialSubmissionRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/provider-accounts/{provider_account_id}/oauth-authorizations": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        }
+      ],
+      "post": {
+        "operationId": "startOAuthAuthorization",
+        "summary": "Start OAuth browser/device authorization",
+        "description": "Starts a server-owned OAuth journey for connect or reauthenticate. Connect requires a pure draft account; reauthentication stages a replacement without making a disabled account usable. Disable intent remains sticky across authorization, exchange, and probe for either purpose; only explicit enable plus a current-version probe may restore active use. It returns only user-facing verification metadata; access tokens, refresh tokens, authorization codes, device_code, and PKCE verifier remain server-side.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthAuthorization"
+                },
+                "example": {
+                  "authorization_id": "oauth_demo_01",
+                  "provider_account_id": "pa_demo_03",
+                  "purpose": "connect",
+                  "flow": "device",
+                  "status": "authorization_pending",
+                  "verification_uri": "https://provider.example/device",
+                  "user_code": "ABCD-EFGH",
+                  "expires_at": "2026-07-18T10:25:00Z",
+                  "remediation": "complete_oauth"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Auth Mode or OAuth purpose is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorInvalidRequest": {
+                    "$ref": "#/components/examples/ErrorInvalidRequest"
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Connect or reauthentication lifecycle preconditions are not met",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAccountNotUsable": {
+                    "$ref": "#/components/examples/ErrorAccountNotUsable"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OAuthStartRequest"
+              },
+              "example": {
+                "purpose": "connect",
+                "flow_preference": "device"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        },
+        {
+          "name": "authorization_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^oauth_[A-Za-z0-9]+$"
+          },
+          "description": "Server-owned OAuth authorization identifier; never a Provider token or device code."
+        }
+      ],
+      "get": {
+        "operationId": "getOAuthAuthorization",
+        "summary": "Poll OAuth authorization status",
+        "description": "Returns authorization_pending, succeeded, or failed/remediation using a server-owned identifier. OAuth token exchange material is never returned and success only advances validation/probe gates; it does not bypass activation. This status poll has no vault decrypt purpose.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthAuthorization"
+                },
+                "example": {
+                  "authorization_id": "oauth_demo_01",
+                  "provider_account_id": "pa_demo_03",
+                  "purpose": "connect",
+                  "flow": "device",
+                  "status": "succeeded",
+                  "expires_at": "2026-07-18T10:25:00Z",
+                  "remediation": "none"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ]
+      }
+    },
+    "/provider-accounts/{provider_account_id}/probe": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        }
+      ],
+      "post": {
+        "operationId": "probeProviderAccount",
+        "summary": "Run a safe Provider Account probe",
+        "description": "Runs the cheapest same-Tenant auth/capability-proving path with vault purpose provider_probe. The same public operation probes either the current version during activation/enable or the pending version during reauthentication; only pending-version success performs atomic cutover, and administrative controls reject before vault decrypt or Adapter call. It never creates a billable render, long chat, user prompt, or Asset. Active-origin auth-class failure moves to reauth_required, while disabled administrative intent remains disabled. Transient failure remains retryable in pending_probe with degraded health and does not pretend credential expiry.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountOperationResponse"
+                },
+                "example": {
+                  "account": {
+                    "provider_account_id": "pa_demo_01",
+                    "provider": "chatgpt",
+                    "auth_mode": "chatgpt_web_access",
+                    "label": "Design team web account",
+                    "lifecycle_state": "active",
+                    "credential": {
+                      "version": 2,
+                      "expires_at": "2026-07-19T10:00:00Z",
+                      "refresh_supported": false,
+                      "last_validated_at": "2026-07-18T10:00:01Z",
+                      "last_probed_at": "2026-07-18T10:00:02Z"
+                    },
+                    "health": {
+                      "summary_state": "healthy",
+                      "conditions": [
+                        {
+                          "scope": {
+                            "kind": "account"
+                          },
+                          "state": "healthy",
+                          "reason": "probe_succeeded",
+                          "credential_version": 2,
+                          "observed_at": "2026-07-18T10:00:02Z",
+                          "remediation": "none"
+                        }
+                      ]
+                    },
+                    "administrative_controls": {
+                      "drain_state": "off",
+                      "quarantine_state": "off",
+                      "auth_mode_execution_enabled": true
+                    },
+                    "created_at": "2026-07-18T09:55:00Z",
+                    "updated_at": "2026-07-18T10:00:02Z"
+                  },
+                  "request_id": "req_probe_01"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Lifecycle or control blocks this probe purpose",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAccountNotUsable": {
+                    "$ref": "#/components/examples/ErrorAccountNotUsable"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbeRequest"
+              },
+              "example": {
+                "scope": {
+                  "kind": "account"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/provider-accounts/{provider_account_id}/reauthentication": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        }
+      ],
+      "post": {
+        "operationId": "reauthenticateProviderAccount",
+        "summary": "Submit direct replacement credential",
+        "description": "Approved direct secret boundary for replacement material. Keeps provider_account_id, Tenant, and Auth Mode immutable. Credential versions are monotonic even after a rejected pending version. The old version may finish authorized in-flight work; the new version cannot serve new admissions until validation plus pending-version provider_probe cutover. Disable intent survives staging, probe success, probe failure, and transient retry.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Replacement accepted and awaiting probe; the public credential version remains the old current version until cutover",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountOperationResponse"
+                },
+                "example": {
+                  "account": {
+                    "provider_account_id": "pa_demo_01",
+                    "provider": "chatgpt",
+                    "auth_mode": "chatgpt_web_access",
+                    "label": "Design team web account",
+                    "lifecycle_state": "pending_probe",
+                    "credential": {
+                      "version": 2,
+                      "expires_at": "2026-07-19T10:00:00Z",
+                      "refresh_supported": false,
+                      "last_validated_at": "2026-07-18T10:20:00Z",
+                      "last_probed_at": "2026-07-18T10:00:02Z"
+                    },
+                    "health": {
+                      "summary_state": "unknown",
+                      "conditions": []
+                    },
+                    "administrative_controls": {
+                      "drain_state": "off",
+                      "quarantine_state": "off",
+                      "auth_mode_execution_enabled": true
+                    },
+                    "created_at": "2026-07-18T09:55:00Z",
+                    "updated_at": "2026-07-18T10:20:00Z"
+                  },
+                  "request_id": "req_reauth_01"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Replacement material failed validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorInvalidRequest": {
+                    "$ref": "#/components/examples/ErrorInvalidRequest"
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Account lifecycle or pending replacement blocks reauthentication",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAccountNotUsable": {
+                    "$ref": "#/components/examples/ErrorAccountNotUsable"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectReauthenticationRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/provider-accounts/{provider_account_id}/disable": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        }
+      ],
+      "post": {
+        "operationId": "disableProviderAccount",
+        "summary": "Disable Provider Account",
+        "description": "Idempotently blocks new execution while preserving credential material and the last truthful health evidence. A draft shell is rejected because there is no usable connection to pause. This action has no vault decrypt purpose.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountOperationResponse"
+                },
+                "example": {
+                  "account": {
+                    "provider_account_id": "pa_demo_01",
+                    "provider": "chatgpt",
+                    "auth_mode": "chatgpt_web_access",
+                    "label": "Design team web account",
+                    "lifecycle_state": "disabled",
+                    "credential": {
+                      "version": 2,
+                      "expires_at": "2026-07-19T10:00:00Z",
+                      "refresh_supported": false,
+                      "last_validated_at": "2026-07-18T10:00:01Z",
+                      "last_probed_at": "2026-07-18T10:00:02Z"
+                    },
+                    "health": {
+                      "summary_state": "healthy",
+                      "conditions": [
+                        {
+                          "scope": {
+                            "kind": "account"
+                          },
+                          "state": "healthy",
+                          "reason": "probe_succeeded",
+                          "credential_version": 2,
+                          "observed_at": "2026-07-18T10:00:02Z",
+                          "remediation": "none"
+                        }
+                      ]
+                    },
+                    "administrative_controls": {
+                      "drain_state": "off",
+                      "quarantine_state": "off",
+                      "auth_mode_execution_enabled": true
+                    },
+                    "created_at": "2026-07-18T09:55:00Z",
+                    "updated_at": "2026-07-18T10:30:00Z"
+                  },
+                  "request_id": "req_disable_01"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Draft cannot be disabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAccountNotUsable": {
+                    "$ref": "#/components/examples/ErrorAccountNotUsable"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ]
+      }
+    },
+    "/provider-accounts/{provider_account_id}/enable": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        }
+      ],
+      "post": {
+        "operationId": "enableProviderAccount",
+        "summary": "Enable Provider Account through probe",
+        "description": "Every disabled-to-active recovery first enters pending_probe and runs a current-credential-version safe provider_probe, per #17 I-ACCOUNT-ENABLE-PROBED. Probe failure keeps the account non-usable; auth-class failure lands reauth_required. Health success cannot bypass quarantine, Auth Mode kill, risk, vault, or snapshot gates.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Enable accepted; account remains non-usable until current-version provider_probe succeeds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountOperationResponse"
+                },
+                "example": {
+                  "account": {
+                    "provider_account_id": "pa_demo_01",
+                    "provider": "chatgpt",
+                    "auth_mode": "chatgpt_web_access",
+                    "label": "Design team web account",
+                    "lifecycle_state": "pending_probe",
+                    "credential": {
+                      "version": 2,
+                      "expires_at": "2026-07-19T10:00:00Z",
+                      "refresh_supported": false,
+                      "last_validated_at": "2026-07-18T10:20:00Z",
+                      "last_probed_at": "2026-07-18T10:00:02Z"
+                    },
+                    "health": {
+                      "summary_state": "unknown",
+                      "conditions": []
+                    },
+                    "administrative_controls": {
+                      "drain_state": "off",
+                      "quarantine_state": "off",
+                      "auth_mode_execution_enabled": true
+                    },
+                    "created_at": "2026-07-18T09:55:00Z",
+                    "updated_at": "2026-07-18T10:35:00Z"
+                  },
+                  "request_id": "req_enable_01"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Account cannot enter enable probe path",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAccountNotUsable": {
+                    "$ref": "#/components/examples/ErrorAccountNotUsable"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "accounts.manage"
+        ]
+      }
+    },
+    "/provider-accounts/{provider_account_id}/capability-snapshot": {
+      "parameters": [
+        {
+          "name": "provider_account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9]+$"
+          },
+          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+        }
+      ],
+      "get": {
+        "operationId": "getCapabilitySnapshot",
+        "summary": "Get per-account Capability Snapshot",
+        "description": "Reads evidence for this Provider Account only, including stale or invalid evidence so operators can inspect freshness. If no snapshot exists yet, the operation returns capability_unverified. The snapshot classifies all five primary operations, binds to credential_version, records freshness and provenance, and lists only observed model slugs. Stale or invalid evidence never authorizes execution. This read has no vault decrypt purpose.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitySnapshot"
+                },
+                "example": {
+                  "provider_account_id": "pa_demo_01",
+                  "credential_version": 2,
+                  "verified_at": "2026-07-18T10:00:02Z",
+                  "freshness": "fresh",
+                  "ttl_class": "TTL-PROBE-LIVE",
+                  "provenance": [
+                    {
+                      "evidence_class": "live_probe",
+                      "probe_surface": "/backend-api/models",
+                      "observed_at": "2026-07-18T10:00:02Z"
+                    }
+                  ],
+                  "operations": {
+                    "chat": {
+                      "status": "verified",
+                      "offerable": true,
+                      "evidence_class": "live_probe"
+                    },
+                    "chat_streaming": {
+                      "status": "conditionally_supported",
+                      "offerable": true,
+                      "evidence_class": "live_probe",
+                      "streaming_class": "real"
+                    },
+                    "image_generation": {
+                      "status": "conditionally_supported",
+                      "offerable": true,
+                      "evidence_class": "live_probe"
+                    },
+                    "image_edit": {
+                      "status": "conditionally_supported",
+                      "offerable": true,
+                      "evidence_class": "live_probe"
+                    },
+                    "inpaint": {
+                      "status": "conditionally_supported",
+                      "offerable": true,
+                      "evidence_class": "live_probe"
+                    }
+                  },
+                  "models": [
+                    {
+                      "model_slug": "gpt-4.1",
+                      "operations": {
+                        "chat": "verified",
+                        "chat_streaming": "conditionally_supported",
+                        "image_generation": "unsupported",
+                        "image_edit": "unsupported",
+                        "inpaint": "unsupported"
+                      },
+                      "surface_binding": "chatgpt_web",
+                      "observed_at": "2026-07-18T10:00:02Z"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No Capability Snapshot exists yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorCapabilityUnverified": {
+                    "$ref": "#/components/examples/ErrorCapabilityUnverified"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Foreign or unknown resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scope-any-of": [
+          "accounts.read",
+          "capabilities.read"
+        ]
+      }
+    },
+    "/routing-policy": {
+      "get": {
+        "operationId": "getRoutingPolicy",
+        "summary": "Get Tenant Routing Policy",
+        "description": "Reads the authenticated Tenant's singleton Routing Policy. No tenant_id is accepted and no vault decrypt occurs.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutingPolicy"
+                },
+                "example": {
+                  "candidate_accounts": [
+                    "pa_demo_01"
+                  ],
+                  "selection_order": [
+                    "pa_demo_01"
+                  ],
+                  "fallback_enabled": false,
+                  "fallback_chain": [],
+                  "fallback_auth_modes": [],
+                  "affinity": {
+                    "enabled": true,
+                    "window_class": "AFFINITY-WINDOW-CLASS"
+                  },
+                  "lease_policy": {
+                    "enabled": true,
+                    "eligible_units": [
+                      "chat_stream",
+                      "render_job"
+                    ]
+                  },
+                  "updated_at": "2026-07-18T10:10:00Z",
+                  "updated_by": "cak_demo_admin"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "routing.read"
+        ]
+      },
+      "put": {
+        "operationId": "replaceRoutingPolicy",
+        "summary": "Replace Tenant Routing Policy",
+        "description": "Atomically replaces the authenticated Tenant's policy. Candidate and fallback ids must be same-Tenant; a foreign/unknown id yields non-enumerating resource_not_found, zero vault decrypt, zero Adapter call, and no partial write. This policy write has no vault decrypt purpose. Fallback defaults false and explicit account pins never silently fall back.",
+        "security": [
+          {
+            "ClientApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutingPolicy"
+                },
+                "example": {
+                  "candidate_accounts": [
+                    "pa_demo_01"
+                  ],
+                  "selection_order": [
+                    "pa_demo_01"
+                  ],
+                  "fallback_enabled": false,
+                  "fallback_chain": [],
+                  "fallback_auth_modes": [],
+                  "affinity": {
+                    "enabled": true,
+                    "window_class": "AFFINITY-WINDOW-CLASS"
+                  },
+                  "lease_policy": {
+                    "enabled": true,
+                    "eligible_units": [
+                      "chat_stream",
+                      "render_job"
+                    ]
+                  },
+                  "updated_at": "2026-07-18T10:10:00Z",
+                  "updated_by": "cak_demo_admin"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid policy shape",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorInvalidRequest": {
+                    "$ref": "#/components/examples/ErrorInvalidRequest"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Any foreign/unknown candidate makes the write fail closed without persistence",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorResourceNotFound": {
+                    "$ref": "#/components/examples/ErrorResourceNotFound"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorAuthenticationFailed": {
+                    "$ref": "#/components/examples/ErrorAuthenticationFailed"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Same-Tenant scope or policy denial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "routing.manage"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoutingPolicyReplaceRequest"
+              },
+              "example": {
+                "candidate_accounts": [
+                  "pa_demo_01"
+                ],
+                "selection_order": [
+                  "pa_demo_01"
+                ],
+                "fallback_enabled": false,
+                "fallback_chain": [],
+                "fallback_auth_modes": [],
+                "affinity": {
+                  "enabled": true,
+                  "window_class": "AFFINITY-WINDOW-CLASS"
+                },
+                "lease_policy": {
+                  "enabled": true,
+                  "eligible_units": [
+                    "chat_stream",
+                    "render_job"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ClientApiKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "sk-pxp_<public_locator>_<secret>",
+        "description": "Client API Key establishes the server-side Security Principal and Tenant. Clients never submit tenant_id."
+      }
+    },
+    "schemas": {
+      "Provider": {
+        "type": "string",
+        "enum": [
+          "chatgpt",
+          "gemini",
+          "grok"
+        ]
+      },
+      "AuthMode": {
+        "type": "string",
+        "enum": [
+          "chatgpt_web_access",
+          "chatgpt_codex_oauth",
+          "gemini_web_cookie",
+          "gemini_antigravity_oauth",
+          "grok_web_sso",
+          "grok_xai_oauth"
+        ]
+      },
+      "LifecycleState": {
+        "type": "string",
+        "enum": [
+          "draft",
+          "pending_validation",
+          "pending_probe",
+          "active",
+          "reauth_required",
+          "disabled",
+          "revoked",
+          "deleted"
+        ]
+      },
+      "HealthState": {
+        "type": "string",
+        "enum": [
+          "unknown",
+          "healthy",
+          "degraded",
+          "cooling_down",
+          "challenged",
+          "expired",
+          "blocked"
+        ]
+      },
+      "HealthReason": {
+        "type": "string",
+        "enum": [
+          "initial_unprobed",
+          "probe_succeeded",
+          "success_window",
+          "elevated_error_rate",
+          "upstream_unavailable",
+          "upstream_timeout",
+          "provider_rate_limited",
+          "provider_quota_exhausted",
+          "challenge_detected",
+          "credential_expired",
+          "credential_rejected",
+          "protocol_drift",
+          "provider_account_banned",
+          "recovery_probe_failed"
+        ]
+      },
+      "Remediation": {
+        "type": "string",
+        "enum": [
+          "authenticate",
+          "replace_client_api_key",
+          "request_permission",
+          "fix_request",
+          "submit_credential",
+          "complete_oauth",
+          "reauthenticate",
+          "ack_risk",
+          "enable_account",
+          "wait_provider_cooldown",
+          "account_remediation",
+          "routing_remediation",
+          "capability_unsupported",
+          "capability_unverified",
+          "snapshot_stale",
+          "model_unavailable",
+          "contact_operator",
+          "auth_mode_unavailable",
+          "delete_and_recreate",
+          "none"
+        ]
+      },
+      "OperationToken": {
+        "type": "string",
+        "enum": [
+          "chat",
+          "chat_streaming",
+          "image_generation",
+          "image_edit",
+          "inpaint"
+        ]
+      },
+      "CapabilityStatus": {
+        "type": "string",
+        "enum": [
+          "verified",
+          "conditionally_supported",
+          "unsupported",
+          "unverified"
+        ]
+      },
+      "SnapshotFreshness": {
+        "type": "string",
+        "enum": [
+          "fresh",
+          "stale",
+          "invalid"
+        ]
+      },
+      "EvidenceClass": {
+        "type": "string",
+        "enum": [
+          "reference_learned",
+          "upstream_verified",
+          "live_probe",
+          "hybrid"
+        ]
+      },
+      "CredentialSubmission": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "credential_class",
+          "material"
+        ],
+        "properties": {
+          "credential_class": {
+            "type": "string",
+            "enum": [
+              "web_session",
+              "oauth_token_import"
+            ]
+          },
+          "material": {
+            "type": "string",
+            "writeOnly": true,
+            "minLength": 8,
+            "pattern": "^[^\\u0000-\\u001F]+$",
+            "description": "Provider Credential material accepted only at this direct intake boundary. Never echoed, logged, projected, or placed in examples."
+          }
+        }
+      },
+      "DirectCredentialSubmissionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "credential"
+        ],
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/CredentialSubmission"
+          }
+        }
+      },
+      "DirectReauthenticationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "credential"
+        ],
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/CredentialSubmission"
+          }
+        },
+        "description": "Replacement material for the same provider_account_id, Tenant, and immutable Auth Mode. The prior version remains the only source for authorized in-flight work until cutover."
+      },
+      "CreateProviderAccountRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "auth_mode"
+        ],
+        "properties": {
+          "provider": {
+            "$ref": "#/components/schemas/Provider"
+          },
+          "auth_mode": {
+            "$ref": "#/components/schemas/AuthMode"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "description": "Creates a draft shell only. Provider Credential material is not accepted here and tenant_id is derived from ClientApiKey."
+      },
+      "OAuthStartRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "purpose",
+          "flow_preference"
+        ],
+        "properties": {
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "connect",
+              "reauthenticate"
+            ]
+          },
+          "flow_preference": {
+            "type": "string",
+            "enum": [
+              "browser",
+              "device"
+            ]
+          }
+        },
+        "description": "Non-secret OAuth flow preference. Token exchange material is server-side and never enters the response."
+      },
+      "ProbeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "account",
+                  "operation",
+                  "model"
+                ]
+              },
+              "operation": {
+                "$ref": "#/components/schemas/OperationToken"
+              },
+              "model_slug": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "description": "Purpose-bound provider_probe request. It carries no Tenant prompt, Asset, or arbitrary Provider payload and uses the cheapest auth/capability-proving path."
+      },
+      "CredentialMetadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "refresh_supported"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "refresh_supported": {
+            "type": "boolean"
+          },
+          "last_validated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_probed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "description": "Safe non-secret version and timing metadata only. No handle, ciphertext, token, cookie, or OAuth exchange material."
+      },
+      "HealthScope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "account",
+              "operation",
+              "model"
+            ]
+          },
+          "operation": {
+            "$ref": "#/components/schemas/OperationToken"
+          },
+          "model_slug": {
+            "type": "string"
+          }
+        }
+      },
+      "HealthCondition": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "scope",
+          "state",
+          "reason",
+          "credential_version",
+          "observed_at",
+          "remediation"
+        ],
+        "properties": {
+          "scope": {
+            "$ref": "#/components/schemas/HealthScope"
+          },
+          "state": {
+            "$ref": "#/components/schemas/HealthState"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/HealthReason"
+          },
+          "credential_version": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "retry_after_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Present only when every matching blocking gate is finite and time-waitable. Omitted for expired, challenged, blocked, disabled, revoked, deleted, reauth_required, quarantine, or Auth Mode kill."
+          },
+          "remediation": {
+            "$ref": "#/components/schemas/Remediation"
+          }
+        }
+      },
+      "HealthSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "summary_state",
+          "conditions"
+        ],
+        "properties": {
+          "summary_state": {
+            "$ref": "#/components/schemas/HealthState"
+          },
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HealthCondition"
+            }
+          }
+        },
+        "description": "Safe scoped projection. The summary does not erase narrower operation/model conditions and carries no raw Provider response."
+      },
+      "AdministrativeControls": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "drain_state",
+          "quarantine_state",
+          "auth_mode_execution_enabled"
+        ],
+        "properties": {
+          "drain_state": {
+            "type": "string",
+            "enum": [
+              "off",
+              "draining"
+            ]
+          },
+          "quarantine_state": {
+            "type": "string",
+            "enum": [
+              "off",
+              "quarantined"
+            ]
+          },
+          "auth_mode_execution_enabled": {
+            "type": "boolean"
+          }
+        },
+        "description": "Administrative controls remain separate from lifecycle_state and operational health; health success cannot bypass them."
+      },
+      "ProviderAccount": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider_account_id",
+          "provider",
+          "auth_mode",
+          "lifecycle_state",
+          "credential",
+          "health",
+          "administrative_controls",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "provider_account_id": {
+            "type": "string",
+            "pattern": "^pa_[A-Za-z0-9_]+$"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider"
+          },
+          "auth_mode": {
+            "$ref": "#/components/schemas/AuthMode"
+          },
+          "label": {
+            "type": "string"
+          },
+          "lifecycle_state": {
+            "$ref": "#/components/schemas/LifecycleState"
+          },
+          "credential": {
+            "$ref": "#/components/schemas/CredentialMetadata"
+          },
+          "health": {
+            "$ref": "#/components/schemas/HealthSummary"
+          },
+          "administrative_controls": {
+            "$ref": "#/components/schemas/AdministrativeControls"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "description": "Owning-Tenant safe projection. Lifecycle, health, and administrative controls are independent dimensions. No tenant_id or Provider Credential material."
+      },
+      "ProviderAccountList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderAccount"
+            }
+          }
+        }
+      },
+      "AccountOperationResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "account",
+          "request_id"
+        ],
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/ProviderAccount"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        }
+      },
+      "OAuthAuthorization": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authorization_id",
+          "provider_account_id",
+          "purpose",
+          "flow",
+          "status",
+          "expires_at"
+        ],
+        "properties": {
+          "authorization_id": {
+            "type": "string",
+            "pattern": "^oauth_[A-Za-z0-9_]+$"
+          },
+          "provider_account_id": {
+            "type": "string"
+          },
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "connect",
+              "reauthenticate"
+            ]
+          },
+          "flow": {
+            "type": "string",
+            "enum": [
+              "browser",
+              "device"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "authorization_pending",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "verification_uri": {
+            "type": "string",
+            "format": "uri"
+          },
+          "user_code": {
+            "type": "string",
+            "description": "User-facing short code only; never the provider device_code, token, authorization code, or PKCE verifier."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "remediation": {
+            "$ref": "#/components/schemas/Remediation"
+          }
+        },
+        "description": "Safe server-owned authorization status. Provider token exchange material never crosses this boundary."
+      },
+      "CapabilityFact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "offerable",
+          "evidence_class"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/CapabilityStatus"
+          },
+          "offerable": {
+            "type": "boolean",
+            "description": "Derived; true only for fresh verified or conditionally_supported facts while account gates pass."
+          },
+          "evidence_class": {
+            "$ref": "#/components/schemas/EvidenceClass"
+          },
+          "probe_surface": {
+            "type": "string"
+          },
+          "streaming_class": {
+            "type": "string",
+            "enum": [
+              "real",
+              "synthetic"
+            ]
+          }
+        }
+      },
+      "OperationFacts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "chat",
+          "chat_streaming",
+          "image_generation",
+          "image_edit",
+          "inpaint"
+        ],
+        "properties": {
+          "chat": {
+            "$ref": "#/components/schemas/CapabilityFact"
+          },
+          "chat_streaming": {
+            "$ref": "#/components/schemas/CapabilityFact"
+          },
+          "image_generation": {
+            "$ref": "#/components/schemas/CapabilityFact"
+          },
+          "image_edit": {
+            "$ref": "#/components/schemas/CapabilityFact"
+          },
+          "inpaint": {
+            "$ref": "#/components/schemas/CapabilityFact"
+          }
+        }
+      },
+      "Provenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "evidence_class",
+          "observed_at"
+        ],
+        "properties": {
+          "evidence_class": {
+            "$ref": "#/components/schemas/EvidenceClass"
+          },
+          "probe_surface": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ModelCapability": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "model_slug",
+          "operations",
+          "observed_at"
+        ],
+        "properties": {
+          "model_slug": {
+            "type": "string"
+          },
+          "operations": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "chat",
+              "chat_streaming",
+              "image_generation",
+              "image_edit",
+              "inpaint"
+            ],
+            "properties": {
+              "chat": {
+                "$ref": "#/components/schemas/CapabilityStatus"
+              },
+              "chat_streaming": {
+                "$ref": "#/components/schemas/CapabilityStatus"
+              },
+              "image_generation": {
+                "$ref": "#/components/schemas/CapabilityStatus"
+              },
+              "image_edit": {
+                "$ref": "#/components/schemas/CapabilityStatus"
+              },
+              "inpaint": {
+                "$ref": "#/components/schemas/CapabilityStatus"
+              }
+            }
+          },
+          "entitlement_hint": {
+            "type": "string"
+          },
+          "surface_binding": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "description": "Observed model slug for this account only. The Gateway never invents models from Provider or Auth Mode names."
+      },
+      "CapabilitySnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider_account_id",
+          "credential_version",
+          "verified_at",
+          "freshness",
+          "ttl_class",
+          "provenance",
+          "operations",
+          "models"
+        ],
+        "properties": {
+          "provider_account_id": {
+            "type": "string"
+          },
+          "credential_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "verified_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "freshness": {
+            "$ref": "#/components/schemas/SnapshotFreshness"
+          },
+          "ttl_class": {
+            "type": "string",
+            "enum": [
+              "TTL-PROBE-LIVE",
+              "TTL-INHERITED",
+              "TTL-DISCOVERY",
+              "TTL-DEGRADED"
+            ]
+          },
+          "provenance": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/Provenance"
+            }
+          },
+          "operations": {
+            "$ref": "#/components/schemas/OperationFacts"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelCapability"
+            }
+          }
+        },
+        "description": "Per-account evidence bound to the current credential version. stale, invalid, unsupported, and unverified facts never authorize routing. Reference evidence alone cannot yield verified."
+      },
+      "AffinityPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "window_class": {
+            "type": "string"
+          }
+        }
+      },
+      "LeasePolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "eligible_units"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "eligible_units": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "chat_stream",
+                "render_job"
+              ]
+            }
+          }
+        }
+      },
+      "RoutingPolicyFields": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidate_accounts",
+          "selection_order",
+          "fallback_enabled",
+          "fallback_chain",
+          "fallback_auth_modes",
+          "affinity",
+          "lease_policy"
+        ],
+        "properties": {
+          "candidate_accounts": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^pa_[A-Za-z0-9_]+$"
+            }
+          },
+          "selection_order": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^pa_[A-Za-z0-9_]+$"
+            }
+          },
+          "fallback_enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "fallback_chain": {
+            "type": "array",
+            "uniqueItems": true,
+            "default": [],
+            "items": {
+              "type": "string",
+              "pattern": "^pa_[A-Za-z0-9_]+$"
+            }
+          },
+          "fallback_auth_modes": {
+            "type": "array",
+            "uniqueItems": true,
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/AuthMode"
+            }
+          },
+          "affinity": {
+            "$ref": "#/components/schemas/AffinityPolicy"
+          },
+          "lease_policy": {
+            "$ref": "#/components/schemas/LeasePolicy"
+          }
+        },
+        "description": "All account ids are interpreted only inside the authenticated Tenant. Fallback defaults off; explicit pins never silently fall back."
+      },
+      "RoutingPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidate_accounts",
+          "selection_order",
+          "fallback_enabled",
+          "fallback_chain",
+          "fallback_auth_modes",
+          "affinity",
+          "lease_policy",
+          "updated_at",
+          "updated_by"
+        ],
+        "properties": {
+          "candidate_accounts": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^pa_[A-Za-z0-9_]+$"
+            }
+          },
+          "selection_order": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^pa_[A-Za-z0-9_]+$"
+            }
+          },
+          "fallback_enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "fallback_chain": {
+            "type": "array",
+            "uniqueItems": true,
+            "default": [],
+            "items": {
+              "type": "string",
+              "pattern": "^pa_[A-Za-z0-9_]+$"
+            }
+          },
+          "fallback_auth_modes": {
+            "type": "array",
+            "uniqueItems": true,
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/AuthMode"
+            }
+          },
+          "affinity": {
+            "$ref": "#/components/schemas/AffinityPolicy"
+          },
+          "lease_policy": {
+            "$ref": "#/components/schemas/LeasePolicy"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_by": {
+            "type": "string"
+          }
+        }
+      },
+      "RoutingPolicyReplaceRequest": {
+        "$ref": "#/components/schemas/RoutingPolicyFields"
+      },
+      "CanonicalError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "category",
+          "status_class",
+          "retryability",
+          "remediation",
+          "request_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "authentication",
+              "authorization",
+              "validation",
+              "routing",
+              "capability",
+              "credential",
+              "dependency",
+              "internal"
+            ]
+          },
+          "status_class": {
+            "type": "string",
+            "enum": [
+              "unauthorized",
+              "not_found",
+              "forbidden",
+              "invalid_request",
+              "account_policy",
+              "capability",
+              "routing",
+              "conflict",
+              "dependency",
+              "internal"
+            ]
+          },
+          "retryability": {
+            "type": "string",
+            "enum": [
+              "not_retryable",
+              "retry_after",
+              "safe_internal_retry",
+              "new_request_only",
+              "operator_action_required"
+            ]
+          },
+          "remediation": {
+            "$ref": "#/components/schemas/Remediation"
+          },
+          "request_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "correlation_id": {
+            "type": "string"
+          },
+          "operation": {
+            "type": "string"
+          },
+          "failure_stage": {
+            "type": "string",
+            "enum": [
+              "authentication",
+              "authorization",
+              "request_validation",
+              "routing",
+              "capability",
+              "credential",
+              "recovery",
+              "dependency",
+              "internal"
+            ]
+          },
+          "retry_after_class": {
+            "type": "string"
+          },
+          "retry_after_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Finite wait only; omitted for non-time gates and never retry authority."
+          },
+          "safe_context": {
+            "type": "object",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": "Bounded safe metadata only. Never tenant_id, Provider Credential, raw Provider payload, challenge material, or foreign resource details."
+          }
+        },
+        "description": "Canonical Provider-independent management error. Foreign and unknown identifiers use identical resource_not_found bodies without resource_reference."
+      }
+    },
+    "examples": {
+      "ErrorAuthenticationFailed": {
+        "summary": "Missing, malformed, unknown, wrong-secret, or revoked key",
+        "value": {
+          "code": "authentication_failed",
+          "category": "authentication",
+          "status_class": "unauthorized",
+          "retryability": "not_retryable",
+          "remediation": "replace_client_api_key",
+          "request_id": "req_auth_01",
+          "failure_stage": "authentication"
+        }
+      },
+      "ErrorForbidden": {
+        "summary": "Same-Tenant principal lacks required scope",
+        "value": {
+          "code": "forbidden",
+          "category": "authorization",
+          "status_class": "forbidden",
+          "retryability": "not_retryable",
+          "remediation": "request_permission",
+          "request_id": "req_scope_01",
+          "failure_stage": "authorization"
+        }
+      },
+      "ErrorResourceNotFound": {
+        "summary": "Foreign and unknown identifiers are indistinguishable",
+        "value": {
+          "code": "resource_not_found",
+          "category": "authorization",
+          "status_class": "not_found",
+          "retryability": "not_retryable",
+          "remediation": "none",
+          "request_id": "req_nf_01",
+          "failure_stage": "authorization"
+        }
+      },
+      "ErrorInvalidRequest": {
+        "summary": "Malformed credential or policy shape",
+        "value": {
+          "code": "invalid_request",
+          "category": "validation",
+          "status_class": "invalid_request",
+          "retryability": "not_retryable",
+          "remediation": "fix_request",
+          "request_id": "req_bad_01",
+          "failure_stage": "request_validation"
+        }
+      },
+      "ErrorAccountNotUsable": {
+        "summary": "Same-Tenant lifecycle or health gate prevents use",
+        "value": {
+          "code": "account_not_usable",
+          "category": "routing",
+          "status_class": "account_policy",
+          "retryability": "not_retryable",
+          "remediation": "account_remediation",
+          "request_id": "req_acc_01",
+          "failure_stage": "routing",
+          "safe_context": {
+            "cause_class": "enable_account"
+          }
+        }
+      },
+      "ErrorAuthModeUnavailable": {
+        "summary": "Auth Mode prohibited, killed, gated-off, or outside lab",
+        "value": {
+          "code": "auth_mode_unavailable",
+          "category": "routing",
+          "status_class": "account_policy",
+          "retryability": "operator_action_required",
+          "remediation": "auth_mode_unavailable",
+          "request_id": "req_mode_01",
+          "failure_stage": "routing"
+        }
+      },
+      "ErrorCapabilityUnverified": {
+        "summary": "No Capability Snapshot exists yet for this account",
+        "value": {
+          "code": "capability_unverified",
+          "category": "capability",
+          "status_class": "capability",
+          "retryability": "retry_after",
+          "remediation": "capability_unverified",
+          "request_id": "req_cap_01",
+          "failure_stage": "capability",
+          "retry_after_class": "capability_reprobe"
+        }
+      },
+      "ErrorSnapshotStale": {
+        "summary": "Stale or invalid snapshot cannot authorize",
+        "value": {
+          "code": "snapshot_stale",
+          "category": "capability",
+          "status_class": "capability",
+          "retryability": "retry_after",
+          "remediation": "snapshot_stale",
+          "request_id": "req_snap_01",
+          "failure_stage": "capability",
+          "retry_after_class": "capability_reprobe"
+        }
+      }
+    }
+  }
+}
