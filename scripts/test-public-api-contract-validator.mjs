@@ -139,7 +139,7 @@ expectFailure(
   (doc) => {
     doc["x-pixelplus-contract-testing"].ownership_rejection_before = ["adapter_call"];
   },
-  /ownership rejection before vault decrypt and Adapter call/,
+  /ownership rejection before vault decrypt, Adapter call, and job enqueue/,
 );
 expectFailure(
   "closed enums cannot grow within v1",
@@ -236,6 +236,49 @@ expectFailure(
     /GET \/models response 200: unresolvable \$ref: #\/components\/responses\/Missing/,
     /stable Public API contract has \d+ violation\(s\)/,
   ],
+);
+
+expectFailure(
+  "all stable resource reads have an idempotency class",
+  source,
+  (doc) => {
+    doc["x-pixelplus-idempotency-policy"].operation_classes.resource_retrieval = {
+      operations: [],
+      header: "not_applicable",
+      replay: "read_existing_resource_without_provider_or_job_execution",
+    };
+  },
+  /resource_retrieval idempotency class must match the stable operation matrix/,
+);
+expectFailure(
+  "resource-state replay cannot duplicate external work",
+  source,
+  (doc) => {
+    doc["x-pixelplus-idempotency-policy"].operation_classes.resource_state_commands.replay =
+      "may_duplicate_external_work";
+  },
+  /resource-state commands must not duplicate external work/,
+);
+expectFailure(
+  "ownership denial precedes job enqueue",
+  source,
+  (doc) => {
+    doc["x-pixelplus-contract-testing"].ownership_rejection_before = [
+      "vault_decrypt",
+      "adapter_call",
+    ];
+  },
+  /ownership rejection before vault decrypt, Adapter call, and job enqueue/,
+);
+expectFailure(
+  "contract tests retain the full observation set",
+  source,
+  (doc) => {
+    doc["x-pixelplus-contract-testing"].required_observations = [
+      "http_status_headers_and_body",
+    ];
+  },
+  /contract tests must observe persistence_and_job_side_effect_counts/,
 );
 
 console.log("PASS: stable Public API validator mutation suite");

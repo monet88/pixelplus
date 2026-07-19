@@ -13,7 +13,7 @@ Prove that the stable artifact contains the complete unified surface, preserves 
 | E2E | Black-box mutation suite invokes the validator as an external process and proves representative incompatible policy changes fail. Runtime Gateway HTTP conformance is deferred until the composition root exists. |
 | Platform | Node CLI plus Python `jsonschema` validation on the repository development environment. |
 | Performance | Not applicable to specification work; no runtime hot path is implemented. |
-| Logs/Audit | Static checks reject secret-bearing response schemas/examples and require ownership rejection before vault decrypt or Adapter calls. |
+| Logs/Audit | Static checks reject secret-bearing response schemas/examples and require ownership rejection before vault decrypt, Adapter calls, or job enqueue. |
 | Repository | Retained prototype validators, scenario assertions, `git diff --check`, full changed-file scope review, and independent Standards/Spec review. |
 
 ## Fixtures
@@ -41,6 +41,7 @@ scripts/bin/harness-cli.exe story verify US-020
 - Retained inference prototype validator passed with 12 paths, 29 schemas, and 61 validated examples.
 - Retained management prototype validator passed with 14 operations and 71 schema-validated examples.
 - Deterministic management scenarios produced 140 PASS assertions and zero FAIL assertions.
+- A delayed Spec-axis review identified two remaining gaps: six resource/catalog GET operations lacked an explicit idempotency class, and ownership/observation policy did not machine-lock job enqueue and the full side-effect observation set. Follow-up mutations reproduced both gaps; the stable extension, validator, policy, decision, and story design now classify all 26 operations and enforce those composition observations.
 - Final independent review found and fixed: two falsely declared response extension points; missing Clock/ID-generator enforcement; operation-class/header-matrix drift; allow-by-default `Idempotency-Key` on unclassified operations; and broken `$ref` crashes that could hide accumulated policy failures. Focused re-reviews confirmed all findings closed.
 - `harness-cli story verify US-020` and durable decision verification passed; `story complete US-020` reran fresh proof and marked the story implemented.
 - `git diff --check` passed. Runtime Gateway composition proof remains intentionally deferred because issue #20 forbids implementing the Gateway; the stable artifact makes the required future composition and observations normative.

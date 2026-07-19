@@ -255,7 +255,8 @@ The HTTP replay record is retained for **24 hours** from initial claim.
 | Direct secret ingress | `POST .../credentials`, `POST .../reauthentication` | Required; fingerprint retains keyed digest only. |
 | OAuth authorization start | `POST .../oauth-authorizations` | Required. |
 | Resource-state commands | chat/job cancel, Provider Account delete/probe/disable/enable, Routing Policy replace | Header not required; repeated command must preserve the resource-state/product idempotency contract and cannot duplicate external work. |
-| Output/resource retrieval | Asset metadata/content and Render Job status GETs | Not applicable; repeat reads the existing resource. |
+| Resource/catalog retrieval | `GET /models`, Provider Account list/detail, OAuth authorization status, Capability Snapshot, Routing Policy | Not applicable; repeat reads existing projection/lifecycle state without Provider or job execution. |
+| Output retrieval | Asset metadata/content and Render Job status GETs | Not applicable; repeat reads the existing durable output/resource identity. |
 | Output delivery retry | `POST .../outputs/{output_entry_id}/retry` | Header not required; stable job/output/placement identity supplies deduplication. |
 
 Header requiredness is itself part of `/v1` compatibility. Changing a row requires a new major.

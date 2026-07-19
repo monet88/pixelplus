@@ -57,6 +57,14 @@ const outputRetrievalOperations = new Set([
   "GET /assets/{asset_id}/content",
   "GET /render-jobs/{job_id}",
 ]);
+const resourceRetrievalOperations = new Set([
+  "GET /models",
+  "GET /provider-accounts",
+  "GET /provider-accounts/{provider_account_id}",
+  "GET /provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}",
+  "GET /provider-accounts/{provider_account_id}/capability-snapshot",
+  "GET /routing-policy",
+]);
 const outputDeliveryRetryOperations = new Set([
   "POST /render-jobs/{job_id}/outputs/{output_entry_id}/retry",
 ]);
@@ -674,6 +682,12 @@ function validateIdempotencyPolicy(doc) {
   );
   validateOperationClass(
     operationClasses,
+    "resource_retrieval",
+    "not_applicable",
+    expectedOperationIds(resourceRetrievalOperations),
+  );
+  validateOperationClass(
+    operationClasses,
     "output_retrieval",
     "not_applicable",
     expectedOperationIds(outputRetrievalOperations),
@@ -685,6 +699,17 @@ function validateIdempotencyPolicy(doc) {
     expectedOperationIds(outputDeliveryRetryOperations),
   );
 
+  const resourceStateCommands = operationClasses.resource_state_commands;
+  if (resourceStateCommands?.replay !== "same_resource_state_transition_must_not_duplicate_external_work") {
+    fail("resource-state commands must not duplicate external work");
+  }
+  const resourceRetrieval = operationClasses.resource_retrieval;
+  if (
+    resourceRetrieval?.header !== "not_applicable"
+    || resourceRetrieval?.replay !== "read_existing_resource_without_provider_or_job_execution"
+  ) {
+    fail("resource retrieval must read existing state without Provider or job execution");
+  }
   const outputRetrieval = operationClasses.output_retrieval;
   if (
     outputRetrieval?.header !== "not_applicable"
@@ -725,8 +750,23 @@ function validateContractTestingPolicy(doc) {
   if (
     !(policy.ownership_rejection_before || []).includes("vault_decrypt")
     || !(policy.ownership_rejection_before || []).includes("adapter_call")
+    || !(policy.ownership_rejection_before || []).includes("job_enqueue")
   ) {
-    fail("contract tests must assert ownership rejection before vault decrypt and Adapter call");
+    fail("contract tests must assert ownership rejection before vault decrypt, Adapter call, and job enqueue");
+  }
+  const requiredObservations = new Set(policy.required_observations || []);
+  for (const observation of [
+    "http_status_headers_and_body",
+    "durable_resource_identity",
+    "adapter_call_count",
+    "vault_read_write_decrypt_and_revoke_counts",
+    "persistence_and_job_side_effect_counts",
+    "same_tenant_and_non_enumeration_behavior",
+    "idempotency_replay_conflict_and_uncertain_outcomes",
+  ]) {
+    if (!requiredObservations.has(observation)) {
+      fail(`contract tests must observe ${observation}`);
+    }
   }
   if (policy.concrete_interface_and_package_layout !== "deferred_to_issue_21") {
     fail("concrete test ports and package layout must remain issue #21 scope");

@@ -21,7 +21,7 @@ Future contract tests enter through the public HTTP interface and exercise real 
 - Authentication authority: shared `ClientApiKey`; clients never supply `tenant_id`.
 - Optional HTTP replay key: chat completion creation.
 - Required HTTP replay key: asset upload, image/Render Job creation, Provider Account creation, credential intake, OAuth authorization start, and direct reauthentication.
-- Retrieval operations do not use replay keys and must not create render or Provider execution side effects.
+- Retrieval operations do not use replay keys and must not create Provider, render, or job-enqueue side effects. Resource/catalog reads and durable output reads remain separate policy classes because they reuse different identities.
 - Deprecation metadata uses RFC 9745 `Deprecation`, RFC 8594 `Sunset`, and a `Link` with `rel="deprecation"`.
 - `CanonicalError` and `Remediation` are shared across inference and management, with declared open extension points where future tokens must not force a major release.
 
@@ -37,7 +37,7 @@ No UI, CLI client, deployment, or runtime platform implementation changes. The s
 
 ## Observability
 
-Future conformance proof must observe public HTTP results and counts for Adapter calls, vault decrypts, persistence writes, job creation/execution, and output delivery. Foreign, unknown, or deleted ownership rejection must be non-enumerating and occur before vault decrypt or Adapter calls. Logs, errors, snapshots, examples, routing records, and idempotency records must remain secret-free.
+Future conformance proof must observe public HTTP results and counts for Adapter calls, vault decrypts, persistence writes, job enqueue/creation/execution, and output delivery. Foreign, unknown, or deleted ownership rejection must be non-enumerating and occur before vault decrypt, Adapter calls, or job enqueue. Logs, errors, snapshots, examples, routing records, and idempotency records must remain secret-free.
 
 ## Alternatives Considered
 

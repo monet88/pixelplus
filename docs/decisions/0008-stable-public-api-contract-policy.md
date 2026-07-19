@@ -20,7 +20,7 @@ Deprecation preserves existing behavior and gives at least 180 days of notice. N
 
 HTTP idempotency is a PixelPlus contract using `Idempotency-Key`; it is not presented as a finalized IETF standard. Replay identity is scoped by authenticated Tenant, Client API Key, and key, with operation identity and all side-effect-changing inputs in the fingerprint. Records retain replay ownership for 24 hours. Matching replay returns the original operation without a new side effect; conflicts, in-progress ownership, and uncertain ownership never steal claims or create replacement executions. Secret-bearing fingerprints use only non-reversible keyed digests.
 
-Chat execution and Render Job execution remain the sole full-execution retry owners for their domains. Output retrieval reads existing state without rendering or Provider execution, and output delivery retries reuse the existing manifest/placement identity.
+Chat execution and Render Job execution remain the sole full-execution retry owners for their domains. Resource/catalog retrieval and output retrieval read existing state without Provider or job execution; output delivery retries reuse the existing manifest/placement identity.
 
 Future runtime contract tests must enter through the public HTTP surface and real Gateway composition. Controlled implementations may replace Adapter, Credential Vault, persistence, job runtime, clock, and ID generator behavior only at their ports. Handler stubs, private functions, concrete database schemas, and goroutine layouts are forbidden test seams. Exact interfaces, packages, and composition root remain issue #21 scope.
 
@@ -52,4 +52,4 @@ Tradeoffs:
 
 - Issue #21 defines concrete module seams, Go interfaces, package layout, and composition root consistent with this policy.
 - The Gateway implementation ticket builds the public HTTP conformance suite and controlled port implementations.
-- Runtime proof must count Adapter, vault, persistence, job, and delivery side effects and verify ownership rejection before decrypt or Provider access.
+- Runtime proof must count Adapter, vault, persistence, job, and delivery side effects and verify ownership rejection before decrypt, Provider access, or job enqueue.

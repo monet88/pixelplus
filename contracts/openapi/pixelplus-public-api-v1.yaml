@@ -6237,6 +6237,18 @@
         "header": "not_required",
         "replay": "same_resource_state_transition_must_not_duplicate_external_work"
       },
+      "resource_retrieval": {
+        "operations": [
+          "listModels",
+          "listProviderAccounts",
+          "getProviderAccount",
+          "getOAuthAuthorization",
+          "getCapabilitySnapshot",
+          "getRoutingPolicy"
+        ],
+        "header": "not_applicable",
+        "replay": "read_existing_resource_without_provider_or_job_execution"
+      },
       "output_retrieval": {
         "operations": [
           "getAsset",
@@ -6287,7 +6299,8 @@
     ],
     "ownership_rejection_before": [
       "vault_decrypt",
-      "adapter_call"
+      "adapter_call",
+      "job_enqueue"
     ],
     "concrete_interface_and_package_layout": "deferred_to_issue_21",
     "runtime_suite_status": "required_when_gateway_composition_exists"
