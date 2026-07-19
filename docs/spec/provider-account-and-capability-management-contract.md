@@ -178,21 +178,23 @@ create
   -> no Adapter call
 
 valid direct credential submission
-  -> pending_validation
   -> vault write for next credential version
-  -> validation success
-  -> pending_probe
+  -> observable 202 pending_validation
   -> still not active
-  -> no Adapter call until explicit probe
+  -> separate server-owned validation completion
+       -> success: pending_probe
+       -> failure: staged version revoked/discarded, draft + submit_credential remediation
+  -> no Adapter call or provider_probe before validation success
+  -> no activation until the later explicit probe succeeds
 ```
 
-Malformed material fails before vault write and probe. Direct `/credentials` intake is valid only for a pure `draft`; later lifecycle states must use reauthentication and cannot bypass disable/enable. Storing material alone never activates the account.
+Request-shape, credential-class, and control-character failures occur before vault write. Post-store validation is a separate server-owned step rather than a transition hidden inside the intake response: success advances to `pending_probe`, while failure revokes/discards the staged version, keeps the account non-usable, and exposes only safe remediation. Direct `/credentials` intake is valid only for a pure `draft`; later lifecycle states must use reauthentication and cannot bypass disable/enable. Storing material alone never activates the account.
 
 ### 4.3 OAuth journey
 
-OAuth start is account-scoped and carries `purpose=connect|reauthenticate`. `connect` requires a pure `draft`; `reauthenticate` stages a replacement while preserving the prior lifecycle target, so a disabled account remains non-decryptable and returns to `disabled` after a successful replacement probe. The server owns `authorization_id` and returns safe fields such as flow, status, verification URI/user code where applicable, expiry, and remediation.
+OAuth start is account-scoped and carries `purpose=connect|reauthenticate`. `connect` requires a pure `draft`; `reauthenticate` stages a replacement while preserving the prior lifecycle target. In particular, starting or completing OAuth reauthentication for a disabled account keeps public lifecycle `disabled`; the authorization state remains observable through the server-owned OAuth resource instead of hiding administrative intent behind `pending_validation`. The account remains non-decryptable and returns to `disabled` after a successful replacement probe. The server owns `authorization_id` and returns safe fields such as flow, status, verification URI/user code where applicable, expiry, and remediation.
 
-A successful server-side exchange stores a current version for connect or a pending version for reauthentication, then moves the account to `pending_probe`. Disable intent is sticky across the OAuth authorization/exchange window: even a successful connect exchange plus probe remains `disabled` and non-decryptable until explicit enable clears that intent. No token is returned by start or poll, and status polling has no vault decrypt purpose.
+A successful server-side exchange stores a current version for connect or a pending version for reauthentication, then opens the appropriate current/pending-version probe path without overriding disabled intent. Disable intent is sticky across the OAuth authorization/exchange window: even a successful connect exchange plus probe remains `disabled` and non-decryptable until explicit enable clears that intent. A failed authorization is terminal for that `authorization_id`, stores no credential version, and returns only `failed` plus safe `complete_oauth` remediation. A failed connect restores `draft` and clears the journey-only disabled marker because no credential exists to protect; a failed reauthentication restores `reauth_required` or preserves `disabled` according to its origin. Only one replacement journey may be in flight per account: another OAuth start, direct replacement, or enable request is rejected until the pending authorization/validation/probe marker reaches a terminal state. No token is returned by start or poll, and status polling has no vault decrypt purpose.
 
 ### 4.4 Probe outcomes
 
@@ -219,13 +221,13 @@ disabled
   -> active | reauth_required | other non-usable state
 ```
 
-The `202` enable response remains `pending_probe`; it never predicts probe success.
+The `202` enable response remains `pending_probe`; it never predicts probe success. Enable is rejected while an OAuth authorization, credential validation, replacement version, or one-shot probe marker is still in flight, preventing an administrative enable from racing or overwriting the journey that preserved `disabled` publicly.
 
 ### 4.6 Reauthentication and cutover
 
-Reauthentication preserves the logical `provider_account_id`, Tenant ownership, Provider, and immutable Auth Mode. New direct material is assigned a monotonically increasing credential version and staged as pending; a rejected/discarded pending version is never reused. While staging, the public credential projection remains on the old current version. The account becomes non-decryptable for new admissions; the prior version may serve only already-authorized in-flight work until cutover.
+Reauthentication preserves the logical `provider_account_id`, Tenant ownership, Provider, and immutable Auth Mode. New direct material is assigned a monotonically increasing credential version, stored as pending, and returned as an observable `pending_validation` active-origin state; a disabled-origin journey keeps public lifecycle `disabled` while the same validation marker remains internal. A rejected/discarded pending version is never reused. While staging, the public credential projection remains on the old current version. The account becomes non-decryptable for new admissions; the prior version may serve only already-authorized in-flight work until cutover.
 
-Pending-version `provider_probe` success atomically promotes the pending version and revokes the old version. Probe auth failure revokes/discards the pending version without promotion; quarantine or Auth Mode kill rejects before decrypt/Adapter. Disable intent wins over the replacement journey whether disable happened before staging or while the replacement was pending: success, auth failure, or transient retry cannot reactivate the account. A successful disabled replacement remains `disabled` and non-decryptable until the ordinary enable plus current-version probe path succeeds.
+Server-owned validation success opens the pending-version `provider_probe` path without promoting the pending version. While validation remains pending, any probe rejects before vault decrypt, Adapter, or Provider probe call, including when public lifecycle stays `disabled`. Validation failure revokes/discards the pending version before any Adapter or Provider probe call, leaves the old current version public, and records safe `reauthenticate` remediation in `reauth_required` or preserves `disabled`. Pending-version `provider_probe` success atomically promotes the pending version and revokes the old version. Probe auth failure revokes/discards the pending version without promotion; quarantine or Auth Mode kill rejects before decrypt/Adapter. Disable intent wins over the replacement journey whether disable happened before staging, during validation, or while the replacement was pending probe: success, auth failure, or transient retry cannot reactivate the account. A successful disabled replacement remains `disabled` and non-decryptable until the ordinary enable plus current-version probe path succeeds. Direct and OAuth replacement share a single-flight gate, and an open current-version one-shot probe marker also blocks replacement, so a second journey cannot overwrite or orphan pending work.
 
 ---
 
@@ -270,7 +272,7 @@ image_edit
 inpaint
 ```
 
-Capability status is `verified|conditionally_supported|unsupported|unverified`. Only `verified` and `conditionally_supported` may be offerable, and only while the snapshot is `fresh`.
+Capability status is `verified|conditionally_supported|unsupported|unverified`. Only `verified` and `conditionally_supported` may be offerable, and only while the snapshot is `fresh`. Reference-learned evidence by itself remains `unverified` and non-offerable; only account-bound upstream/live probe evidence may elevate an operation to `verified` or `conditionally_supported`.
 
 Important read-versus-authorize distinction:
 
@@ -339,7 +341,7 @@ Foreign/unknown `resource_not_found` omits a resource reference. Error examples 
 7. side-effect delta
 8. assertion result
 
-The scenarios cover authentication/scope/ownership precedence, same-Tenant list isolation, valid Auth Mode gates, credential-class and malformed-material rejection, direct and OAuth intake, monotonically increasing current/pending-version probe outcomes, disable/enable, direct and OAuth reauthentication cutover, quarantine and drain zero-side-effect rejection, sticky disable intent across direct staging and OAuth connect/reauth authorization-exchange windows, operation-scoped health admission, five-operation snapshot behavior, missing/stale read-versus-authorization behavior, unsupported inpaint, successful and atomic-rejected routing writes, explicit-pin no-fallback, finite/non-time health gates, deletion of current plus pending credentials, and internal retention evidence.
+The scenarios cover authentication/scope/ownership precedence, same-Tenant list isolation, valid Auth Mode gates, credential-class and malformed-material rejection, observable post-store validation success/failure, probe-before-validation rejection, direct and OAuth intake, OAuth connect/reauthentication failed-remediation and terminal recovery, single-flight replacement/enable/current-probe-marker race rejection, monotonically increasing current/pending-version probe outcomes, disable/enable, direct and OAuth reauthentication cutover, quarantine and drain zero-side-effect rejection, sticky public disabled intent across direct validation/probe staging and OAuth connect/reauth authorization-exchange windows, operation-scoped health admission, five-operation snapshot behavior, missing/stale/invalid read-versus-authorization behavior, reference-only evidence remaining unverified, unsupported inpaint, successful and atomic-rejected routing writes, explicit-pin no-fallback, finite/non-time health gates, deletion of current plus pending credentials, and internal retention evidence.
 
 Side effects are explicit counters (`vaultWrites`, `vaultDecrypts`, `vaultRevokes`, `vaultDeletes`, `adapterCalls`, `providerProbeCalls`, `oauthExchanges`, `policyWrites`). Therefore a scenario can prove not only its response but also that a forbidden operation did not reach a sensitive boundary.
 
@@ -364,7 +366,7 @@ node scripts/prototype-management-contract.mjs
 The command first validates the OpenAPI artifact, then runs the state scenarios. The validator:
 
 1. parses JSON-compatible YAML without a YAML dependency;
-2. checks OpenAPI version, prototype marker, server, security, scopes, and operation coverage;
+2. checks OpenAPI version, top-level-only prototype marker, server, security, reusable identifier parameters, scopes, and operation coverage;
 3. rejects client-supplied `tenant_id`;
 4. resolves internal `$ref`s and rejects external/cyclic references;
 5. restricts secret-bearing fields to approved write-only request schemas;

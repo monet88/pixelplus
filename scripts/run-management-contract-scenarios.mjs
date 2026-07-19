@@ -12,6 +12,8 @@ const SECRET_KEYS = new Set([
   "refresh_token",
   "cookie",
   "cookies",
+  "set-cookie",
+  "set_cookie",
   "ciphertext",
   "device_code",
   "authorization_code",
@@ -27,6 +29,13 @@ const SECRET_VALUE_PATTERNS = [
   /access[_-]?token\s*[:=]/i,
   /set-cookie\s*:/i,
 ];
+const SECRET_KEY_CANONICAL = new Set(
+  [...SECRET_KEYS].map((name) => name.replace(/[^a-z0-9]/g, "")),
+);
+const isSecretName = (value) => {
+  if (typeof value !== "string") return false;
+  return SECRET_KEY_CANONICAL.has(value.toLowerCase().replace(/[^a-z0-9]/g, ""));
+};
 
 const clock = (() => {
   let tick = 0;
@@ -169,6 +178,13 @@ function accessAccount(principal, providerAccountId, scope) {
   return { account };
 }
 
+function hasPendingOAuthAuthorization(providerAccountId) {
+  return Object.values(state.oauth).some((authorization) => (
+    authorization.providerAccountId === providerAccountId
+    && authorization.status === "authorization_pending"
+  ));
+}
+
 function validateCredential(account, credential) {
   if (!credential || !CREDENTIAL_CLASSES.has(credential.credential_class)) return "credential_class_invalid";
   const expectedClass = account.authMode.includes("oauth") ? "oauth_token_import" : "web_session";
@@ -287,7 +303,7 @@ function accountResponse(account, status = 200, trace = []) {
 function redact(value) {
   if (Array.isArray(value)) return value.map(redact);
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, SECRET_KEYS.has(key.toLowerCase()) ? "<redacted>" : redact(nested)]));
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, isSecretName(key) ? "<redacted>" : redact(nested)]));
   }
   if (typeof value === "string" && SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value))) return "<redacted>";
   return value;
@@ -392,18 +408,75 @@ function submitCredential(principal, request) {
   const validationError = validateCredential(account, request.credential);
   if (validationError) return errors.invalid(validationError);
 
-  account.lifecycleState = "pending_validation";
-  account.updatedAt = clock();
   const nextVersion = allocateCredentialVersion(account);
   state.effects.vaultWrites += 1;
   state.vault[account.providerAccountId] = { version: nextVersion, revoked: false, deleted: false };
   account.credential.currentVersion = nextVersion;
+  account.credential.validationTarget = "current";
   account.credential.decryptable = false;
-  account.credential.lastValidatedAt = clock();
-  account.credential.probeReturnState = "active";
-  account.lifecycleState = "pending_probe";
+  account.lifecycleState = "pending_validation";
+  account.health = condition("account", "unknown", "initial_unprobed", nextVersion, "none");
   account.updatedAt = clock();
-  return accountResponse(account, 202, ["pending_validation", "validation_success", "pending_probe"]);
+  return accountResponse(account, 202, ["credential_stored", "pending_validation"]);
+}
+
+function completeCredentialValidation(principal, request) {
+  const { account, denied } = accessAccount(principal, request.provider_account_id, "accounts.manage");
+  if (denied) return denied;
+
+  const target = account.credential.validationTarget;
+  const version = target === "pending"
+    ? account.credential.pendingVersion
+    : target === "current"
+      ? account.credential.currentVersion
+      : null;
+  const validationStateAllowed = account.lifecycleState === "pending_validation"
+    || (account.lifecycleState === "disabled" && account.credential.disabledIntent);
+  if (!target || !version || !validationStateAllowed) {
+    return errors.accountNotUsable("credential_validation_not_pending");
+  }
+
+  if (request.simulated_result === "success") {
+    account.credential.validationTarget = null;
+    account.credential.lastValidatedAt = clock();
+    const preserveDisabled = account.credential.disabledIntent
+      || account.lifecycleState === "disabled"
+      || account.credential.reauthReturnState === "disabled";
+    if (target === "current") {
+      account.credential.probeReturnState = preserveDisabled ? "disabled" : "active";
+    }
+    account.lifecycleState = preserveDisabled ? "disabled" : "pending_probe";
+    account.updatedAt = clock();
+    return accountResponse(account, 200, ["validation_success", account.lifecycleState, "provider_probe_required"]);
+  }
+
+  if (request.simulated_result !== "failure") return errors.invalid("validation_result_invalid");
+
+  state.effects.vaultRevokes += 1;
+  account.credential.validationTarget = null;
+  account.credential.decryptable = false;
+  if (target === "pending") {
+    delete state.vault[`${account.providerAccountId}:pending`];
+    account.credential.pendingVersion = null;
+    account.credential.priorVersionForInFlight = null;
+    account.credential.retiredForNewAdmissions = account.credential.currentVersion;
+    const preserveDisabled = account.credential.disabledIntent
+      || account.lifecycleState === "disabled"
+      || account.credential.reauthReturnState === "disabled";
+    account.credential.reauthReturnState = null;
+    account.lifecycleState = preserveDisabled ? "disabled" : "reauth_required";
+    account.health = condition("account", "expired", "credential_rejected", version, "reauthenticate");
+  } else {
+    delete state.vault[account.providerAccountId];
+    account.credential.currentVersion = null;
+    account.credential.probeReturnState = null;
+    account.credential.disabledIntent = false;
+    account.lifecycleState = "draft";
+    account.health = condition("account", "unknown", "credential_rejected", version, "submit_credential");
+  }
+  invalidateSnapshot(account.providerAccountId);
+  account.updatedAt = clock();
+  return accountResponse(account, 200, ["validation_failed", "staged_version_revoked", account.lifecycleState]);
 }
 
 function startOAuth(principal, request) {
@@ -420,6 +493,15 @@ function startOAuth(principal, request) {
     if (!account.credential.currentVersion || !["active", "reauth_required", "revoked", "disabled"].includes(account.lifecycleState)) {
       return errors.accountNotUsable("oauth_reauthentication_not_allowed");
     }
+    if (
+      account.credential.pendingVersion
+      || account.credential.validationTarget
+      || account.credential.reauthReturnState
+      || account.credential.probeReturnState
+      || hasPendingOAuthAuthorization(account.providerAccountId)
+    ) {
+      return errors.accountNotUsable("reauthentication_in_progress");
+    }
     account.credential.priorVersionForInFlight = account.credential.currentVersion;
     account.credential.retiredForNewAdmissions = account.credential.currentVersion;
     account.credential.reauthReturnState = account.lifecycleState === "disabled" ? "disabled" : "active";
@@ -428,7 +510,7 @@ function startOAuth(principal, request) {
   }
 
   const authorizationId = nextId("oauth");
-  account.lifecycleState = "pending_validation";
+  if (account.lifecycleState !== "disabled") account.lifecycleState = "pending_validation";
   account.updatedAt = clock();
   state.oauth[authorizationId] = {
     tenantId: principal.tenantId,
@@ -462,8 +544,9 @@ function pollOAuth(principal, request) {
     return errors.notFound();
   }
 
-  if (request.simulated_result === "succeeded" && authorization.status !== "succeeded") {
+  if (authorization.status === "authorization_pending" && request.simulated_result === "succeeded") {
     authorization.status = "succeeded";
+    authorization.remediation = "none";
     state.effects.oauthExchanges += 1;
     state.effects.vaultWrites += 1;
     const nextVersion = allocateCredentialVersion(account);
@@ -473,11 +556,33 @@ function pollOAuth(principal, request) {
     } else {
       state.vault[account.providerAccountId] = { version: nextVersion, revoked: false, deleted: false };
       account.credential.currentVersion = nextVersion;
-      account.credential.probeReturnState = account.credential.disabledIntent ? "disabled" : "active";
+      account.credential.probeReturnState = account.credential.disabledIntent || account.lifecycleState === "disabled"
+        ? "disabled"
+        : "active";
     }
     account.credential.decryptable = false;
     account.credential.lastValidatedAt = clock();
-    account.lifecycleState = "pending_probe";
+    const preserveDisabled = account.credential.disabledIntent
+      || account.lifecycleState === "disabled"
+      || account.credential.reauthReturnState === "disabled";
+    account.lifecycleState = preserveDisabled ? "disabled" : "pending_probe";
+    account.updatedAt = clock();
+  } else if (authorization.status === "authorization_pending" && request.simulated_result === "failed") {
+    authorization.status = "failed";
+    authorization.remediation = "complete_oauth";
+    state.effects.oauthExchanges += 1;
+    account.credential.decryptable = false;
+    if (authorization.purpose === "reauthenticate") {
+      const preserveDisabled = account.credential.disabledIntent
+        || account.lifecycleState === "disabled"
+        || account.credential.reauthReturnState === "disabled";
+      account.credential.priorVersionForInFlight = null;
+      account.credential.reauthReturnState = null;
+      account.lifecycleState = preserveDisabled ? "disabled" : "reauth_required";
+    } else {
+      account.credential.disabledIntent = false;
+      account.lifecycleState = "draft";
+    }
     account.updatedAt = clock();
   }
   return {
@@ -489,19 +594,23 @@ function pollOAuth(principal, request) {
       flow: authorization.flow,
       status: authorization.status,
       expires_at: authorization.expiresAt,
-      remediation: authorization.status === "authorization_pending" ? "complete_oauth" : "none",
+      remediation: authorization.remediation
+        || (authorization.status === "authorization_pending" ? "complete_oauth" : "none"),
     },
   };
 }
 
-function buildSnapshot(account, freshness = "fresh") {
-  const statuses = account.authMode.startsWith("gemini")
+function buildSnapshot(account, freshness = "fresh", evidenceClass = "live_probe") {
+  const observedStatuses = account.authMode.startsWith("gemini")
     ? { chat: "verified", chat_streaming: "conditionally_supported", image_generation: "conditionally_supported", image_edit: "conditionally_supported", inpaint: "unsupported" }
     : { chat: "verified", chat_streaming: "conditionally_supported", image_generation: "conditionally_supported", image_edit: "conditionally_supported", inpaint: "conditionally_supported" };
+  const statuses = evidenceClass === "reference_learned"
+    ? Object.fromEntries(OPERATIONS.map((operation) => [operation, "unverified"]))
+    : observedStatuses;
   const operations = Object.fromEntries(OPERATIONS.map((operation) => [operation, {
     status: statuses[operation],
-    offerable: freshness === "fresh" && OFFERABLE.has(statuses[operation]),
-    evidence_class: "live_probe",
+    offerable: freshness === "fresh" && evidenceClass !== "reference_learned" && OFFERABLE.has(statuses[operation]),
+    evidence_class: evidenceClass,
     ...(operation === "chat_streaming" ? { streaming_class: account.authMode === "gemini_web_cookie" ? "synthetic" : "real" } : {}),
   }]));
   return {
@@ -509,8 +618,12 @@ function buildSnapshot(account, freshness = "fresh") {
     credential_version: account.credential.currentVersion,
     verified_at: clock(),
     freshness,
-    ttl_class: "TTL-PROBE-LIVE",
-    provenance: [{ evidence_class: "live_probe", probe_surface: "safe-account-probe", observed_at: clock() }],
+    ttl_class: evidenceClass === "reference_learned" ? "TTL-REFERENCE" : "TTL-PROBE-LIVE",
+    provenance: [{
+      evidence_class: evidenceClass,
+      probe_surface: evidenceClass === "reference_learned" ? "provider-reference-metadata" : "safe-account-probe",
+      observed_at: clock(),
+    }],
     operations,
     models: [{
       model_slug: account.provider === "gemini" ? "gemini-observed-1" : "gpt-observed-1",
@@ -531,6 +644,9 @@ function invalidateSnapshot(providerAccountId) {
 function completeProbe(principal, request) {
   const { account, denied } = accessAccount(principal, request.provider_account_id, "accounts.manage");
   if (denied) return denied;
+  if (account.credential.validationTarget) {
+    return errors.accountNotUsable("credential_validation_pending");
+  }
   const controlDenial = probeControlDenial(account);
   if (controlDenial) return controlDenial;
 
@@ -614,7 +730,11 @@ function completeProbe(principal, request) {
     account.health = condition("account", "expired", "credential_rejected", probeVersion, "reauthenticate");
     invalidateSnapshot(account.providerAccountId);
   } else {
-    account.lifecycleState = "pending_probe";
+    const preserveDisabled = account.credential.disabledIntent
+      || account.lifecycleState === "disabled"
+      || account.credential.reauthReturnState === "disabled"
+      || account.credential.probeReturnState === "disabled";
+    account.lifecycleState = preserveDisabled ? "disabled" : "pending_probe";
     account.credential.decryptable = false;
     account.health = condition("account", "degraded", "upstream_unavailable", probeVersion, "wait_provider_cooldown");
   }
@@ -645,8 +765,17 @@ function disableAccount(principal, request) {
 function enableAccount(principal, request) {
   const { account, denied } = accessAccount(principal, request.provider_account_id, "accounts.manage");
   if (denied) return denied;
-  if (account.lifecycleState !== "disabled" || !account.credential.currentVersion || account.credential.pendingVersion) {
-    return errors.accountNotUsable("enable_requires_disabled_credentialed_account");
+  const journeyInProgress = account.credential.validationTarget
+    || account.credential.reauthReturnState
+    || account.credential.probeReturnState
+    || hasPendingOAuthAuthorization(account.providerAccountId);
+  if (
+    account.lifecycleState !== "disabled"
+    || !account.credential.currentVersion
+    || account.credential.pendingVersion
+    || journeyInProgress
+  ) {
+    return errors.accountNotUsable("enable_requires_idle_disabled_credentialed_account");
   }
   account.credential.disabledIntent = false;
   account.lifecycleState = "pending_probe";
@@ -659,8 +788,17 @@ function enableAccount(principal, request) {
 function reauthenticate(principal, request) {
   const { account, denied } = accessAccount(principal, request.provider_account_id, "accounts.manage");
   if (denied) return denied;
-  if (!account.credential.currentVersion || account.credential.pendingVersion || !["active", "reauth_required", "revoked", "disabled"].includes(account.lifecycleState)) {
+  if (!account.credential.currentVersion || !["active", "reauth_required", "revoked", "disabled"].includes(account.lifecycleState)) {
     return errors.accountNotUsable("reauthentication_not_allowed");
+  }
+  if (
+    account.credential.pendingVersion
+    || account.credential.validationTarget
+    || account.credential.reauthReturnState
+    || account.credential.probeReturnState
+    || hasPendingOAuthAuthorization(account.providerAccountId)
+  ) {
+    return errors.accountNotUsable("reauthentication_in_progress");
   }
   const validationError = validateCredential(account, request.credential);
   if (validationError) return errors.invalid(validationError);
@@ -670,16 +808,20 @@ function reauthenticate(principal, request) {
   state.effects.vaultWrites += 1;
   state.vault[`${account.providerAccountId}:pending`] = { version: pendingVersion, revoked: false, deleted: false };
   account.credential.pendingVersion = pendingVersion;
+  account.credential.validationTarget = "pending";
   account.credential.priorVersionForInFlight = priorVersion;
   account.credential.retiredForNewAdmissions = priorVersion;
   account.credential.reauthReturnState = account.lifecycleState === "disabled" ? "disabled" : "active";
   account.credential.decryptable = false;
   invalidateSnapshot(account.providerAccountId);
-  account.lifecycleState = "pending_validation";
+  if (account.lifecycleState !== "disabled") account.lifecycleState = "pending_validation";
   account.updatedAt = clock();
-  account.credential.lastValidatedAt = clock();
-  account.lifecycleState = "pending_probe";
-  return accountResponse(account, 202, ["same_provider_account_id", "pending_validation", "pending_probe", "old_version_new_admission_blocked"]);
+  return accountResponse(account, 202, [
+    "same_provider_account_id",
+    "pending_version_stored",
+    account.lifecycleState,
+    "old_version_new_admission_blocked",
+  ]);
 }
 
 
@@ -799,7 +941,7 @@ function noSecretBearingKeys(value, path = "$", found = []) {
   if (Array.isArray(value)) value.forEach((item, index) => noSecretBearingKeys(item, `${path}[${index}]`, found));
   else if (value && typeof value === "object") {
     for (const [key, nested] of Object.entries(value)) {
-      if (SECRET_KEYS.has(key.toLowerCase())) found.push(`${path}.${key}`);
+      if (isSecretName(key)) found.push(`${path}.${key}`);
       noSecretBearingKeys(nested, `${path}.${key}`, found);
     }
   } else if (typeof value === "string" && SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value))) {
@@ -807,6 +949,15 @@ function noSecretBearingKeys(value, path = "$", found = []) {
   }
   return found;
 }
+
+assert.deepEqual(
+  noSecretBearingKeys({ accessToken: "opaque", nested: { setCookie: "opaque" } }),
+  ["$.accessToken", "$.nested.setCookie"],
+);
+assert.deepEqual(
+  redact({ accessToken: "opaque", nested: { setCookie: "opaque" } }),
+  { accessToken: "<redacted>", nested: { setCookie: "<redacted>" } },
+);
 
 console.log("PROTOTYPE — issue #19 management contract logic; throwaway executable evidence, not Gateway runtime.\n");
 
@@ -865,15 +1016,45 @@ action("Control character credential is rejected before vault and probe", admin,
   assert.equal(delta.vaultWrites, 0);
   assert.equal(delta.providerProbeCalls, 0);
 });
-action("Direct credential store ends pending_probe, never active", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "cookie-session-material" } }, submitCredential, ({ response, delta }) => {
-  assert.equal(response.body.account.lifecycle_state, "pending_probe");
+action("Direct credential store lands in observable pending_validation", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "cookie-session-material" } }, submitCredential, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "pending_validation");
+  assert.equal(response.body.account.credential.version, 1);
+  assert.equal("last_validated_at" in response.body.account.credential, false);
   assert.equal(delta.vaultWrites, 1);
   assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
   assert.equal(noSecretBearingKeys(response).length, 0);
 });
 action("Credential intake cannot bypass lifecycle after draft", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "second-session-material" } }, submitCredential, ({ response, delta }) => {
   assert.equal(response.body.safe_context.cause_class, "credential_intake_requires_draft");
   assert.equal(delta.vaultWrites, 0);
+});
+action("Server-owned validation success advances to pending_probe", admin, { provider_account_id: directId, simulated_result: "success" }, completeCredentialValidation, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "pending_probe");
+  assert.equal(response.body.account.credential.version, 1);
+  assert.equal("last_validated_at" in response.body.account.credential, true);
+  assert.equal(delta.vaultWrites, 0);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
+});
+const validationFailureAccount = action("Create shell for post-store validation failure", admin, { provider: "gemini", auth_mode: "gemini_web_cookie", label: "Validation failure" }, createAccount, ({ response }) => {
+  assert.equal(response.body.account.lifecycle_state, "draft");
+});
+const validationFailureId = validationFailureAccount.body.account.provider_account_id;
+action("Credential is stored before server-owned validation", admin, { provider_account_id: validationFailureId, credential: { credential_class: "web_session", material: "stored-invalid-session" } }, submitCredential, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "pending_validation");
+  assert.equal(delta.vaultWrites, 1);
+  assert.equal(delta.adapterCalls, 0);
+});
+action("Post-store validation failure revokes material with safe remediation", admin, { provider_account_id: validationFailureId, simulated_result: "failure" }, completeCredentialValidation, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "draft");
+  assert.equal("version" in response.body.account.credential, false);
+  assert.equal(response.body.account.health.conditions[0].remediation, "submit_credential");
+  assert.equal(state.accounts[validationFailureId].credential.highestVersion, 1);
+  assert.equal(state.vault[validationFailureId], undefined);
+  assert.equal(delta.vaultRevokes, 1);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
 });
 action("Transient activation probe failure stays non-usable", admin, { provider_account_id: directId, simulated_result: "transient_failure" }, completeProbe, ({ response, delta }) => {
   assert.equal(response.body.account.lifecycle_state, "pending_probe");
@@ -938,6 +1119,28 @@ action("OAuth activation auth failure requires reauthentication", admin, { provi
   assert.equal(response.body.account.health.summary_state, "expired");
   assert.equal("retry_after_seconds" in response.body.account.health.conditions[0], false);
 });
+const oauthFailureAccount = action("Create OAuth account for failed authorization", admin, { provider: "chatgpt", auth_mode: "chatgpt_codex_oauth", label: "OAuth failure" }, createAccount, ({ response }) => {
+  assert.equal(response.body.account.lifecycle_state, "draft");
+});
+const oauthFailureId = oauthFailureAccount.body.account.provider_account_id;
+const oauthFailureStart = action("OAuth failure journey starts with safe pending metadata", admin, { provider_account_id: oauthFailureId, purpose: "connect", flow_preference: "device" }, startOAuth, ({ response }) => {
+  assert.equal(response.body.status, "authorization_pending");
+  assert.equal(response.body.remediation, "complete_oauth");
+});
+action("OAuth failed status returns remediation without storing credential", admin, { provider_account_id: oauthFailureId, authorization_id: oauthFailureStart.body.authorization_id, simulated_result: "failed" }, pollOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "failed");
+  assert.equal(response.body.remediation, "complete_oauth");
+  assert.equal(state.accounts[oauthFailureId].lifecycleState, "draft");
+  assert.equal(delta.oauthExchanges, 1);
+  assert.equal(delta.vaultWrites, 0);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(noSecretBearingKeys(response).length, 0);
+});
+action("Failed OAuth authorization is terminal and idempotent", admin, { provider_account_id: oauthFailureId, authorization_id: oauthFailureStart.body.authorization_id, simulated_result: "succeeded" }, pollOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "failed");
+  assert.equal(delta.oauthExchanges, 0);
+  assert.equal(delta.vaultWrites, 0);
+});
 
 // Tenant list isolation and disable semantics.
 action("List exposes only same-Tenant non-deleted accounts", reader, {}, listAccounts, ({ response, delta }) => {
@@ -971,13 +1174,56 @@ action("Pure draft disable is stable rejection", admin, { provider_account_id: d
 });
 
 // OAuth reauthentication preserves disabled administration state.
-const oauthReauthStart = action("Disabled OAuth account can start reauthentication without becoming usable", admin, { provider_account_id: oauthId, purpose: "reauthenticate", flow_preference: "device" }, startOAuth, ({ response, delta }) => {
+const oauthReauthStart = action("Disabled OAuth account can start reauthentication without hiding disabled lifecycle", admin, { provider_account_id: oauthId, purpose: "reauthenticate", flow_preference: "device" }, startOAuth, ({ response, delta }) => {
   assert.equal(response.body.status, "authorization_pending");
+  assert.equal(state.accounts[oauthId].lifecycleState, "disabled");
   assert.equal(state.accounts[oauthId].credential.decryptable, false);
   assert.equal(delta.vaultDecrypts, 0);
 });
-action("OAuth reauthentication exchange stages a pending version", admin, { provider_account_id: oauthId, authorization_id: oauthReauthStart.body.authorization_id, simulated_result: "succeeded" }, pollOAuth, ({ response, delta }) => {
+action("Second OAuth reauthentication is rejected while authorization is pending", admin, { provider_account_id: oauthId, purpose: "reauthenticate", flow_preference: "browser" }, startOAuth, ({ response, delta }) => {
+  assert.equal(response.body.safe_context.cause_class, "reauthentication_in_progress");
+  assert.equal(delta.oauthExchanges, 0);
+  assert.equal(delta.vaultWrites, 0);
+});
+action("Direct replacement cannot race an OAuth reauthentication", admin, { provider_account_id: oauthId, credential: { credential_class: "oauth_token_import", material: "parallel-oauth-material" } }, reauthenticate, ({ response, delta }) => {
+  assert.equal(response.body.safe_context.cause_class, "reauthentication_in_progress");
+  assert.equal(state.accounts[oauthId].credential.pendingVersion, null);
+  assert.equal(delta.vaultWrites, 0);
+});
+action("Enable is rejected while disabled OAuth reauthentication is pending", admin, { provider_account_id: oauthId }, enableAccount, ({ response, delta }) => {
+  assert.equal(response.body.safe_context.cause_class, "enable_requires_idle_disabled_credentialed_account");
+  assert.equal(state.accounts[oauthId].lifecycleState, "disabled");
+  assert.equal(delta.vaultDecrypts, 0);
+  assert.equal(delta.providerProbeCalls, 0);
+});
+action("Failed disabled OAuth reauthentication preserves disabled intent without storing credential", admin, { provider_account_id: oauthId, authorization_id: oauthReauthStart.body.authorization_id, simulated_result: "failed" }, pollOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "failed");
+  assert.equal(response.body.remediation, "complete_oauth");
+  assert.equal(state.accounts[oauthId].lifecycleState, "disabled");
+  assert.equal(state.accounts[oauthId].credential.disabledIntent, true);
+  assert.equal(state.accounts[oauthId].credential.currentVersion, 1);
+  assert.equal(state.accounts[oauthId].credential.pendingVersion, null);
+  assert.equal(delta.oauthExchanges, 1);
+  assert.equal(delta.vaultWrites, 0);
+  assert.equal(delta.vaultDecrypts, 0);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
+  assert.equal(noSecretBearingKeys(response).length, 0);
+});
+action("Failed disabled OAuth reauthentication authorization stays terminal", admin, { provider_account_id: oauthId, authorization_id: oauthReauthStart.body.authorization_id, simulated_result: "succeeded" }, pollOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "failed");
+  assert.equal(state.accounts[oauthId].credential.pendingVersion, null);
+  assert.equal(delta.oauthExchanges, 0);
+  assert.equal(delta.vaultWrites, 0);
+});
+const oauthReauthRetry = action("Disabled OAuth account can restart reauthentication after terminal failure", admin, { provider_account_id: oauthId, purpose: "reauthenticate", flow_preference: "browser" }, startOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "authorization_pending");
+  assert.equal(state.accounts[oauthId].lifecycleState, "disabled");
+  assert.equal(delta.vaultWrites, 0);
+});
+action("OAuth reauthentication exchange stages a pending version while disabled", admin, { provider_account_id: oauthId, authorization_id: oauthReauthRetry.body.authorization_id, simulated_result: "succeeded" }, pollOAuth, ({ response, delta }) => {
   assert.equal(response.body.status, "succeeded");
+  assert.equal(state.accounts[oauthId].lifecycleState, "disabled");
   assert.equal(state.accounts[oauthId].credential.currentVersion, 1);
   assert.equal(state.accounts[oauthId].credential.pendingVersion, 2);
   assert.equal(delta.vaultWrites, 1);
@@ -996,7 +1242,24 @@ action("OAuth current-version probe restores active use", admin, { provider_acco
   assert.equal(response.body.account.lifecycle_state, "active");
   assert.equal(response.body.account.credential.version, 2);
 });
-const activeOAuthReauth = action("Active OAuth account starts replacement before exchange", admin, { provider_account_id: oauthId, purpose: "reauthenticate", flow_preference: "device" }, startOAuth, ({ response }) => {
+const activeOAuthFailureStart = action("Active OAuth account starts reauthentication failure journey", admin, { provider_account_id: oauthId, purpose: "reauthenticate", flow_preference: "device" }, startOAuth, ({ response }) => {
+  assert.equal(response.body.status, "authorization_pending");
+  assert.equal(state.accounts[oauthId].credential.reauthReturnState, "active");
+});
+action("Failed active-origin OAuth reauthentication returns reauth_required without storing credential", admin, { provider_account_id: oauthId, authorization_id: activeOAuthFailureStart.body.authorization_id, simulated_result: "failed" }, pollOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "failed");
+  assert.equal(response.body.remediation, "complete_oauth");
+  assert.equal(state.accounts[oauthId].lifecycleState, "reauth_required");
+  assert.equal(state.accounts[oauthId].credential.currentVersion, 2);
+  assert.equal(state.accounts[oauthId].credential.pendingVersion, null);
+  assert.equal(delta.oauthExchanges, 1);
+  assert.equal(delta.vaultWrites, 0);
+  assert.equal(delta.vaultDecrypts, 0);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
+  assert.equal(noSecretBearingKeys(response).length, 0);
+});
+const activeOAuthReauth = action("Non-disabled OAuth account can restart replacement after terminal failure", admin, { provider_account_id: oauthId, purpose: "reauthenticate", flow_preference: "device" }, startOAuth, ({ response }) => {
   assert.equal(response.body.status, "authorization_pending");
   assert.equal(state.accounts[oauthId].credential.reauthReturnState, "active");
 });
@@ -1019,7 +1282,48 @@ action("Post-disable OAuth cutover cannot reactivate the account", admin, { prov
   assert.equal(delta.vaultRevokes, 1);
 });
 
-// Disable intent also survives the OAuth connect authorization/exchange window.
+const disabledConnectFailureAccount = action("Create OAuth connect failure race account", admin, { provider: "chatgpt", auth_mode: "chatgpt_codex_oauth", label: "OAuth disabled connect failure" }, createAccount, ({ response }) => {
+  assert.equal(response.body.account.lifecycle_state, "draft");
+});
+const disabledConnectFailureId = disabledConnectFailureAccount.body.account.provider_account_id;
+const disabledConnectFailureStart = action("OAuth connect failure race starts before credential exchange", admin, { provider_account_id: disabledConnectFailureId, purpose: "connect", flow_preference: "device" }, startOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "authorization_pending");
+  assert.equal(state.accounts[disabledConnectFailureId].lifecycleState, "pending_validation");
+  assert.equal(delta.vaultWrites, 0);
+});
+action("Disable during failed OAuth connect records temporary intent", admin, { provider_account_id: disabledConnectFailureId }, disableAccount, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "disabled");
+  assert.equal(state.accounts[disabledConnectFailureId].credential.disabledIntent, true);
+  assert.equal(delta.vaultDecrypts, 0);
+});
+action("Failed disabled OAuth connect returns credentialless account to draft", admin, { provider_account_id: disabledConnectFailureId, authorization_id: disabledConnectFailureStart.body.authorization_id, simulated_result: "failed" }, pollOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "failed");
+  assert.equal(response.body.remediation, "complete_oauth");
+  assert.equal(state.accounts[disabledConnectFailureId].lifecycleState, "draft");
+  assert.equal(state.accounts[disabledConnectFailureId].credential.disabledIntent, false);
+  assert.equal(state.accounts[disabledConnectFailureId].credential.currentVersion, null);
+  assert.equal(delta.oauthExchanges, 1);
+  assert.equal(delta.vaultWrites, 0);
+  assert.equal(delta.vaultDecrypts, 0);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
+  assert.equal(noSecretBearingKeys(response).length, 0);
+});
+const disabledConnectRetry = action("Failed disabled OAuth connect can restart from draft", admin, { provider_account_id: disabledConnectFailureId, purpose: "connect", flow_preference: "browser" }, startOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "authorization_pending");
+  assert.equal(state.accounts[disabledConnectFailureId].lifecycleState, "pending_validation");
+  assert.equal(delta.oauthExchanges, 0);
+  assert.equal(delta.vaultWrites, 0);
+});
+action("Retried OAuth connect failure remains terminal and credential-free", admin, { provider_account_id: disabledConnectFailureId, authorization_id: disabledConnectRetry.body.authorization_id, simulated_result: "failed" }, pollOAuth, ({ response, delta }) => {
+  assert.equal(response.body.status, "failed");
+  assert.equal(state.accounts[disabledConnectFailureId].lifecycleState, "draft");
+  assert.equal(state.accounts[disabledConnectFailureId].credential.currentVersion, null);
+  assert.equal(delta.oauthExchanges, 1);
+  assert.equal(delta.vaultWrites, 0);
+});
+
+// Disable intent also survives a successful OAuth connect authorization/exchange window.
 const oauthConnectRaceAccount = action("Create OAuth connect race account", admin, { provider: "chatgpt", auth_mode: "chatgpt_codex_oauth", label: "OAuth connect race" }, createAccount, ({ response }) => {
   assert.equal(response.body.account.lifecycle_state, "draft");
 });
@@ -1035,12 +1339,26 @@ action("Disable during OAuth connect records sticky administrative intent", admi
 });
 action("OAuth connect exchange cannot erase disable intent", admin, { provider_account_id: oauthConnectRaceId, authorization_id: oauthConnectRaceStart.body.authorization_id, simulated_result: "succeeded" }, pollOAuth, ({ response, delta }) => {
   assert.equal(response.body.status, "succeeded");
+  assert.equal(state.accounts[oauthConnectRaceId].lifecycleState, "disabled");
   assert.equal(state.accounts[oauthConnectRaceId].credential.currentVersion, 1);
   assert.equal(state.accounts[oauthConnectRaceId].credential.probeReturnState, "disabled");
   assert.equal(delta.vaultWrites, 1);
 });
-action("Sticky-disable transient probe remains retryable and non-usable", admin, { provider_account_id: oauthConnectRaceId, simulated_result: "transient_failure" }, completeProbe, ({ response, delta }) => {
-  assert.equal(response.body.account.lifecycle_state, "pending_probe");
+action("Direct replacement is rejected while current-version probe marker is open", admin, { provider_account_id: oauthConnectRaceId, credential: { credential_class: "oauth_token_import", material: "blocked-probe-marker-material" } }, reauthenticate, ({ response, delta }) => {
+  assert.equal(response.body.safe_context.cause_class, "reauthentication_in_progress");
+  assert.equal(state.accounts[oauthConnectRaceId].credential.pendingVersion, null);
+  assert.equal(state.accounts[oauthConnectRaceId].credential.probeReturnState, "disabled");
+  assert.equal(delta.vaultWrites, 0);
+});
+action("OAuth replacement is rejected while current-version probe marker is open", admin, { provider_account_id: oauthConnectRaceId, purpose: "reauthenticate", flow_preference: "browser" }, startOAuth, ({ response, delta }) => {
+  assert.equal(response.body.safe_context.cause_class, "reauthentication_in_progress");
+  assert.equal(state.accounts[oauthConnectRaceId].credential.pendingVersion, null);
+  assert.equal(state.accounts[oauthConnectRaceId].credential.probeReturnState, "disabled");
+  assert.equal(delta.oauthExchanges, 0);
+  assert.equal(delta.vaultWrites, 0);
+});
+action("Sticky-disable transient probe remains disabled and retryable", admin, { provider_account_id: oauthConnectRaceId, simulated_result: "transient_failure" }, completeProbe, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "disabled");
   assert.equal(response.body.account.health.summary_state, "degraded");
   assert.equal(state.accounts[oauthConnectRaceId].credential.disabledIntent, true);
   assert.equal(state.accounts[oauthConnectRaceId].credential.decryptable, false);
@@ -1162,19 +1480,28 @@ action("Malformed direct reauthentication is rejected before vault", admin, { pr
   assert.equal(response.body.safe_context.cause_class, "credential_malformed");
   assert.equal(delta.vaultWrites, 0);
 });
-action("Direct reauthentication keeps logical account and stages new version", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "replacement-session-material" } }, reauthenticate, ({ response, delta }) => {
+action("Direct reauthentication keeps logical account and lands pending_validation", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "replacement-session-material" } }, reauthenticate, ({ response, delta }) => {
   assert.equal(response.body.account.provider_account_id, directId);
-  assert.equal(response.body.account.lifecycle_state, "pending_probe");
+  assert.equal(response.body.account.lifecycle_state, "pending_validation");
   assert.equal(state.accounts[directId].credential.pendingVersion, 2);
   assert.equal(state.accounts[directId].credential.currentVersion, 1);
   assert.equal(state.accounts[directId].credential.decryptable, false);
   assert.equal(state.snapshots[directId].freshness, "invalid");
   assert.equal(delta.vaultWrites, 1);
+  assert.equal(delta.adapterCalls, 0);
 });
-action("Pending reauthentication blocks new admissions", admin, { provider_account_id: directId, operation: "chat" }, authorizeCapability, ({ response, delta }) => {
+action("Pending-validation reauthentication blocks new admissions", admin, { provider_account_id: directId, operation: "chat" }, authorizeCapability, ({ response, delta }) => {
   assert.equal(response.body.safe_context.cause_class, "lifecycle_or_credential_gate");
   assert.equal(delta.vaultDecrypts, 0);
   assert.equal(delta.adapterCalls, 0);
+});
+action("Replacement validation success advances to pending_probe", admin, { provider_account_id: directId, simulated_result: "success" }, completeCredentialValidation, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "pending_probe");
+  assert.equal(response.body.account.credential.version, 1);
+  assert.equal(state.accounts[directId].credential.pendingVersion, 2);
+  assert.equal(delta.vaultWrites, 0);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
 });
 state.accounts[directId].controls.quarantine = "quarantined";
 action("Quarantined reauthentication probe has zero decrypt and Adapter calls", admin, { provider_account_id: directId, simulated_result: "success" }, completeProbe, ({ response, delta }) => {
@@ -1203,9 +1530,16 @@ action("Reauthentication probe auth failure never promotes pending version", adm
   assert.equal(delta.vaultRevokes, 1);
 });
 action("Replacement version is monotonic after failed pending version", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "replacement-session-material-2" } }, reauthenticate, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "pending_validation");
   assert.equal(state.accounts[directId].credential.pendingVersion, 3);
   assert.equal(response.body.account.credential.version, 1);
   assert.equal(delta.vaultWrites, 1);
+});
+action("Monotonic replacement validates before its public probe", admin, { provider_account_id: directId, simulated_result: "success" }, completeCredentialValidation, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "pending_probe");
+  assert.equal(state.accounts[directId].credential.pendingVersion, 3);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
 });
 action("Public probe cuts over replacement and retires old admissions", admin, { provider_account_id: directId, simulated_result: "success" }, completeProbe, ({ response, delta }) => {
   assert.equal(response.body.account.lifecycle_state, "active");
@@ -1217,17 +1551,23 @@ action("Public probe cuts over replacement and retires old admissions", admin, {
 });
 
 // Administrative disable intent survives replacement races and failures.
-action("Active reauthentication stages another monotonic version", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "midflight-replacement-material" } }, reauthenticate, ({ response, delta }) => {
-  assert.equal(response.body.account.lifecycle_state, "pending_probe");
+action("Active reauthentication stages another monotonic version for validation", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "midflight-replacement-material" } }, reauthenticate, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "pending_validation");
   assert.equal(response.body.account.credential.version, 3);
   assert.equal(state.accounts[directId].credential.pendingVersion, 4);
   assert.equal(delta.vaultWrites, 1);
 });
-action("Disable during pending replacement preserves administrative intent", admin, { provider_account_id: directId }, disableAccount, ({ response, delta }) => {
+action("Disable during pending validation preserves administrative intent", admin, { provider_account_id: directId }, disableAccount, ({ response, delta }) => {
   assert.equal(response.body.account.lifecycle_state, "disabled");
   assert.equal(state.accounts[directId].credential.pendingVersion, 4);
   assert.equal(state.accounts[directId].credential.reauthReturnState, "disabled");
   assert.equal(delta.vaultDecrypts, 0);
+});
+action("Validation success remains disabled while opening one pending-version probe", admin, { provider_account_id: directId, simulated_result: "success" }, completeCredentialValidation, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "disabled");
+  assert.equal(state.accounts[directId].credential.pendingVersion, 4);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
 });
 action("Mid-flight replacement success cannot reactivate disabled account", admin, { provider_account_id: directId, simulated_result: "success" }, completeProbe, ({ response, delta }) => {
   assert.equal(response.body.account.lifecycle_state, "disabled");
@@ -1248,11 +1588,24 @@ action("Enable probe activates the cut-over current version", admin, { provider_
 action("Disable before replacement failure keeps administrative intent", admin, { provider_account_id: directId }, disableAccount, ({ response }) => {
   assert.equal(response.body.account.lifecycle_state, "disabled");
 });
-action("Disabled reauthentication stages without opening admissions", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "disabled-failing-replacement" } }, reauthenticate, ({ response, delta }) => {
-  assert.equal(response.body.account.lifecycle_state, "pending_probe");
+action("Disabled reauthentication stages validation without hiding disabled lifecycle", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "disabled-failing-replacement" } }, reauthenticate, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "disabled");
   assert.equal(state.accounts[directId].credential.pendingVersion, 5);
   assert.equal(state.accounts[directId].credential.decryptable, false);
   assert.equal(delta.vaultWrites, 1);
+});
+action("Disabled pending validation rejects probe before sensitive boundaries", admin, { provider_account_id: directId, simulated_result: "success" }, completeProbe, ({ response, delta }) => {
+  assert.equal(response.body.safe_context.cause_class, "credential_validation_pending");
+  assert.equal(state.accounts[directId].credential.pendingVersion, 5);
+  assert.equal(delta.vaultDecrypts, 0);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
+});
+action("Disabled replacement validation success preserves disabled lifecycle", admin, { provider_account_id: directId, simulated_result: "success" }, completeCredentialValidation, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "disabled");
+  assert.equal(state.accounts[directId].credential.pendingVersion, 5);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
 });
 action("Disabled-origin auth failure remains disabled", admin, { provider_account_id: directId, simulated_result: "auth_failure" }, completeProbe, ({ response, delta }) => {
   assert.equal(response.body.account.lifecycle_state, "disabled");
@@ -1263,9 +1616,16 @@ action("Disabled-origin auth failure remains disabled", admin, { provider_accoun
   assert.equal(delta.vaultRevokes, 1);
 });
 action("Disabled reauthentication after failure allocates a new version", admin, { provider_account_id: directId, credential: { credential_class: "web_session", material: "disabled-success-replacement" } }, reauthenticate, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "disabled");
   assert.equal(response.body.account.credential.version, 4);
   assert.equal(state.accounts[directId].credential.pendingVersion, 6);
   assert.equal(delta.vaultWrites, 1);
+});
+action("Disabled replacement validates without becoming active", admin, { provider_account_id: directId, simulated_result: "success" }, completeCredentialValidation, ({ response, delta }) => {
+  assert.equal(response.body.account.lifecycle_state, "disabled");
+  assert.equal(state.accounts[directId].credential.pendingVersion, 6);
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.providerProbeCalls, 0);
 });
 action("Disabled replacement success stays disabled and non-decryptable", admin, { provider_account_id: directId, simulated_result: "success" }, completeProbe, ({ response, delta }) => {
   assert.equal(response.body.account.lifecycle_state, "disabled");
@@ -1315,6 +1675,30 @@ action("Stale snapshot remains readable but visibly non-authorizing", reader, { 
 });
 action("Stale snapshot rejects before Adapter and vault", admin, { provider_account_id: directId, operation: "chat" }, authorizeCapability, ({ response, delta }) => {
   assert.equal(response.body.code, "snapshot_stale");
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.vaultDecrypts, 0);
+});
+state.snapshots[directId].freshness = "invalid";
+action("Invalid snapshot remains readable for operator inspection", reader, { provider_account_id: directId }, getSnapshot, ({ response, delta }) => {
+  assert.equal(response.status, 200);
+  assert.equal(response.body.freshness, "invalid");
+  assert.equal(Object.values(response.body.operations).some((fact) => fact.offerable), false);
+  assert.equal(delta.vaultDecrypts, 0);
+});
+action("Invalid snapshot rejects execution before sensitive boundaries", admin, { provider_account_id: directId, operation: "chat" }, authorizeCapability, ({ response, delta }) => {
+  assert.equal(response.body.code, "snapshot_stale");
+  assert.equal(delta.adapterCalls, 0);
+  assert.equal(delta.vaultDecrypts, 0);
+});
+state.snapshots[directId] = buildSnapshot(state.accounts[directId], "fresh", "reference_learned");
+action("Reference-only evidence remains unverified and non-offerable", reader, { provider_account_id: directId }, getSnapshot, ({ response, delta }) => {
+  assert.equal(response.body.provenance[0].evidence_class, "reference_learned");
+  assert.equal(Object.values(response.body.operations).every((fact) => fact.status === "unverified"), true);
+  assert.equal(Object.values(response.body.operations).some((fact) => fact.offerable), false);
+  assert.equal(delta.vaultDecrypts, 0);
+});
+action("Reference-only evidence cannot authorize execution", admin, { provider_account_id: directId, operation: "chat" }, authorizeCapability, ({ response, delta }) => {
+  assert.equal(response.body.code, "capability_unverified");
   assert.equal(delta.adapterCalls, 0);
   assert.equal(delta.vaultDecrypts, 0);
 });

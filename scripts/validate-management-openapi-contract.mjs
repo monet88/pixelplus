@@ -1,4 +1,17 @@
 #!/usr/bin/env node
+/**
+ * Prototype OpenAPI contract validator for PixelPlus #19 management evidence.
+ *
+ * Usage (from repo root):
+ *   node scripts/validate-management-openapi-contract.mjs contracts/openapi/pixelplus-management-api-v0alpha.yaml
+ *
+ * Zero new Node dependencies. The tracer is JSON-compatible YAML (JSON subset)
+ * so it is loaded with JSON.parse. Draft 2020-12 example validation requires
+ * Python with the `jsonschema` package in the validation environment.
+ *
+ * This is representation validation, not a runtime Gateway/E2E test and not a
+ * full external OpenAPI metaschema check.
+ */
 
 import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -697,7 +710,11 @@ function main() {
   }
 
   if (doc.openapi !== "3.1.1") fail(`openapi must be 3.1.1, got ${JSON.stringify(doc.openapi)}`);
-  if (doc.info?.version !== "0.0.0-prototype") fail(`info.version must be 0.0.0-prototype`);
+  const info = doc.info || {};
+  if (info.version !== "0.0.0-prototype") fail(`info.version must be 0.0.0-prototype`);
+  if ("x-pixelplus-status" in info || "x-pixelplus-artifact-status" in info) {
+    fail("prototype status must use only top-level x-pixelplus-artifact-status");
+  }
   if (doc["x-pixelplus-artifact-status"] !== "prototype") fail(`top-level x-pixelplus-artifact-status must be prototype`);
   if (!String(doc.jsonSchemaDialect || "").includes("2020-12")) fail(`jsonSchemaDialect must be Draft 2020-12`);
   const servers = doc.servers || [];
@@ -723,6 +740,35 @@ function main() {
   }
   for (const [pathKey, pathItem] of Object.entries(paths)) {
     if (pathItem?.$ref) fail(`${pathKey}: path item $ref is outside the locked management prototype surface`);
+  }
+
+  const reusableParameters = doc.components?.parameters || {};
+  const providerAccountParameter = reusableParameters.ProviderAccountId;
+  const oauthAuthorizationParameter = reusableParameters.OAuthAuthorizationId;
+  if (
+    providerAccountParameter?.name !== "provider_account_id"
+    || providerAccountParameter?.in !== "path"
+    || providerAccountParameter?.required !== true
+    || providerAccountParameter?.schema?.pattern !== "^pa_[A-Za-z0-9_]+$"
+  ) {
+    fail(`components.parameters.ProviderAccountId must lock the Provider Account path identifier`);
+  }
+  if (
+    oauthAuthorizationParameter?.name !== "authorization_id"
+    || oauthAuthorizationParameter?.in !== "path"
+    || oauthAuthorizationParameter?.required !== true
+    || oauthAuthorizationParameter?.schema?.pattern !== "^oauth_[A-Za-z0-9_]+$"
+  ) {
+    fail(`components.parameters.OAuthAuthorizationId must lock the OAuth authorization path identifier`);
+  }
+  for (const [pathKey, pathItem] of Object.entries(paths)) {
+    const refs = (pathItem?.parameters || []).map((parameter) => parameter?.$ref);
+    if (pathKey.includes("{provider_account_id}") && !refs.includes("#/components/parameters/ProviderAccountId")) {
+      fail(`${pathKey}: must reuse components.parameters.ProviderAccountId`);
+    }
+    if (pathKey.includes("{authorization_id}") && !refs.includes("#/components/parameters/OAuthAuthorizationId")) {
+      fail(`${pathKey}: must reuse components.parameters.OAuthAuthorizationId`);
+    }
   }
 
   const expectedOperationKeys = REQUIRED_OPERATIONS
@@ -794,7 +840,15 @@ function main() {
 
   const enableOperation = paths["/provider-accounts/{provider_account_id}/enable"]?.post;
   const enableText = gatherText(enableOperation).join(" ").toLowerCase();
-  for (const phrase of ["pending_probe", "current-credential-version", "provider_probe", "non-usable"]) {
+  for (const phrase of [
+    "pending_probe",
+    "current-credential-version",
+    "separate",
+    "provider_probe",
+    "does not claim the probe has run",
+    "rejects while any authorization, validation, replacement, or one-shot probe marker is in flight",
+    "non-usable",
+  ]) {
     if (!enableText.includes(phrase)) fail(`enable operation must document ${phrase}`);
   }
   const enableExamples = responseExamples(enableOperation, "202");
@@ -856,8 +910,22 @@ function main() {
 
   const credentialIntakeOperation = paths["/provider-accounts/{provider_account_id}/credentials"]?.post;
   const credentialIntakeResponses = credentialIntakeOperation?.responses || {};
+  const credentialIntakeText = gatherText(credentialIntakeOperation).join(" ").toLowerCase();
+  const credentialIntakeExamples = responseExamples(credentialIntakeOperation, "202");
   if (!JSON.stringify(credentialIntakeResponses["409"] || {}).includes("ErrorAccountNotUsable")) {
     fail(`direct credential intake must expose account_not_usable for non-draft lifecycle rejection`);
+  }
+  for (const phrase of ["pending_validation", "separate server-owned validation", "revokes the staged version", "no adapter call"]) {
+    if (!credentialIntakeText.includes(phrase)) fail(`direct credential intake must document ${phrase}`);
+  }
+  if (credentialIntakeExamples.length === 0) fail(`direct credential intake 202 response must include a semantic example`);
+  for (const [index, credentialExample] of credentialIntakeExamples.entries()) {
+    if (credentialExample?.account?.lifecycle_state !== "pending_validation") {
+      fail(`direct credential intake 202 example ${index + 1} must expose pending_validation before server-owned validation completes`);
+    }
+    if (exampleClaimsProbeSuccess(credentialExample)) {
+      fail(`direct credential intake 202 example ${index + 1} must not claim probe success`);
+    }
   }
 
   const oauthStartOperation = paths["/provider-accounts/{provider_account_id}/oauth-authorizations"]?.post;
@@ -871,6 +939,23 @@ function main() {
   }
   if (!oauthStartText.includes("disable intent remains sticky across authorization, exchange, and probe")) {
     fail(`OAuth authorization start must document sticky disable intent across connect and reauthentication`);
+  }
+  if (!oauthStartText.includes("reauthentication start is rejected while any authorization, validation, replacement, or one-shot probe marker is in flight")) {
+    fail(`OAuth authorization start must document the complete reauthentication single-flight gate`);
+  }
+
+  const oauthPollOperation = paths["/provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}"]?.get;
+  const oauthPollText = gatherText(oauthPollOperation).join(" ").toLowerCase();
+  const oauthPollExamples = responseExamples(oauthPollOperation, "200");
+  for (const phrase of ["failed is terminal", "complete_oauth remediation", "stores no credential", "connect failure restores draft", "preserves disabled intent"]) {
+    if (!oauthPollText.includes(phrase)) fail(`OAuth authorization poll must document ${phrase}`);
+  }
+  const oauthFailureExamples = oauthPollExamples.filter((example) => example?.status === "failed");
+  if (oauthFailureExamples.length === 0) fail(`OAuth authorization poll must include a failed/remediation example`);
+  for (const [index, example] of oauthFailureExamples.entries()) {
+    if (example.remediation !== "complete_oauth") {
+      fail(`OAuth failed example ${index + 1} must use safe complete_oauth remediation`);
+    }
   }
 
   const reauthenticationOperation = paths["/provider-accounts/{provider_account_id}/reauthentication"]?.post;
@@ -899,8 +984,8 @@ function main() {
   if (reauthenticationExamples.length === 0) fail(`reauthentication 202 response must include a semantic example`);
   for (const [index, reauthenticationExample] of reauthenticationExamples.entries()) {
     const account = reauthenticationExample?.account;
-    if (account?.lifecycle_state !== "pending_probe") {
-      fail(`reauthentication 202 example ${index + 1} must remain pending_probe until cutover`);
+    if (account?.lifecycle_state !== "pending_validation") {
+      fail(`reauthentication 202 example ${index + 1} must expose pending_validation before server-owned validation completes`);
     }
     if (exampleClaimsProbeSuccess(reauthenticationExample)) {
       fail(`reauthentication 202 example ${index + 1} must not claim healthy probe success before cutover`);
@@ -922,7 +1007,10 @@ function main() {
     }
   }
   if (!reauthenticationText.includes("public credential version remains the old current version until cutover")) fail(`reauthentication 202 response must not publish the pending version as current`);
-  if (!reauthenticationText.includes("pending-version provider_probe cutover")) fail(`reauthentication must document pending-version provider_probe cutover`);
+  if (!reauthenticationText.includes("pending-version provider_probe")) fail(`reauthentication must document pending-version provider_probe cutover`);
+  for (const phrase of ["observable pending_validation", "server-owned validation", "revokes/discards the pending version", "safe reauthenticate remediation", "direct replacement is rejected while any authorization, validation, replacement, or one-shot probe marker is in flight"]) {
+    if (!reauthenticationText.includes(phrase)) fail(`reauthentication must document ${phrase}`);
+  }
   if (!reauthenticationConflict.includes("ErrorAccountNotUsable") || reauthenticationConflict.includes("ErrorAuthModeUnavailable")) {
     fail(`reauthentication 409 must represent account_not_usable lifecycle rejection`);
   }

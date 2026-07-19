@@ -315,14 +315,7 @@
     "/provider-accounts/{provider_account_id}": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         }
       ],
       "get": {
@@ -498,20 +491,13 @@
     "/provider-accounts/{provider_account_id}/credentials": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         }
       ],
       "post": {
         "operationId": "submitProviderCredential",
         "summary": "Submit direct Provider Credential",
-        "description": "Approved direct secret boundary for a pure draft account. The request may carry Provider Credential material once; the response never echoes it. Validation failure occurs before provider_probe, storing material alone never sets active, and later lifecycle states cannot use this endpoint to bypass reauthentication or enable.",
+        "description": "Approved direct secret boundary for a pure draft account. The request may carry Provider Credential material once; the response never echoes it. Request-shape and credential-class failures occur before vault write. Accepted material is stored and lands in observable pending_validation; a separate server-owned validation step either advances to pending_probe or revokes the staged version and records safe submit_credential remediation. No Adapter call or provider_probe occurs until validation succeeds, storing material alone never sets active, and later lifecycle states cannot use this endpoint to bypass reauthentication or enable.",
         "security": [
           {
             "ClientApiKey": []
@@ -519,7 +505,7 @@
         ],
         "responses": {
           "202": {
-            "description": "Credential accepted and validation completed; account remains non-usable pending probe",
+            "description": "Credential accepted and stored; account remains non-usable in pending_validation until the separate server-owned validation step completes",
             "content": {
               "application/json": {
                 "schema": {
@@ -531,11 +517,10 @@
                     "provider": "gemini",
                     "auth_mode": "gemini_web_cookie",
                     "label": "Gemini web",
-                    "lifecycle_state": "pending_probe",
+                    "lifecycle_state": "pending_validation",
                     "credential": {
                       "version": 1,
-                      "refresh_supported": false,
-                      "last_validated_at": "2026-07-18T10:06:00Z"
+                      "refresh_supported": false
                     },
                     "health": {
                       "summary_state": "unknown",
@@ -546,9 +531,9 @@
                           },
                           "state": "unknown",
                           "reason": "initial_unprobed",
-                          "credential_version": 0,
-                          "observed_at": "2026-07-18T10:05:00Z",
-                          "remediation": "submit_credential"
+                          "credential_version": 1,
+                          "observed_at": "2026-07-18T10:06:00Z",
+                          "remediation": "none"
                         }
                       ]
                     },
@@ -659,20 +644,13 @@
     "/provider-accounts/{provider_account_id}/oauth-authorizations": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         }
       ],
       "post": {
         "operationId": "startOAuthAuthorization",
         "summary": "Start OAuth browser/device authorization",
-        "description": "Starts a server-owned OAuth journey for connect or reauthenticate. Connect requires a pure draft account; reauthentication stages a replacement without making a disabled account usable. Disable intent remains sticky across authorization, exchange, and probe for either purpose; only explicit enable plus a current-version probe may restore active use. It returns only user-facing verification metadata; access tokens, refresh tokens, authorization codes, device_code, and PKCE verifier remain server-side.",
+        "description": "Starts a server-owned OAuth journey for connect or reauthenticate. Connect requires a pure draft account; reauthentication stages a replacement without making a disabled account usable. A reauthentication start is rejected while any authorization, validation, replacement, or one-shot probe marker is in flight. Disable intent remains sticky across authorization, exchange, and probe for either purpose; only explicit enable plus a current-version probe may restore active use. It returns only user-facing verification metadata; access tokens, refresh tokens, authorization codes, device_code, and PKCE verifier remain server-side.",
         "security": [
           {
             "ClientApiKey": []
@@ -798,30 +776,16 @@
     "/provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         },
         {
-          "name": "authorization_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^oauth_[A-Za-z0-9_]+$"
-          },
-          "description": "Server-owned OAuth authorization identifier; never a Provider token or device code."
+          "$ref": "#/components/parameters/OAuthAuthorizationId"
         }
       ],
       "get": {
         "operationId": "getOAuthAuthorization",
         "summary": "Poll OAuth authorization status",
-        "description": "Returns authorization_pending, succeeded, or failed/remediation using a server-owned identifier. OAuth token exchange material is never returned and success only advances validation/probe gates; it does not bypass activation. This status poll has no vault decrypt purpose.",
+        "description": "Returns authorization_pending, succeeded, or failed using a server-owned identifier. OAuth token exchange material is never returned. Success only advances validation/probe gates and does not bypass activation. Failed is terminal for that authorization id, returns safe complete_oauth remediation, and stores no credential. A connect failure restores draft because no credential exists; a reauthentication failure preserves disabled intent or restores reauth_required. This status poll has no vault decrypt purpose.",
         "security": [
           {
             "ClientApiKey": []
@@ -835,14 +799,29 @@
                 "schema": {
                   "$ref": "#/components/schemas/OAuthAuthorization"
                 },
-                "example": {
-                  "authorization_id": "oauth_demo_01",
-                  "provider_account_id": "pa_demo_03",
-                  "purpose": "connect",
-                  "flow": "device",
-                  "status": "succeeded",
-                  "expires_at": "2026-07-18T10:25:00Z",
-                  "remediation": "none"
+                "examples": {
+                  "succeeded": {
+                    "value": {
+                      "authorization_id": "oauth_demo_01",
+                      "provider_account_id": "pa_demo_03",
+                      "purpose": "connect",
+                      "flow": "device",
+                      "status": "succeeded",
+                      "expires_at": "2026-07-18T10:25:00Z",
+                      "remediation": "none"
+                    }
+                  },
+                  "failed": {
+                    "value": {
+                      "authorization_id": "oauth_demo_02",
+                      "provider_account_id": "pa_demo_04",
+                      "purpose": "connect",
+                      "flow": "device",
+                      "status": "failed",
+                      "expires_at": "2026-07-18T10:30:00Z",
+                      "remediation": "complete_oauth"
+                    }
+                  }
                 }
               }
             }
@@ -901,14 +880,7 @@
     "/provider-accounts/{provider_account_id}/probe": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         }
       ],
       "post": {
@@ -1054,20 +1026,13 @@
     "/provider-accounts/{provider_account_id}/reauthentication": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         }
       ],
       "post": {
         "operationId": "reauthenticateProviderAccount",
         "summary": "Submit direct replacement credential",
-        "description": "Approved direct secret boundary for replacement material. Keeps provider_account_id, Tenant, and Auth Mode immutable. Credential versions are monotonic even after a rejected pending version. The old version may finish authorized in-flight work; the new version cannot serve new admissions until validation plus pending-version provider_probe cutover. Disable intent survives staging, probe success, probe failure, and transient retry.",
+        "description": "Approved direct secret boundary for replacement material. Keeps provider_account_id, Tenant, and Auth Mode immutable. Credential versions are monotonic even after a rejected pending version. Direct replacement is rejected while any authorization, validation, replacement, or one-shot probe marker is in flight. Accepted replacement material is stored and lands in observable pending_validation for an active-origin journey; a disabled-origin journey keeps disabled publicly visible while validation remains internal. The old version may finish authorized in-flight work, but the new version cannot serve new admissions. Separate server-owned validation either advances to pending-version provider_probe or revokes/discards the pending version with safe reauthenticate remediation. Disable intent survives staging, validation, probe success, probe failure, and transient retry.",
         "security": [
           {
             "ClientApiKey": []
@@ -1075,7 +1040,7 @@
         ],
         "responses": {
           "202": {
-            "description": "Replacement accepted and awaiting probe; the public credential version remains the old current version until cutover",
+            "description": "Replacement accepted and awaiting server-owned validation; the public credential version remains the old current version until cutover, which only a successful pending-version provider_probe performs",
             "content": {
               "application/json": {
                 "schema": {
@@ -1087,12 +1052,12 @@
                     "provider": "chatgpt",
                     "auth_mode": "chatgpt_web_access",
                     "label": "Design team web account",
-                    "lifecycle_state": "pending_probe",
+                    "lifecycle_state": "pending_validation",
                     "credential": {
                       "version": 2,
                       "expires_at": "2026-07-19T10:00:00Z",
                       "refresh_supported": false,
-                      "last_validated_at": "2026-07-18T10:20:00Z",
+                      "last_validated_at": "2026-07-18T10:00:01Z",
                       "last_probed_at": "2026-07-18T10:00:02Z"
                     },
                     "health": {
@@ -1113,7 +1078,7 @@
             }
           },
           "400": {
-            "description": "Replacement material failed validation",
+            "description": "Malformed replacement request rejected before vault write",
             "content": {
               "application/json": {
                 "schema": {
@@ -1206,14 +1171,7 @@
     "/provider-accounts/{provider_account_id}/disable": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         }
       ],
       "post": {
@@ -1344,20 +1302,13 @@
     "/provider-accounts/{provider_account_id}/enable": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         }
       ],
       "post": {
         "operationId": "enableProviderAccount",
-        "summary": "Enable Provider Account through probe",
-        "description": "Every disabled-to-active recovery first enters pending_probe and runs a current-credential-version safe provider_probe, per #17 I-ACCOUNT-ENABLE-PROBED. Probe failure keeps the account non-usable; auth-class failure lands reauth_required. Health success cannot bypass quarantine, Auth Mode kill, risk, vault, or snapshot gates.",
+        "summary": "Begin Provider Account enable probe path",
+        "description": "Every disabled-to-active recovery first enters pending_probe and requires a separate current-credential-version safe provider_probe operation, per #17 I-ACCOUNT-ENABLE-PROBED. This enable request only schedules that non-usable state; its 202 response does not claim the probe has run. Enable rejects while any authorization, validation, replacement, or one-shot probe marker is in flight. Probe failure keeps the account non-usable; auth-class failure lands reauth_required. Health success cannot bypass quarantine, Auth Mode kill, risk, vault, or snapshot gates.",
         "security": [
           {
             "ClientApiKey": []
@@ -1403,7 +1354,7 @@
             }
           },
           "409": {
-            "description": "Account cannot enter enable probe path",
+            "description": "Account cannot enter enable probe path while authorization, validation, replacement, or one-shot probe work remains in flight",
             "content": {
               "application/json": {
                 "schema": {
@@ -1471,14 +1422,7 @@
     "/provider-accounts/{provider_account_id}/capability-snapshot": {
       "parameters": [
         {
-          "name": "provider_account_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string",
-            "pattern": "^pa_[A-Za-z0-9_]+$"
-          },
-          "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+          "$ref": "#/components/parameters/ProviderAccountId"
         }
       ],
       "get": {
@@ -1854,6 +1798,28 @@
         "scheme": "bearer",
         "bearerFormat": "sk-pxp_<public_locator>_<secret>",
         "description": "Client API Key establishes the server-side Security Principal and Tenant. Clients never submit tenant_id."
+      }
+    },
+    "parameters": {
+      "ProviderAccountId": {
+        "name": "provider_account_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^pa_[A-Za-z0-9_]+$"
+        },
+        "description": "Same-Tenant Provider Account id. Foreign and unknown ids are indistinguishable resource_not_found outcomes."
+      },
+      "OAuthAuthorizationId": {
+        "name": "authorization_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^oauth_[A-Za-z0-9_]+$"
+        },
+        "description": "Server-owned OAuth authorization identifier; never a Provider token or device code."
       }
     },
     "schemas": {
