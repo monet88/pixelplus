@@ -763,8 +763,8 @@ function replaceRoutingPolicy(principal, request) {
     fallbackEnabled: request.fallback_enabled,
     fallbackChain: clone(request.fallback_chain),
     fallbackAuthModes: clone(request.fallback_auth_modes),
-    affinity: { enabled: request.affinity.enabled, windowClass: request.affinity.window_class },
-    leasePolicy: { enabled: request.lease_policy.enabled, eligibleUnits: clone(request.lease_policy.eligible_units) },
+    affinity: { enabled: request.affinity?.enabled ?? false, windowClass: request.affinity?.window_class ?? "" },
+    leasePolicy: { enabled: request.lease_policy?.enabled ?? false, eligibleUnits: clone(request.lease_policy?.eligible_units || []) },
     updatedAt: clock(),
     updatedBy: principal.key,
   };
