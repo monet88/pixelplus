@@ -38,7 +38,8 @@ It is **specification / prototype work**. It does **not** implement Gateway, ser
 |---|---|---|
 | **Locked inherited semantics** | Tenant ownership / non-enumeration, Client API Key + admission, Capability Snapshot, routing/fallback/leases, chat lifecycle, Asset lifecycle, Render Job + output-only retry, canonical errors + retry ownership, Provider Account Health | #6–#17 specs under `docs/spec/` |
 | **#18 wire decisions** | HTTP path grouping, OpenAPI security scheme encoding, field names for request/response/SSE/error envelope, async 202 image job surface, chat cancel path, output retry path, example set, validator checks | this document + OpenAPI artifact |
-| **Non-goals / deferred** | Final versioned Public API packaging, management contract, numeric limit values, full external OpenAPI metaschema CI, runtime HTTP conformance harness | #17 (numbers), #20 (unified versioned artifact), runtime tickets |
+| **Resolved after prototype** | Stable versioned Public API packaging and unified management contract | #20 stable policy/artifact |
+| **Still deferred** | Numeric limit values, full external OpenAPI metaschema CI, runtime HTTP conformance harness | #17 (numbers), #21 and runtime tickets |
 
 ### 1.3 Non-goals
 
@@ -51,7 +52,7 @@ This prototype does **not**:
 - Collapse admission errors with Provider runtime errors, or treat `commit_status=unknown` as safe retry.
 - Expose `tenant_id`, credentials, prompt/content bytes, raw Provider payloads, or foreign-resource existence.
 
-**#20** consolidates this inference tracer with the management contract into the final versioned Public API artifact.
+Issue #20 has consolidated this inference tracer with the management tracer in `contracts/openapi/pixelplus-public-api-v1.yaml`; stable policy is `docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md`.
 
 ### 1.4 Normative language
 
@@ -60,7 +61,7 @@ This prototype does **not**:
 - **SHOULD**: strongly preferred default.
 - **MAY**: optional surface that cannot weaken a MUST rule.
 
-Prototype status means the **representation choices** here are accepted evidence for #18; field renames that preserve semantics remain possible until #20 freezes the versioned contract.
+Prototype status means the **representation choices** here remain accepted evidence for #18. Stable clients use the #20 artifact; changes to `/v1` now follow the #20 compatibility policy.
 
 ---
 
@@ -358,12 +359,12 @@ The validator:
 
 ## 7. Finality statement
 
-This is **not** the final versioned Public API.
+This remains a retained prototype, not the stable client artifact.
 
 - `info.version` is `0.0.0-prototype`.
 - Artifact paths live under `contracts/openapi/` as a **tracer** (`pixelplus-public-api-v0alpha.yaml`).
-- **Issue #20** consolidates this inference contract with the management contract into the versioned Public API package.
-- Downstream implementation MUST preserve the locked inherited semantics and the wire invariants above; cosmetic field renames before #20 require an explicit contract update.
+- Issue #20 consolidated this inference contract with management in `pixelplus-public-api-v1.yaml` and the stable policy document.
+- Downstream implementation MUST preserve the locked inherited semantics and stable `/v1` wire invariants; representation changes now follow the #20 compatibility policy.
 
 ---
 

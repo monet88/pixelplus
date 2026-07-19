@@ -42,7 +42,8 @@ It is **contract and throwaway logic evidence**, not Gateway runtime. It does no
 |---|---|---|
 | Locked inherited semantics | Tenant ownership, Client API Key authority, Auth Mode risk gates, Provider Account lifecycle/usability, Credential Vault rights, Capability Snapshot, routing/fallback, canonical errors, health/operator controls | #6–#17 specs |
 | #19 representation decisions | Management paths, scope metadata, request/response field names, direct-secret request boundaries, OAuth journey representation, stale-snapshot read behavior, examples, validator, deterministic state scenarios | this document + artifacts |
-| Deferred | Unified inference + management package, final versioning/idempotency policy, production runtime architecture | #20 and runtime tickets |
+| Resolved after prototype | Unified inference + management package and stable versioning/idempotency policy | #20 stable policy/artifact |
+| Still deferred | Production runtime architecture and HTTP conformance harness | #21 and runtime tickets |
 
 Issue #17 invariant `I-ACCOUNT-ENABLE-PROBED` takes precedence over the older optional short-disable path in #9: **every enable enters `pending_probe` and runs a current-credential-version safe probe**.
 
@@ -51,13 +52,13 @@ Issue #17 invariant `I-ACCOUNT-ENABLE-PROBED` takes precedence over the older op
 This prototype does not:
 
 - Change the issue #18 inference tracer or its validator.
-- Publish stable management path or schema compatibility.
+- Publish stable management path or schema compatibility by itself.
 - Let a client supply `tenant_id`.
 - Return Provider Credential material, OAuth exchange tokens, raw Provider responses, or vault envelopes.
 - Implement cross-Tenant administration, shared credentials, silent routing fallback, or static Provider/model capability catalogs.
 - Treat stored credential material, healthy status, or successful enable request as sufficient proof that an account is usable.
 
-Issue #20 owns consolidation of this management tracer with `contracts/openapi/pixelplus-public-api-v0alpha.yaml`.
+Issue #20 has consolidated this management tracer with inference in `contracts/openapi/pixelplus-public-api-v1.yaml`; stable policy is `docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md`.
 
 ---
 
@@ -380,10 +381,10 @@ The repository adds no package dependency. This remains neither a full external 
 
 ## 11. Finality statement
 
-This is not the final versioned Public API.
+This remains a retained management prototype, not the stable client artifact.
 
 - The artifact is separately named `pixelplus-management-api-v0alpha.yaml`.
 - `info.version` remains `0.0.0-prototype`.
-- Paths and field names are accepted prototype evidence, not a stability promise.
-- Issue #18 inference artifacts remain unchanged.
-- Issue #20 must reconcile shared components/errors and publish the unified versioned package.
+- Paths and field names remain accepted prototype evidence.
+- Issue #18 inference artifacts remain unchanged as retained evidence.
+- Issue #20 reconciled shared components/errors and published `pixelplus-public-api-v1.yaml`; changes to stable `/v1` now follow the #20 policy.
