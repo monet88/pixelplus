@@ -35,7 +35,18 @@ async function createFixture(mutator = () => {}) {
     "docs/decisions/0008.md": "# Public API decision\n",
     "docs/decisions/0009.md": "# Architecture decision\n",
     "docs/spec/domain.md": "# Domain specification\n",
-    "docs/spec/evidence.md": "# Evidence\n",
+    "docs/spec/evidence.md": [
+      "# Evidence",
+      "",
+      "## Capability matrices",
+      "",
+      "### 1.1 Example Mode",
+      "",
+      "| Capability | Status | Evidence |",
+      "| --- | --- | --- |",
+      "| chat (non-streaming) | `conditionally supported` | fixture |",
+      "",
+    ].join("\n"),
     "docs/spec/provider-gateway-implementation-ready-specification.md": [
       "# Provider Gateway Implementation-Ready Specification",
       "",
@@ -46,6 +57,11 @@ async function createFixture(mutator = () => {}) {
       "| --- | --- | --- | --- | --- | --- | --- | --- |",
       "| Example Mode | `gated` | `conditionally_supported` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | `docs/spec/evidence.md` |",
       "## Decision ledger",
+      "## Planning closure ledger",
+      "",
+      "| Domain | Disposition | Decision IDs |",
+      "| --- | --- | --- |",
+      "| `product` | `locked` | `tenant_authority` |",
       "## Implementation work breakdown",
       "## Deferred item register",
       "## Completion gate",
@@ -92,6 +108,13 @@ async function createFixture(mutator = () => {}) {
         dependencies: ["docs/spec/domain.md"],
       },
     ],
+    planning_closure: [
+      {
+        domain: "product",
+        disposition: "locked",
+        decision_ids: ["tenant_authority"],
+      },
+    ],
     implementation_slices: [
       {
         id: "foundation",
@@ -115,12 +138,14 @@ async function createFixture(mutator = () => {}) {
       },
       required_capability_operations: ["chat"],
       required_decision_ids: ["tenant_authority"],
+      required_planning_domains: ["product"],
       required_implementation_slice_ids: ["foundation"],
       required_deferred_item_ids: ["deployment_topology"],
       required_sections: [
         "Authority and conflict resolution",
         "Capability evidence ledger",
         "Decision ledger",
+        "Planning closure ledger",
         "Implementation work breakdown",
         "Deferred item register",
         "Completion gate",
@@ -147,12 +172,19 @@ async function createFixture(mutator = () => {}) {
       },
     ],
     decisionIds: ["tenant_authority"],
+    planningDomains: [
+      {
+        id: "product",
+        decisionIds: ["tenant_authority"],
+      },
+    ],
     implementationSliceIds: ["foundation"],
     deferredItemIds: ["deployment_topology"],
     requiredSections: [
       "Authority and conflict resolution",
       "Capability evidence ledger",
       "Decision ledger",
+      "Planning closure ledger",
       "Implementation work breakdown",
       "Deferred item register",
       "Completion gate",
@@ -190,10 +222,6 @@ async function createProductionFixture(mutator = () => {}) {
       "utf8",
     ),
   };
-  mutator(state);
-
-  const root = await mkdtemp(path.join(os.tmpdir(), "pixelplus-us022-real-"));
-  fixtureRoots.add(root);
   const authorityPaths = [
     state.manifest.authority.glossary,
     state.manifest.authority.stable_public_api,
@@ -201,10 +229,22 @@ async function createProductionFixture(mutator = () => {}) {
     ...state.manifest.authority.normative_specs,
     ...state.manifest.authority.evidence_sources,
   ];
+  state.authorityContents = Object.fromEntries(
+    await Promise.all(
+      authorityPaths.map(async (relativePath) => [
+        relativePath,
+        await readFile(path.join(repositoryRoot, relativePath), "utf8"),
+      ]),
+    ),
+  );
+  mutator(state);
+
+  const root = await mkdtemp(path.join(os.tmpdir(), "pixelplus-us022-real-"));
+  fixtureRoots.add(root);
   for (const relativePath of authorityPaths) {
     const absolutePath = path.join(root, relativePath);
     await mkdir(path.dirname(absolutePath), { recursive: true });
-    await writeFile(absolutePath, "# Declared authority fixture\n", "utf8");
+    await writeFile(absolutePath, state.authorityContents[relativePath], "utf8");
   }
 
   const specificationPath = path.join(root, state.manifest.specification);
@@ -326,6 +366,20 @@ test("rejects capability evidence outside the declared evidence authority", asyn
   );
 });
 
+test("rejects capability drift in the declared evidence matrix", async () => {
+  const fixture = await createFixture(({ files }) => {
+    files["docs/spec/evidence.md"] = files["docs/spec/evidence.md"].replace(
+      "`conditionally supported`",
+      "`unsupported`",
+    );
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /evidence matrix example_mode\/chat status must be conditionally_supported/,
+  );
+});
+
 test("rejects decisions that omit required implementation dimensions", async () => {
   const fixture = await createFixture(({ manifest }) => {
     delete manifest.decisions[0].failure_semantics;
@@ -370,6 +424,35 @@ test("rejects missing required decisions and implementation slices", async () =>
   await assert.rejects(
     validateImplementationSpecification(missingSlice),
     /completion_gate\.required_implementation_slice_ids does not match validator-owned contract/,
+  );
+});
+
+test("rejects incomplete planning closure for mandatory decision domains", async () => {
+  const missingDomain = await createFixture(({ manifest }) => {
+    manifest.completion_gate.required_planning_domains = [];
+  });
+  await assert.rejects(
+    validateImplementationSpecification(missingDomain),
+    /completion_gate\.required_planning_domains must be a non-empty string array/,
+  );
+
+  const missingDecision = await createFixture(({ manifest }) => {
+    manifest.planning_closure[0].decision_ids = [];
+  });
+  await assert.rejects(
+    validateImplementationSpecification(missingDecision),
+    /planning domain product decision ids must be a non-empty string array/,
+  );
+});
+
+test("rejects a planning domain that is not locked", async () => {
+  const fixture = await createFixture(({ manifest }) => {
+    manifest.planning_closure[0].disposition = "deferred";
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /planning domain product must be locked/,
   );
 });
 
@@ -462,6 +545,47 @@ test("rejects a package that shrinks its manifest and completion gate together",
   );
 });
 
+test("rejects authority content drift even when every path still exists", async () => {
+  const fixture = await createProductionFixture((state) => {
+    const authorityPath = state.manifest.authority.normative_specs[0];
+    state.authorityContents[authorityPath] = "# Hollow authority\n";
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /authority content does not match validator-owned fingerprint:/,
+  );
+});
+
+test("accepts semantic JSON with reordered object keys", async () => {
+  const fixture = await createProductionFixture(({ manifest }) => {
+    manifest.decisions[0] = Object.fromEntries(
+      Object.entries(manifest.decisions[0]).reverse(),
+    );
+    manifest.completion_gate.required_auth_mode_risk_statuses =
+      Object.fromEntries(
+        Object.entries(
+          manifest.completion_gate.required_auth_mode_risk_statuses,
+        ).reverse(),
+      );
+  });
+
+  const result = await validateImplementationSpecification(fixture);
+  assert.equal(result.decisions, 15);
+});
+
+test("rejects provider policy drift", async () => {
+  const fixture = await createProductionFixture(({ manifest }) => {
+    manifest.provider_policies.grok_xai_oauth.operation_surfaces.image_edit =
+      "cli_chat_proxy";
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /provider policies do not match validator-owned contract/,
+  );
+});
+
 test("rejects capability drift from the accepted evidence baseline", async () => {
   const fixture = await createProductionFixture(({ manifest }) => {
     manifest.capabilities[0].claims[0].status = "unsupported";
@@ -484,6 +608,20 @@ test("rejects capability drift in the human evidence ledger", async () => {
   await assert.rejects(
     validateImplementationSpecification(fixture),
     /human capability ChatGPT Web Access\/chat status must be conditionally_supported/,
+  );
+});
+
+test("rejects planning closure drift in the human handoff", async () => {
+  const fixture = await createProductionFixture((state) => {
+    state.specification = state.specification.replace(
+      "| `product` | `locked` |",
+      "| `product` | `deferred` |",
+    );
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /human planning domain product must be locked/,
   );
 });
 
@@ -559,9 +697,19 @@ test("rejects a hollow or relocated human implementation handoff", async () => {
       "## Capability evidence ledger",
     );
     const decisionStart = state.specification.indexOf("## Decision ledger");
+    const planningStart = state.specification.indexOf(
+      "## Planning closure ledger",
+    );
+    const implementationStart = state.specification.indexOf(
+      "## Implementation work breakdown",
+    );
     const capabilitySection = state.specification.slice(
       capabilityStart,
       decisionStart,
+    );
+    const planningSection = state.specification.slice(
+      planningStart,
+      implementationStart,
     );
     state.specification = [
       "# Provider Gateway Implementation-Ready Specification",
@@ -571,6 +719,7 @@ test("rejects a hollow or relocated human implementation handoff", async () => {
       capabilitySection.trim(),
       "## Decision ledger",
       "TBD",
+      planningSection.trim(),
       "## Implementation work breakdown",
       "TBD",
       "## Deferred item register",
@@ -591,5 +740,19 @@ test("rejects a hollow or relocated human implementation handoff", async () => {
   await assert.rejects(
     validateImplementationSpecification(relocated),
     /specification path does not match validator-owned contract/,
+  );
+});
+
+test("reports malformed human capability rows as validation errors", async () => {
+  const fixture = await createProductionFixture((state) => {
+    state.specification = state.specification.replace(
+      /\| ChatGPT Web Access \|[^\n]+/,
+      "| ChatGPT Web Access | `experimental` |",
+    );
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /human capability ChatGPT Web Access\/chat status must be conditionally_supported/,
   );
 });

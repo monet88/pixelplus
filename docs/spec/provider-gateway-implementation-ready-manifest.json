@@ -15,7 +15,8 @@
     "stable_public_api": "contracts/openapi/pixelplus-public-api-v1.yaml",
     "architecture_decisions": [
       "docs/decisions/0008-stable-public-api-contract-policy.md",
-      "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md"
+      "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md",
+      "docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md"
     ],
     "normative_specs": [
       "docs/spec/tenant-ownership-authorization-invariants.md",
@@ -232,6 +233,22 @@
       ]
     }
   ],
+  "provider_policies": {
+    "grok_xai_oauth": {
+      "selection_owner": "server",
+      "client_override": false,
+      "automatic_cross_surface_fallback": false,
+      "activation_probe_surface": "cli_chat_proxy",
+      "operation_surfaces": {
+        "chat": "cli_chat_proxy",
+        "chat_streaming": "cli_chat_proxy",
+        "image_generation": "api_x_ai",
+        "image_edit": "api_x_ai",
+        "inpaint": "unsupported"
+      },
+      "image_operations_require_exact_live_probe": true
+    }
+  },
   "decisions": [
     {
       "id": "tenant_ownership_and_authorization",
@@ -365,6 +382,65 @@
       "dependencies": [
         "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md"
       ]
+    },
+    {
+      "id": "grok_xai_oauth_operation_surface_policy",
+      "observable_behavior": "Grok xAI OAuth chat and streaming use cli_chat_proxy, image generation and edit use api_x_ai, and inpaint remains unsupported; clients cannot select or override these surfaces.",
+      "failure_semantics": "Activation chat proof does not authorize image operations; a missing or failed exact-surface capability probe rejects before execution, and no Adapter, routing, retry, or recovery path attempts the alternate surface.",
+      "security_impact": "Prevents client-controlled upstream widening, cross-surface capability inflation, and silent fallback that could change credential, commit, or retry semantics.",
+      "dependencies": [
+        "docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md",
+        "docs/spec/provider-account-connection-and-credential-lifecycle.md",
+        "docs/spec/capability-snapshot-and-model-availability-semantics.md",
+        "docs/spec/research/grok-auth-mode-capability-evidence.md"
+      ]
+    }
+  ],
+  "planning_closure": [
+    {
+      "domain": "product",
+      "disposition": "locked",
+      "decision_ids": [
+        "auth_mode_risk_envelope",
+        "capability_snapshot_and_model_availability"
+      ]
+    },
+    {
+      "domain": "domain",
+      "disposition": "locked",
+      "decision_ids": [
+        "provider_account_and_credential_lifecycle",
+        "tenant_routing_fallback_affinity_and_leases",
+        "asset_exchange_and_retention",
+        "durable_render_jobs_and_output_retry",
+        "health_cooldown_circuit_and_operator_controls"
+      ]
+    },
+    {
+      "domain": "interface",
+      "disposition": "locked",
+      "decision_ids": [
+        "stable_public_api_and_compatibility",
+        "pure_go_module_seams_and_dependency_budget"
+      ]
+    },
+    {
+      "domain": "security",
+      "disposition": "locked",
+      "decision_ids": [
+        "tenant_ownership_and_authorization",
+        "client_api_key_and_admission",
+        "credential_vault_and_sensitive_data"
+      ]
+    },
+    {
+      "domain": "execution",
+      "disposition": "locked",
+      "decision_ids": [
+        "chat_execution_and_streaming",
+        "canonical_errors_idempotency_and_retry_ownership",
+        "grok_xai_oauth_operation_surface_policy"
+      ]
     }
   ],
   "implementation_slices": [
@@ -446,6 +522,7 @@
         "docs/spec/research/chatgpt-auth-mode-capability-evidence.md",
         "docs/spec/research/gemini-auth-mode-capability-evidence.md",
         "docs/spec/research/grok-auth-mode-capability-evidence.md",
+        "docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md",
         "contracts/openapi/pixelplus-public-api-v1.yaml"
       ],
       "proof_seam": "All 26 stable operations through production composition, followed by per-Auth-Mode controlled and live probes without status inflation."
@@ -878,7 +955,15 @@
       "canonical_errors_idempotency_and_retry_ownership",
       "health_cooldown_circuit_and_operator_controls",
       "stable_public_api_and_compatibility",
-      "pure_go_module_seams_and_dependency_budget"
+      "pure_go_module_seams_and_dependency_budget",
+      "grok_xai_oauth_operation_surface_policy"
+    ],
+    "required_planning_domains": [
+      "product",
+      "domain",
+      "interface",
+      "security",
+      "execution"
     ],
     "required_implementation_slice_ids": [
       "foundation_and_composition",
@@ -938,6 +1023,7 @@
       "Authority and conflict resolution",
       "Capability evidence ledger",
       "Decision ledger",
+      "Planning closure ledger",
       "Implementation work breakdown",
       "Deferred item register",
       "Completion gate"

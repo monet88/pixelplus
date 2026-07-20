@@ -12,6 +12,9 @@ for existing truth:
 - `decisions` records stable cross-domain IDs and the four dimensions required
   by issue #22: observable behavior, failure semantics, security impact, and
   dependencies.
+- `planning_closure` assigns every accepted decision exactly once to the
+  mandatory `product`, `domain`, `interface`, `security`, or `execution`
+  domain and requires each domain to be `locked`.
 - `implementation_slices` defines a dependency graph of vertical runtime work
   and names the public seam at which behavior must later be proven.
 - `deferred_items` records a stable ID, reason, dependencies, and reopen
@@ -26,9 +29,12 @@ The static validation flow is:
 ```text
 load manifest
   -> validate schema/gate identity
-  -> resolve every authority artifact
-  -> enforce exact capability vocabulary and required matrix
+  -> resolve and fingerprint every authority artifact
+  -> parse detailed evidence matrices and enforce exact capability vocabulary
+     and required matrix
+  -> enforce Provider-specific operation policy
   -> enforce decision dimensions and required decision IDs
+  -> enforce five locked planning domains and exact decision coverage
   -> enforce implementation slice dependencies and required slice IDs
   -> enforce deferred reason/dependency/reopen trigger
   -> verify required human-spec sections
@@ -65,10 +71,31 @@ and prose contract summaries but no secret, live Provider credential, Tenant
 record, runtime identifier, or mutable operational state. Harness remains the
 durable operational store for intake, story status, proof, and trace.
 
-The validator uses filesystem existence and structured JSON checks. It does
-not parse Markdown to rediscover product semantics; required headings are only
-a navigation/completeness gate. The explicit manifest IDs avoid ad hoc text
-matching for capability and decision coverage.
+The validator uses a separate validator-owned JSON contract, SHA-256
+fingerprints over all authority files, canonical JSON serialization, and
+structured manifest checks. Each expected capability claim keeps `status` and
+`evidence` together, avoiding parallel maps. A dedicated Markdown-validation
+module parses each detailed Auth Mode capability matrix in the three evidence
+sources, the human capability ledger, and the planning-closure ledger. Accepted decision, slice, deferred,
+Provider-policy, and human-spec semantics remain fingerprinted independently
+from the manifest under test. The explicit IDs avoid ad hoc discovery from
+broad prose matching, and one shared register helper enforces duplicate IDs,
+required sets, semantic hashes, and item validation for decisions, slices, and
+deferrals.
+
+The fingerprint refresh command is a maintenance-only operation that updates
+derived hashes after an intentional authority review:
+
+```text
+node scripts/refresh-provider-gateway-implementation-spec-contract.mjs
+```
+
+Required IDs, capability tuples, authority paths, and Provider policies remain
+reviewed data in
+`scripts/provider-gateway-implementation-spec-contract.json`; they are not
+copied automatically from the manifest being validated. The command is not a
+routine validation step: review authority changes, refresh once, then run the
+validator and mutation suite without refreshing again.
 
 ## UI / Platform Impact
 
@@ -97,3 +124,6 @@ sensitive-data/error specifications.
 5. **Treat all implementation details as unresolved product questions.**
    Rejected because concrete driver/vendor/topology choices can be safely
    deferred when their logical guarantees and reopen evidence are explicit.
+6. **Let a Grok xAI OAuth account or client choose one base URL.** Rejected
+   because chat and image operations use distinct upstream surfaces and client
+   selection would widen execution policy. Decision 0010 fixes the mapping.

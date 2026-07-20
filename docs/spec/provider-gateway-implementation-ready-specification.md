@@ -42,16 +42,19 @@ file is newest or most convenient:
 3. `docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md` owns the
    Go package boundaries, dependency direction, port catalogue, composition
    root, and external-dependency budget.
-4. The normative specifications listed in the manifest own product behavior,
+4. `docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md` owns the
+   server-side operation-to-surface mapping for Grok xAI OAuth and forbids
+   client overrides or automatic cross-surface fallback.
+5. The normative specifications listed in the manifest own product behavior,
    domain invariants, authorization, security, lifecycle, execution, failure,
    retry, retention, health, and routing semantics in their named domains.
-5. `CONTEXT.md` owns canonical domain vocabulary and points to each normative
+6. `CONTEXT.md` owns canonical domain vocabulary and points to each normative
    specification. It summarizes rules but does not override them.
-6. The four research documents under `docs/spec/research/` own evidence and
+7. The four research documents under `docs/spec/research/` own evidence and
    baseline capability confidence. Evidence never authorizes execution by
    itself; a current Provider Account snapshot, usability gate, risk gate, and
    routing decision are still required.
-7. The inference and management prototype specifications and `v0alpha`
+8. The inference and management prototype specifications and `v0alpha`
    OpenAPI artifacts are retained evidence. They do not compete with the
    stable `/v1` artifact.
 
@@ -169,6 +172,7 @@ normative sections it consumes rather than citing this table alone.
 | `health_cooldown_circuit_and_operator_controls` | Scoped health, cooldown, recovery permits, circuits, drain, quarantine, and disable remain separate state dimensions. | Stale success cannot clear newer failure; expiry grants bounded half-open proof; kill/quarantine dominate without rewriting health. | Prevents hammering, unsafe recovery, circuit poisoning, and control state becoming authorization. | `provider-account-health-cooldown-and-operator-controls.md` |
 | `stable_public_api_and_compatibility` | One OpenAPI 3.1.1 `/v1` 1.0.0 artifact owns 26 operations, scopes, schemas, and idempotency classes. | Breaking v1 change fails validation and requires a major; removal follows deprecation notice and successor gates. | Prevents silent auth, scope, replay, error, and representation drift. | `api-versioning-compatibility-idempotency-contract-testing-policy.md`, decision 0008 |
 | `pure_go_module_seams_and_dependency_budget` | A Pure-Go module uses the accepted domain/application/ports/outer-adapter/composition layout and production/test constructor. | Forbidden imports, generic policy shortcuts, private test seams, or unapproved dependencies block acceptance. | Keeps protocol, storage, queue, HTTP, and secret representations outside the canonical domain. | decision 0009 |
+| `grok_xai_oauth_operation_surface_policy` | Grok xAI OAuth chat/streaming use `cli_chat_proxy`; image generation/edit use `api_x_ai`; inpaint stays unsupported; clients cannot choose the surface. | Activation chat proof cannot authorize image work; missing exact-surface proof rejects before execution and no alternate surface is attempted. | Prevents upstream widening, capability inflation, and silent fallback that changes credential, commit, or retry semantics. | decision 0010, Grok evidence, Provider Account lifecycle, Capability Snapshot semantics |
 
 ### Stable Public API operation groups
 
@@ -236,6 +240,24 @@ Each HTTP request emits one canonical safe JSON request log with `timestamp`,
 `status_code`, and `message`. This operational log is separate from product and
 security audit. A required audit record that cannot be accepted denies the
 protected operation; logs or metrics cannot substitute for it.
+
+## Planning closure ledger
+
+Issue #22 acceptance criterion 3 is represented as five mandatory planning
+domains. Every locked decision belongs to exactly one domain below, every
+domain is present in the manifest completion gate, and the validator rejects a
+missing domain, uncovered decision, duplicate assignment, or non-locked
+disposition. This proves register coverage; independent review still judges
+whether the decisions themselves are sufficient and the full handoff remains
+fingerprinted after that review.
+
+| Domain | Disposition | Decision IDs |
+| --- | --- | --- |
+| `product` | `locked` | `auth_mode_risk_envelope`, `capability_snapshot_and_model_availability` |
+| `domain` | `locked` | `provider_account_and_credential_lifecycle`, `tenant_routing_fallback_affinity_and_leases`, `asset_exchange_and_retention`, `durable_render_jobs_and_output_retry`, `health_cooldown_circuit_and_operator_controls` |
+| `interface` | `locked` | `stable_public_api_and_compatibility`, `pure_go_module_seams_and_dependency_budget` |
+| `security` | `locked` | `tenant_ownership_and_authorization`, `client_api_key_and_admission`, `credential_vault_and_sensitive_data` |
+| `execution` | `locked` | `chat_execution_and_streaming`, `canonical_errors_idempotency_and_retry_ownership`, `grok_xai_oauth_operation_surface_policy` |
 
 ## Implementation work breakdown
 
@@ -343,6 +365,22 @@ shape, authorization, risk status, capability meaning, lifecycle transitions,
 secret boundaries, failure semantics, retry ownership, commit certainty,
 accounting, retention meaning, or test seams.
 
+### Locked Grok xAI OAuth surface policy
+
+Grok xAI OAuth surface selection is not a client or implementation choice.
+Decision 0010 fixes the server-owned operation mapping:
+
+- `chat` and `chat_streaming` use `cli_chat_proxy`.
+- `image_generation` and `image_edit` use `api_x_ai`.
+- `inpaint` is unsupported.
+
+Account activation uses a cost-minimal `cli_chat_proxy` chat probe. That proof
+does not authorize image operations. Each image operation/model remains
+non-offerable until a current-credential live probe proves it on `api_x_ai`.
+Capability facts carry the exact surface binding, and Adapter, routing, retry,
+or recovery code never attempts the alternate surface after a failure. The
+stable Public API exposes no surface-selection field.
+
 ## Deferred item register
 
 The full register, including reason, dependencies, and exact reopen trigger,
@@ -399,10 +437,16 @@ technology choice is not permission to defer product correctness.
 The specification gate passes only when:
 
 - every authority file exists;
+- every authority file matches its validator-owned SHA-256 fingerprint;
 - the stable implementation issue is distinct from gate issue #22;
 - every capability claim uses the four-token vocabulary and links evidence;
+- every capability claim matches the detailed Auth Mode capability matrix
+  parsed from its declared evidence source;
 - every decision states observable behavior, failure semantics, security
   impact, and dependencies;
+- the product, domain, interface, security, and execution planning domains are
+  all locked and cover every accepted decision exactly once;
+- Provider-specific execution policies match the validator-owned contract;
 - every implementation slice has dependencies, authority, and a public proof
   seam;
 - every deferred item has a reason, dependency, and reopen trigger;
@@ -464,6 +508,8 @@ The gate conclusion is:
   semantics are locked by #10-#17 and #20.
 - Pure-Go package seams, ports, composition, contract-test seam, and dependency
   budget are locked by #21 and decision 0009.
+- Grok xAI OAuth operation-to-surface selection is locked by decision 0010 and
+  cannot be recreated by issue #42.
 - Remaining items are explicit bounded implementation/operations choices or
   separate future product decisions with reasons, dependencies, and reopen
   triggers. None requires an implementation agent to invent current Tenant,

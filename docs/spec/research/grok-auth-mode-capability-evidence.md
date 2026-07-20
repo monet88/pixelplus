@@ -187,7 +187,7 @@ Statuses are **Auth Mode capabilities as PixelPlus may later probe**, not “doe
 | Egress proxy + CF cookie pairing | Gateway | Web SSO | Same browser session realism |
 | SSO import / encryption / reauth UX | Gateway | Web SSO | Upstream only sees cookies |
 | Device OAuth + refresh scheduling | Gateway | xAI OAuth | Endpoints are upstream |
-| CLI chat-proxy vs `api.x.ai` base URL choice | Gateway policy | xAI OAuth | OAuth default chat-proxy is reference policy, not PixelPlus decision yet |
+| CLI chat-proxy vs `api.x.ai` base URL choice | Gateway policy | xAI OAuth | Evidence alone did not choose it; decision 0010 now locks `cli_chat_proxy` for chat/streaming and `api_x_ai` for image generation/edit, with no client override or cross-surface fallback |
 | Image archive / public URL rewrite | Gateway | Web SSO | Saves to local media store |
 | Capability Snapshot probe | Gateway | Both | Parent #1 invariant |
 | Rate-limit windows / billing numbers | Upstream | Both | Gateway only stores snapshots |

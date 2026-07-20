@@ -17,24 +17,32 @@ persistence, job worker, or deployment composition.
 
 ```text
 node --check scripts/validate-provider-gateway-implementation-spec.mjs
+node --check scripts/lib/provider-gateway-spec-markdown.mjs
 node --check scripts/test-provider-gateway-implementation-spec-validator.mjs
+node --check scripts/refresh-provider-gateway-implementation-spec-contract.mjs
 node --test scripts/test-provider-gateway-implementation-spec-validator.mjs
 node scripts/validate-provider-gateway-implementation-spec.mjs
 node scripts/validate-public-api-contract.mjs
 node scripts/test-public-api-contract-validator.mjs
 node scripts/validate-openapi-contract.mjs contracts/openapi/pixelplus-public-api-v0alpha.yaml
 node scripts/prototype-management-contract.mjs
-git diff --check 63d6454...HEAD
+git diff --check
 scripts/bin/harness-cli.exe story verify US-022
+scripts/bin/harness-cli.exe story complete US-022
 ```
+
+Maintenance-only fingerprint refresh was run after the final intentional
+authority review and before this command sequence. It is deliberately excluded
+from the routine validation list so validation cannot bless unreviewed source
+drift.
 
 ## Results
 
 | Check | Result | Notes |
 | --- | --- | --- |
-| Syntax | pass | Both new Node scripts pass `node --check`. |
-| Unit | pass | 22 focused tests: one positive complete-package case plus 21 negative mutations covering missing/escaping authority, invalid or incomplete capability/risk rows, undeclared sources, incomplete/duplicate decisions, invalid/cyclic slices, incomplete/missing deferrals, self-shrinking gates, evidence/human-ledger capability drift, altered issue identities, placeholder semantics, changed slice proof/order, hollow handoffs, and relocated specifications. |
-| Integration | pass | Real manifest: issue #22, implementation #42, 30 capability claims, 14 decisions, seven slices, 43 required deferred items, and 26 authority files. |
+| Syntax | pass | Validator, Markdown module, mutation suite, and maintenance-only refresh script pass `node --check`. |
+| Unit | pass | 30 focused tests covering missing/escaping/changed authority, invalid or incomplete capability/risk rows, parsed detailed-evidence drift, Provider-policy drift, JSON key-order invariance, incomplete/duplicate decisions, unlocked/incomplete five-domain planning closure, invalid/cyclic slices, incomplete/missing deferrals, self-shrinking gates, human-ledger drift, altered issue identities, placeholder semantics, malformed Markdown, hollow handoffs, and relocated specifications. |
+| Integration | pass | Real manifest: issue #22, implementation #42, 30 capability claims, 15 decisions covered exactly once by five locked planning domains, seven slices, 43 required deferred items, and 27 fingerprinted authority files. |
 | Stable contract | pass | 26 `/v1` operations and 205 Draft 2020-12 examples; full validator mutation suite passes. |
 | Prototype inference | pass | 12 operations, 29 schemas, 61 schema-validated examples. |
 | Prototype management | pass | Management OpenAPI validation and 140 deterministic cause-to-effect actions. |
@@ -42,7 +50,7 @@ scripts/bin/harness-cli.exe story verify US-022
 | Platform | not applicable | No process, deployment, or Photoshop Plugin artifact exists in this story. |
 | Performance | deferred | Persistence, Vault, queue/runtime, and topology benchmarks open only through the manifest triggers. |
 | Logs/Audit | static pass | The handoff preserves audit-before-protected-access and secret/content-free ordinary projection rules; runtime emission proof belongs to #42. |
-| Repository | pass | `git diff --check 63d6454...HEAD` is clean; Harness story verification passes. |
+| Repository | pass | `git diff --check` is clean; Harness story verification and completion pass. |
 
 ## Evidence
 
@@ -50,13 +58,15 @@ scripts/bin/harness-cli.exe story verify US-022
   `docs/spec/provider-gateway-implementation-ready-specification.md`.
 - Machine gate:
   `docs/spec/provider-gateway-implementation-ready-manifest.json`.
+- Validator-owned contract and fingerprints:
+  `scripts/provider-gateway-implementation-spec-contract.json`.
 - Story packet:
   `docs/stories/epics/E01-provider-gateway/US-022-implementation-ready-specification/`.
 - Separate implementation issue:
   `https://github.com/monet88/pixelplus/issues/42`, open, unassigned,
   `enhancement` only, blocked by #22, and not marked `ready-for-agent`.
-- Fixed implementation range reviewed: `63d6454...79df356`, comprising
-  `3bf76be`, `2870860`, `d31ca52`, and `79df356`.
+- PR #43 branch and final working-tree diff reviewed, including the original
+  handoff commits and all review-finding fixes recorded by Git history.
 
 ## Gaps
 
@@ -72,13 +82,28 @@ scripts/bin/harness-cli.exe story verify US-022
 
 Independent review closure:
 
-- The completion contract is validator-owned rather than trusted from the
-  manifest under test. It fixes issue #22/#42 identities, authority files,
-  capability tuples, decision/slice/deferred IDs, and required headings.
+- The completion contract is a separate validator-owned artifact rather than
+  trusted from the manifest under test. It fixes issue #22/#42 identities,
+  authority paths and content fingerprints, capability tuples,
+  Provider-specific policies, decision/slice/deferred IDs, and required
+  headings.
 - Capability status/evidence is checked against the validator-owned accepted
-  baseline and against the human capability ledger.
+  baseline, the detailed Auth Mode matrix parsed from each declared evidence
+  source, and the human capability ledger.
 - Gate and implementation issue identities are unconditional; the manifest
   cannot disable the separation rule.
-- SHA-256 fingerprints over the accepted decision ledger, slice graph/proof
-  seams, deferred register, and full human handoff prevent placeholder or
-  semantics-removal edits from passing while retaining the same IDs.
+- SHA-256 fingerprints cover every authority file plus the accepted decision
+  ledger, slice graph/proof seams, deferred register, and full human handoff.
+  Canonical JSON serialization prevents object-key reordering from creating a
+  false failure.
+- Decision 0010 locks Grok xAI OAuth chat/streaming to `cli_chat_proxy`, image
+  generation/edit to `api_x_ai`, inpaint to unsupported, and forbids client
+  override or automatic cross-surface fallback.
+- AC#3 is represented by five mandatory locked planning domains. The gate
+  rejects missing domains, non-locked dispositions, uncovered decisions,
+  duplicate assignments, and human planning-ledger drift; independent review
+  remains the sufficiency check for the accepted decisions themselves.
+- Decision, implementation-slice, and deferred-item registers share one
+  duplicate/required-set/semantic-hash validation path. Markdown table parsing
+  and human/evidence-ledger checks live in a separate module, while capability
+  `status` and `evidence` remain one claim object in the validator contract.

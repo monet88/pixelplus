@@ -37,6 +37,7 @@ Risk flags:
 - Existing accepted behavior across multiple product domains.
 - External Provider evidence and risk envelopes.
 - Weak proof if assembly completeness is checked only by human reading.
+- External Provider surface ambiguity for Grok xAI OAuth.
 
 Hard gates:
 
@@ -49,6 +50,8 @@ Hard gates:
   opens it.
 - Runtime implementation belongs to a different issue and does not start in
   this story.
+- Authority content drift, Provider-policy drift, and semantically hollow
+  source replacement must fail the executable gate.
 
 ## Work Phases
 

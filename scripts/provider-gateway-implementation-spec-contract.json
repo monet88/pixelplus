@@ -1,0 +1,383 @@
+{
+  "issue": 22,
+  "implementationIssue": 42,
+  "specificationPath": "docs/spec/provider-gateway-implementation-ready-specification.md",
+  "semanticHashes": {
+    "decisions": "adad5d5907aa87fe63368e15a1ad6969b27a4b638609ce464c609d220d940f10",
+    "implementationSlices": "542ad21323b15d016f7903246522ecb2572a537af290cc322dd697391fe108c6",
+    "deferredItems": "64ac69d2ac956ec35c675ba4b85fc7c63c86fce2b14e2bc3276d00ed7cb87925",
+    "specification": "db649d342e0c88abe0c7edd504f62ad7ec6bbe0cd0e9dda41060724cf5413ec0"
+  },
+  "canonicalStatuses": [
+    "verified",
+    "conditionally_supported",
+    "unsupported",
+    "unverified"
+  ],
+  "authority": {
+    "glossary": "CONTEXT.md",
+    "stablePublicApi": "contracts/openapi/pixelplus-public-api-v1.yaml",
+    "architectureDecisions": [
+      "docs/decisions/0008-stable-public-api-contract-policy.md",
+      "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md",
+      "docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md"
+    ],
+    "normativeSpecs": [
+      "docs/spec/tenant-ownership-authorization-invariants.md",
+      "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+      "docs/spec/client-api-key-lifecycle-and-admission-controls.md",
+      "docs/spec/provider-account-connection-and-credential-lifecycle.md",
+      "docs/spec/capability-snapshot-and-model-availability-semantics.md",
+      "docs/spec/tenant-scoped-routing-fallback-affinity-leases.md",
+      "docs/spec/chat-execution-and-streaming-lifecycle.md",
+      "docs/spec/asset-exchange-authorization-and-retention-lifecycle.md",
+      "docs/spec/durable-render-job-and-output-retry-lifecycle.md",
+      "docs/spec/credential-vault-and-sensitive-data-lifecycle.md",
+      "docs/spec/canonical-errors-and-retry-ownership.md",
+      "docs/spec/provider-account-health-cooldown-and-operator-controls.md",
+      "docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md"
+    ],
+    "evidenceSources": [
+      "docs/spec/research/web-to-api-compliance-risk-evidence.md",
+      "docs/spec/research/chatgpt-auth-mode-capability-evidence.md",
+      "docs/spec/research/gemini-auth-mode-capability-evidence.md",
+      "docs/spec/research/grok-auth-mode-capability-evidence.md",
+      "docs/spec/openai-compatible-inference-contract.md",
+      "docs/spec/provider-account-and-capability-management-contract.md",
+      "contracts/openapi/pixelplus-public-api-v0alpha.yaml",
+      "contracts/openapi/pixelplus-management-api-v0alpha.yaml",
+      "contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml"
+    ]
+  },
+  "authModes": [
+    {
+      "id": "chatgpt_web_access",
+      "label": "ChatGPT Web Access",
+      "riskStatus": "experimental",
+      "claims": {
+        "chat": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        "chat_streaming": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        "image_generation": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        "image_edit": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        "inpaint": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        }
+      }
+    },
+    {
+      "id": "chatgpt_codex_oauth",
+      "label": "ChatGPT Codex OAuth",
+      "riskStatus": "gated",
+      "claims": {
+        "chat": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        "chat_streaming": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        "image_generation": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        "image_edit": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        "inpaint": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        }
+      }
+    },
+    {
+      "id": "gemini_web_cookie",
+      "label": "Gemini Web Cookie",
+      "riskStatus": "experimental",
+      "claims": {
+        "chat": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        "chat_streaming": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        "image_generation": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        "image_edit": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        "inpaint": {
+          "status": "unsupported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        }
+      }
+    },
+    {
+      "id": "gemini_antigravity_oauth",
+      "label": "Gemini Antigravity OAuth",
+      "riskStatus": "gated",
+      "claims": {
+        "chat": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        "chat_streaming": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        "image_generation": {
+          "status": "unverified",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        "image_edit": {
+          "status": "unverified",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        "inpaint": {
+          "status": "unsupported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        }
+      }
+    },
+    {
+      "id": "grok_web_sso",
+      "label": "Grok Web SSO",
+      "riskStatus": "prohibited",
+      "claims": {
+        "chat": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        "chat_streaming": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        "image_generation": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        "image_edit": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        "inpaint": {
+          "status": "unsupported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        }
+      }
+    },
+    {
+      "id": "grok_xai_oauth",
+      "label": "Grok xAI OAuth",
+      "riskStatus": "gated",
+      "claims": {
+        "chat": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        "chat_streaming": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        "image_generation": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        "image_edit": {
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        "inpaint": {
+          "status": "unsupported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        }
+      }
+    }
+  ],
+  "providerPolicies": {
+    "grok_xai_oauth": {
+      "selection_owner": "server",
+      "client_override": false,
+      "automatic_cross_surface_fallback": false,
+      "activation_probe_surface": "cli_chat_proxy",
+      "operation_surfaces": {
+        "chat": "cli_chat_proxy",
+        "chat_streaming": "cli_chat_proxy",
+        "image_generation": "api_x_ai",
+        "image_edit": "api_x_ai",
+        "inpaint": "unsupported"
+      },
+      "image_operations_require_exact_live_probe": true
+    }
+  },
+  "decisionIds": [
+    "tenant_ownership_and_authorization",
+    "auth_mode_risk_envelope",
+    "client_api_key_and_admission",
+    "provider_account_and_credential_lifecycle",
+    "capability_snapshot_and_model_availability",
+    "tenant_routing_fallback_affinity_and_leases",
+    "chat_execution_and_streaming",
+    "asset_exchange_and_retention",
+    "durable_render_jobs_and_output_retry",
+    "credential_vault_and_sensitive_data",
+    "canonical_errors_idempotency_and_retry_ownership",
+    "health_cooldown_circuit_and_operator_controls",
+    "stable_public_api_and_compatibility",
+    "pure_go_module_seams_and_dependency_budget",
+    "grok_xai_oauth_operation_surface_policy"
+  ],
+  "planningDomains": [
+    {
+      "id": "product",
+      "decisionIds": [
+        "auth_mode_risk_envelope",
+        "capability_snapshot_and_model_availability"
+      ]
+    },
+    {
+      "id": "domain",
+      "decisionIds": [
+        "provider_account_and_credential_lifecycle",
+        "tenant_routing_fallback_affinity_and_leases",
+        "asset_exchange_and_retention",
+        "durable_render_jobs_and_output_retry",
+        "health_cooldown_circuit_and_operator_controls"
+      ]
+    },
+    {
+      "id": "interface",
+      "decisionIds": [
+        "stable_public_api_and_compatibility",
+        "pure_go_module_seams_and_dependency_budget"
+      ]
+    },
+    {
+      "id": "security",
+      "decisionIds": [
+        "tenant_ownership_and_authorization",
+        "client_api_key_and_admission",
+        "credential_vault_and_sensitive_data"
+      ]
+    },
+    {
+      "id": "execution",
+      "decisionIds": [
+        "chat_execution_and_streaming",
+        "canonical_errors_idempotency_and_retry_ownership",
+        "grok_xai_oauth_operation_surface_policy"
+      ]
+    }
+  ],
+  "implementationSliceIds": [
+    "foundation_and_composition",
+    "principal_admission_audit_and_replay",
+    "provider_account_and_vault",
+    "capability_health_and_routing",
+    "asset_and_render_execution",
+    "chat_execution",
+    "provider_adapters_and_full_conformance"
+  ],
+  "deferredItemIds": [
+    "D-PERSISTENCE-DRIVER",
+    "D-VAULT-CRYPTO-VENDOR",
+    "D-JOB-RUNTIME",
+    "D-DEPLOYMENT-TOPOLOGY",
+    "D-SLO-CANARY-LAUNCH",
+    "D-LEGACY-MIGRATION",
+    "D-NUMERIC-TUNE",
+    "D-PROBE-RATE",
+    "D-SNAPSHOT-GRACE",
+    "D-ROTATE-GRACE",
+    "D-REAUTH-GRACE",
+    "D-CODEX-APIKEY-MODE",
+    "D-MULTI-ACCT",
+    "D-ROUTE-AUTOFALLBACK",
+    "D-ROUTE-XMODE",
+    "D-CHAT-TOOLS",
+    "D-CHAT-RESUME",
+    "D-RENDER-RESUME",
+    "D-RENDER-UPSTREAM-IDEMPOTENCY",
+    "D-RENDER-OUTPUT-RECREATE",
+    "D-ASSET-CHUNK",
+    "D-ASSET-DEDUPE",
+    "D-CHAT-HISTORY",
+    "D-BREAK-GLASS",
+    "D-TENANT-DELETE-EXPORT",
+    "D-JURISDICTION-RETENTION",
+    "D-INCIDENT-UPSTREAM-EVIDENCE",
+    "D-BATCH-RETRY",
+    "D-BILLING",
+    "D-NEW-PROVIDERS-OFFICIAL-ADAPTERS",
+    "D-COUNSEL-AGENT",
+    "D-COUNSEL-RE",
+    "D-OAI-TOKEN",
+    "D-ANTIGRAVITY-TERMS",
+    "D-GROK-ISSUER",
+    "D-XAI-COMPETE",
+    "D-COMM",
+    "D-REGION",
+    "D-ASSET-CAP-TUNE",
+    "D-ERROR-WIRE",
+    "D-RETRY-AT-LEAST-ONCE",
+    "D-VAULT-KEY-TOPOLOGY",
+    "D-LEGAL-HOLD-CREDENTIAL"
+  ],
+  "requiredSections": [
+    "Authority and conflict resolution",
+    "Capability evidence ledger",
+    "Decision ledger",
+    "Planning closure ledger",
+    "Implementation work breakdown",
+    "Deferred item register",
+    "Completion gate"
+  ],
+  "authorityFingerprints": {
+    "CONTEXT.md": "cad8f6513c4fcc985c70313fc5135848ee9faafac9895bb9bbfba7db36f4bb30",
+    "contracts/openapi/pixelplus-public-api-v1.yaml": "af64f43b9c6d423d464d2ff81453dd3999f30f6d293ec3820d58067abd03bdc1",
+    "docs/decisions/0008-stable-public-api-contract-policy.md": "5b47cf09b98405ee6e92c66b58260a251cf3c4418d9f8b2bfcab520b90327fe3",
+    "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md": "5c3d6cf1e5fadd52bc775a67f3057f1ff8543daa6504d5ee29cf2cad3b75b2bd",
+    "docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md": "a9bd85522a9f3dce26e983c3311f8993aa0c4764f809622cb5423eb717871102",
+    "docs/spec/tenant-ownership-authorization-invariants.md": "a6e5bb4f6a08578bd889a95472f64638b833f6a17c870520989268a7d689dec7",
+    "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md": "14913c18bcd9f2cd81a97bdf81f876aaa0694ae4a9fc880e39d2b072cbd99cb8",
+    "docs/spec/client-api-key-lifecycle-and-admission-controls.md": "45e531b2a669632e39e6e448030db4209062b1369f60732a497ad168214809c5",
+    "docs/spec/provider-account-connection-and-credential-lifecycle.md": "0ecafe6b9c98f714d6cfea303a6a11f476ab3c18f4bc25063c29ea475759a379",
+    "docs/spec/capability-snapshot-and-model-availability-semantics.md": "3052f9a7a38fa5fac8c0e8f1b939256eeb78a87f24d881069ec57b2af3a99cf5",
+    "docs/spec/tenant-scoped-routing-fallback-affinity-leases.md": "5865e291472760ef095c5a8a84d64e580e3da3de7d405773db65891cbf7f7d2e",
+    "docs/spec/chat-execution-and-streaming-lifecycle.md": "6b71866e5b1ec6350cfc6bc68c8433819be6b47d074ff369b07c109dcae8c6ba",
+    "docs/spec/asset-exchange-authorization-and-retention-lifecycle.md": "d8c58221ea8d357f286b66d4b3a1bca3a67a4a0cfaab04dd8ea7e5673f04473d",
+    "docs/spec/durable-render-job-and-output-retry-lifecycle.md": "904c081e8e87ecb65eddd788794206ff410fee1d096640c63271f90691418689",
+    "docs/spec/credential-vault-and-sensitive-data-lifecycle.md": "f3361c88854d561170789b7dae14a220c4d0e3ce6826e5e85c567586375d9970",
+    "docs/spec/canonical-errors-and-retry-ownership.md": "4eeccb944605147afb975bc2919ac6f8cbaf36b376562a17536bae55696aa6e0",
+    "docs/spec/provider-account-health-cooldown-and-operator-controls.md": "5aa8e413bb7c812ef64ed01b7002fde4b02b05063222c6b50c8804e3fec008bc",
+    "docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md": "6332f6c791ce56bc87b9dda5ba7159f2cb8a7e42c8f5cf27ebfbb92e3a0bddc1",
+    "docs/spec/research/web-to-api-compliance-risk-evidence.md": "9adfec77942dcccc43ad66641df014e0d950542393b8142ebd5c6533be11441f",
+    "docs/spec/research/chatgpt-auth-mode-capability-evidence.md": "99d80c94564ea90d92e4f00166d4960d16a66abfe7a8a09da8df61660adab4f4",
+    "docs/spec/research/gemini-auth-mode-capability-evidence.md": "479f97f75efc6c3432ddfee082475ac2c5502ec2e0bfa38e7ef0d48850d1039a",
+    "docs/spec/research/grok-auth-mode-capability-evidence.md": "0721b649e97a511f6d261f4d62d0a268056fabd6ff331559b504827bb7c829e6",
+    "docs/spec/openai-compatible-inference-contract.md": "0a0bc7fe8216d51babcbaeb49afc01b72587fac1aee4ca2775c25b0b82569d60",
+    "docs/spec/provider-account-and-capability-management-contract.md": "c4c9d0027d1c45b033f2ccb65d96ec830131c197484bd0c3e4aa238d6de43855",
+    "contracts/openapi/pixelplus-public-api-v0alpha.yaml": "55ff18dee24daccbda3b380c7c55b2db56898ef39176a84663d74945978a7a39",
+    "contracts/openapi/pixelplus-management-api-v0alpha.yaml": "6c04fae1114e48b6a0e99e6adb8eef793cc39106839e3d9f3ee2e1d0c66b2753",
+    "contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml": "af64f43b9c6d423d464d2ff81453dd3999f30f6d293ec3820d58067abd03bdc1"
+  }
+}

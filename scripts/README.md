@@ -119,6 +119,21 @@ weakened requirements fail. These checks validate the implementation handoff;
 they do not substitute for the future issue #42 public-HTTP runtime contract
 suite.
 
+The independent accepted contract and authority fingerprints live at
+`scripts/provider-gateway-implementation-spec-contract.json`. The refresh
+command is maintenance-only. After an intentional authority review changes a
+source or accepted handoff semantic, run it once, then run the validator and
+tests without another refresh:
+
+```bash
+node scripts/refresh-provider-gateway-implementation-spec-contract.mjs
+```
+
+The refresh command does not copy required IDs, capability tuples, authority
+paths, planning-domain coverage, or Provider policies from the manifest under
+validation. Do not put it in routine validation, pre-commit, or CI command
+lists; doing so could bless unreviewed authority drift.
+
 The retained Public API and prototype contract checks are:
 
 ```bash

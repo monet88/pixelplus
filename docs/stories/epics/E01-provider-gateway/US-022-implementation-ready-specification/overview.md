@@ -27,6 +27,15 @@ product decisions.
   missing Auth Modes/operations/decisions/slices, incomplete decision
   dimensions, undeclared evidence, deferred work without reopen conditions,
   and attempts to use issue #22 as the runtime implementation issue.
+- The validator-owned contract fingerprints every authority file, compares
+  structured semantics independent of JSON member order, and locks
+  Provider-specific execution policies that implementation must not recreate.
+- The validator parses the accepted capability baseline from each declared
+  evidence source and checks five mandatory locked planning domains covering
+  every decision exactly once.
+- Grok xAI OAuth uses the server-owned decision 0010 mapping: chat/streaming on
+  `cli_chat_proxy`, image generation/edit on `api_x_ai`, and no client override
+  or automatic cross-surface fallback.
 - GitHub issue #42 is the separate blocked Gateway implementation umbrella.
   It is not automatically started or marked ready for autonomous execution.
 

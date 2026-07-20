@@ -11,6 +11,8 @@ are in
 [`docs/spec/provider-gateway-implementation-ready-specification.md`](../../docs/spec/provider-gateway-implementation-ready-specification.md).
 Its machine-readable completion gate is
 [`docs/spec/provider-gateway-implementation-ready-manifest.json`](../../docs/spec/provider-gateway-implementation-ready-manifest.json).
+Grok xAI OAuth operation-to-surface behavior is locked separately in
+[`docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md`](../../docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md).
 
 Issues #21 and #22 are specification-only. Gateway runtime work belongs to
 the separate implementation umbrella #42 and must be decomposed into vertical
