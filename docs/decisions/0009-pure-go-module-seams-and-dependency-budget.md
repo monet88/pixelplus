@@ -196,12 +196,18 @@ boundary. Prompt, Asset bytes, Render staging, and audit-safe records use the
 same principle with data-class-specific intents.
 
 The first interface catalogue is deliberately concrete even though the Go
-module is deferred. Names below are the minimum shape; request and outcome
-types are typed domain/application values and are not `map[string]any` or wire
-DTOs:
+module is deferred. The package labels below are normative: application owns
+the inbound interfaces, `domain` owns canonical values that cross the
+application/port seam, and `ports` owns infrastructure intents/receipts. The
+examples use explicit `domain.` qualification at both seams; request and
+outcome types are not `map[string]any` or wire DTOs:
 
 ```go
 // internal/application
+package application
+
+// domain refers to the sibling internal/domain package.
+
 type PublicGateway interface {
 	ModelsGateway
 	ChatGateway
@@ -212,55 +218,62 @@ type PublicGateway interface {
 }
 
 type ModelsGateway interface {
-	ListModels(context.Context, ModelsQuery) (ModelsResponse, error)
+	ListModels(context.Context, domain.ModelsQuery) (domain.ModelsResponse, error)
 }
 
 type ChatGateway interface {
-	CreateChatCompletion(context.Context, ChatRequest) (ChatResponse, error)
-	StreamChat(context.Context, ChatRequest, ChatSink) error
-	CancelChatExecution(context.Context, CancelChatRequest) (CancelChatResponse, error)
+	CreateChatCompletion(context.Context, domain.ChatRequest) (domain.ChatResponse, error)
+	StreamChat(context.Context, domain.ChatRequest, domain.ChatSink) error
+	CancelChatExecution(context.Context, domain.CancelChatRequest) (domain.CancelChatResponse, error)
 }
 
 type AssetGateway interface {
-	CreateAsset(context.Context, CreateAssetRequest) (AssetResponse, error)
-	GetAsset(context.Context, GetAssetRequest) (AssetResponse, error)
-	GetAssetContent(context.Context, GetAssetContentRequest) (AssetContentResponse, error)
+	CreateAsset(context.Context, domain.CreateAssetRequest) (domain.AssetResponse, error)
+	GetAsset(context.Context, domain.GetAssetRequest) (domain.AssetResponse, error)
+	GetAssetContent(context.Context, domain.GetAssetContentRequest) (domain.AssetContentResponse, error)
 }
 
 type RenderGateway interface {
-	CreateImageGeneration(context.Context, ImageGenerationRequest) (RenderJobResponse, error)
-	CreateImageEdit(context.Context, ImageEditRequest) (RenderJobResponse, error)
-	CreateImageInpaint(context.Context, ImageInpaintRequest) (RenderJobResponse, error)
-	GetRenderJob(context.Context, GetRenderJobRequest) (RenderJobResponse, error)
-	CancelRenderJob(context.Context, CancelRenderJobRequest) (CancelRenderJobResponse, error)
-	RetryRenderJobOutput(context.Context, RetryOutputRequest) (OutputDeliveryResponse, error)
+	CreateImageGeneration(context.Context, domain.ImageGenerationRequest) (domain.RenderJobResponse, error)
+	CreateImageEdit(context.Context, domain.ImageEditRequest) (domain.RenderJobResponse, error)
+	CreateImageInpaint(context.Context, domain.ImageInpaintRequest) (domain.RenderJobResponse, error)
+	GetRenderJob(context.Context, domain.GetRenderJobRequest) (domain.RenderJobResponse, error)
+	CancelRenderJob(context.Context, domain.CancelRenderJobRequest) (domain.CancelRenderJobResponse, error)
+	RetryRenderJobOutput(context.Context, domain.RetryOutputRequest) (domain.OutputDeliveryResponse, error)
 }
 
 type ProviderAccountGateway interface {
-	CreateProviderAccount(context.Context, CreateProviderAccountRequest) (ProviderAccountResponse, error)
-	ListProviderAccounts(context.Context, ListProviderAccountsRequest) (ProviderAccountsResponse, error)
-	GetProviderAccount(context.Context, GetProviderAccountRequest) (ProviderAccountResponse, error)
-	DeleteProviderAccount(context.Context, DeleteProviderAccountRequest) (DeleteProviderAccountResponse, error)
-	SubmitProviderCredential(context.Context, SubmitCredentialRequest) (ProviderAccountResponse, error)
-	StartOAuthAuthorization(context.Context, StartOAuthRequest) (OAuthAuthorizationResponse, error)
-	GetOAuthAuthorization(context.Context, GetOAuthRequest) (OAuthAuthorizationResponse, error)
-	ProbeProviderAccount(context.Context, ProbeAccountRequest) (ProviderAccountResponse, error)
-	ReauthenticateProviderAccount(context.Context, ReauthenticateRequest) (ProviderAccountResponse, error)
-	DisableProviderAccount(context.Context, DisableAccountRequest) (ProviderAccountResponse, error)
-	EnableProviderAccount(context.Context, EnableAccountRequest) (ProviderAccountResponse, error)
-	GetCapabilitySnapshot(context.Context, GetCapabilitySnapshotRequest) (CapabilitySnapshotResponse, error)
+	CreateProviderAccount(context.Context, domain.CreateProviderAccountRequest) (domain.ProviderAccountResponse, error)
+	ListProviderAccounts(context.Context, domain.ListProviderAccountsRequest) (domain.ProviderAccountsResponse, error)
+	GetProviderAccount(context.Context, domain.GetProviderAccountRequest) (domain.ProviderAccountResponse, error)
+	DeleteProviderAccount(context.Context, domain.DeleteProviderAccountRequest) (domain.DeleteProviderAccountResponse, error)
+	SubmitProviderCredential(context.Context, domain.SubmitCredentialRequest) (domain.ProviderAccountResponse, error)
+	StartOAuthAuthorization(context.Context, domain.StartOAuthRequest) (domain.OAuthAuthorizationResponse, error)
+	GetOAuthAuthorization(context.Context, domain.GetOAuthRequest) (domain.OAuthAuthorizationResponse, error)
+	ProbeProviderAccount(context.Context, domain.ProbeAccountRequest) (domain.ProviderAccountResponse, error)
+	ReauthenticateProviderAccount(context.Context, domain.ReauthenticateRequest) (domain.ProviderAccountResponse, error)
+	DisableProviderAccount(context.Context, domain.DisableAccountRequest) (domain.ProviderAccountResponse, error)
+	EnableProviderAccount(context.Context, domain.EnableAccountRequest) (domain.ProviderAccountResponse, error)
+	GetCapabilitySnapshot(context.Context, domain.GetCapabilitySnapshotRequest) (domain.CapabilitySnapshotResponse, error)
 }
 
 type RoutingPolicyGateway interface {
-	GetRoutingPolicy(context.Context, GetRoutingPolicyRequest) (RoutingPolicyResponse, error)
-	ReplaceRoutingPolicy(context.Context, ReplaceRoutingPolicyRequest) (RoutingPolicyResponse, error)
+	GetRoutingPolicy(context.Context, domain.GetRoutingPolicyRequest) (domain.RoutingPolicyResponse, error)
+	ReplaceRoutingPolicy(context.Context, domain.ReplaceRoutingPolicyRequest) (domain.RoutingPolicyResponse, error)
 }
 
 type JobExecutor interface {
-	ExecuteJob(context.Context, JobReference) error
+	ExecuteJob(context.Context, domain.JobReference) error
 }
 
+```
+
+```go
 // internal/ports
+package ports
+
+// domain refers to the sibling internal/domain package.
+
 type AdapterRegistry interface {
 	ResolveChat(context.Context, domain.ProviderAccountRef) (ChatAdapter, error)
 	ResolveRender(context.Context, domain.ProviderAccountRef) (RenderAdapter, error)
@@ -270,24 +283,24 @@ type AdapterRegistry interface {
 }
 
 type ChatAdapter interface {
-	Chat(context.Context, ChatRequest) (ChatOutcome, error)
-	StreamChat(context.Context, ChatRequest, StreamSink) error
+	Chat(context.Context, domain.ChatRequest) (domain.ChatOutcome, error)
+	StreamChat(context.Context, domain.ChatRequest, domain.ChatSink) error
 }
 
 type RenderAdapter interface {
-	Render(context.Context, RenderRequest) (RenderOutcome, error)
+	Render(context.Context, domain.RenderRequest) (domain.RenderOutcome, error)
 }
 
 type RecoveryAdapter interface {
-	Recover(context.Context, RecoveryRequest) (RecoveryOutcome, error)
+	Recover(context.Context, domain.RecoveryRequest) (domain.RecoveryOutcome, error)
 }
 
 type ProbeAdapter interface {
-	Probe(context.Context, ProbeRequest) (ProbeOutcome, error)
+	Probe(context.Context, domain.ProbeRequest) (domain.ProbeOutcome, error)
 }
 
 type CapabilityAdapter interface {
-	ObserveCapabilities(context.Context, CapabilityRequest) (CapabilityOutcome, error)
+	ObserveCapabilities(context.Context, domain.CapabilityRequest) (domain.CapabilityOutcome, error)
 }
 
 type CredentialVault interface {
@@ -420,24 +433,29 @@ constructor; tests replace only port implementations.
 The constructor shape is:
 
 ```go
+// internal/composition
+package composition
+
+// Imports omitted: context, net/http, internal/application, and internal/ports.
+
 type Dependencies struct {
-	Principal PrincipalStore
-	Admission AdmissionStore
-	Replay ReplayStore
-	Accounts AccountStore
-	Capabilities CapabilityStore
-	Health HealthStore
-	Routing RoutingPolicyStore
-	Assets AssetStore
-	Jobs RenderJobStore
-	Adapters AdapterRegistry
-	Vault CredentialVault
-	Runtime JobRuntime
-	Clock Clock
-	IDs IDGenerator
-	Audit AuditRecorder
-	Telemetry TelemetryRecorder
-	RequestLog RequestLogRecorder
+	Principal ports.PrincipalStore
+	Admission ports.AdmissionStore
+	Replay ports.ReplayStore
+	Accounts ports.AccountStore
+	Capabilities ports.CapabilityStore
+	Health ports.HealthStore
+	Routing ports.RoutingPolicyStore
+	Assets ports.AssetStore
+	Jobs ports.RenderJobStore
+	Adapters ports.AdapterRegistry
+	Vault ports.CredentialVault
+	Runtime ports.JobRuntime
+	Clock ports.Clock
+	IDs ports.IDGenerator
+	Audit ports.AuditRecorder
+	Telemetry ports.TelemetryRecorder
+	RequestLog ports.RequestLogRecorder
 }
 
 func New(Config, Dependencies) (*Runtime, error)
