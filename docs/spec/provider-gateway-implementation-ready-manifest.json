@@ -1,0 +1,785 @@
+{
+  "schema_version": 1,
+  "issue": 22,
+  "implementation_issue": 42,
+  "status": "implementation_ready",
+  "specification": "docs/spec/provider-gateway-implementation-ready-specification.md",
+  "canonical_capability_statuses": [
+    "verified",
+    "conditionally_supported",
+    "unsupported",
+    "unverified"
+  ],
+  "authority": {
+    "glossary": "CONTEXT.md",
+    "stable_public_api": "contracts/openapi/pixelplus-public-api-v1.yaml",
+    "architecture_decisions": [
+      "docs/decisions/0008-stable-public-api-contract-policy.md",
+      "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md"
+    ],
+    "normative_specs": [
+      "docs/spec/tenant-ownership-authorization-invariants.md",
+      "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+      "docs/spec/client-api-key-lifecycle-and-admission-controls.md",
+      "docs/spec/provider-account-connection-and-credential-lifecycle.md",
+      "docs/spec/capability-snapshot-and-model-availability-semantics.md",
+      "docs/spec/tenant-scoped-routing-fallback-affinity-leases.md",
+      "docs/spec/chat-execution-and-streaming-lifecycle.md",
+      "docs/spec/asset-exchange-authorization-and-retention-lifecycle.md",
+      "docs/spec/durable-render-job-and-output-retry-lifecycle.md",
+      "docs/spec/credential-vault-and-sensitive-data-lifecycle.md",
+      "docs/spec/canonical-errors-and-retry-ownership.md",
+      "docs/spec/provider-account-health-cooldown-and-operator-controls.md",
+      "docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md"
+    ],
+    "evidence_sources": [
+      "docs/spec/research/web-to-api-compliance-risk-evidence.md",
+      "docs/spec/research/chatgpt-auth-mode-capability-evidence.md",
+      "docs/spec/research/gemini-auth-mode-capability-evidence.md",
+      "docs/spec/research/grok-auth-mode-capability-evidence.md",
+      "docs/spec/openai-compatible-inference-contract.md",
+      "docs/spec/provider-account-and-capability-management-contract.md",
+      "contracts/openapi/pixelplus-public-api-v0alpha.yaml",
+      "contracts/openapi/pixelplus-management-api-v0alpha.yaml",
+      "contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml"
+    ]
+  },
+  "capabilities": [
+    {
+      "auth_mode": "chatgpt_web_access",
+      "risk_status": "experimental",
+      "claims": [
+        {
+          "operation": "chat",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "chat_streaming",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_generation",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_edit",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "inpaint",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        }
+      ]
+    },
+    {
+      "auth_mode": "chatgpt_codex_oauth",
+      "risk_status": "gated",
+      "claims": [
+        {
+          "operation": "chat",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "chat_streaming",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_generation",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_edit",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "inpaint",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/chatgpt-auth-mode-capability-evidence.md"
+        }
+      ]
+    },
+    {
+      "auth_mode": "gemini_web_cookie",
+      "risk_status": "experimental",
+      "claims": [
+        {
+          "operation": "chat",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "chat_streaming",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_generation",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_edit",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "inpaint",
+          "status": "unsupported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        }
+      ]
+    },
+    {
+      "auth_mode": "gemini_antigravity_oauth",
+      "risk_status": "gated",
+      "claims": [
+        {
+          "operation": "chat",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "chat_streaming",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_generation",
+          "status": "unverified",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_edit",
+          "status": "unverified",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "inpaint",
+          "status": "unsupported",
+          "evidence": "docs/spec/research/gemini-auth-mode-capability-evidence.md"
+        }
+      ]
+    },
+    {
+      "auth_mode": "grok_web_sso",
+      "risk_status": "prohibited",
+      "claims": [
+        {
+          "operation": "chat",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "chat_streaming",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_generation",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_edit",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "inpaint",
+          "status": "unsupported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        }
+      ]
+    },
+    {
+      "auth_mode": "grok_xai_oauth",
+      "risk_status": "gated",
+      "claims": [
+        {
+          "operation": "chat",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "chat_streaming",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_generation",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "image_edit",
+          "status": "conditionally_supported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        },
+        {
+          "operation": "inpaint",
+          "status": "unsupported",
+          "evidence": "docs/spec/research/grok-auth-mode-capability-evidence.md"
+        }
+      ]
+    }
+  ],
+  "decisions": [
+    {
+      "id": "tenant_ownership_and_authorization",
+      "observable_behavior": "Every public request derives one Tenant-bound Security Principal from the Client API Key; foreign and unknown resources are non-enumerating.",
+      "failure_semantics": "Authentication fails as 401-class, same-Tenant missing scope fails as 403-class, and foreign/unknown/deleted resources fail as indistinguishable 404-class outcomes before protected effects.",
+      "security_impact": "Prevents cross-Tenant data, credential, account, job, asset, capability, and routing access and confused-deputy execution.",
+      "dependencies": [
+        "docs/spec/tenant-ownership-authorization-invariants.md"
+      ]
+    },
+    {
+      "id": "auth_mode_risk_envelope",
+      "observable_behavior": "Each Provider Account keeps one immutable Auth Mode whose allowed, prohibited, experimental, or gated risk state is evaluated independently from capability and health.",
+      "failure_semantics": "Prohibited, killed, or gated-without-acknowledgement modes fail closed before credential use or Provider execution; reopening requires the documented evidence and operator gates.",
+      "security_impact": "Prevents capability probes or routing policy from overriding compliance, acceptable-use, credential-custody, or kill-switch decisions.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "docs/spec/research/web-to-api-compliance-risk-evidence.md"
+      ]
+    },
+    {
+      "id": "client_api_key_and_admission",
+      "observable_behavior": "Client API Keys are one-time bearer credentials with Tenant-bound scopes; admission evaluates scope, request size, rate, concurrency, and quota in the locked order.",
+      "failure_semantics": "Revoked or invalid keys fail at authentication; scope, size, rate, concurrency, quota, and dependency failures remain admission outcomes and never masquerade as Provider runtime failures.",
+      "security_impact": "Enforces least privilege, immediate revoke behavior, anti-abuse isolation, fail-closed limit state, and non-secret key storage.",
+      "dependencies": [
+        "docs/spec/client-api-key-lifecycle-and-admission-controls.md"
+      ]
+    },
+    {
+      "id": "provider_account_and_credential_lifecycle",
+      "observable_behavior": "Provider Accounts follow the locked create, submit, validate, probe, activate, refresh, reauthenticate, disable, revoke, and delete journeys with monotonic credential versions.",
+      "failure_semantics": "An account is non-usable unless every usability gate passes for the current credential version; failures stop before Adapter execution and map to canonical remediation.",
+      "security_impact": "Keeps Web and OAuth credentials independent, prevents stale or pending credentials from executing, and ensures delete/revoke removes use before metadata disappearance.",
+      "dependencies": [
+        "docs/spec/provider-account-connection-and-credential-lifecycle.md"
+      ]
+    },
+    {
+      "id": "capability_snapshot_and_model_availability",
+      "observable_behavior": "Every account exposes a credential-version-bound Capability Snapshot with per-operation and observed-model status, provenance, freshness, and probe identity.",
+      "failure_semantics": "Only fresh verified or conditionally_supported operation-model pairs are offerable; unsupported, unverified, stale, or invalid facts reject before upstream execution.",
+      "security_impact": "Prevents static catalogs, another account's evidence, or a successful unrelated probe from authorizing unavailable or unsafe work.",
+      "dependencies": [
+        "docs/spec/capability-snapshot-and-model-availability-semantics.md",
+        "docs/spec/research/chatgpt-auth-mode-capability-evidence.md",
+        "docs/spec/research/gemini-auth-mode-capability-evidence.md",
+        "docs/spec/research/grok-auth-mode-capability-evidence.md"
+      ]
+    },
+    {
+      "id": "tenant_routing_fallback_affinity_and_leases",
+      "observable_behavior": "Routing constructs a same-Tenant candidate set and applies explicit selection, lease, affinity, policy, then declared fallback precedence.",
+      "failure_semantics": "Missing policy, explicit pins, non-offerable capability, unusable accounts, prohibited risk, or insufficient non-commit proof fail closed without silent or cross-Tenant fallback.",
+      "security_impact": "Prevents shared account pools, cross-mode widening, retry multiplication, and routing around lifecycle, risk, capability, or health gates.",
+      "dependencies": [
+        "docs/spec/tenant-scoped-routing-fallback-affinity-leases.md"
+      ]
+    },
+    {
+      "id": "chat_execution_and_streaming",
+      "observable_behavior": "Chat runs through the locked X1-X6 lifecycle; streams emit open, zero or more delta/heartbeat events, then exactly one completed, failed, or canceled terminal.",
+      "failure_semantics": "Cancel, disconnect, timeout, residual work, commit uncertainty, and idempotency no-steal retain one execution identity and conservative accounting without duplicate terminals or retries.",
+      "security_impact": "Keeps Tenant/key occupancy attached to residual work, prevents replacement execution after uncertain commit, and avoids Provider-specific leakage in stream semantics.",
+      "dependencies": [
+        "docs/spec/chat-execution-and-streaming-lifecycle.md"
+      ]
+    },
+    {
+      "id": "asset_exchange_and_retention",
+      "observable_behavior": "Assets are immutable Tenant-owned input, mask, or output objects with canonical decode/dimension/mask validation, bounded retention, idempotent deletion, and atomic storage reservation.",
+      "failure_semantics": "Invalid media or dimensions fail before upstream; foreign and unknown IDs are non-enumerating; expired or deleted content is non-retrievable and capacity reservations release once.",
+      "security_impact": "Prevents cross-Tenant content disclosure, mask downgrades, cap races, unbounded retention, and output visibility beyond the owner Tenant.",
+      "dependencies": [
+        "docs/spec/asset-exchange-authorization-and-retention-lifecycle.md"
+      ]
+    },
+    {
+      "id": "durable_render_jobs_and_output_retry",
+      "observable_behavior": "Image operations create durable jobs with leases, fencing, one attempt ledger, commit certainty, immutable result manifests, cancellation, and placement-key output delivery.",
+      "failure_semantics": "Committed or unknown attempts may recover only the same attempt; output retry reuses the manifest and never re-renders; cancellation and accounting settle conservatively.",
+      "security_impact": "Prevents duplicate costly side effects, stale-worker commits, cross-Tenant recovery, optimistic refunds, and content leakage through staging or output placement.",
+      "dependencies": [
+        "docs/spec/durable-render-job-and-output-retry-lifecycle.md"
+      ]
+    },
+    {
+      "id": "credential_vault_and_sensitive_data",
+      "observable_behavior": "Credentials and Tenant-confidential content use separate encrypted, purpose-bound, Tenant/resource-bound access paths with independent business, crypto, and hash versions.",
+      "failure_semantics": "Authorization, audit, key, binding, retention, or dependency failures deny decrypt/use; logical deletion immediately removes public/use authority even when encrypted evidence is held.",
+      "security_impact": "Keeps plaintext out of application code and ordinary records, blocks handle-as-authority and cross-Tenant ciphertext reuse, and makes compromise/revocation/purge observable.",
+      "dependencies": [
+        "docs/spec/credential-vault-and-sensitive-data-lifecycle.md"
+      ]
+    },
+    {
+      "id": "canonical_errors_idempotency_and_retry_ownership",
+      "observable_behavior": "All layers normalize to one Provider-independent error envelope, commit certainty, retryability, remediation, and exactly one retry owner per operation.",
+      "failure_semantics": "Fingerprint conflict, in-progress, and uncertain claims never steal ownership; transport, Adapter, queue, and worker layers cannot create a second full-operation retry chain.",
+      "security_impact": "Prevents duplicate side effects and diagnostic leakage while preserving non-enumeration, safe correlation, and honest admission-versus-runtime classification.",
+      "dependencies": [
+        "docs/spec/canonical-errors-and-retry-ownership.md"
+      ]
+    },
+    {
+      "id": "health_cooldown_circuit_and_operator_controls",
+      "observable_behavior": "Scoped health conditions, durable cooldowns, recovery permits, surface circuits, drain, quarantine, and Tenant disable remain independent from lifecycle and risk state.",
+      "failure_semantics": "Stale observations cannot clear newer failures; cooldown expiry opens bounded half-open proof rather than marking healthy; quarantine and Auth Mode kill dominate routing without rewriting account health.",
+      "security_impact": "Prevents upstream hammering, stale-success recovery, Tenant circuit poisoning, unsafe operator release, and health state from becoming authorization.",
+      "dependencies": [
+        "docs/spec/provider-account-health-cooldown-and-operator-controls.md"
+      ]
+    },
+    {
+      "id": "stable_public_api_and_compatibility",
+      "observable_behavior": "The sole stable client contract is OpenAPI 3.1.1 `/v1` version 1.0.0 with 26 operations, exact scopes, operation-specific idempotency classes, and a frozen compatibility baseline.",
+      "failure_semantics": "Breaking v1 changes, scope/auth changes, narrowed requests, closed-response expansion, or weakened idempotency fail validation and require a new major; deprecation requires the locked notice window and successor.",
+      "security_impact": "Prevents silent authorization or replay-policy drift and requires future behavioral proof through the public HTTP surface and real composition.",
+      "dependencies": [
+        "contracts/openapi/pixelplus-public-api-v1.yaml",
+        "contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml",
+        "docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md",
+        "docs/decisions/0008-stable-public-api-contract-policy.md"
+      ]
+    },
+    {
+      "id": "pure_go_module_seams_and_dependency_budget",
+      "observable_behavior": "The Gateway is a Pure-Go module with domain, application, ports, HTTP transport, Provider adapters, Vault, persistence, jobs, observability, composition, and contract-test boundaries.",
+      "failure_semantics": "Forbidden imports, secret-returning Vault APIs, generic retry/store shortcuts, private test seams, or unapproved dependency slots block implementation acceptance.",
+      "security_impact": "Keeps HTTP, Provider protocol, queue, storage, and secret representations outside the canonical domain and makes production/test wiring share one composition root.",
+      "dependencies": [
+        "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md"
+      ]
+    }
+  ],
+  "implementation_slices": [
+    {
+      "id": "foundation_and_composition",
+      "depends_on": [],
+      "authority": [
+        "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md",
+        "docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md"
+      ],
+      "proof_seam": "Production composition constructor exposed through public HTTP plus exported worker lifecycle, with compile-time dependency checks."
+    },
+    {
+      "id": "principal_admission_audit_and_replay",
+      "depends_on": [
+        "foundation_and_composition"
+      ],
+      "authority": [
+        "docs/spec/tenant-ownership-authorization-invariants.md",
+        "docs/spec/client-api-key-lifecycle-and-admission-controls.md",
+        "docs/spec/canonical-errors-and-retry-ownership.md"
+      ],
+      "proof_seam": "Public HTTP requests with controlled Principal, Admission, Replay, Audit, Clock, and ID ports."
+    },
+    {
+      "id": "provider_account_and_vault",
+      "depends_on": [
+        "principal_admission_audit_and_replay"
+      ],
+      "authority": [
+        "docs/spec/provider-account-connection-and-credential-lifecycle.md",
+        "docs/spec/credential-vault-and-sensitive-data-lifecycle.md",
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md"
+      ],
+      "proof_seam": "Public management HTTP lifecycle with controlled AccountStore, protected CredentialVault use, Audit, and no plaintext observations."
+    },
+    {
+      "id": "capability_health_and_routing",
+      "depends_on": [
+        "provider_account_and_vault"
+      ],
+      "authority": [
+        "docs/spec/capability-snapshot-and-model-availability-semantics.md",
+        "docs/spec/provider-account-health-cooldown-and-operator-controls.md",
+        "docs/spec/tenant-scoped-routing-fallback-affinity-leases.md"
+      ],
+      "proof_seam": "Public model, account, capability, and routing HTTP operations plus controlled probe/recovery Adapter capabilities."
+    },
+    {
+      "id": "asset_and_render_execution",
+      "depends_on": [
+        "capability_health_and_routing"
+      ],
+      "authority": [
+        "docs/spec/asset-exchange-authorization-and-retention-lifecycle.md",
+        "docs/spec/durable-render-job-and-output-retry-lifecycle.md",
+        "docs/spec/canonical-errors-and-retry-ownership.md"
+      ],
+      "proof_seam": "Public Asset and Render Job HTTP plus exported JobExecutor with controlled stores, JobRuntime, Vault, Render Adapter, Clock, and IDs."
+    },
+    {
+      "id": "chat_execution",
+      "depends_on": [
+        "capability_health_and_routing"
+      ],
+      "authority": [
+        "docs/spec/chat-execution-and-streaming-lifecycle.md",
+        "docs/spec/canonical-errors-and-retry-ownership.md"
+      ],
+      "proof_seam": "Public non-streaming and SSE HTTP through real composition with controlled Chat Adapter, cancellation, residual tracking, Replay, and accounting."
+    },
+    {
+      "id": "provider_adapters_and_full_conformance",
+      "depends_on": [
+        "asset_and_render_execution",
+        "chat_execution"
+      ],
+      "authority": [
+        "docs/spec/research/chatgpt-auth-mode-capability-evidence.md",
+        "docs/spec/research/gemini-auth-mode-capability-evidence.md",
+        "docs/spec/research/grok-auth-mode-capability-evidence.md",
+        "contracts/openapi/pixelplus-public-api-v1.yaml"
+      ],
+      "proof_seam": "All 26 stable operations through production composition, followed by per-Auth-Mode controlled and live probes without status inflation."
+    }
+  ],
+  "deferred_items": [
+    {
+      "id": "D-PERSISTENCE-DRIVER",
+      "reason": "The domain requires logical atomicity but current evidence does not justify a specific physical database driver or schema.",
+      "dependencies": [
+        "implementation issue #42 foundation and persistence benchmark story",
+        "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md"
+      ],
+      "reopen_trigger": "Before the first durable persistence implementation is selected; require cgo-free Pure-Go evidence, migration proof, transaction semantics, and no ORM/query builder."
+    },
+    {
+      "id": "D-VAULT-CRYPTO-VENDOR",
+      "reason": "Logical envelope, AAD, versioning, and fail-closed behavior are locked, but KMS/HSM vendor and exact approved primitive depend on deployment custody requirements.",
+      "dependencies": [
+        "implementation issue #42 Provider Account and Vault slice",
+        "docs/spec/credential-vault-and-sensitive-data-lifecycle.md"
+      ],
+      "reopen_trigger": "Before production credential storage; record the primitive, key custody, cryptoperiod, recovery, and whether standard library crypto is insufficient."
+    },
+    {
+      "id": "D-JOB-RUNTIME",
+      "reason": "JobRuntime semantics are locked but no deployment evidence currently requires an external queue client.",
+      "dependencies": [
+        "implementation issue #42 Asset and Render slice",
+        "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md"
+      ],
+      "reopen_trigger": "Before multi-process durable delivery; document acknowledgement, redelivery, recovery, operational ownership, and why the standard library or selected database is insufficient."
+    },
+    {
+      "id": "D-DEPLOYMENT-TOPOLOGY",
+      "reason": "Single-region versus distributed coordination is an operational topology choice, not a missing domain or execution rule.",
+      "dependencies": [
+        "implementation issue #42 completed conformance runtime",
+        "measured load, availability, and recovery evidence"
+      ],
+      "reopen_trigger": "Before production deployment or when one-process/single-region recovery cannot meet an accepted SLO."
+    },
+    {
+      "id": "D-SLO-CANARY-LAUNCH",
+      "reason": "SLO thresholds, alerts, canary percentages, and launch gates require a running composition and Provider measurements.",
+      "dependencies": [
+        "implementation issue #42 full conformance",
+        "deployment topology decision"
+      ],
+      "reopen_trigger": "After runtime conformance and before any production Tenant or Provider credential is admitted."
+    },
+    {
+      "id": "D-LEGACY-MIGRATION",
+      "reason": "Legacy backend and Photoshop migration must consume a stable running Gateway rather than change its locked Public API semantics.",
+      "dependencies": [
+        "implementation issue #42 release candidate",
+        "Photoshop Plugin implementation initiative"
+      ],
+      "reopen_trigger": "When the Gateway `/v1` conformance suite is green in the target deployment and the replacement Plugin story is ready."
+    },
+    {
+      "id": "D-NUMERIC-TUNE",
+      "reason": "Named TTL, retention, cooldown, lease, timeout, quota, and retry classes are locked while many numeric values remain operationally tunable.",
+      "dependencies": [
+        "runtime telemetry and load evidence",
+        "docs/spec/provider-account-health-cooldown-and-operator-controls.md"
+      ],
+      "reopen_trigger": "When observed safety, latency, cost, or Provider behavior shows a named default does not meet its stated invariant; semantics and fail-closed rules may not be weakened."
+    },
+    {
+      "id": "D-PROBE-RATE",
+      "reason": "Probe operations must be bounded and non-hammering, but exact per-Tenant budgets require live Provider cost and throttle evidence.",
+      "dependencies": [
+        "implementation issue #42 capability probe slice",
+        "Provider-specific probe measurements"
+      ],
+      "reopen_trigger": "Before enabling scheduled or user-triggered probes in production."
+    },
+    {
+      "id": "D-SNAPSHOT-GRACE",
+      "reason": "The accepted MVP rejects stale snapshots; a grace window could weaken pre-execution capability proof.",
+      "dependencies": [
+        "production freshness telemetry",
+        "risk review"
+      ],
+      "reopen_trigger": "Only if measured probe outages create unacceptable availability and a per-operation low-risk grace policy can be proven fail-closed for unsupported or invalid facts."
+    },
+    {
+      "id": "D-ROTATE-GRACE",
+      "reason": "Immediate Client API Key invalidation on rotation is the accepted MVP and avoids dual-valid bearer ambiguity.",
+      "dependencies": [
+        "client migration evidence",
+        "security review"
+      ],
+      "reopen_trigger": "When a concrete client rollout requires overlap and bounded dual-key admission can preserve revoke propagation and audit identity."
+    },
+    {
+      "id": "D-REAUTH-GRACE",
+      "reason": "Provider credential cutover occurs only after the pending version probes successfully; longer dual-valid grace increases secret exposure.",
+      "dependencies": [
+        "credential lifecycle telemetry",
+        "Vault security review"
+      ],
+      "reopen_trigger": "When a Provider proves atomic cutover is operationally unsafe and a bounded, version-fenced overlap is specified."
+    },
+    {
+      "id": "D-CODEX-APIKEY-MODE",
+      "reason": "Codex API-key login is not one of the six accepted Auth Modes and cannot be merged into Codex OAuth without changing credential and risk semantics.",
+      "dependencies": [
+        "new product decision",
+        "risk and capability evidence"
+      ],
+      "reopen_trigger": "When product scope explicitly requests the mode and evidence establishes its independent credential lifecycle, risk envelope, and capability surface."
+    },
+    {
+      "id": "D-MULTI-ACCT",
+      "reason": "The accepted routing model does not authorize pooled multi-account load balancing beyond deterministic Tenant-owned candidates.",
+      "dependencies": [
+        "new routing decision",
+        "Tenant policy and fairness requirements"
+      ],
+      "reopen_trigger": "When a Tenant-facing requirement needs concurrent pool balancing and can preserve explicit selection, leases, quotas, and no cross-Tenant sharing."
+    },
+    {
+      "id": "D-ROUTE-AUTOFALLBACK",
+      "reason": "Fallback is opt-in and fail-closed; automatic fallback would change observable execution and retry behavior.",
+      "dependencies": [
+        "new Public API and routing decision",
+        "retry-safety evidence"
+      ],
+      "reopen_trigger": "When product explicitly requests default failover and every operation has authoritative no-commit or idempotent recovery proof."
+    },
+    {
+      "id": "D-ROUTE-XMODE",
+      "reason": "Cross-Auth-Mode fallback is allowed only through an explicit Tenant policy list and never as a default.",
+      "dependencies": [
+        "new routing and risk decision",
+        "per-mode capability and disclosure requirements"
+      ],
+      "reopen_trigger": "When product requests a default cross-mode policy and user disclosure, risk acknowledgements, capability equality, and retry safety are specified."
+    },
+    {
+      "id": "D-CHAT-TOOLS",
+      "reason": "The stable MVP locks text chat ordering while tool calling and richer multimodal streaming remain secondary unverified operations.",
+      "dependencies": [
+        "new capability evidence",
+        "Public API compatibility decision"
+      ],
+      "reopen_trigger": "When a client requirement names tool or multimodal semantics and at least one Auth Mode has probe-backed support without breaking terminal ordering."
+    },
+    {
+      "id": "D-CHAT-RESUME",
+      "reason": "Disconnect is implicit cancel and the accepted MVP has no client-visible stream resume; server-side residual recovery remains separate.",
+      "dependencies": [
+        "new chat execution and API decision",
+        "durable stream cursor evidence"
+      ],
+      "reopen_trigger": "When clients require resume and a cursor/idempotency contract can prove one execution, one terminal, bounded retention, and Tenant isolation."
+    },
+    {
+      "id": "D-RENDER-RESUME",
+      "reason": "Current recovery is server-side job/attempt recovery, not resumable client upload or download transport.",
+      "dependencies": [
+        "new Asset and Public API decision",
+        "large-transfer measurements"
+      ],
+      "reopen_trigger": "When measured transfer sizes or reliability require a client resume protocol with bounded storage, ownership, and integrity semantics."
+    },
+    {
+      "id": "D-RENDER-UPSTREAM-IDEMPOTENCY",
+      "reason": "Gateway correctness cannot assume Provider-native idempotency, although an Adapter may use it to strengthen same-attempt recovery.",
+      "dependencies": [
+        "Provider-specific official contract evidence",
+        "Adapter implementation story"
+      ],
+      "reopen_trigger": "When an upstream publishes and a live probe confirms a stable idempotency key contract for the exact Auth Mode and operation."
+    },
+    {
+      "id": "D-RENDER-OUTPUT-RECREATE",
+      "reason": "Expired outputs are never implicitly re-rendered because that would create a new costly side effect under an old job identity.",
+      "dependencies": [
+        "new product and billing decision",
+        "explicit client consent contract"
+      ],
+      "reopen_trigger": "When product requires recreation and defines it as a new admitted request with new quota, idempotency, and output lifetime."
+    },
+    {
+      "id": "D-ASSET-CHUNK",
+      "reason": "MVP upload is a bounded single request; chunking adds partial-object, retention, integrity, and admission semantics.",
+      "dependencies": [
+        "large-upload measurements",
+        "new Asset API decision"
+      ],
+      "reopen_trigger": "When required input sizes exceed the accepted single-request limit and a resumable ownership/integrity protocol is specified."
+    },
+    {
+      "id": "D-ASSET-DEDUPE",
+      "reason": "Dedupe is an optimization and must not create cross-Tenant metadata, ciphertext, retention, or deletion coupling.",
+      "dependencies": [
+        "storage cost measurements",
+        "Vault and Asset security review"
+      ],
+      "reopen_trigger": "When measured storage cost justifies implementation and dedupe remains Tenant-local or otherwise proves complete cryptographic and lifecycle isolation."
+    },
+    {
+      "id": "D-CHAT-HISTORY",
+      "reason": "MVP does not retain a user-visible transcript by default; replay/recovery content has a separate bounded confidential lifecycle.",
+      "dependencies": [
+        "new product privacy decision",
+        "retention and export requirements"
+      ],
+      "reopen_trigger": "When product explicitly requires history and defines consent, retrieval, deletion, retention, export, and Tenant administration."
+    },
+    {
+      "id": "D-BREAK-GLASS",
+      "reason": "Operator decrypt is default-deny and would materially change the security boundary.",
+      "dependencies": [
+        "future security ADR",
+        "incident and compliance requirements"
+      ],
+      "reopen_trigger": "When a mandatory incident workflow cannot be met without access and dual control, time bounds, purpose binding, notification, and audit-before-decrypt are specified."
+    },
+    {
+      "id": "D-TENANT-DELETE-EXPORT",
+      "reason": "Resource-level ownership and deletion are locked, but full Tenant export/deletion orchestration is a separate product and compliance workflow.",
+      "dependencies": [
+        "future product/compliance decision",
+        "all durable data-class implementations"
+      ],
+      "reopen_trigger": "Before offering Tenant account deletion/export or when a jurisdictional obligation requires it."
+    },
+    {
+      "id": "D-JURISDICTION-RETENTION",
+      "reason": "Jurisdiction-specific schedules and attestations require legal/compliance input; the current contract already requires bounded retention and non-use after logical deletion.",
+      "dependencies": [
+        "future compliance decision",
+        "deployment jurisdictions"
+      ],
+      "reopen_trigger": "Before processing production data in a jurisdiction with specific retention, deletion, export, or evidence-hold requirements."
+    },
+    {
+      "id": "D-INCIDENT-UPSTREAM-EVIDENCE",
+      "reason": "Ordinary records cannot retain raw upstream payloads; authorized incident evidence needs a separate encrypted and access-controlled lifecycle.",
+      "dependencies": [
+        "future security/incident ADR",
+        "Credential Vault and retention implementation"
+      ],
+      "reopen_trigger": "When incident response requires raw evidence that cannot be represented by the existing safe diagnostic allowlist."
+    },
+    {
+      "id": "D-BATCH-RETRY",
+      "reason": "The stable API defines individual operations; a batch wrapper could accidentally multiply retry owners and commit boundaries.",
+      "dependencies": [
+        "new Public API decision",
+        "per-contained-operation retry proof"
+      ],
+      "reopen_trigger": "When a concrete batch use case is requested and each contained operation retains its own idempotency, retry owner, accounting, and terminal result."
+    },
+    {
+      "id": "D-BILLING",
+      "reason": "Current quotas are admission and abuse controls, not invoices or commercial metering.",
+      "dependencies": [
+        "new product initiative",
+        "accounting telemetry and commercial policy"
+      ],
+      "reopen_trigger": "When the product explicitly requires billing, credits, refunds, plans, or invoice-grade usage semantics."
+    },
+    {
+      "id": "D-NEW-PROVIDERS-OFFICIAL-ADAPTERS",
+      "reason": "The accepted MVP contains six Auth Modes and excludes additional Provider families and official API adapters.",
+      "dependencies": [
+        "new product and risk decision",
+        "capability evidence and stable API fit"
+      ],
+      "reopen_trigger": "When product scope names an additional Provider/Auth Mode and its ownership, credential, risk, capability, error, and retry contracts are specified."
+    }
+  ],
+  "completion_gate": {
+    "required_auth_modes": [
+      "chatgpt_web_access",
+      "chatgpt_codex_oauth",
+      "gemini_web_cookie",
+      "gemini_antigravity_oauth",
+      "grok_web_sso",
+      "grok_xai_oauth"
+    ],
+    "required_auth_mode_risk_statuses": {
+      "chatgpt_web_access": "experimental",
+      "chatgpt_codex_oauth": "gated",
+      "gemini_web_cookie": "experimental",
+      "gemini_antigravity_oauth": "gated",
+      "grok_web_sso": "prohibited",
+      "grok_xai_oauth": "gated"
+    },
+    "required_capability_operations": [
+      "chat",
+      "chat_streaming",
+      "image_generation",
+      "image_edit",
+      "inpaint"
+    ],
+    "required_decision_ids": [
+      "tenant_ownership_and_authorization",
+      "auth_mode_risk_envelope",
+      "client_api_key_and_admission",
+      "provider_account_and_credential_lifecycle",
+      "capability_snapshot_and_model_availability",
+      "tenant_routing_fallback_affinity_and_leases",
+      "chat_execution_and_streaming",
+      "asset_exchange_and_retention",
+      "durable_render_jobs_and_output_retry",
+      "credential_vault_and_sensitive_data",
+      "canonical_errors_idempotency_and_retry_ownership",
+      "health_cooldown_circuit_and_operator_controls",
+      "stable_public_api_and_compatibility",
+      "pure_go_module_seams_and_dependency_budget"
+    ],
+    "required_implementation_slice_ids": [
+      "foundation_and_composition",
+      "principal_admission_audit_and_replay",
+      "provider_account_and_vault",
+      "capability_health_and_routing",
+      "asset_and_render_execution",
+      "chat_execution",
+      "provider_adapters_and_full_conformance"
+    ],
+    "required_sections": [
+      "Authority and conflict resolution",
+      "Capability evidence ledger",
+      "Decision ledger",
+      "Implementation work breakdown",
+      "Deferred item register",
+      "Completion gate"
+    ],
+    "implementation_issue_must_differ": true
+  }
+}
