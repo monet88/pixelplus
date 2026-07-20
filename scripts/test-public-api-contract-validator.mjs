@@ -11,10 +11,18 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const artifact = resolve(root, "contracts/openapi/pixelplus-public-api-v1.yaml");
 const validator = resolve(root, "scripts/validate-public-api-contract.mjs");
 
-function run(path) {
+function run(path, env = {}) {
   return spawnSync(process.execPath, [validator, path], {
     cwd: root,
     encoding: "utf8",
+    env: {
+      ...process.env,
+      CI: "",
+      PIXELPLUS_PUBLIC_API_BASELINE: "",
+      PIXELPLUS_PUBLIC_API_BASELINE_REF: "",
+      PIXELPLUS_PUBLIC_API_ALLOW_TEST_BASELINE: "",
+      ...env,
+    },
     maxBuffer: 32 * 1024 * 1024,
   });
 }
@@ -27,6 +35,33 @@ function expectFailure(name, source, mutate, messages) {
   try {
     writeFileSync(path, `${JSON.stringify(doc, null, 2)}\n`);
     const result = run(path);
+    assert.equal(result.error, undefined, `${name}: validator process failed: ${result.error?.message}`);
+    assert.notEqual(result.status, 0, `${name}: validator unexpectedly passed`);
+    const output = `${result.stdout}\n${result.stderr}`;
+    for (const message of Array.isArray(messages) ? messages : [messages]) {
+      assert.match(output, message, `${name}: wrong failure`);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function expectFailureAgainstBaseline(name, source, mutateBaseline, mutateCandidate, messages) {
+  const baselineDoc = structuredClone(source);
+  const candidateDoc = structuredClone(source);
+  mutateBaseline(baselineDoc);
+  mutateCandidate(candidateDoc);
+  const directory = mkdtempSync(resolve(tmpdir(), "pixelplus-api-baseline-"));
+  const baselinePath = resolve(directory, "baseline.yaml");
+  const candidatePath = resolve(directory, "candidate.yaml");
+  try {
+    writeFileSync(baselinePath, `${JSON.stringify(baselineDoc, null, 2)}\n`);
+    writeFileSync(candidatePath, `${JSON.stringify(candidateDoc, null, 2)}\n`);
+    const result = run(candidatePath, {
+      PIXELPLUS_PUBLIC_API_ALLOW_TEST_BASELINE: "1",
+      PIXELPLUS_PUBLIC_API_BASELINE: baselinePath,
+      PIXELPLUS_PUBLIC_API_BASELINE_REF: "",
+    });
     assert.equal(result.error, undefined, `${name}: validator process failed: ${result.error?.message}`);
     assert.notEqual(result.status, 0, `${name}: validator unexpectedly passed`);
     const output = `${result.stdout}\n${result.stderr}`;
@@ -56,6 +91,88 @@ function expectSuccess(name, source, mutate) {
 const source = JSON.parse(readFileSync(artifact, "utf8"));
 const baseline = run(artifact);
 assert.equal(baseline.status, 0, baseline.stderr || baseline.stdout);
+
+const headRef = spawnSync("git", ["rev-parse", "HEAD"], {
+  cwd: root,
+  encoding: "utf8",
+});
+assert.equal(headRef.status, 0, headRef.stderr || headRef.stdout);
+const headSha = headRef.stdout.trim();
+const headBaseline = run(artifact, { PIXELPLUS_PUBLIC_API_BASELINE_REF: headSha });
+assert.equal(headBaseline.status, 0, headBaseline.stderr || headBaseline.stdout);
+assert.match(headBaseline.stdout, new RegExp(`baseline_source=ref:${headSha}`));
+
+const mutableRefBaseline = run(artifact, { PIXELPLUS_PUBLIC_API_BASELINE_REF: "HEAD" });
+assert.notEqual(mutableRefBaseline.status, 0, "mutable baseline ref unexpectedly passed");
+assert.match(
+  `${mutableRefBaseline.stdout}\n${mutableRefBaseline.stderr}`,
+  /PIXELPLUS_PUBLIC_API_BASELINE_REF must be a full immutable commit SHA/,
+);
+
+const missingRefBaseline = run(artifact, {
+  PIXELPLUS_PUBLIC_API_BASELINE_REF: "0000000000000000000000000000000000000000",
+});
+assert.notEqual(missingRefBaseline.status, 0, "missing baseline ref unexpectedly passed");
+assert.match(
+  `${missingRefBaseline.stdout}\n${missingRefBaseline.stderr}`,
+  /stable baseline unavailable from 0000000000000000000000000000000000000000/,
+);
+
+const forbiddenTestOverride = run(artifact, {
+  PIXELPLUS_PUBLIC_API_BASELINE: artifact,
+});
+assert.notEqual(forbiddenTestOverride.status, 0, "unguarded test baseline override unexpectedly passed");
+assert.match(
+  `${forbiddenTestOverride.stdout}\n${forbiddenTestOverride.stderr}`,
+  /PIXELPLUS_PUBLIC_API_BASELINE is restricted to isolated tests/,
+);
+
+const conflictingBaselineSources = run(artifact, {
+  PIXELPLUS_PUBLIC_API_ALLOW_TEST_BASELINE: "1",
+  PIXELPLUS_PUBLIC_API_BASELINE: artifact,
+  PIXELPLUS_PUBLIC_API_BASELINE_REF: headSha,
+});
+assert.notEqual(conflictingBaselineSources.status, 0, "test baseline override shadowed immutable ref");
+assert.match(
+  `${conflictingBaselineSources.stdout}\n${conflictingBaselineSources.stderr}`,
+  /PIXELPLUS_PUBLIC_API_BASELINE cannot override PIXELPLUS_PUBLIC_API_BASELINE_REF/,
+);
+
+const unpinnedCiBaseline = run(artifact, {
+  CI: "true",
+  PIXELPLUS_PUBLIC_API_BASELINE: "",
+  PIXELPLUS_PUBLIC_API_BASELINE_REF: "",
+});
+assert.notEqual(unpinnedCiBaseline.status, 0, "CI worktree baseline unexpectedly passed");
+assert.match(
+  `${unpinnedCiBaseline.stdout}\n${unpinnedCiBaseline.stderr}`,
+  /CI validation requires PIXELPLUS_PUBLIC_API_BASELINE_REF to be the pull-request base SHA/,
+);
+
+{
+  const directory = mkdtempSync(resolve(tmpdir(), "pixelplus-api-baseline-"));
+  const baselinePath = resolve(directory, "baseline.yaml");
+  const candidatePath = resolve(directory, "candidate.yaml");
+  const pinnedBaseline = structuredClone(source);
+  const brokenCandidate = structuredClone(source);
+  delete brokenCandidate.components.schemas.ChatCompletionResponse.properties.model;
+  try {
+    writeFileSync(baselinePath, `${JSON.stringify(pinnedBaseline, null, 2)}\n`);
+    writeFileSync(candidatePath, `${JSON.stringify(brokenCandidate, null, 2)}\n`);
+    const result = run(candidatePath, {
+      PIXELPLUS_PUBLIC_API_ALLOW_TEST_BASELINE: "1",
+      PIXELPLUS_PUBLIC_API_BASELINE: baselinePath,
+      PIXELPLUS_PUBLIC_API_BASELINE_REF: "",
+    });
+    assert.notEqual(result.status, 0, "independent baseline unexpectedly allowed candidate co-edit");
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /baseline compatibility: components\.schemas\.ChatCompletionResponse property model cannot be removed/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
 
 expectFailure(
   "prototype version is rejected",
@@ -444,6 +561,169 @@ expectFailure(
   /OpenAPI structural validation failed/,
 );
 expectFailure(
+  "request schemas cannot gain maxLength constraints",
+  source,
+  (doc) => { doc.components.schemas.ChatCompletionRequest.properties.model.maxLength = 64; },
+  /baseline compatibility: POST \/chat\/completions request application\/json\.properties\.model cannot add request-narrowing maxLength/,
+);
+expectFailure(
+  "request schemas cannot gain minimum constraints",
+  source,
+  (doc) => { doc.components.schemas.ChatCompletionRequest.properties.temperature.minimum = 0; },
+  /cannot add request-narrowing minimum/,
+);
+expectFailure(
+  "request schemas cannot gain maxItems constraints",
+  source,
+  (doc) => { doc.components.schemas.ChatCompletionRequest.properties.messages.maxItems = 100; },
+  /cannot add request-narrowing maxItems/,
+);
+expectFailure(
+  "request schemas cannot gain dependentRequired constraints",
+  source,
+  (doc) => {
+    doc.components.schemas.ChatCompletionRequest.dependentRequired = {
+      temperature: ["model"],
+    };
+  },
+  /cannot add request-narrowing dependentRequired/,
+);
+expectFailure(
+  "request schemas cannot gain minProperties constraints",
+  source,
+  (doc) => { doc.components.schemas.ChatCompletionRequest.minProperties = 2; },
+  /cannot add request-narrowing minProperties/,
+);
+expectFailure(
+  "request schemas cannot gain required properties",
+  source,
+  (doc) => {
+    doc.components.schemas.ChatCompletionRequest.properties.client_trace = { type: "string" };
+    doc.components.schemas.ChatCompletionRequest.required.push("client_trace");
+  },
+  /cannot add required property client_trace/,
+);
+expectSuccess(
+  "request schemas may gain optional properties",
+  source,
+  (doc) => {
+    doc.components.schemas.ChatCompletionRequest.properties.client_trace = { type: "string" };
+  },
+);
+expectFailure(
+  "response fields cannot gain const constraints",
+  source,
+  (doc) => {
+    doc.components.schemas.ChatCompletionResponse.properties.model.const = "gpt-4o-mini";
+  },
+  /cannot add response-narrowing const/,
+);
+expectFailure(
+  "response fields cannot gain maxLength constraints",
+  source,
+  (doc) => {
+    doc.components.schemas.ChatCompletionResponse.properties.object.maxLength = 128;
+  },
+  /cannot add response-narrowing maxLength/,
+);
+expectFailure(
+  "closed response objects cannot gain optional properties",
+  source,
+  (doc) => {
+    doc.components.schemas.ChatCompletionResponse.properties.service_tier = { type: "string" };
+  },
+  /cannot add response property service_tier on a closed object/,
+);
+
+expectFailure(
+  "direct credential request examples cannot contain raw material",
+  source,
+  (doc) => {
+    doc.paths["/provider-accounts/{provider_account_id}/credentials"].post.requestBody.content[
+      "application/json"
+    ].examples = {
+      LeakedCredential: {
+        value: {
+          credential: {
+            credential_class: "web_session",
+            material: "raw-cookie-value",
+          },
+        },
+      },
+    };
+  },
+  /POST \/provider-accounts\/\{provider_account_id\}\/credentials request application\/json\.examples\.LeakedCredential: example must not contain secret material/,
+);
+expectFailure(
+  "schema singular examples cannot contain secrets",
+  source,
+  (doc) => {
+    doc.components.schemas.ChatMessage.properties.content.example = "Bearer abcdefghijklmnop";
+  },
+  /components\.schemas\.ChatMessage\.properties\.content\.example: example must not contain secret material/,
+);
+expectFailure(
+  "parameter examples cannot contain secrets",
+  source,
+  (doc) => {
+    doc.paths["/assets/{asset_id}"].get.parameters[0].example = "Bearer abcdefghijklmnop";
+  },
+  /GET \/assets\/\{asset_id\} parameter path:asset_id\.example: example must not contain secret material/,
+);
+expectFailure(
+  "request examples cannot contain token-shaped strings",
+  source,
+  (doc) => {
+    doc.paths["/chat/completions"].post.requestBody.content["application/json"].examples.TokenLeak = {
+      value: {
+        model: "gpt-4.1",
+        messages: [{ role: "user", content: "Bearer abcdefghijklmnop" }],
+      },
+    };
+  },
+  /POST \/chat\/completions request application\/json\.examples\.TokenLeak: example must not contain secret material/,
+);
+expectSuccess(
+  "benign request examples remain valid",
+  source,
+  (doc) => {
+    doc.paths["/chat/completions"].post.requestBody.content["application/json"].examples.Benign = {
+      value: {
+        model: "gpt-4.1",
+        messages: [{ role: "user", content: "Summarize this document" }],
+      },
+    };
+  },
+);
+
+expectFailure(
+  "asset upload requires the stable forbidden outcome",
+  source,
+  (doc) => { delete doc.paths["/assets"].post.responses["403"]; },
+  /POST \/assets must document 403 insufficient assets\.write via ErrorForbidden/,
+);
+expectFailure(
+  "asset upload requires the stable request-too-large outcome",
+  source,
+  (doc) => { delete doc.paths["/assets"].post.responses["413"]; },
+  /POST \/assets must document 413 request_too_large for uploads over L-ASSET-UPLOAD-MAX/,
+);
+expectFailure(
+  "asset upload 413 keeps its canonical example",
+  source,
+  (doc) => {
+    delete doc.paths["/assets"].post.responses["413"].content["application/json"].examples.ErrorRequestTooLarge;
+  },
+  /POST \/assets must document 413 request_too_large for uploads over L-ASSET-UPLOAD-MAX/,
+);
+expectFailure(
+  "request-too-large example keeps its canonical code",
+  source,
+  (doc) => { doc.components.examples.ErrorRequestTooLarge.value.code = "invalid_request"; },
+  /ErrorRequestTooLarge must demonstrate code=request_too_large/,
+);
+
+expectFailure(
   "stable response required fields cannot disappear",
   source,
   (doc) => {
@@ -469,6 +749,13 @@ expectFailure(
   "required request bodies remain required",
   source,
   (doc) => { doc.paths["/chat/completions"].post.requestBody.required = false; },
+  /baseline compatibility: POST \/chat\/completions request body requiredness cannot change/,
+);
+expectFailureAgainstBaseline(
+  "optional request bodies cannot become required",
+  source,
+  (baselineDoc) => { baselineDoc.paths["/chat/completions"].post.requestBody.required = false; },
+  (candidateDoc) => { candidateDoc.paths["/chat/completions"].post.requestBody.required = true; },
   /baseline compatibility: POST \/chat\/completions request body requiredness cannot change/,
 );
 expectFailure(

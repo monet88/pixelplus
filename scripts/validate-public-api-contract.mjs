@@ -9,10 +9,13 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
 const redoclyConfig = resolve(root, "redocly.yaml");
-const baselinePath = resolve(root, "contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml");
+const baselineRepoPath = "contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml";
+const baselinePath = resolve(root, baselineRepoPath);
+const baselineReleaseTag = "pixelplus-public-api-v1.0.0";
 const httpMethods = new Set(["get", "put", "post", "delete", "patch", "options", "head", "trace"]);
 const failures = [];
 let docCache = null;
+let baselineSource = "unavailable";
 
 const OPERATION_DESCRIPTORS = [
   { path: "/models", method: "get", operationId: "listModels", idempotencyClass: "resource_retrieval", idempotencyHeader: "not_applicable", scopes: ["capabilities.read"] },
@@ -91,6 +94,7 @@ const requiredErrorExamples = {
   ErrorResourceNotFound: "resource_not_found",
   ErrorAuthenticationFailed: "authentication_failed",
   ErrorForbidden: "forbidden",
+  ErrorRequestTooLarge: "request_too_large",
   ErrorInvalidRequest: "invalid_request",
   ErrorAuthModeUnavailable: "auth_mode_unavailable",
   ErrorIdempotencyConflict: "idempotency_conflict",
@@ -195,6 +199,81 @@ function loadDocument(path) {
   } catch (error) {
     throw new Error(`failed to parse JSON-compatible YAML: ${error.message}`);
   }
+}
+
+function gitShowBlob(ref, repoPath) {
+  const result = spawnSync("git", ["show", `${ref}:${repoPath}`], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    const detail = (result.stderr || result.stdout || result.error?.message || "").trim();
+    throw new Error(`stable baseline unavailable from ${ref}: ${detail || `git show exited ${result.status}`}`);
+  }
+  return result.stdout;
+}
+
+function releaseTagExists(tag) {
+  const result = spawnSync("git", ["rev-parse", "-q", "--verify", `refs/tags/${tag}`], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  return !result.error && result.status === 0;
+}
+
+function parseBaselineDocument(content) {
+  try {
+    return JSON.parse(content);
+  } catch (error) {
+    throw new Error(`failed to parse JSON-compatible YAML: ${error.message}`);
+  }
+}
+
+function loadBaselineDocument() {
+  const refOverride = process.env.PIXELPLUS_PUBLIC_API_BASELINE_REF;
+  const pathOverride = process.env.PIXELPLUS_PUBLIC_API_BASELINE;
+  if (refOverride) {
+    if (!/^[0-9a-f]{40}$/i.test(refOverride)) {
+      throw new Error("PIXELPLUS_PUBLIC_API_BASELINE_REF must be a full immutable commit SHA");
+    }
+    if (pathOverride) {
+      throw new Error("PIXELPLUS_PUBLIC_API_BASELINE cannot override PIXELPLUS_PUBLIC_API_BASELINE_REF");
+    }
+    baselineSource = `ref:${refOverride}`;
+    return parseBaselineDocument(gitShowBlob(refOverride, baselineRepoPath));
+  }
+
+  if (pathOverride) {
+    if (process.env.PIXELPLUS_PUBLIC_API_ALLOW_TEST_BASELINE !== "1") {
+      throw new Error("PIXELPLUS_PUBLIC_API_BASELINE is restricted to isolated tests");
+    }
+    const path = resolve(root, pathOverride);
+    baselineSource = `file:${path}`;
+    return loadDocument(path);
+  }
+
+  if (releaseTagExists(baselineReleaseTag)) {
+    const taggedContent = gitShowBlob(baselineReleaseTag, baselineRepoPath);
+    if (
+      existsSync(baselinePath)
+      && stableJson(parseBaselineDocument(readFileSync(baselinePath, "utf8")))
+        !== stableJson(parseBaselineDocument(taggedContent))
+    ) {
+      throw new Error(
+        `stable baseline file diverges from release tag ${baselineReleaseTag}; post-release baseline edits are forbidden within v1`,
+      );
+    }
+    baselineSource = `tag:${baselineReleaseTag}`;
+    return parseBaselineDocument(taggedContent);
+  }
+
+  if (process.env.CI) {
+    throw new Error("CI validation requires PIXELPLUS_PUBLIC_API_BASELINE_REF to be the pull-request base SHA");
+  }
+
+  baselineSource = "worktree:pre-release";
+  return loadDocument(baselinePath);
 }
 
 function resolvePointer(doc, pointer) {
@@ -381,6 +460,26 @@ function validateIdempotencyConflictResponse(path, method, operation) {
   }
 }
 
+function validateAssetUploadOutcomes(doc) {
+  const responses = doc.paths?.["/assets"]?.post?.responses || {};
+  const forbidden = responses["403"]?.content?.["application/json"];
+  if (
+    forbidden?.schema?.$ref !== "#/components/schemas/CanonicalError"
+    || forbidden?.examples?.ErrorForbidden?.$ref !== "#/components/examples/ErrorForbidden"
+  ) {
+    fail("POST /assets must document 403 insufficient assets.write via ErrorForbidden");
+  }
+
+  const requestTooLarge = responses["413"]?.content?.["application/json"];
+  if (
+    requestTooLarge?.schema?.$ref !== "#/components/schemas/CanonicalError"
+    || requestTooLarge?.examples?.ErrorRequestTooLarge?.$ref
+      !== "#/components/examples/ErrorRequestTooLarge"
+  ) {
+    fail("POST /assets must document 413 request_too_large for uploads over L-ASSET-UPLOAD-MAX");
+  }
+}
+
 function validateOperationScopes(path, method, operation, descriptor) {
   const label = operationKey(path, method);
   const hasAllOf = Object.hasOwn(operation, "x-required-scopes");
@@ -468,6 +567,9 @@ function collectExamples(doc) {
   function collectSchemaExamples(schema, label) {
     if (!schema || typeof schema !== "object" || seenSchemaNodes.has(schema)) return;
     seenSchemaNodes.add(schema);
+    if (Object.hasOwn(schema, "example")) {
+      items.push({ label: `${label}.example`, schema, value: schema.example });
+    }
     if (Array.isArray(schema.examples)) {
       schema.examples.forEach((value, index) => items.push({
         label: `${label}.examples[${index}]`,
@@ -476,7 +578,7 @@ function collectExamples(doc) {
       }));
     }
     for (const [key, value] of Object.entries(schema)) {
-      if (key !== "examples") collectSchemaExamples(value, `${label}.${key}`);
+      if (key !== "example" && key !== "examples") collectSchemaExamples(value, `${label}.${key}`);
     }
   }
 
@@ -525,6 +627,29 @@ function collectExamples(doc) {
       } catch (error) {
         fail(`${operationKey(path, method)} request: ${error.message}`);
       }
+      for (const rawParameter of getParameters(pathItem, operation)) {
+        let parameter;
+        try {
+          parameter = resolveObject(rawParameter, doc);
+        } catch {
+          continue;
+        }
+        const label = `${operationKey(path, method)} parameter ${parameterIdentity(parameter)}`;
+        if (Object.hasOwn(parameter || {}, "example")) {
+          items.push({ label: `${label}.example`, schema: parameter.schema, value: parameter.example });
+        }
+        for (const [name, rawExample] of Object.entries(parameter?.examples || {})) {
+          let example;
+          try {
+            example = resolveObject(rawExample, doc);
+          } catch {
+            continue;
+          }
+          if (Object.hasOwn(example || {}, "value")) {
+            items.push({ label: `${label}.examples.${name}`, schema: parameter.schema, value: example.value });
+          }
+        }
+      }
       for (const [mediaTypeName, mediaType] of Object.entries(requestBody?.content || {})) {
         collectMediaExamples(mediaType, `${operationKey(path, method)} request ${mediaTypeName}`);
       }
@@ -544,6 +669,14 @@ function collectExamples(doc) {
   }
 
   return items;
+}
+
+function validateExampleSecrets(items) {
+  for (const item of items) {
+    if (valueContainsSecretMaterial(item.value)) {
+      fail(`${item.label}: example must not contain secret material`);
+    }
+  }
 }
 
 function validateExamplesWithPython(doc, items) {
@@ -844,8 +977,28 @@ const COMPATIBILITY_KEYWORDS = [
   "minItems",
   "maxItems",
   "uniqueItems",
+  "minProperties",
+  "maxProperties",
+  "dependentRequired",
   "additionalProperties",
 ];
+
+const REQUEST_NARROWING_KEYWORDS = new Set([
+  "const",
+  "pattern",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "uniqueItems",
+  "minProperties",
+  "maxProperties",
+  "dependentRequired",
+]);
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -855,10 +1008,15 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
-function compareSchemaCompatibility(currentNode, baselineNode, currentDoc, baselineDoc, label, seen = {
-  refs: new Set(),
-  inlinePairs: new WeakMap(),
-}) {
+function compareSchemaCompatibility(
+  currentNode,
+  baselineNode,
+  currentDoc,
+  baselineDoc,
+  label,
+  direction = "shared",
+  seen = { refs: new Set(), inlinePairs: new WeakMap() },
+) {
   if (
     currentNode && baselineNode
     && typeof currentNode === "object" && typeof baselineNode === "object"
@@ -886,8 +1044,14 @@ function compareSchemaCompatibility(currentNode, baselineNode, currentDoc, basel
 
   for (const keyword of COMPATIBILITY_KEYWORDS) {
     if (!Object.hasOwn(baseline, keyword)) {
-      if ((keyword === "const" || keyword === "pattern") && Object.hasOwn(current, keyword)) {
-        fail(`baseline compatibility: ${label} cannot add ${keyword}`);
+      if (
+        REQUEST_NARROWING_KEYWORDS.has(keyword)
+        && Object.hasOwn(current, keyword)
+        && (direction === "request" || direction === "response")
+      ) {
+        fail(
+          `baseline compatibility: ${label} cannot add ${direction}-narrowing ${keyword}`,
+        );
       }
       continue;
     }
@@ -902,8 +1066,15 @@ function compareSchemaCompatibility(currentNode, baselineNode, currentDoc, basel
     const missing = baseline.required.find((property) => !(current.required || []).includes(property));
     if (missing) {
       fail(`baseline compatibility: ${label} required property ${missing} cannot be removed`);
+    } else if (direction === "request") {
+      const added = (current.required || []).find((property) => !baseline.required.includes(property));
+      fail(`baseline compatibility: ${label} cannot add required property ${added}`);
     } else {
       fail(`baseline compatibility: ${label} required properties cannot change`);
+    }
+  } else if (direction === "request" && !Array.isArray(baseline.required) && Array.isArray(current.required)) {
+    for (const property of current.required) {
+      fail(`baseline compatibility: ${label} cannot add required property ${property}`);
     }
   }
   if (Array.isArray(baseline.enum) && !exactSet(current.enum, baseline.enum)) {
@@ -922,12 +1093,29 @@ function compareSchemaCompatibility(currentNode, baselineNode, currentDoc, basel
       currentDoc,
       baselineDoc,
       `${label}.properties.${property}`,
+      direction,
       seen,
     );
   }
 
+  if (direction === "response" && baseline.additionalProperties === false) {
+    for (const property of Object.keys(current.properties || {})) {
+      if (!Object.hasOwn(baseline.properties || {}, property)) {
+        fail(`baseline compatibility: ${label} cannot add response property ${property} on a closed object`);
+      }
+    }
+  }
+
   if (baseline.items && current.items) {
-    compareSchemaCompatibility(current.items, baseline.items, currentDoc, baselineDoc, `${label}.items`, seen);
+    compareSchemaCompatibility(
+      current.items,
+      baseline.items,
+      currentDoc,
+      baselineDoc,
+      `${label}.items`,
+      direction,
+      seen,
+    );
   }
   for (const keyword of ["allOf", "oneOf", "anyOf"]) {
     if (!Array.isArray(baseline[keyword])) continue;
@@ -941,6 +1129,7 @@ function compareSchemaCompatibility(currentNode, baselineNode, currentDoc, basel
       currentDoc,
       baselineDoc,
       `${label}.${keyword}[${index}]`,
+      direction,
       seen,
     ));
   }
@@ -997,6 +1186,7 @@ function compareOperationCompatibility(currentDoc, baselineDoc, descriptor) {
       currentDoc,
       baselineDoc,
       `${label} parameter ${parameterIdentity(baselineParameter)}`,
+      "request",
     );
   }
   for (const { parameter } of currentParameters.values()) {
@@ -1012,7 +1202,7 @@ function compareOperationCompatibility(currentDoc, baselineDoc, descriptor) {
 
   const currentRequest = resolveForComparison(current.requestBody, currentDoc);
   const baselineRequest = resolveForComparison(baseline.requestBody, baselineDoc);
-  if (baselineRequest?.required === true && currentRequest?.required !== true) {
+  if (Boolean(currentRequest?.required) !== Boolean(baselineRequest?.required)) {
     fail(`baseline compatibility: ${label} request body requiredness cannot change`);
   }
   for (const [mediaType, baselineMedia] of Object.entries(baselineRequest?.content || {})) {
@@ -1020,7 +1210,14 @@ function compareOperationCompatibility(currentDoc, baselineDoc, descriptor) {
     if (!currentMedia) {
       fail(`baseline compatibility: ${label} request media type ${mediaType} cannot be removed`);
     } else {
-      compareSchemaCompatibility(currentMedia.schema, baselineMedia.schema, currentDoc, baselineDoc, `${label} request ${mediaType}`);
+      compareSchemaCompatibility(
+        currentMedia.schema,
+        baselineMedia.schema,
+        currentDoc,
+        baselineDoc,
+        `${label} request ${mediaType}`,
+        "request",
+      );
     }
   }
 
@@ -1043,6 +1240,7 @@ function compareOperationCompatibility(currentDoc, baselineDoc, descriptor) {
           currentDoc,
           baselineDoc,
           `${label} response ${status} ${mediaType}`,
+          "response",
         );
       }
     }
@@ -1052,9 +1250,9 @@ function compareOperationCompatibility(currentDoc, baselineDoc, descriptor) {
 function compareCompatibleSurface(currentDoc) {
   let baselineDoc;
   try {
-    baselineDoc = loadDocument(baselinePath);
+    baselineDoc = loadBaselineDocument();
   } catch (error) {
-    fail(`stable baseline unavailable: ${error.message}`);
+    fail(error.message.startsWith("stable baseline") ? error.message : `stable baseline unavailable: ${error.message}`);
     return;
   }
   for (const descriptor of OPERATION_DESCRIPTORS) {
@@ -1161,6 +1359,7 @@ function main() {
   validateLifecyclePolicy(doc);
   validateIdempotencyPolicy(doc);
   validateContractTestingPolicy(doc);
+  validateAssetUploadOutcomes(doc);
   compareCompatibleSurface(doc);
   walkRefs(doc);
 
@@ -1235,6 +1434,7 @@ function main() {
   }
 
   const examples = collectExamples(doc);
+  validateExampleSecrets(examples);
   const validatedExamples = validateExamplesWithPython(doc, examples);
 
   if (failures.length > 0) {
@@ -1244,7 +1444,7 @@ function main() {
   }
 
   console.log(
-    `PASS: stable Public API contract (${operationCount} operations, ${validatedExamples} Draft 2020-12 examples)`,
+    `PASS: stable Public API contract (${operationCount} operations, ${validatedExamples} Draft 2020-12 examples, baseline_source=${baselineSource})`,
   );
 }
 

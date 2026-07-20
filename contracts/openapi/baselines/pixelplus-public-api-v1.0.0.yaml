@@ -644,6 +644,21 @@
               }
             }
           },
+          "403": {
+            "description": "Authenticated same-Tenant principal lacks assets.write",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorForbidden": {
+                    "$ref": "#/components/examples/ErrorForbidden"
+                  }
+                }
+              }
+            }
+          },
           "409": {
             "description": "Idempotency conflict, in-progress claim, or uncertain ownership",
             "content": {
@@ -660,6 +675,21 @@
                   },
                   "ErrorIdempotencyUncertain": {
                     "$ref": "#/components/examples/ErrorIdempotencyUncertain"
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Upload exceeds L-ASSET-UPLOAD-MAX (20 MiB)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalError"
+                },
+                "examples": {
+                  "ErrorRequestTooLarge": {
+                    "$ref": "#/components/examples/ErrorRequestTooLarge"
                   }
                 }
               }
@@ -6087,6 +6117,19 @@
           "remediation": "request_permission",
           "request_id": "req_scope_01",
           "failure_stage": "authorization"
+        }
+      },
+      "ErrorRequestTooLarge": {
+        "summary": "Asset upload exceeds L-ASSET-UPLOAD-MAX (20 MiB)",
+        "value": {
+          "code": "request_too_large",
+          "category": "admission",
+          "status_class": "request_size",
+          "retryability": "not_retryable",
+          "remediation": "reduce_payload",
+          "request_id": "req_asset_too_large_01",
+          "failure_stage": "admission",
+          "operation": "create_asset"
         }
       },
       "ErrorInvalidRequest": {

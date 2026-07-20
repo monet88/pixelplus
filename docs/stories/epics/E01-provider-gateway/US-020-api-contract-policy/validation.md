@@ -19,7 +19,7 @@ Prove that the stable artifact contains the complete unified surface, preserves 
 ## Fixtures
 
 - `contracts/openapi/pixelplus-public-api-v1.yaml` as the stable source under test.
-- `contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml` as the immutable semantic compatibility oracle.
+- `contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml` as the semantic compatibility oracle, loaded from an immutable PR base ref or the public release tag; the worktree copy is only the pre-release fallback.
 - Temporary cloned artifacts with one structural, authorization, compatibility, or policy mutation per black-box failure case.
 - The retained inference and management prototype artifacts.
 - Deterministic management contract scenarios and their expected assertion counts.
@@ -38,7 +38,7 @@ scripts/bin/harness-cli.exe story verify US-020
 
 ## Acceptance Evidence
 
-- Stable validator: 26 operations and 202 Draft 2020-12 examples passed.
+- Stable validator: 26 operations and 205 Draft 2020-12 examples passed.
 - Stable validator black-box mutation suite passed all policy mutations.
 - Retained inference prototype validator passed with 12 paths, 29 schemas, and 61 validated examples.
 - Retained management prototype validator passed with 14 operations and 71 schema-validated examples.
@@ -49,4 +49,5 @@ scripts/bin/harness-cli.exe story verify US-020
 - A final contract-policy review found seven enforcement gaps: inference scope metadata, semantic baseline comparison, SemVer MINOR/PATCH support, complete idempotency fingerprints/replay values, closed controlled-port allowlist, complete removal gates, and structural OpenAPI validation. The implementation now uses one 26-row operation descriptor matrix, exact scope/idempotency/contract-test sets, a frozen v1.0.0 baseline, aligned SemVer checks, Redocly structural validation, and black-box mutations for every reproduced gap.
 - Redocly's built-in `struct` rule did not reject an empty Responses Object, so the structural config includes the narrow `pixelplus/non-empty-responses` rule matching the official OAS schema's non-empty constraint. Both the golden artifact and `responses={}` mutation were exercised through the same public validator CLI.
 - The descriptor matrix removes the previous operation identity data clump: path, method, operationId, scope, idempotency class, header policy, and approved secret boundary are now derived from one source, with partition mutations rejecting missing or overlapping classes.
+- A final follow-up review closed five additional gaps: PR-head baseline co-editing, request-narrowing constraints added where none existed, optional fields added to closed response objects, missing `POST /assets` 403/413 outcomes, and unscanned request examples. The validator now sources baselines from a base ref/release tag, compares schemas by request/response direction, locks both Asset outcomes, and secret-scans every collected example through the public CLI mutation suite.
 - `git diff --check` passed. Runtime Gateway composition proof remains intentionally deferred because issue #20 forbids implementing the Gateway; the stable artifact makes the required future composition and observations normative.

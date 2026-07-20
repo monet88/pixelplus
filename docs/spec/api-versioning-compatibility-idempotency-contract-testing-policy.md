@@ -78,7 +78,7 @@ The URL major and semantic major describe different layers but MUST remain align
 - `/v1` is the routing and client-compatibility boundary.
 - `info.version=1.0.0` identifies the first stable contract document release.
 - A backward-compatible clarification or addition can increase MINOR or PATCH while remaining on `/v1`; the validator requires valid SemVer, equality with `x-pixelplus-api-lifecycle.semantic_version`, and semantic-major alignment with `/v1`.
-- The frozen `contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml` artifact is the compatibility oracle: a MINOR/PATCH candidate must preserve its operations, authorization scopes, parameter/idempotency requiredness, response statuses/media types, required response fields, and closed enums.
+- The frozen `contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml` artifact is the compatibility oracle: a MINOR/PATCH candidate must preserve its operations, authorization scopes, parameter/idempotency requiredness, response statuses/media types, required response fields, and closed enums. Pull-request validation MUST load this blob from the full immutable PR base commit SHA via `PIXELPLUS_PUBLIC_API_BASELINE_REF`; mutable refs are rejected and CI fails closed when no immutable source is available. After public release, protected tag `pixelplus-public-api-v1.0.0` is the oracle and the validator rejects worktree baseline drift. The worktree file is only a non-CI local pre-release fallback before that tag exists.
 - An incompatible Public API change requires a new URL major and semantic MAJOR, for example `/v2` and `2.0.0`.
 
 OpenAPI's own `openapi: 3.1.1` field identifies the OpenAPI Specification version and is independent of `info.version`.
@@ -133,6 +133,8 @@ Incompatible examples:
 |---|---|
 | Rename or remove `/chat/completions` | Existing clients receive 404 or call a different operation. |
 | Make an optional input required | A request that passed yesterday now fails validation. |
+| Add `maxLength`, `minimum`, `maxItems`, or another narrowing constraint where none existed | A previously valid request can now fail schema validation. |
+| Add an optional field to a closed response object | An exhaustive generated client can no longer treat the documented object shape as complete. |
 | Change Client API Key scope or authentication | The same credential/request pair receives a different authorization result. |
 | Change `202` Render Job creation to synchronous output | Polling, cancellation, accounting, and durability behavior all change. |
 | Add a value to closed `Remediation` | Generated clients with exhaustive enum handling can fail or mis-handle the response. |
@@ -144,7 +146,7 @@ Incompatible examples:
 
 `additionalProperties` and enum rules in the OpenAPI schema are normative:
 
-- A closed object MUST NOT gain arbitrary response fields within `/v1` unless the field is at a declared extension point or the object was explicitly documented as open.
+- A closed object MUST NOT gain arbitrary response fields within `/v1` unless the field is at a declared extension point or the object was explicitly documented as open. The compatibility comparator enforces this on response schemas while continuing to allow new optional request fields.
 - A closed enum MUST NOT gain or lose values within `/v1`.
 - Clients MUST tolerate new `CanonicalError.code`, `operation`, `retry_after_class`, and bounded `safe_context` entries because those are declared open tokens/metadata.
 - Extension points never allow secrets, `tenant_id`, prompt/content, raw Provider payload, ciphertext, cookies, tokens, or foreign identifiers.
@@ -238,7 +240,7 @@ The fingerprint MUST include:
 - Normalized path/query inputs.
 - Every request input that can change the side effect or resulting durable resource.
 
-For direct credential submission and direct reauthentication, the fingerprint stores only a non-reversible keyed digest of secret-bearing input. Raw Provider Credential material, token, cookie, ciphertext, or replayable secret MUST NOT enter the idempotency record, logs, errors, snapshots, or examples.
+For direct credential submission and direct reauthentication, the fingerprint stores only a non-reversible keyed digest of secret-bearing input. Raw Provider Credential material, token, cookie, ciphertext, or replayable secret MUST NOT enter the idempotency record, logs, errors, snapshots, or examples. The static gate scans request, response, component, and schema examples before schema validation.
 
 ### 5.3 Retention
 
