@@ -55,8 +55,8 @@ scripts/bin/harness-cli.exe story verify US-022
 - Separate implementation issue:
   `https://github.com/monet88/pixelplus/issues/42`, open, unassigned,
   `enhancement` only, blocked by #22, and not marked `ready-for-agent`.
-- Commits under review: `3bf76be`, `2870860`, plus final validation/report
-  follow-up.
+- Fixed implementation range reviewed: `63d6454...79df356`, comprising
+  `3bf76be`, `2870860`, `d31ca52`, and `79df356`.
 
 ## Gaps
 
