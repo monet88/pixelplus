@@ -1,8 +1,11 @@
 # Provider Gateway Implementation-Ready Specification
 
-Status: implementation ready  
-Gate issue: #22  
-Deferred implementation issue: #42  
+Status: implementation ready
+
+Gate issue: #22
+
+Deferred implementation issue: #42
+
 Machine-readable index:
 `docs/spec/provider-gateway-implementation-ready-manifest.json`
 
@@ -367,6 +370,7 @@ technology choice is not permission to defer product correctness.
 | `D-RENDER-UPSTREAM-IDEMPOTENCY`, `D-RENDER-OUTPUT-RECREATE` | Provider idempotency strengthening or explicit recreation after output expiry. | Exact upstream evidence or a new admitted client operation defines the behavior without reusing an old side-effect identity. |
 | `D-ASSET-CHUNK`, `D-ASSET-DEDUPE` | Resumable upload and storage dedupe. | Measured transfer/storage needs justify a design that retains Tenant, encryption, accounting, retention, and deletion isolation. |
 | `D-CODEX-APIKEY-MODE`, `D-NEW-PROVIDERS-OFFICIAL-ADAPTERS` | New Auth Modes, Provider families, or official API adapters. | A new product/risk/capability decision defines the complete independent surface. |
+| `D-ERROR-WIRE`, `D-RETRY-AT-LEAST-ONCE` | Semantic error-wire changes or accepting at-least-once non-idempotent execution. | A new compatibility/product decision proves current canonical semantics are insufficient and defines duplicate/accounting consequences. |
 
 ### Product, security, and compliance initiatives
 
@@ -377,6 +381,16 @@ technology choice is not permission to defer product correctness.
 | `D-TENANT-DELETE-EXPORT`, `D-JURISDICTION-RETENTION` | Full Tenant deletion/export and jurisdiction schedules. | Product or legal obligations identify deployment jurisdictions and complete data-class behavior. |
 | `D-BATCH-RETRY` | Multi-operation batch API and retry semantics. | A new contract preserves per-operation idempotency, commit, accounting, and retry ownership. |
 | `D-BILLING` | Commercial metering, credits, refunds, plans, and invoice-grade usage. | A separate product initiative distinguishes billing from anti-abuse quota and defines accounting authority. |
+
+### Risk-envelope and security reopen decisions
+
+| IDs | Deferred scope | Opens when |
+| --- | --- | --- |
+| `D-COUNSEL-AGENT`, `D-COUNSEL-RE`, `D-REGION` | Technical-agent theory, reverse-engineering enforceability, and regional launch restrictions. | Counsel evidence exists for the exact launch jurisdiction and risk-state change under consideration. |
+| `D-OAI-TOKEN`, `D-ANTIGRAVITY-TERMS`, `D-GROK-ISSUER`, `D-XAI-COMPETE` | Provider-specific token custody, terms, issuer, and competitive-product gaps. | The primary source or counsel evidence named in the source risk specification is recorded before the affected risk-state promotion. |
+| `D-COMM` | Commercial fee characterization under resale, lease, or time-sharing restrictions. | Product and counsel record the proposed pricing/marketing posture before claims or risk promotion. |
+| `D-ASSET-CAP-TUNE` | Numeric Tenant Asset cap and reclamation tuning. | Storage evidence supports new values without changing atomic committed-plus-reserved semantics. |
+| `D-VAULT-KEY-TOPOLOGY`, `D-LEGAL-HOLD-CREDENTIAL` | Logical key-topology change or a legal requirement to change the no-decryptable-credential-hold rule. | A security ADR proves equivalent Tenant binding, non-use, access, audit, revocation, and purge behavior. |
 
 ## Validation contract
 

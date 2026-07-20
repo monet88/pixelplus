@@ -366,6 +366,18 @@ function validateDeferredItems(manifest) {
     );
   }
 
+  const requiredDeferredIds =
+    manifest.completion_gate?.required_deferred_item_ids;
+  requireStringArray(
+    requiredDeferredIds,
+    "completion_gate.required_deferred_item_ids must be a non-empty string array",
+  );
+  for (const deferredId of requiredDeferredIds) {
+    if (!deferredIds.has(deferredId)) {
+      throw new Error(`missing required deferred item: ${deferredId}`);
+    }
+  }
+
   return manifest.deferred_items.length;
 }
 

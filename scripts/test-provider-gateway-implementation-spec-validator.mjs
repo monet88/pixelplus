@@ -107,6 +107,7 @@ async function createFixture(mutator = () => {}) {
       required_capability_operations: ["chat"],
       required_decision_ids: ["tenant_authority"],
       required_implementation_slice_ids: ["foundation"],
+      required_deferred_item_ids: ["deployment_topology"],
       required_sections: [
         "Authority and conflict resolution",
         "Capability evidence ledger",
@@ -327,6 +328,17 @@ test("rejects deferred items without a reason, dependency, and reopen trigger", 
   await assert.rejects(
     validateImplementationSpecification(fixture),
     /deferred item deployment_topology is missing reopen_trigger/,
+  );
+});
+
+test("rejects a missing source-owned deferred item", async () => {
+  const fixture = await createFixture(({ manifest }) => {
+    manifest.completion_gate.required_deferred_item_ids.push("risk_terms");
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /missing required deferred item: risk_terms/,
   );
 });
 

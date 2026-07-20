@@ -721,6 +721,123 @@
         "capability evidence and stable API fit"
       ],
       "reopen_trigger": "When product scope names an additional Provider/Auth Mode and its ownership, credential, risk, capability, error, and retry contracts are specified."
+    },
+    {
+      "id": "D-COUNSEL-AGENT",
+      "reason": "It is unresolved whether acting as a technical agent of the account owner mitigates Provider credential-sharing restrictions.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "written counsel analysis for target launch jurisdictions"
+      ],
+      "reopen_trigger": "Before promoting any Auth Mode to allowed, or before promoting an experimental Web mode to gated on this theory."
+    },
+    {
+      "id": "D-COUNSEL-RE",
+      "reason": "Reverse-engineering restrictions and their enforceability vary by jurisdiction and can change the permitted launch envelope for Web modes.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "regional launch checklist and counsel"
+      ],
+      "reopen_trigger": "Before launching an experimental Web Auth Mode outside a pure lab in a target region."
+    },
+    {
+      "id": "D-OAI-TOKEN",
+      "reason": "OpenAI permission for third-party SaaS custody of Codex OAuth tokens outside official clients remains unresolved.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "OpenAI policy evidence or counsel"
+      ],
+      "reopen_trigger": "Before promoting ChatGPT Codex OAuth from gated to allowed."
+    },
+    {
+      "id": "D-ANTIGRAVITY-TERMS",
+      "reason": "Product-specific Antigravity terms beyond the general Google API and Gemini developer-family terms have not been established.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "primary-source Antigravity terms review"
+      ],
+      "reopen_trigger": "Before promoting Gemini Antigravity OAuth from gated to allowed."
+    },
+    {
+      "id": "D-GROK-ISSUER",
+      "reason": "The exact xAI-versus-X issuer and governing-terms matrix for Grok Web SSO tokens remains incomplete.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "updated Grok issuer-to-terms evidence"
+      ],
+      "reopen_trigger": "Before any future change from the prohibited Grok Web SSO risk state."
+    },
+    {
+      "id": "D-XAI-COMPETE",
+      "reason": "The scope of xAI's competitive-product clause against a multi-provider SaaS Gateway remains unresolved.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "counsel analysis of the product shape"
+      ],
+      "reopen_trigger": "Before promoting Grok xAI OAuth from gated to allowed."
+    },
+    {
+      "id": "D-COMM",
+      "reason": "The commercial fee structure has not been characterized against resale, lease, or time-sharing restrictions.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "product pricing decision and counsel"
+      ],
+      "reopen_trigger": "Before making resale-style marketing claims or promoting a gated mode to allowed where commercial characterization matters."
+    },
+    {
+      "id": "D-REGION",
+      "reason": "Production launch geography can change applicable enforcement and compliance risk even when the technical contract is unchanged.",
+      "dependencies": [
+        "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+        "counsel and regional enforcement review"
+      ],
+      "reopen_trigger": "Before selecting or expanding production launch regions."
+    },
+    {
+      "id": "D-ASSET-CAP-TUNE",
+      "reason": "Asset byte/count cap semantics are locked, while their numeric defaults and reclamation timing remain operationally tunable.",
+      "dependencies": [
+        "docs/spec/asset-exchange-authorization-and-retention-lifecycle.md",
+        "runtime storage and reservation evidence"
+      ],
+      "reopen_trigger": "When measured Tenant usage or recovery behavior justifies changing cap numbers without weakening atomic committed-plus-reserved accounting."
+    },
+    {
+      "id": "D-ERROR-WIRE",
+      "reason": "The stable wire encoding is locked; reopening is needed only if a requested change alters canonical error semantics rather than representation.",
+      "dependencies": [
+        "docs/spec/canonical-errors-and-retry-ownership.md",
+        "new Public API compatibility decision"
+      ],
+      "reopen_trigger": "When a client requirement cannot be represented by the current canonical code, retryability, remediation, and safe-context contract."
+    },
+    {
+      "id": "D-RETRY-AT-LEAST-ONCE",
+      "reason": "Automatic re-execution after uncertain or committed work is forbidden because it can duplicate non-idempotent side effects.",
+      "dependencies": [
+        "docs/spec/canonical-errors-and-retry-ownership.md",
+        "explicit product, billing, and commit-proof decision"
+      ],
+      "reopen_trigger": "Only when product explicitly accepts at-least-once execution and defines client-visible duplicate, accounting, and reconciliation semantics."
+    },
+    {
+      "id": "D-VAULT-KEY-TOPOLOGY",
+      "reason": "The logical Tenant/resource-bound key hierarchy is fixed, but a future architecture may require a different equivalent KMS/HSM topology.",
+      "dependencies": [
+        "docs/spec/credential-vault-and-sensitive-data-lifecycle.md",
+        "future security architecture ADR"
+      ],
+      "reopen_trigger": "When the selected deployment or custody model cannot implement the accepted logical hierarchy without a topology change."
+    },
+    {
+      "id": "D-LEGAL-HOLD-CREDENTIAL",
+      "reason": "The accepted rule forbids keeping revoked Provider Credential material decryptable under a retention hold.",
+      "dependencies": [
+        "docs/spec/credential-vault-and-sensitive-data-lifecycle.md",
+        "binding legal requirement and security ADR"
+      ],
+      "reopen_trigger": "Only when a binding legal requirement would change the no-decryptable-credential-hold rule and an ADR defines equivalent non-use and access controls."
     }
   ],
   "completion_gate": {
@@ -771,6 +888,51 @@
       "asset_and_render_execution",
       "chat_execution",
       "provider_adapters_and_full_conformance"
+    ],
+    "required_deferred_item_ids": [
+      "D-PERSISTENCE-DRIVER",
+      "D-VAULT-CRYPTO-VENDOR",
+      "D-JOB-RUNTIME",
+      "D-DEPLOYMENT-TOPOLOGY",
+      "D-SLO-CANARY-LAUNCH",
+      "D-LEGACY-MIGRATION",
+      "D-NUMERIC-TUNE",
+      "D-PROBE-RATE",
+      "D-SNAPSHOT-GRACE",
+      "D-ROTATE-GRACE",
+      "D-REAUTH-GRACE",
+      "D-CODEX-APIKEY-MODE",
+      "D-MULTI-ACCT",
+      "D-ROUTE-AUTOFALLBACK",
+      "D-ROUTE-XMODE",
+      "D-CHAT-TOOLS",
+      "D-CHAT-RESUME",
+      "D-RENDER-RESUME",
+      "D-RENDER-UPSTREAM-IDEMPOTENCY",
+      "D-RENDER-OUTPUT-RECREATE",
+      "D-ASSET-CHUNK",
+      "D-ASSET-DEDUPE",
+      "D-CHAT-HISTORY",
+      "D-BREAK-GLASS",
+      "D-TENANT-DELETE-EXPORT",
+      "D-JURISDICTION-RETENTION",
+      "D-INCIDENT-UPSTREAM-EVIDENCE",
+      "D-BATCH-RETRY",
+      "D-BILLING",
+      "D-NEW-PROVIDERS-OFFICIAL-ADAPTERS",
+      "D-COUNSEL-AGENT",
+      "D-COUNSEL-RE",
+      "D-OAI-TOKEN",
+      "D-ANTIGRAVITY-TERMS",
+      "D-GROK-ISSUER",
+      "D-XAI-COMPETE",
+      "D-COMM",
+      "D-REGION",
+      "D-ASSET-CAP-TUNE",
+      "D-ERROR-WIRE",
+      "D-RETRY-AT-LEAST-ONCE",
+      "D-VAULT-KEY-TOPOLOGY",
+      "D-LEGAL-HOLD-CREDENTIAL"
     ],
     "required_sections": [
       "Authority and conflict resolution",
