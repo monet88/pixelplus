@@ -55,8 +55,8 @@ Recorded on 2026-07-20 against the issue #22 working tree based on `63d6454`:
 
 | Command | Result |
 | --- | --- |
-| `node --test scripts/test-provider-gateway-implementation-spec-validator.mjs` | pass: 13 mutations cover complete package, missing/escaping authority, exact capability vocabulary/matrix/risk, undeclared evidence/authority, decision dimensions/IDs, slice IDs/dependencies/cycles, deferred requirements, and separate implementation issue |
-| `node scripts/validate-provider-gateway-implementation-spec.mjs` | pass before final review fixes: issue #22, implementation #42, 30 capability claims, 14 decisions, seven slices, 30 deferred items, 26 authority files; rerun below records the expanded source-owned deferred register |
+| `node --test scripts/test-provider-gateway-implementation-spec-validator.mjs` | pass: 18 mutations cover complete package, missing/escaping authority, exact capability vocabulary/matrix/risk/evidence, undeclared evidence/authority, decision dimensions/IDs, slice IDs/dependencies/cycles, deferred requirements/source-owned IDs, self-shrinking gate attempts, human-ledger drift, and unconditional issue identities |
+| `node scripts/validate-provider-gateway-implementation-spec.mjs` | pass: issue #22, implementation #42, 30 capability claims, 14 decisions, seven slices, 43 deferred items, 26 authority files |
 | `node scripts/validate-public-api-contract.mjs` | pass: stable contract has 26 operations and 205 Draft 2020-12 examples; worktree pre-release baseline |
 | `node scripts/test-public-api-contract-validator.mjs` | pass: stable Public API validator mutation suite |
 | `node scripts/validate-openapi-contract.mjs contracts/openapi/pixelplus-public-api-v0alpha.yaml` | pass: retained inference prototype, 12 operations, 29 schemas, 61 validated examples |
@@ -78,6 +78,13 @@ Implementation handoff evidence:
   reason/dependency/reopen trigger.
 - The stable `/v1` artifact remains the only client wire authority; the
   assembly points to rather than copies/replaces normative domain sources.
+- Standalone high-risk proof is recorded at
+  `docs/validation/US-022-implementation-ready-provider-gateway-specification.md`.
+- Independent Standards and Spec review findings were closed by making the
+  completion contract validator-owned, checking capability tuples against the
+  accepted evidence baseline and human ledger, enforcing issue #22/#42
+  identities unconditionally, expanding all source-owned deferrals, and
+  refreshing validation evidence.
 
 Harness story verification/completion, independent review, and the final
 commit are recorded after this evidence block is written.

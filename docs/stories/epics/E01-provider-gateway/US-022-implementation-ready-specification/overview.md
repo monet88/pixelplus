@@ -48,6 +48,7 @@ product decisions.
 - `docs/decisions/0008-stable-public-api-contract-policy.md`
 - `docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md`
 - All normative specifications and research evidence listed in the manifest.
+- `docs/validation/US-022-implementation-ready-provider-gateway-specification.md`
 - `apps/gateway/README.md`
 
 ## Non-Goals

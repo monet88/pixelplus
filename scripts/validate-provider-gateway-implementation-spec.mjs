@@ -5,6 +5,248 @@ import { fileURLToPath } from "node:url";
 const defaultManifest =
   "docs/spec/provider-gateway-implementation-ready-manifest.json";
 
+const productionContract = {
+  issue: 22,
+  implementationIssue: 42,
+  canonicalStatuses: [
+    "verified",
+    "conditionally_supported",
+    "unsupported",
+    "unverified",
+  ],
+  authority: {
+    glossary: "CONTEXT.md",
+    stablePublicApi: "contracts/openapi/pixelplus-public-api-v1.yaml",
+    architectureDecisions: [
+      "docs/decisions/0008-stable-public-api-contract-policy.md",
+      "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md",
+    ],
+    normativeSpecs: [
+      "docs/spec/tenant-ownership-authorization-invariants.md",
+      "docs/spec/auth-mode-risk-envelope-and-kill-criteria.md",
+      "docs/spec/client-api-key-lifecycle-and-admission-controls.md",
+      "docs/spec/provider-account-connection-and-credential-lifecycle.md",
+      "docs/spec/capability-snapshot-and-model-availability-semantics.md",
+      "docs/spec/tenant-scoped-routing-fallback-affinity-leases.md",
+      "docs/spec/chat-execution-and-streaming-lifecycle.md",
+      "docs/spec/asset-exchange-authorization-and-retention-lifecycle.md",
+      "docs/spec/durable-render-job-and-output-retry-lifecycle.md",
+      "docs/spec/credential-vault-and-sensitive-data-lifecycle.md",
+      "docs/spec/canonical-errors-and-retry-ownership.md",
+      "docs/spec/provider-account-health-cooldown-and-operator-controls.md",
+      "docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md",
+    ],
+    evidenceSources: [
+      "docs/spec/research/web-to-api-compliance-risk-evidence.md",
+      "docs/spec/research/chatgpt-auth-mode-capability-evidence.md",
+      "docs/spec/research/gemini-auth-mode-capability-evidence.md",
+      "docs/spec/research/grok-auth-mode-capability-evidence.md",
+      "docs/spec/openai-compatible-inference-contract.md",
+      "docs/spec/provider-account-and-capability-management-contract.md",
+      "contracts/openapi/pixelplus-public-api-v0alpha.yaml",
+      "contracts/openapi/pixelplus-management-api-v0alpha.yaml",
+      "contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml",
+    ],
+  },
+  authModes: [
+    {
+      id: "chatgpt_web_access",
+      label: "ChatGPT Web Access",
+      riskStatus: "experimental",
+      evidence: "docs/spec/research/chatgpt-auth-mode-capability-evidence.md",
+      claims: {
+        chat: "conditionally_supported",
+        chat_streaming: "conditionally_supported",
+        image_generation: "conditionally_supported",
+        image_edit: "conditionally_supported",
+        inpaint: "conditionally_supported",
+      },
+    },
+    {
+      id: "chatgpt_codex_oauth",
+      label: "ChatGPT Codex OAuth",
+      riskStatus: "gated",
+      evidence: "docs/spec/research/chatgpt-auth-mode-capability-evidence.md",
+      claims: {
+        chat: "conditionally_supported",
+        chat_streaming: "conditionally_supported",
+        image_generation: "conditionally_supported",
+        image_edit: "conditionally_supported",
+        inpaint: "conditionally_supported",
+      },
+    },
+    {
+      id: "gemini_web_cookie",
+      label: "Gemini Web Cookie",
+      riskStatus: "experimental",
+      evidence: "docs/spec/research/gemini-auth-mode-capability-evidence.md",
+      claims: {
+        chat: "conditionally_supported",
+        chat_streaming: "conditionally_supported",
+        image_generation: "conditionally_supported",
+        image_edit: "conditionally_supported",
+        inpaint: "unsupported",
+      },
+    },
+    {
+      id: "gemini_antigravity_oauth",
+      label: "Gemini Antigravity OAuth",
+      riskStatus: "gated",
+      evidence: "docs/spec/research/gemini-auth-mode-capability-evidence.md",
+      claims: {
+        chat: "conditionally_supported",
+        chat_streaming: "conditionally_supported",
+        image_generation: "unverified",
+        image_edit: "unverified",
+        inpaint: "unsupported",
+      },
+    },
+    {
+      id: "grok_web_sso",
+      label: "Grok Web SSO",
+      riskStatus: "prohibited",
+      evidence: "docs/spec/research/grok-auth-mode-capability-evidence.md",
+      claims: {
+        chat: "conditionally_supported",
+        chat_streaming: "conditionally_supported",
+        image_generation: "conditionally_supported",
+        image_edit: "conditionally_supported",
+        inpaint: "unsupported",
+      },
+    },
+    {
+      id: "grok_xai_oauth",
+      label: "Grok xAI OAuth",
+      riskStatus: "gated",
+      evidence: "docs/spec/research/grok-auth-mode-capability-evidence.md",
+      claims: {
+        chat: "conditionally_supported",
+        chat_streaming: "conditionally_supported",
+        image_generation: "conditionally_supported",
+        image_edit: "conditionally_supported",
+        inpaint: "unsupported",
+      },
+    },
+  ],
+  decisionIds: [
+    "tenant_ownership_and_authorization",
+    "auth_mode_risk_envelope",
+    "client_api_key_and_admission",
+    "provider_account_and_credential_lifecycle",
+    "capability_snapshot_and_model_availability",
+    "tenant_routing_fallback_affinity_and_leases",
+    "chat_execution_and_streaming",
+    "asset_exchange_and_retention",
+    "durable_render_jobs_and_output_retry",
+    "credential_vault_and_sensitive_data",
+    "canonical_errors_idempotency_and_retry_ownership",
+    "health_cooldown_circuit_and_operator_controls",
+    "stable_public_api_and_compatibility",
+    "pure_go_module_seams_and_dependency_budget",
+  ],
+  implementationSliceIds: [
+    "foundation_and_composition",
+    "principal_admission_audit_and_replay",
+    "provider_account_and_vault",
+    "capability_health_and_routing",
+    "asset_and_render_execution",
+    "chat_execution",
+    "provider_adapters_and_full_conformance",
+  ],
+  deferredItemIds: [
+    "D-PERSISTENCE-DRIVER",
+    "D-VAULT-CRYPTO-VENDOR",
+    "D-JOB-RUNTIME",
+    "D-DEPLOYMENT-TOPOLOGY",
+    "D-SLO-CANARY-LAUNCH",
+    "D-LEGACY-MIGRATION",
+    "D-NUMERIC-TUNE",
+    "D-PROBE-RATE",
+    "D-SNAPSHOT-GRACE",
+    "D-ROTATE-GRACE",
+    "D-REAUTH-GRACE",
+    "D-CODEX-APIKEY-MODE",
+    "D-MULTI-ACCT",
+    "D-ROUTE-AUTOFALLBACK",
+    "D-ROUTE-XMODE",
+    "D-CHAT-TOOLS",
+    "D-CHAT-RESUME",
+    "D-RENDER-RESUME",
+    "D-RENDER-UPSTREAM-IDEMPOTENCY",
+    "D-RENDER-OUTPUT-RECREATE",
+    "D-ASSET-CHUNK",
+    "D-ASSET-DEDUPE",
+    "D-CHAT-HISTORY",
+    "D-BREAK-GLASS",
+    "D-TENANT-DELETE-EXPORT",
+    "D-JURISDICTION-RETENTION",
+    "D-INCIDENT-UPSTREAM-EVIDENCE",
+    "D-BATCH-RETRY",
+    "D-BILLING",
+    "D-NEW-PROVIDERS-OFFICIAL-ADAPTERS",
+    "D-COUNSEL-AGENT",
+    "D-COUNSEL-RE",
+    "D-OAI-TOKEN",
+    "D-ANTIGRAVITY-TERMS",
+    "D-GROK-ISSUER",
+    "D-XAI-COMPETE",
+    "D-COMM",
+    "D-REGION",
+    "D-ASSET-CAP-TUNE",
+    "D-ERROR-WIRE",
+    "D-RETRY-AT-LEAST-ONCE",
+    "D-VAULT-KEY-TOPOLOGY",
+    "D-LEGAL-HOLD-CREDENTIAL",
+  ],
+  requiredSections: [
+    "Authority and conflict resolution",
+    "Capability evidence ledger",
+    "Decision ledger",
+    "Implementation work breakdown",
+    "Deferred item register",
+    "Completion gate",
+  ],
+};
+
+function sortedUnique(values) {
+  return [...new Set(values)].sort();
+}
+
+function assertExactStringSet(actual, expected, label) {
+  requireStringArray(actual, `${label} must be a non-empty string array`);
+  const actualSorted = sortedUnique(actual);
+  const expectedSorted = sortedUnique(expected);
+  if (
+    actual.length !== actualSorted.length ||
+    JSON.stringify(actualSorted) !== JSON.stringify(expectedSorted)
+  ) {
+    throw new Error(`${label} does not match validator-owned contract`);
+  }
+}
+
+function normalizeExpectedContract(contract) {
+  return {
+    ...contract,
+    authority: contract.authority ?? null,
+    authModes: contract.authModes.map((mode) => ({
+      ...mode,
+      evidence: mode.evidence ?? Object.values(mode.claims)[0]?.evidence,
+      claims: Object.fromEntries(
+        Object.entries(mode.claims).map(([operation, claim]) => [
+          operation,
+          typeof claim === "string" ? claim : claim.status,
+        ]),
+      ),
+      claimEvidence: Object.fromEntries(
+        Object.entries(mode.claims).map(([operation, claim]) => [
+          operation,
+          typeof claim === "string" ? mode.evidence : claim.evidence,
+        ]),
+      ),
+    })),
+  };
+}
+
 function requireText(value, message) {
   if (typeof value !== "string" || value.trim() === "") {
     throw new Error(message);
@@ -69,26 +311,45 @@ async function assertFilesExist(root, relativePaths) {
   }
 }
 
-function validateCapabilities(manifest) {
-  const canonical = manifest.canonical_capability_statuses;
-  requireStringArray(
-    canonical,
-    "canonical_capability_statuses must be a non-empty string array",
-  );
-  const expected = new Set([
-    "verified",
-    "conditionally_supported",
-    "unsupported",
-    "unverified",
-  ]);
+function validateAuthority(manifest, contract) {
+  if (!contract.authority) {
+    return;
+  }
+  if (manifest.authority.glossary !== contract.authority.glossary) {
+    throw new Error("authority.glossary does not match validator-owned contract");
+  }
   if (
-    canonical.length !== expected.size ||
-    canonical.some((item) => !expected.has(item))
+    manifest.authority.stable_public_api !== contract.authority.stablePublicApi
   ) {
     throw new Error(
-      "canonical_capability_statuses must contain exactly verified, conditionally_supported, unsupported, and unverified",
+      "authority.stable_public_api does not match validator-owned contract",
     );
   }
+  assertExactStringSet(
+    manifest.authority.architecture_decisions,
+    contract.authority.architectureDecisions,
+    "authority.architecture_decisions",
+  );
+  assertExactStringSet(
+    manifest.authority.normative_specs,
+    contract.authority.normativeSpecs,
+    "authority.normative_specs",
+  );
+  assertExactStringSet(
+    manifest.authority.evidence_sources,
+    contract.authority.evidenceSources,
+    "authority.evidence_sources",
+  );
+}
+
+function validateCapabilities(manifest, contract) {
+  const canonical = manifest.canonical_capability_statuses;
+  assertExactStringSet(
+    canonical,
+    contract.canonicalStatuses,
+    "canonical_capability_statuses",
+  );
+  const expected = new Set(contract.canonicalStatuses);
 
   if (!Array.isArray(manifest.capabilities) || manifest.capabilities.length === 0) {
     throw new Error("capabilities must be a non-empty array");
@@ -116,6 +377,28 @@ function validateCapabilities(manifest) {
       "completion_gate.required_auth_mode_risk_statuses must be an object",
     );
   }
+  const expectedAuthModeIds = contract.authModes.map((mode) => mode.id);
+  const expectedOperations = Object.keys(contract.authModes[0].claims);
+  assertExactStringSet(
+    requiredAuthModes,
+    expectedAuthModeIds,
+    "completion_gate.required_auth_modes",
+  );
+  assertExactStringSet(
+    requiredOperations,
+    expectedOperations,
+    "completion_gate.required_capability_operations",
+  );
+  const expectedRiskStatuses = Object.fromEntries(
+    contract.authModes.map((mode) => [mode.id, mode.riskStatus]),
+  );
+  if (
+    JSON.stringify(requiredRiskStatuses) !== JSON.stringify(expectedRiskStatuses)
+  ) {
+    throw new Error(
+      "completion_gate.required_auth_mode_risk_statuses does not match validator-owned contract",
+    );
+  }
   const declaredEvidence = new Set(manifest.authority.evidence_sources);
   const modesById = new Map();
   for (const mode of manifest.capabilities) {
@@ -138,6 +421,9 @@ function validateCapabilities(manifest) {
 
   let claims = 0;
   for (const mode of manifest.capabilities) {
+    const expectedMode = contract.authModes.find(
+      (candidate) => candidate.id === mode.auth_mode,
+    );
     const requiredRiskStatus = requiredRiskStatuses[mode.auth_mode];
     requireText(
       requiredRiskStatus,
@@ -193,6 +479,19 @@ function validateCapabilities(manifest) {
       if (!expected.has(claim?.status)) {
         throw new Error(`non-canonical capability status: ${claim?.status}`);
       }
+      const expectedStatus = expectedMode.claims[claim.operation];
+      if (claim.status !== expectedStatus) {
+        throw new Error(
+          `capability ${mode.auth_mode}/${claim.operation} status must be ${expectedStatus}`,
+        );
+      }
+      const expectedEvidence =
+        expectedMode.claimEvidence[claim.operation] ?? expectedMode.evidence;
+      if (claim.evidence !== expectedEvidence) {
+        throw new Error(
+          `capability ${mode.auth_mode}/${claim.operation} evidence must be ${expectedEvidence}`,
+        );
+      }
       claims += 1;
     }
   }
@@ -204,7 +503,7 @@ function declaredAuthoritySet(manifest) {
   return new Set(authorityPaths(manifest.authority));
 }
 
-function validateDecisions(manifest) {
+function validateDecisions(manifest, contract) {
   if (!Array.isArray(manifest.decisions) || manifest.decisions.length === 0) {
     throw new Error("decisions must be a non-empty array");
   }
@@ -246,6 +545,16 @@ function validateDecisions(manifest) {
     requiredDecisionIds,
     "completion_gate.required_decision_ids must be a non-empty string array",
   );
+  assertExactStringSet(
+    requiredDecisionIds,
+    contract.decisionIds,
+    "completion_gate.required_decision_ids",
+  );
+  assertExactStringSet(
+    [...decisionIds],
+    contract.decisionIds,
+    "decision ids",
+  );
   for (const decisionId of requiredDecisionIds) {
     if (!decisionIds.has(decisionId)) {
       throw new Error(`missing required decision: ${decisionId}`);
@@ -255,7 +564,7 @@ function validateDecisions(manifest) {
   return manifest.decisions.length;
 }
 
-function validateImplementationSlices(manifest) {
+function validateImplementationSlices(manifest, contract) {
   if (
     !Array.isArray(manifest.implementation_slices) ||
     manifest.implementation_slices.length === 0
@@ -308,6 +617,16 @@ function validateImplementationSlices(manifest) {
     requiredSliceIds,
     "completion_gate.required_implementation_slice_ids must be a non-empty string array",
   );
+  assertExactStringSet(
+    requiredSliceIds,
+    contract.implementationSliceIds,
+    "completion_gate.required_implementation_slice_ids",
+  );
+  assertExactStringSet(
+    [...knownIds],
+    contract.implementationSliceIds,
+    "implementation slice ids",
+  );
   for (const sliceId of requiredSliceIds) {
     if (!knownIds.has(sliceId)) {
       throw new Error(`missing required implementation slice: ${sliceId}`);
@@ -340,7 +659,7 @@ function validateImplementationSlices(manifest) {
   }
 }
 
-function validateDeferredItems(manifest) {
+function validateDeferredItems(manifest, contract) {
   if (
     !Array.isArray(manifest.deferred_items) ||
     manifest.deferred_items.length === 0
@@ -372,6 +691,16 @@ function validateDeferredItems(manifest) {
     requiredDeferredIds,
     "completion_gate.required_deferred_item_ids must be a non-empty string array",
   );
+  assertExactStringSet(
+    requiredDeferredIds,
+    contract.deferredItemIds,
+    "completion_gate.required_deferred_item_ids",
+  );
+  assertExactStringSet(
+    [...deferredIds],
+    contract.deferredItemIds,
+    "deferred item ids",
+  );
   for (const deferredId of requiredDeferredIds) {
     if (!deferredIds.has(deferredId)) {
       throw new Error(`missing required deferred item: ${deferredId}`);
@@ -381,12 +710,78 @@ function validateDeferredItems(manifest) {
   return manifest.deferred_items.length;
 }
 
-async function validateSpecificationSections(root, manifest) {
+function parseMarkdownTable(sectionText) {
+  return sectionText
+    .split(/\r?\n/)
+    .filter((line) => line.trim().startsWith("|"))
+    .map((line) =>
+      line
+        .trim()
+        .slice(1, -1)
+        .split("|")
+        .map((cell) => cell.trim()),
+    );
+}
+
+function stripCode(value) {
+  const codeToken = value.match(/^`([^`]+)`/);
+  return codeToken ? codeToken[1] : value.replace(/ \([^)]*\)$/, "");
+}
+
+function validateHumanCapabilityLedger(specification, contract) {
+  const start = specification.indexOf("## Capability evidence ledger");
+  const end = specification.indexOf("\n## ", start + 1);
+  const section = specification.slice(start, end === -1 ? undefined : end);
+  const rows = parseMarkdownTable(section);
+  const dataRows = rows.slice(2);
+  const rowsByLabel = new Map(dataRows.map((row) => [row[0], row]));
+  const columns = [
+    ["chat", 2],
+    ["chat_streaming", 3],
+    ["image_generation", 4],
+    ["image_edit", 5],
+    ["inpaint", 6],
+  ];
+
+  for (const expectedMode of contract.authModes) {
+    const row = rowsByLabel.get(expectedMode.label);
+    if (!row) {
+      throw new Error(`human capability ledger is missing ${expectedMode.label}`);
+    }
+    if (stripCode(row[1]) !== expectedMode.riskStatus) {
+      throw new Error(
+        `human capability ${expectedMode.label} risk status must be ${expectedMode.riskStatus}`,
+      );
+    }
+    for (const [operation, column] of columns) {
+      if (!(operation in expectedMode.claims)) {
+        continue;
+      }
+      const expectedStatus = expectedMode.claims[operation];
+      if (stripCode(row[column]) !== expectedStatus) {
+        throw new Error(
+          `human capability ${expectedMode.label}/${operation} status must be ${expectedStatus}`,
+        );
+      }
+    }
+    if (stripCode(row[7]) !== expectedMode.evidence) {
+      throw new Error(
+        `human capability ${expectedMode.label} evidence must be ${expectedMode.evidence}`,
+      );
+    }
+  }
+  if (dataRows.length !== contract.authModes.length) {
+    throw new Error("human capability ledger has unexpected rows");
+  }
+}
+
+async function validateSpecificationSections(root, manifest, contract) {
   requireText(manifest.specification, "specification path is required");
   const requiredSections = manifest.completion_gate?.required_sections;
-  requireStringArray(
+  assertExactStringSet(
     requiredSections,
-    "completion_gate.required_sections must be a non-empty string array",
+    contract.requiredSections,
+    "completion_gate.required_sections",
   );
 
   const specPath = path.join(root, manifest.specification);
@@ -404,12 +799,15 @@ async function validateSpecificationSections(root, manifest) {
       throw new Error(`specification is missing required section: ${section}`);
     }
   }
+  validateHumanCapabilityLedger(specification, contract);
 }
 
 export async function validateImplementationSpecification({
   manifestPath = defaultManifest,
   root = process.cwd(),
+  expectedContract = productionContract,
 } = {}) {
+  const contract = normalizeExpectedContract(expectedContract);
   const absoluteManifestPath = path.isAbsolute(manifestPath)
     ? manifestPath
     : path.join(root, manifestPath);
@@ -418,32 +816,27 @@ export async function validateImplementationSpecification({
   if (manifest.schema_version !== 1) {
     throw new Error("schema_version must be 1");
   }
-  if (!Number.isInteger(manifest.issue) || manifest.issue <= 0) {
-    throw new Error("issue must be a positive integer");
+  if (manifest.issue !== contract.issue) {
+    throw new Error(`gate issue must be ${contract.issue}`);
   }
-  if (
-    !Number.isInteger(manifest.implementation_issue) ||
-    manifest.implementation_issue <= 0
-  ) {
-    throw new Error("implementation_issue must be a positive integer");
+  if (manifest.implementation_issue !== contract.implementationIssue) {
+    throw new Error(`implementation issue must be ${contract.implementationIssue}`);
   }
-  if (
-    manifest.completion_gate?.implementation_issue_must_differ === true &&
-    manifest.issue === manifest.implementation_issue
-  ) {
-    throw new Error("implementation issue must differ from gate issue");
+  if (manifest.completion_gate?.implementation_issue_must_differ !== true) {
+    throw new Error("implementation issue separation must be enforced");
   }
   if (manifest.status !== "implementation_ready") {
     throw new Error("status must be implementation_ready");
   }
 
   const referencedAuthority = authorityPaths(manifest.authority);
+  validateAuthority(manifest, contract);
   await assertFilesExist(root, [manifest.specification, ...referencedAuthority]);
-  const capabilityClaims = validateCapabilities(manifest);
-  const decisions = validateDecisions(manifest);
-  validateImplementationSlices(manifest);
-  const deferredItems = validateDeferredItems(manifest);
-  await validateSpecificationSections(root, manifest);
+  const capabilityClaims = validateCapabilities(manifest, contract);
+  const decisions = validateDecisions(manifest, contract);
+  validateImplementationSlices(manifest, contract);
+  const deferredItems = validateDeferredItems(manifest, contract);
+  await validateSpecificationSections(root, manifest, contract);
 
   return {
     issue: manifest.issue,

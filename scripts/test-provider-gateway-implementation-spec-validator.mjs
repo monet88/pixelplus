@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { afterEach } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { validateImplementationSpecification } from "./validate-provider-gateway-implementation-spec.mjs";
 
@@ -13,6 +14,10 @@ const canonicalStatuses = [
   "unverified",
 ];
 const fixtureRoots = new Set();
+const repositoryRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
 
 afterEach(async () => {
   await Promise.all(
@@ -36,6 +41,10 @@ async function createFixture(mutator = () => {}) {
       "",
       "## Authority and conflict resolution",
       "## Capability evidence ledger",
+      "",
+      "| Auth Mode | Risk state | Chat | Streaming | Image generation | Image edit | Inpaint | Evidence |",
+      "| --- | --- | --- | --- | --- | --- | --- | --- |",
+      "| Example Mode | `gated` | `conditionally_supported` | `unsupported` | `unsupported` | `unsupported` | `unsupported` | `docs/spec/evidence.md` |",
       "## Decision ledger",
       "## Implementation work breakdown",
       "## Deferred item register",
@@ -120,6 +129,36 @@ async function createFixture(mutator = () => {}) {
     },
   };
 
+  const expectedContract = {
+    issue: 22,
+    implementationIssue: 42,
+    canonicalStatuses,
+    authModes: [
+      {
+        id: "example_mode",
+        label: "Example Mode",
+        riskStatus: "gated",
+        claims: {
+          chat: {
+            status: "conditionally_supported",
+            evidence: "docs/spec/evidence.md",
+          },
+        },
+      },
+    ],
+    decisionIds: ["tenant_authority"],
+    implementationSliceIds: ["foundation"],
+    deferredItemIds: ["deployment_topology"],
+    requiredSections: [
+      "Authority and conflict resolution",
+      "Capability evidence ledger",
+      "Decision ledger",
+      "Implementation work breakdown",
+      "Deferred item register",
+      "Completion gate",
+    ],
+  };
+
   mutator({ files, manifest });
 
   for (const [relativePath, contents] of Object.entries(files)) {
@@ -135,7 +174,54 @@ async function createFixture(mutator = () => {}) {
   await mkdir(path.dirname(manifestPath), { recursive: true });
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 
-  return { manifestPath, root };
+  return { expectedContract, manifestPath, root };
+}
+
+async function createProductionFixture(mutator = () => {}) {
+  const manifestPath = path.join(
+    repositoryRoot,
+    "docs/spec/provider-gateway-implementation-ready-manifest.json",
+  );
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const state = {
+    manifest,
+    specification: await readFile(
+      path.join(repositoryRoot, manifest.specification),
+      "utf8",
+    ),
+  };
+  mutator(state);
+
+  const root = await mkdtemp(path.join(os.tmpdir(), "pixelplus-us022-real-"));
+  fixtureRoots.add(root);
+  const authorityPaths = [
+    state.manifest.authority.glossary,
+    state.manifest.authority.stable_public_api,
+    ...state.manifest.authority.architecture_decisions,
+    ...state.manifest.authority.normative_specs,
+    ...state.manifest.authority.evidence_sources,
+  ];
+  for (const relativePath of authorityPaths) {
+    const absolutePath = path.join(root, relativePath);
+    await mkdir(path.dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, "# Declared authority fixture\n", "utf8");
+  }
+
+  const specificationPath = path.join(root, state.manifest.specification);
+  await mkdir(path.dirname(specificationPath), { recursive: true });
+  await writeFile(specificationPath, state.specification, "utf8");
+
+  const fixtureManifestPath = path.join(
+    root,
+    "docs/spec/provider-gateway-implementation-ready-manifest.json",
+  );
+  await writeFile(
+    fixtureManifestPath,
+    `${JSON.stringify(state.manifest, null, 2)}\n`,
+    "utf8",
+  );
+
+  return { manifestPath: fixtureManifestPath, root };
 }
 
 test("accepts a complete implementation-ready specification package", async () => {
@@ -188,7 +274,7 @@ test("rejects a missing required Auth Mode or capability operation", async () =>
   });
   await assert.rejects(
     validateImplementationSpecification(missingMode),
-    /missing required Auth Mode: second_mode/,
+    /completion_gate\.required_auth_modes does not match validator-owned contract/,
   );
 
   const missingOperation = await createFixture(({ manifest }) => {
@@ -196,7 +282,7 @@ test("rejects a missing required Auth Mode or capability operation", async () =>
   });
   await assert.rejects(
     validateImplementationSpecification(missingOperation),
-    /capability example_mode is missing required operation: inpaint/,
+    /completion_gate\.required_capability_operations does not match validator-owned contract/,
   );
 });
 
@@ -275,7 +361,7 @@ test("rejects missing required decisions and implementation slices", async () =>
   });
   await assert.rejects(
     validateImplementationSpecification(missingDecision),
-    /missing required decision: retry_ownership/,
+    /completion_gate\.required_decision_ids does not match validator-owned contract/,
   );
 
   const missingSlice = await createFixture(({ manifest }) => {
@@ -283,7 +369,7 @@ test("rejects missing required decisions and implementation slices", async () =>
   });
   await assert.rejects(
     validateImplementationSpecification(missingSlice),
-    /missing required implementation slice: runtime/,
+    /completion_gate\.required_implementation_slice_ids does not match validator-owned contract/,
   );
 });
 
@@ -297,14 +383,7 @@ test("rejects duplicate IDs and cyclic implementation slices", async () => {
   );
 
   const cyclicSlices = await createFixture(({ manifest }) => {
-    manifest.implementation_slices[0].depends_on = ["runtime"];
-    manifest.implementation_slices.push({
-      id: "runtime",
-      depends_on: ["foundation"],
-      authority: ["docs/decisions/0009.md"],
-      proof_seam: "public HTTP composition",
-    });
-    manifest.completion_gate.required_implementation_slice_ids.push("runtime");
+    manifest.implementation_slices[0].depends_on = ["foundation"];
   });
   await assert.rejects(
     validateImplementationSpecification(cyclicSlices),
@@ -338,7 +417,7 @@ test("rejects a missing source-owned deferred item", async () => {
 
   await assert.rejects(
     validateImplementationSpecification(fixture),
-    /missing required deferred item: risk_terms/,
+    /completion_gate\.required_deferred_item_ids does not match validator-owned contract/,
   );
 });
 
@@ -349,6 +428,81 @@ test("rejects a package that starts implementation in the gate issue", async () 
 
   await assert.rejects(
     validateImplementationSpecification(fixture),
-    /implementation issue must differ from gate issue/,
+    /implementation issue must be 42/,
+  );
+});
+
+test("rejects a package that shrinks its manifest and completion gate together", async () => {
+  const fixture = await createProductionFixture(({ manifest }) => {
+    const retained = manifest.capabilities[0];
+    manifest.capabilities = [retained];
+    manifest.completion_gate.required_auth_modes = [retained.auth_mode];
+    manifest.completion_gate.required_auth_mode_risk_statuses = {
+      [retained.auth_mode]: retained.risk_status,
+    };
+    manifest.completion_gate.required_capability_operations = [
+      retained.claims[0].operation,
+    ];
+    retained.claims = [retained.claims[0]];
+    manifest.decisions = [manifest.decisions[0]];
+    manifest.completion_gate.required_decision_ids = [manifest.decisions[0].id];
+    manifest.implementation_slices = [manifest.implementation_slices[0]];
+    manifest.completion_gate.required_implementation_slice_ids = [
+      manifest.implementation_slices[0].id,
+    ];
+    manifest.deferred_items = [manifest.deferred_items[0]];
+    manifest.completion_gate.required_deferred_item_ids = [
+      manifest.deferred_items[0].id,
+    ];
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /completion_gate\.required_auth_modes does not match validator-owned contract/,
+  );
+});
+
+test("rejects capability drift from the accepted evidence baseline", async () => {
+  const fixture = await createProductionFixture(({ manifest }) => {
+    manifest.capabilities[0].claims[0].status = "unsupported";
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /capability chatgpt_web_access\/chat status must be conditionally_supported/,
+  );
+});
+
+test("rejects capability drift in the human evidence ledger", async () => {
+  const fixture = await createProductionFixture((state) => {
+    state.specification = state.specification.replace(
+      "| ChatGPT Web Access | `experimental` | `conditionally_supported` |",
+      "| ChatGPT Web Access | `experimental` | `unsupported` |",
+    );
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /human capability ChatGPT Web Access\/chat status must be conditionally_supported/,
+  );
+});
+
+test("rejects altered gate and implementation issue identities unconditionally", async () => {
+  const wrongGate = await createProductionFixture(({ manifest }) => {
+    manifest.issue = 999;
+    manifest.implementation_issue = 1000;
+  });
+  await assert.rejects(
+    validateImplementationSpecification(wrongGate),
+    /gate issue must be 22/,
+  );
+
+  const reusedGate = await createProductionFixture(({ manifest }) => {
+    manifest.implementation_issue = 22;
+    manifest.completion_gate.implementation_issue_must_differ = false;
+  });
+  await assert.rejects(
+    validateImplementationSpecification(reusedGate),
+    /implementation issue must be 42/,
   );
 });
