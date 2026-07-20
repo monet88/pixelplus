@@ -252,7 +252,7 @@ pending_probe ──fail──► reauth_required | disabled*** | draft****
 
 - `auth_mode` (required)
 - optional `label`
-- optional connection parameters that are **non-secret** (e.g. prefer device-auth vs browser for OAuth)
+- optional connection parameters that are **non-secret** (e.g. prefer device-auth vs browser for OAuth). These parameters MUST NOT select or override a Provider upstream surface; operation-to-surface policy is server-owned.
 
 **Effect:**
 
@@ -321,7 +321,7 @@ pending_probe ──fail──► reauth_required | disabled*** | draft****
 | Gemini Web Cookie | Session init / session-token derivation success without sign-in HTML |
 | Gemini Antigravity OAuth | Token valid + project/onboard load success path |
 | Grok Web SSO | Product: **not connectable** (`prohibited`); probe path MUST NOT be exposed in product |
-| Grok xAI OAuth | Token valid + authenticated call on the bound base-URL family recorded for the account |
+| Grok xAI OAuth | Token valid + cost-minimal authenticated chat call on `cli_chat_proxy`; this proves activation/authentication only, while `api_x_ai` image operations require their own live capability probes before offerability (decision 0010) |
 
 **Probe rules:**
 
@@ -683,10 +683,11 @@ Responses carrying remediation MUST still obey redaction (§9).
 
 | Topic | Lock |
 |---|---|
-| Credential class | OAuth access + refresh (+ optional id_token); record bound base-URL family as non-secret account metadata (`cli-chat-proxy` vs `api.x.ai` usage policy) |
+| Credential class | OAuth access + refresh (+ optional id_token); record the server-owned surface-policy version as non-secret account metadata |
 | Submission | Device or browser OAuth against allowlisted `x.ai` issuer endpoints |
 | Validation | OIDC/device/token host allowlist; token exchange success |
-| Required probe | Authenticated call on the bound surface family |
+| Surface policy | Decision 0010: `chat`/`chat_streaming` -> `cli_chat_proxy`; `image_generation`/`image_edit` -> `api_x_ai`; `inpaint` -> `unsupported`; no client override and no automatic cross-surface fallback |
+| Required probe | Activation uses a cost-minimal authenticated `cli_chat_proxy` chat call. `api_x_ai` image facts stay non-offerable until exact operation+model live probes succeed for the current credential version. |
 | Refresh | refresh_token; singleflight; permanent unauthorized → `reauth_required` |
 | Reauth | OAuth restart; MUST NOT use Web SSO |
 | Gates | Flag + Tenant risk ack |
@@ -892,6 +893,11 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 19. **I-NO-CHALLENGE-SOLVER-PRODUCT** — Challenge health does not authorize shipping anti-bot bypass product features (#7).
 20. **I-PROBE-MINIMAL** — Required probes are auth-proving and cost-minimal; not full billable renders.
 21. **I-FAIL-CLOSED-KILL** — Auth Mode kill/feature gate stops new connections and executions for that mode; reconciler MUST move former `active` accounts to `disabled` or `reauth_required` per §4.2 rule 6.
+22. **I-GROK-XAI-SURFACE-POLICY** — Grok xAI OAuth surface selection is
+    server-owned and operation-specific per decision 0010. Client input,
+    routing, Adapter retry, or recovery cannot change the mapping or attempt the
+    alternate surface after failure. Activation proof on `cli_chat_proxy` does
+    not authorize `api_x_ai` image operations.
 
 ---
 
@@ -916,7 +922,11 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 
 ## 17. ADR decision
 
-No new ADR. Provider Account / Credential ownership and BYOA were product-locked in parent #1 and #6; risk status in #7. This document is the durable normative expansion under `docs/spec/` for connection journeys and credential lifecycle state machines.
+Provider Account / Credential ownership and BYOA were product-locked in parent
+#1 and #6; risk status in #7. Decision 0010 locks the Grok xAI OAuth
+operation-to-surface policy that this lifecycle consumes. This document remains
+the durable normative expansion under `docs/spec/` for connection journeys and
+credential lifecycle state machines.
 
 An ADR **would** be warranted if product later introduced:
 

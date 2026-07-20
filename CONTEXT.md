@@ -97,6 +97,16 @@ Các Auth Mode ban đầu là:
 
 Trạng thái risk envelope (`allowed` / `prohibited` / `experimental` / `gated`), kill criteria và điều kiện phục hồi của từng Auth Mode nằm tại `docs/spec/auth-mode-risk-envelope-and-kill-criteria.md`. Risk status độc lập với Capability Snapshot.
 
+## Grok xAI OAuth Operation Surface Policy
+
+Policy server-owned tại `docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md`
+khóa surface theo operation: `chat` và `chat_streaming` dùng
+`cli_chat_proxy`; `image_generation` và `image_edit` dùng `api_x_ai`;
+`inpaint` là `unsupported`. Client không được chọn/override surface và Gateway
+không tự động fallback qua surface còn lại. Activation chat probe chỉ chứng
+minh chat surface; từng image operation/model phải có live probe hiện hành trên
+`api_x_ai` trước khi offerable.
+
 ## Capability Snapshot
 
 Kết quả kiểm chứng capability của một Provider Account tại một thời điểm, bao gồm các thao tác và model account thực sự được phép sử dụng. Capability Snapshot không phải tuyên bố capability tĩnh của Provider hoặc Adapter. Capability Snapshot thuộc Tenant của Provider Account tương ứng và không được dùng ngoài Tenant đó. Snapshot phân loại năm operation chính (`chat`, `chat_streaming`, `image_generation`, `image_edit`, `inpaint`) theo capability status (`verified`/`conditionally_supported`/`unsupported`/`unverified` từ #3–#5), liệt kê model theo slug **quan sát được** (không phải catalog tĩnh), và mang `verified_at`, freshness (`fresh`/`stale`/`invalid`), TTL class cùng evidence/probe provenance. Snapshot gắn với `credential_version` hiện tại; operation `unsupported`/`unverified` hoặc snapshot không `fresh` bị từ chối trước upstream execution (là item 7 của `I-USABLE-GATE`). Snapshot không bao giờ nâng risk status của Auth Mode và không chứa plaintext credential. Chi tiết taxonomy, model availability, freshness, invalidation và enforcement nằm tại `docs/spec/capability-snapshot-and-model-availability-semantics.md`.
@@ -172,6 +182,10 @@ Stable Provider-independent error codes, status/remediation/retryability classes
 ## Stable API versioning, compatibility, idempotency and contract-testing policy (#20)
 
 Stable Public API OpenAPI 3.1.1 package dùng `/v1`, `info.version=1.0.0` và `x-pixelplus-artifact-status: stable` tại `contracts/openapi/pixelplus-public-api-v1.yaml`; normative policy nằm tại `docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md`. Contract hợp nhất toàn bộ inference #18 và management #19 thành 26 operation dùng chung `ClientApiKey`, `CanonicalError` và `Remediation`. Trong `/v1`, additive change chỉ compatible tại declared extension points; endpoint/field removal, requiredness/auth/status change, closed-enum expansion hoặc đổi idempotency header requirement đều cần major mới. Deprecation giữ behavior, notice tối thiểu 180 ngày, dùng RFC 9745 `Deprecation`, RFC 8594 `Sunset` và migration `Link`, chỉ remove khi successor đã generally available và major mới phát hành. HTTP replay scope là authenticated Tenant + Client API Key + key, fingerprint gồm operation identity, retention 24 giờ; chat key optional, Asset/Render Job/Provider Account/secret-ingress/OAuth create key required, output retrieval chỉ đọc durable resource và output delivery retry chỉ reuse manifest/placement identity. Future runtime contract tests phải đi qua public HTTP surface + real Gateway composition, chỉ thay controlled implementation tại Adapter, Credential Vault, persistence, job-runtime, clock và ID ports; concrete interfaces/package layout thuộc #21. Validate representation/policy bằng `node scripts/validate-public-api-contract.mjs` và mutation suite `node scripts/test-public-api-contract-validator.mjs`.
+
+## Implementation-ready Provider Gateway specification (#22)
+
+Handoff thống nhất cho implementation nằm tại `docs/spec/provider-gateway-implementation-ready-specification.md`, với manifest machine-readable tại `docs/spec/provider-gateway-implementation-ready-manifest.json`. Package này không thay thế normative specs: stable wire vẫn do `contracts/openapi/pixelplus-public-api-v1.yaml` sở hữu, Pure-Go seams/dependency budget do decisions 0008/0009 sở hữu, Grok xAI OAuth operation surface do decision 0010 sở hữu, còn semantics domain/security/execution do các spec #6-#17 và #20 sở hữu. Manifest khóa sáu Auth Mode, năm capability operation chính, bốn status canonical, 15 decision, năm planning-closure domain, bảy vertical implementation slices, deferred item reason/dependency/reopen trigger và yêu cầu implementation nằm ở issue riêng #42. Validator parse claim/status trực tiếp từ sáu detailed Auth Mode capability matrices trong ba evidence documents, fingerprint 27 authority files, và kiểm tra mọi decision được cover đúng một lần trong `product|domain|interface|security|execution`. Chạy `node scripts/validate-provider-gateway-implementation-spec.mjs` để kiểm tra completion gate; issue #22 không triển khai Gateway runtime.
 
 ## Prototype OpenAI-compatible inference contract (#18)
 

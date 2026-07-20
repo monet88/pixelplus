@@ -103,6 +103,46 @@ Requires: the prebuilt Rust CLI at `scripts/bin/harness-cli` on macOS/Linux or
 Direct database inspection may still use SQLite tools, but normal Harness use
 should go through the Rust CLI.
 
+## PixelPlus Contract Validators
+
+The Provider Gateway specification package has a focused completeness gate:
+
+```bash
+node scripts/validate-provider-gateway-implementation-spec.mjs
+node --test scripts/test-provider-gateway-implementation-spec-validator.mjs
+```
+
+The first command validates the issue #22 authority manifest, capability
+matrix, decision ledger, implementation slices, deferred register, and human
+specification. The Node test suite mutates those inputs to prove missing or
+weakened requirements fail. These checks validate the implementation handoff;
+they do not substitute for the future issue #42 public-HTTP runtime contract
+suite.
+
+The independent accepted contract and authority fingerprints live at
+`scripts/provider-gateway-implementation-spec-contract.json`. The refresh
+command is maintenance-only. After an intentional authority review changes a
+source or accepted handoff semantic, run it once, then run the validator and
+tests without another refresh:
+
+```bash
+node scripts/refresh-provider-gateway-implementation-spec-contract.mjs
+```
+
+The refresh command does not copy required IDs, capability tuples, authority
+paths, planning-domain coverage, or Provider policies from the manifest under
+validation. Do not put it in routine validation, pre-commit, or CI command
+lists; doing so could bless unreviewed authority drift.
+
+The retained Public API and prototype contract checks are:
+
+```bash
+node scripts/validate-public-api-contract.mjs
+node scripts/test-public-api-contract-validator.mjs
+node scripts/validate-openapi-contract.mjs contracts/openapi/pixelplus-public-api-v0alpha.yaml
+node scripts/prototype-management-contract.mjs
+```
+
 ### Rust CLI Commands
 
 Current migrated commands:

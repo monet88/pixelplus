@@ -78,7 +78,10 @@ Cause → effect:
 
 1. A ChatGPT Web Access account and a ChatGPT Codex OAuth account for the same human are **two** Provider Accounts (#9 §1.5) → **two** Capability Snapshots. Their image capabilities can diverge (web `image_gen` conversation vs Codex `image_generation` tool; evidence #3) and the snapshots MUST reflect that independently.
 2. A silent refresh or reauth that bumps `credential_version` (#9 §4.8/§4.9) supersedes the snapshot's version binding. The new version is capability-satisfied only via a fresh probe **or** #9 §4.8 rule 3 inheritance; a superseded snapshot MUST NOT authorize work on the new version.
-3. A Grok xAI OAuth account bound to `cli-chat-proxy.grok.com` vs `api.x.ai` (evidence #5) may expose different models; the snapshot MUST record the bound base-URL family so routing does not assume one from the other.
+3. A Grok xAI OAuth account uses both surface families under the fixed
+   operation mapping in decision 0010. The snapshot MUST record the exact
+   surface per capability/model fact so proof from `cli_chat_proxy` never
+   authorizes `api_x_ai`, or vice versa.
 
 ---
 
@@ -176,6 +179,10 @@ Notes locked by evidence:
 2. `inpaint` is `unsupported` everywhere except the two ChatGPT modes; the gateway MUST NOT synthesize inpaint on the four unsupported modes.
 3. Gemini Antigravity image gen/edit are `unverified` — MUST be probed per candidate model before offering, never assumed from the mode.
 4. Gemini Web Cookie streaming is synthetic; snapshots MUST mark it so #11/#12 do not promise token-level latency it cannot deliver.
+5. Grok xAI OAuth uses `cli_chat_proxy` for chat/streaming and `api_x_ai` for
+   image generation/edit. The `api_x_ai` image rows remain evidence baselines,
+   not offerable account facts, until exact live probes confirm OAuth-token
+   acceptance for the current account, credential version, operation, and model.
 
 ---
 
@@ -194,7 +201,7 @@ Notes locked by evidence:
 | `model_slug` | yes | Observed identifier as returned upstream (e.g. `gpt-image-2`, `codex-gpt-image-2`, `grok-imagine-image-quality`, `gemini-*`) |
 | `operations` | yes | Map of operation token → capability status (§4) for this model |
 | `entitlement_hint` | when known | Non-secret tier/plan gate (e.g. Grok `min_tier` Basic/Super/Heavy; Codex Plus/Team/Pro; Antigravity `currentTier`) |
-| `surface_binding` | when relevant | Which upstream surface/base-URL family the model was observed on (e.g. Grok `cli-chat-proxy` vs `api.x.ai`; ChatGPT web vs codex image surface). Prevents cross-surface assumption (#3/#5) |
+| `surface_binding` | when relevant | Which upstream surface/base-URL family the fact was observed on (e.g. Grok `cli_chat_proxy` vs `api_x_ai`; ChatGPT web vs codex image surface). For Grok xAI OAuth it MUST match decision 0010's operation mapping. Prevents cross-surface assumption (#3/#5) |
 | `observed_at` | yes | When this model entry was last observed |
 | `offerable` | derived | §5.3 |
 
@@ -207,6 +214,9 @@ A model+operation pair is **offerable** to a client iff **all**:
 3. The Provider Account is **usable** per #9 §5.1 `I-USABLE-GATE` (this document does not restate that conjunction).
 4. The Auth Mode is risk-permitted for this deployment/Tenant (#7): not `prohibited`; `gated` needs flag+ack; `experimental` lab-only.
 5. No matching `cooling_down/provider_quota_exhausted` condition or `entitlement_drift` blocks the model/operation (§8).
+6. When the Auth Mode has a locked operation-to-surface policy, the fact's
+   `surface_binding` matches that operation. A successful probe on another
+   surface is not capability evidence for this pair.
 
 Offerable is **derived**, never a stored authority that can outlive its inputs. A client-facing model list (#18/#20) is the set of offerable pairs.
 
@@ -279,7 +289,7 @@ Rules:
 
 ### 7.2 Probe surface identifier
 
-A snapshot fact SHOULD record the probe surface it was confirmed against (e.g. `/backend-api/models`, `loadCodeAssist`, `/rest/rate-limits`, `GET /models`) plus, where dual surfaces exist, the bound family (§5.2 `surface_binding`). This lets #11/#18 diagnose stale/drift without re-reading evidence docs and prevents "probed api.x.ai, assumed cli-chat-proxy" mistakes (#5).
+A snapshot fact SHOULD record the probe surface it was confirmed against (e.g. `/backend-api/models`, `loadCodeAssist`, `/rest/rate-limits`, `GET /models`) plus, where dual surfaces exist, the bound family (§5.2 `surface_binding`). For Grok xAI OAuth this is mandatory and must match decision 0010. This lets #11/#18 diagnose stale/drift without re-reading evidence docs and prevents "probed api.x.ai, assumed cli-chat-proxy" mistakes (#5).
 
 ### 7.3 Redaction
 
@@ -330,6 +340,9 @@ For a capability-bearing request naming operation `op` and model `m` on a usable
 3. If `op` is not present or its status is `unsupported`/`unverified` → **reject before upstream** with a stable capability class (e.g. `capability_unsupported`).
 4. If model `m` is not in the observed model list, or its per-model `op` status is not offerable → **reject before upstream** (`model_unavailable` class).
 5. Otherwise capability is satisfied; #9 §5.1 items 1–6 still all apply. This document is item 7 only.
+6. For Grok xAI OAuth, reject before upstream when the fact was observed on a
+   surface other than decision 0010's required surface for `op`. Never repair
+   this mismatch by attempting the alternate surface.
 
 `inpaint` specifically: a masked request on a mode where `inpaint` is `unsupported` (all Gemini/Grok modes, §4.3) MUST be rejected **before** upstream and MUST NOT be silently downgraded to `image_edit` (parent #1 mask fidelity; #3–#5).
 
@@ -420,7 +433,9 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 
 5. Model list is populated from observed slugs; a discovery failure yields an empty list and non-offerable affected ops, never invented models.
 6. Two accounts (Web + OAuth) same Tenant, same human keep independent model lists and capability facts.
-7. Grok xAI OAuth snapshot records the bound base-URL family; api.x.ai facts do not authorize cli-chat-proxy assumptions.
+7. Grok xAI OAuth snapshot records `cli_chat_proxy` for chat/streaming facts and
+   `api_x_ai` for image generation/edit facts; neither authorizes the other,
+   and activation chat proof does not make image facts offerable.
 
 ### 14.3 Freshness and invalidation
 
@@ -460,7 +475,7 @@ Exact harness arrives with contract prototypes (#18–#20). Required observable 
 12. **I-CAP-REDACT** — Capability Snapshot payloads never contain Provider Credential material (#9 §9.1, #7 OP-G3).
 13. **I-CAP-SCOPE** — Snapshot read requires `accounts.read`/`capabilities.read`; forcing re-probe/invalidation requires `accounts.manage`; default inference keys have neither (#8).
 14. **I-CAP-PROBE-MINIMAL** — Capability probes are auth/capability-proving and cost-minimal; no billable renders (#9 `I-PROBE-MINIMAL`).
-15. **I-CAP-SURFACE-BIND** — Where an Auth Mode has divergent surfaces (Grok cli-chat-proxy vs api.x.ai; ChatGPT web vs codex image), the snapshot records the bound surface per model; one family's facts do not authorize the other (#3/#5).
+15. **I-CAP-SURFACE-BIND** — Where an Auth Mode has divergent surfaces (Grok `cli_chat_proxy` vs `api_x_ai`; ChatGPT web vs codex image), the snapshot records the bound surface per model; one family's facts do not authorize the other (#3/#5). Grok facts must match decision 0010's operation mapping and cannot trigger alternate-surface fallback.
 
 ---
 
