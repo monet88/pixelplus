@@ -48,7 +48,7 @@ This issue does not:
 - Choose concrete Go interfaces or package layout before #21.
 - Change the domain state machines accepted in #6–#17.
 - Claim `Idempotency-Key` is a finalized IETF standard.
-- Add an OpenAPI parser, YAML parser, or other package dependency.
+- Add a general-purpose YAML parser to the contract validator; the stable artifact remains JSON-compatible YAML. Structural OpenAPI validation uses the pinned Redocly CLI dependency.
 - Turn output retrieval or output delivery retry into permission to execute a Provider operation again.
 
 ### 1.4 Normative language
@@ -76,8 +76,9 @@ This issue does not:
 The URL major and semantic major describe different layers but MUST remain aligned:
 
 - `/v1` is the routing and client-compatibility boundary.
-- `info.version=1.0.0` identifies this contract document release.
-- A backward-compatible clarification or addition can increase MINOR or PATCH while remaining on `/v1`.
+- `info.version=1.0.0` identifies the first stable contract document release.
+- A backward-compatible clarification or addition can increase MINOR or PATCH while remaining on `/v1`; the validator requires valid SemVer, equality with `x-pixelplus-api-lifecycle.semantic_version`, and semantic-major alignment with `/v1`.
+- The frozen `contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml` artifact is the compatibility oracle: a MINOR/PATCH candidate must preserve its operations, authorization scopes, parameter/idempotency requiredness, response statuses/media types, required response fields, and closed enums.
 - An incompatible Public API change requires a new URL major and semantic MAJOR, for example `/v2` and `2.0.0`.
 
 OpenAPI's own `openapi: 3.1.1` field identifies the OpenAPI Specification version and is independent of `info.version`.
@@ -90,6 +91,8 @@ The stable package contains both accepted surfaces:
 - Management: Provider Account lifecycle, direct credential intake, OAuth authorization, probe, reauthentication, controls, Capability Snapshot, and Routing Policy.
 
 The #18 and #19 prototype artifacts remain historical evidence. They are not alternative stable client contracts.
+
+Every stable operation declares its Client API Key authorization requirement with exactly one of `x-required-scopes` or `x-required-scope-any-of`. The validator owns one descriptor matrix that binds path, method, `operationId`, idempotency class/header, and scope requirement. Inference mappings follow #8: models use `capabilities.read`; chat create/cancel use `chat.completions`; Assets use `assets.read`/`assets.write`; image creates use `images.generate`/`images.edit`; Render Job read/cancel/output retry use `jobs.read`/`jobs.manage`. Management mappings preserve the #19 matrix, including Capability Snapshot accepting either `accounts.read` or `capabilities.read`.
 
 ### 2.3 Shared components
 
@@ -192,6 +195,8 @@ Removal is permitted only when all conditions are true:
 - Migration instructions identify request, response, error, authorization, and idempotency differences.
 - Removal ships on a new major such as `/v2`; `/v1` is not silently repurposed.
 - Contract tests cover both the supported old behavior and the successor until the old support window ends.
+
+The lifecycle extension machine-locks this gate with `migration_instructions_required=true`, an exact migration dimension set (`request`, `response`, `error`, `authorization_scope`, `idempotency`), and `parallel_old_and_successor_contract_tests_until_support_window_ends=true`.
 
 ### 4.3 Security or compliance emergencies
 
@@ -398,8 +403,9 @@ This cause → effect sequence proves the security order through the public seam
 
 Because no Gateway composition root exists in #20, current executable checks are representation/policy checks:
 
-- `scripts/validate-public-api-contract.mjs` validates the unified stable artifact, refs, operations, security, secret boundaries, examples, lifecycle, idempotency, and composition policy declarations.
-- `scripts/test-public-api-contract-validator.mjs` mutates the public artifact and proves the validator rejects policy drift.
+- Redocly CLI runs first with structural OpenAPI rules plus the PixelPlus non-empty Responses Object rule.
+- `scripts/validate-public-api-contract.mjs` validates the unified stable artifact, refs, operations, exact scope/idempotency matrices, secret boundaries, examples, lifecycle/removal gates, the frozen v1.0.0 compatibility baseline, and composition policy declarations.
+- `scripts/test-public-api-contract-validator.mjs` mutates the public artifact and proves the validator rejects structural, compatibility, authorization, idempotency, and policy drift.
 - The #18 and #19 prototype validators/scenarios remain executable evidence for inherited inference and management representation.
 
 A future Gateway implementation MUST add the runtime suite described above; schema-only validation does not satisfy that future requirement.
@@ -423,6 +429,7 @@ A future Gateway implementation MUST add the runtime suite described above; sche
 Run from repository root:
 
 ```bash
+npx redocly lint contracts/openapi/pixelplus-public-api-v1.yaml --config redocly.yaml
 node scripts/validate-public-api-contract.mjs
 node scripts/test-public-api-contract-validator.mjs
 node scripts/validate-openapi-contract.mjs contracts/openapi/pixelplus-public-api-v0alpha.yaml
@@ -431,10 +438,12 @@ node scripts/prototype-management-contract.mjs
 
 | Acceptance criterion | Evidence |
 |---|---|
-| Versioning and backward-compatible change rules are consistent across inference and management | One `/v1`, `1.0.0` artifact; §2–§3; `x-pixelplus-api-lifecycle`; validator checks all 26 operations. |
-| Deprecation defines notice, support window, and removal | §4; minimum 180 days; RFC headers; successor/general-availability and new-major removal gates. |
-| Idempotency distinguishes HTTP replay, chat, Render Job creation, and output retrieval | §5 concept table, operation matrix, replay outcomes, and concrete examples; machine-checked `x-pixelplus-idempotency-policy`. |
-| Contract testing uses real Gateway composition with controlled implementations at locked ports | §6 and `x-pixelplus-contract-testing`; mutation suite rejects handler-stub composition and missing protected-side-effect ordering. |
+| Versioning and backward-compatible change rules are consistent across inference and management | SemVer/URL-major alignment plus the frozen v1.0.0 baseline comparator across operations, schemas, statuses, scopes, and idempotency requiredness. |
+| Deprecation defines notice, support window, and removal | §4; minimum 180 days; RFC headers; successor/general-availability, migration-instruction, dual-suite, and new-major removal gates. |
+| Authorization remains stable for every operation | One descriptor matrix and exact `x-required-scopes` / `x-required-scope-any-of` checks for all 26 operations. |
+| Idempotency distinguishes HTTP replay, chat, Render Job creation, and output retrieval | §5 concept table, operation matrix, exact fingerprint/replay/retry-owner values, and mutation evidence. |
+| OpenAPI structure is machine-valid | Pinned Redocly CLI structural gate plus the non-empty Responses Object rule runs before PixelPlus-specific validation. |
+| Contract testing uses real Gateway composition with controlled implementations at locked ports | §6 and `x-pixelplus-contract-testing`; exact six-port allowlist and mutation suite reject handler-stub composition or missing protected-side-effect observations. |
 
 ---
 

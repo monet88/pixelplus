@@ -1,82 +1,78 @@
 #!/usr/bin/env node
 
 import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const require = createRequire(import.meta.url);
+const redoclyConfig = resolve(root, "redocly.yaml");
+const baselinePath = resolve(root, "contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml");
 const httpMethods = new Set(["get", "put", "post", "delete", "patch", "options", "head", "trace"]);
 const failures = [];
 let docCache = null;
 
-const requiredOperations = [
-  ["/models", "get", "listModels"],
-  ["/chat/completions", "post", "createChatCompletion"],
-  ["/chat/executions/{execution_id}/cancel", "post", "cancelChatExecution"],
-  ["/assets", "post", "createAsset"],
-  ["/assets/{asset_id}", "get", "getAsset"],
-  ["/assets/{asset_id}/content", "get", "getAssetContent"],
-  ["/images/generations", "post", "createImageGeneration"],
-  ["/images/edits", "post", "createImageEdit"],
-  ["/images/inpaints", "post", "createImageInpaint"],
-  ["/render-jobs/{job_id}", "get", "getRenderJob"],
-  ["/render-jobs/{job_id}/cancel", "post", "cancelRenderJob"],
-  ["/render-jobs/{job_id}/outputs/{output_entry_id}/retry", "post", "retryRenderJobOutput"],
-  ["/provider-accounts", "post", "createProviderAccount"],
-  ["/provider-accounts", "get", "listProviderAccounts"],
-  ["/provider-accounts/{provider_account_id}", "get", "getProviderAccount"],
-  ["/provider-accounts/{provider_account_id}", "delete", "deleteProviderAccount"],
-  ["/provider-accounts/{provider_account_id}/credentials", "post", "submitProviderCredential"],
-  ["/provider-accounts/{provider_account_id}/oauth-authorizations", "post", "startOAuthAuthorization"],
-  ["/provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}", "get", "getOAuthAuthorization"],
-  ["/provider-accounts/{provider_account_id}/probe", "post", "probeProviderAccount"],
-  ["/provider-accounts/{provider_account_id}/reauthentication", "post", "reauthenticateProviderAccount"],
-  ["/provider-accounts/{provider_account_id}/disable", "post", "disableProviderAccount"],
-  ["/provider-accounts/{provider_account_id}/enable", "post", "enableProviderAccount"],
-  ["/provider-accounts/{provider_account_id}/capability-snapshot", "get", "getCapabilitySnapshot"],
-  ["/routing-policy", "get", "getRoutingPolicy"],
-  ["/routing-policy", "put", "replaceRoutingPolicy"],
+const OPERATION_DESCRIPTORS = [
+  { path: "/models", method: "get", operationId: "listModels", idempotencyClass: "resource_retrieval", idempotencyHeader: "not_applicable", scopes: ["capabilities.read"] },
+  { path: "/chat/completions", method: "post", operationId: "createChatCompletion", idempotencyClass: "chat_execution", idempotencyHeader: "optional", headerRef: "#/components/parameters/IdempotencyKey", scopes: ["chat.completions"] },
+  { path: "/chat/executions/{execution_id}/cancel", method: "post", operationId: "cancelChatExecution", idempotencyClass: "resource_state_commands", idempotencyHeader: "not_required", scopes: ["chat.completions"] },
+  { path: "/assets", method: "post", operationId: "createAsset", idempotencyClass: "durable_creation", idempotencyHeader: "required", headerRef: "#/components/parameters/RequiredIdempotencyKey", scopes: ["assets.write"] },
+  { path: "/assets/{asset_id}", method: "get", operationId: "getAsset", idempotencyClass: "output_retrieval", idempotencyHeader: "not_applicable", scopes: ["assets.read"] },
+  { path: "/assets/{asset_id}/content", method: "get", operationId: "getAssetContent", idempotencyClass: "output_retrieval", idempotencyHeader: "not_applicable", scopes: ["assets.read"] },
+  { path: "/images/generations", method: "post", operationId: "createImageGeneration", idempotencyClass: "durable_creation", idempotencyHeader: "required", headerRef: "#/components/parameters/RequiredIdempotencyKey", scopes: ["images.generate"] },
+  { path: "/images/edits", method: "post", operationId: "createImageEdit", idempotencyClass: "durable_creation", idempotencyHeader: "required", headerRef: "#/components/parameters/RequiredIdempotencyKey", scopes: ["images.edit"] },
+  { path: "/images/inpaints", method: "post", operationId: "createImageInpaint", idempotencyClass: "durable_creation", idempotencyHeader: "required", headerRef: "#/components/parameters/RequiredIdempotencyKey", scopes: ["images.edit"] },
+  { path: "/render-jobs/{job_id}", method: "get", operationId: "getRenderJob", idempotencyClass: "output_retrieval", idempotencyHeader: "not_applicable", scopes: ["jobs.read"] },
+  { path: "/render-jobs/{job_id}/cancel", method: "post", operationId: "cancelRenderJob", idempotencyClass: "resource_state_commands", idempotencyHeader: "not_required", scopes: ["jobs.manage"] },
+  { path: "/render-jobs/{job_id}/outputs/{output_entry_id}/retry", method: "post", operationId: "retryRenderJobOutput", idempotencyClass: "output_delivery_retry", idempotencyHeader: "not_required", scopes: ["jobs.manage"] },
+  { path: "/provider-accounts", method: "post", operationId: "createProviderAccount", idempotencyClass: "durable_creation", idempotencyHeader: "required", headerRef: "#/components/parameters/RequiredIdempotencyKey", scopes: ["accounts.manage"] },
+  { path: "/provider-accounts", method: "get", operationId: "listProviderAccounts", idempotencyClass: "resource_retrieval", idempotencyHeader: "not_applicable", scopes: ["accounts.read"] },
+  { path: "/provider-accounts/{provider_account_id}", method: "get", operationId: "getProviderAccount", idempotencyClass: "resource_retrieval", idempotencyHeader: "not_applicable", scopes: ["accounts.read"] },
+  { path: "/provider-accounts/{provider_account_id}", method: "delete", operationId: "deleteProviderAccount", idempotencyClass: "resource_state_commands", idempotencyHeader: "not_required", scopes: ["accounts.manage"] },
+  { path: "/provider-accounts/{provider_account_id}/credentials", method: "post", operationId: "submitProviderCredential", idempotencyClass: "durable_creation", idempotencyHeader: "required", headerRef: "#/components/parameters/RequiredIdempotencyKey", scopes: ["accounts.manage"], secretSchemaRef: "#/components/schemas/DirectCredentialSubmissionRequest" },
+  { path: "/provider-accounts/{provider_account_id}/oauth-authorizations", method: "post", operationId: "startOAuthAuthorization", idempotencyClass: "durable_creation", idempotencyHeader: "required", headerRef: "#/components/parameters/RequiredIdempotencyKey", scopes: ["accounts.manage"] },
+  { path: "/provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}", method: "get", operationId: "getOAuthAuthorization", idempotencyClass: "resource_retrieval", idempotencyHeader: "not_applicable", scopes: ["accounts.manage"] },
+  { path: "/provider-accounts/{provider_account_id}/probe", method: "post", operationId: "probeProviderAccount", idempotencyClass: "resource_state_commands", idempotencyHeader: "not_required", scopes: ["accounts.manage"] },
+  { path: "/provider-accounts/{provider_account_id}/reauthentication", method: "post", operationId: "reauthenticateProviderAccount", idempotencyClass: "durable_creation", idempotencyHeader: "required", headerRef: "#/components/parameters/RequiredIdempotencyKey", scopes: ["accounts.manage"], secretSchemaRef: "#/components/schemas/DirectReauthenticationRequest" },
+  { path: "/provider-accounts/{provider_account_id}/disable", method: "post", operationId: "disableProviderAccount", idempotencyClass: "resource_state_commands", idempotencyHeader: "not_required", scopes: ["accounts.manage"] },
+  { path: "/provider-accounts/{provider_account_id}/enable", method: "post", operationId: "enableProviderAccount", idempotencyClass: "resource_state_commands", idempotencyHeader: "not_required", scopes: ["accounts.manage"] },
+  { path: "/provider-accounts/{provider_account_id}/capability-snapshot", method: "get", operationId: "getCapabilitySnapshot", idempotencyClass: "resource_retrieval", idempotencyHeader: "not_applicable", scopeAnyOf: ["accounts.read", "capabilities.read"] },
+  { path: "/routing-policy", method: "get", operationId: "getRoutingPolicy", idempotencyClass: "resource_retrieval", idempotencyHeader: "not_applicable", scopes: ["routing.read"] },
+  { path: "/routing-policy", method: "put", operationId: "replaceRoutingPolicy", idempotencyClass: "resource_state_commands", idempotencyHeader: "not_required", scopes: ["routing.manage"] },
 ];
 
-const optionalIdempotencyOperations = new Map([
-  ["POST /chat/completions", "#/components/parameters/IdempotencyKey"],
-]);
-const requiredIdempotencyOperations = new Map([
-  ["POST /assets", "#/components/parameters/RequiredIdempotencyKey"],
-  ["POST /images/generations", "#/components/parameters/RequiredIdempotencyKey"],
-  ["POST /images/edits", "#/components/parameters/RequiredIdempotencyKey"],
-  ["POST /images/inpaints", "#/components/parameters/RequiredIdempotencyKey"],
-  ["POST /provider-accounts", "#/components/parameters/RequiredIdempotencyKey"],
-  ["POST /provider-accounts/{provider_account_id}/credentials", "#/components/parameters/RequiredIdempotencyKey"],
-  ["POST /provider-accounts/{provider_account_id}/oauth-authorizations", "#/components/parameters/RequiredIdempotencyKey"],
-  ["POST /provider-accounts/{provider_account_id}/reauthentication", "#/components/parameters/RequiredIdempotencyKey"],
-]);
-const outputRetrievalOperations = new Set([
-  "GET /assets/{asset_id}",
-  "GET /assets/{asset_id}/content",
-  "GET /render-jobs/{job_id}",
-]);
-const resourceRetrievalOperations = new Set([
-  "GET /models",
-  "GET /provider-accounts",
-  "GET /provider-accounts/{provider_account_id}",
-  "GET /provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}",
-  "GET /provider-accounts/{provider_account_id}/capability-snapshot",
-  "GET /routing-policy",
-]);
-const outputDeliveryRetryOperations = new Set([
-  "POST /render-jobs/{job_id}/outputs/{output_entry_id}/retry",
-]);
-const resourceStateCommandOperations = new Set([
-  "POST /chat/executions/{execution_id}/cancel",
-  "POST /render-jobs/{job_id}/cancel",
-  "DELETE /provider-accounts/{provider_account_id}",
-  "POST /provider-accounts/{provider_account_id}/probe",
-  "POST /provider-accounts/{provider_account_id}/disable",
-  "POST /provider-accounts/{provider_account_id}/enable",
-  "PUT /routing-policy",
-]);
+const IDEMPOTENCY_CLASS_RULES = {
+  chat_execution: { header: "optional" },
+  durable_creation: { header: "required" },
+  resource_state_commands: {
+    header: "not_required",
+    replay: "same_resource_state_transition_must_not_duplicate_external_work",
+  },
+  resource_retrieval: {
+    header: "not_applicable",
+    replay: "read_existing_resource_without_provider_or_job_execution",
+  },
+  output_retrieval: {
+    header: "not_applicable",
+    replay: "read_existing_resource_without_rendering_or_provider_execution",
+  },
+  output_delivery_retry: {
+    header: "not_required",
+    replay: "reuse_existing_manifest_and_placement_identity",
+    forbidden: ["new_render_job", "new_provider_execution"],
+  },
+};
+
+const descriptorByLabel = new Map(
+  OPERATION_DESCRIPTORS.map((descriptor) => [`${descriptor.method.toUpperCase()} ${descriptor.path}`, descriptor]),
+);
+const approvedSecretBoundaries = new Map(
+  OPERATION_DESCRIPTORS.filter((descriptor) => descriptor.secretSchemaRef).map(
+    (descriptor) => [`${descriptor.method.toUpperCase()} ${descriptor.path}`, descriptor.secretSchemaRef],
+  ),
+);
 
 const requiredErrorExamples = {
   ErrorCapabilityUnsupported: "capability_unsupported",
@@ -102,10 +98,6 @@ const requiredErrorExamples = {
   ErrorIdempotencyUncertain: "idempotency_uncertain",
 };
 
-const approvedSecretBoundaries = new Map([
-  ["POST /provider-accounts/{provider_account_id}/credentials", "#/components/schemas/DirectCredentialSubmissionRequest"],
-  ["POST /provider-accounts/{provider_account_id}/reauthentication", "#/components/schemas/DirectReauthenticationRequest"],
-]);
 const secretKeys = new Set([
   "material",
   "access_token",
@@ -135,6 +127,66 @@ const secretValuePatterns = [
 
 const fail = (message) => failures.push(message);
 const operationKey = (path, method) => `${method.toUpperCase()} ${path}`;
+
+function exactSet(actual, expected) {
+  if (!Array.isArray(actual) || !Array.isArray(expected)) return false;
+  const actualSet = new Set(actual);
+  const expectedSet = new Set(expected);
+  return actualSet.size === actual.length
+    && expectedSet.size === expected.length
+    && actualSet.size === expectedSet.size
+    && [...expectedSet].every((value) => actualSet.has(value));
+}
+
+function parseStableSemVer(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(value);
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] || null,
+  };
+}
+
+function validateDescriptorIntegrity() {
+  const labels = new Set();
+  const operationIds = new Set();
+  for (const descriptor of OPERATION_DESCRIPTORS) {
+    const label = operationKey(descriptor.path, descriptor.method);
+    if (labels.has(label)) fail(`duplicate operation descriptor ${label}`);
+    if (operationIds.has(descriptor.operationId)) fail(`duplicate operation descriptor id ${descriptor.operationId}`);
+    if (!IDEMPOTENCY_CLASS_RULES[descriptor.idempotencyClass]) {
+      fail(`${descriptor.operationId} must declare a known idempotency class`);
+    } else if (descriptor.idempotencyHeader !== IDEMPOTENCY_CLASS_RULES[descriptor.idempotencyClass].header) {
+      fail(`${descriptor.operationId} idempotency header must match its class rule`);
+    }
+    labels.add(label);
+    operationIds.add(descriptor.operationId);
+  }
+}
+
+function validateOpenApiStructure(path) {
+  let redoclyCli;
+  try {
+    redoclyCli = require.resolve("@redocly/cli/bin/cli.js");
+  } catch (error) {
+    fail(`OpenAPI structural validation failed: @redocly/cli is unavailable: ${error.message}`);
+    return;
+  }
+  const result = spawnSync(process.execPath, [redoclyCli, "lint", path, "--config", redoclyConfig], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  if (result.error) {
+    fail(`OpenAPI structural validation failed: ${result.error.message}`);
+  } else if (result.status !== 0) {
+    const detail = `${result.stdout || ""}\n${result.stderr || ""}`.trim().replace(/\x1b\[[0-9;]*m/g, "");
+    fail(`OpenAPI structural validation failed${detail ? `: ${detail}` : ""}`);
+  }
+}
 
 function loadDocument(path) {
   if (!existsSync(path)) throw new Error(`missing artifact: ${path}`);
@@ -329,11 +381,29 @@ function validateIdempotencyConflictResponse(path, method, operation) {
   }
 }
 
-function validateOperationSecurityAndInput(path, method, pathItem, operation) {
+function validateOperationScopes(path, method, operation, descriptor) {
+  const label = operationKey(path, method);
+  const hasAllOf = Object.hasOwn(operation, "x-required-scopes");
+  const hasAnyOf = Object.hasOwn(operation, "x-required-scope-any-of");
+  if (hasAllOf === hasAnyOf) {
+    fail(`${label} must declare exactly one authorization scope requirement form`);
+    return;
+  }
+  if (descriptor.scopeAnyOf) {
+    if (!hasAnyOf || !exactSet(operation["x-required-scope-any-of"], descriptor.scopeAnyOf)) {
+      fail(`${label} authorization scopes must allow any of ${descriptor.scopeAnyOf.join(", ")}`);
+    }
+  } else if (!hasAllOf || !exactSet(operation["x-required-scopes"], descriptor.scopes)) {
+    fail(`${label} authorization scopes must exactly require ${descriptor.scopes.join(", ")}`);
+  }
+}
+
+function validateOperationSecurityAndInput(path, method, pathItem, operation, descriptor) {
   const label = operationKey(path, method);
   if (!operationUsesClientApiKey(operation, docCache)) {
     fail(`${label} must require ClientApiKey security`);
   }
+  if (descriptor) validateOperationScopes(path, method, operation, descriptor);
   if (path.includes("{tenant_id}")) fail(`${label} must not accept tenant_id in the path`);
 
   for (const rawParameter of getParameters(pathItem, operation)) {
@@ -549,8 +619,20 @@ function validateLifecyclePolicy(doc) {
     fail("missing x-pixelplus-api-lifecycle policy");
     return;
   }
-  if (lifecycle.public_api_major !== "v1" || lifecycle.semantic_version !== "1.0.0") {
-    fail("API lifecycle must bind semantic version 1.0.0 to URL major v1");
+  const semanticVersion = parseStableSemVer(doc.info?.version);
+  if (!semanticVersion || semanticVersion.prerelease) {
+    fail("stable API semantic version must be valid SemVer without a prerelease");
+  }
+  if (doc.info?.version !== lifecycle.semantic_version) {
+    fail("info.version and lifecycle semantic_version must match");
+  }
+  if (
+    semanticVersion
+    && (lifecycle.public_api_major !== `v${semanticVersion.major}`
+      || doc.servers?.length !== 1
+      || doc.servers[0]?.url !== `/v${semanticVersion.major}`)
+  ) {
+    fail(`semantic major ${semanticVersion.major} must match public API major ${lifecycle.public_api_major} and server ${doc.servers?.[0]?.url}`);
   }
   const versioning = lifecycle.versioning || {};
   if (
@@ -577,10 +659,7 @@ function validateLifecyclePolicy(doc) {
     "CanonicalError.retry_after_class",
     "CanonicalError.safe_context",
   ];
-  if (
-    JSON.stringify([...(versioning.declared_response_extension_points || [])].sort())
-    !== JSON.stringify([...expectedExtensionPoints].sort())
-  ) {
+  if (!exactSet(versioning.declared_response_extension_points, expectedExtensionPoints)) {
     fail("declared response extension points must match the stable schemas");
   }
 
@@ -597,6 +676,21 @@ function validateLifecyclePolicy(doc) {
     fail("deprecation must preserve behavior, require a generally available successor, and remove only in a later major");
   }
   if (
+    deprecation.migration_instructions_required !== true
+    || !exactSet(deprecation.migration_instructions_must_cover, [
+      "request",
+      "response",
+      "error",
+      "authorization_scope",
+      "idempotency",
+    ])
+  ) {
+    fail("removal requires migration instructions covering the stable compatibility dimensions");
+  }
+  if (deprecation.parallel_old_and_successor_contract_tests_until_support_window_ends !== true) {
+    fail("old and successor contract tests must run in parallel through the support window");
+  }
+  if (
     deprecation.notice_headers?.deprecation !== "RFC 9745 Structured Field Date"
     || deprecation.notice_headers?.sunset !== "RFC 8594 HTTP-date"
     || deprecation.notice_headers?.migration_link_relation !== "deprecation"
@@ -605,22 +699,39 @@ function validateLifecyclePolicy(doc) {
   }
 }
 
-function expectedOperationIds(labels) {
-  return [...labels].map((label) => {
-    const [method, ...pathParts] = label.split(" ");
-    return docCache.paths?.[pathParts.join(" ")]?.[method.toLowerCase()]?.operationId;
-  });
-}
-
-function validateOperationClass(operationClasses, name, expectedHeader, expectedOperationIds) {
+function validateOperationClass(operationClasses, name, rule, expectedOperationIds) {
   const operationClass = operationClasses?.[name];
-  const actualOperationIds = operationClass?.operations;
   if (
-    operationClass?.header !== expectedHeader
-    || !Array.isArray(actualOperationIds)
-    || JSON.stringify([...actualOperationIds].sort()) !== JSON.stringify([...expectedOperationIds].sort())
+    operationClass?.header !== rule.header
+    || !exactSet(operationClass?.operations, expectedOperationIds)
   ) {
     fail(`${name} idempotency class must match the stable operation matrix`);
+  }
+  if (rule.replay && operationClass?.replay !== rule.replay) {
+    const messages = {
+      resource_state_commands: "resource-state commands must not duplicate external work",
+      resource_retrieval: "resource retrieval must read existing state without Provider or job execution",
+      output_retrieval: "output retrieval must read existing resources without rendering or Provider execution",
+      output_delivery_retry: "output delivery retry must reuse placement identity without a new Render Job or Provider execution",
+    };
+    fail(messages[name]);
+  }
+  if (rule.forbidden && !exactSet(operationClass?.forbidden, rule.forbidden)) {
+    fail("output delivery retry must reuse placement identity without a new Render Job or Provider execution");
+  }
+}
+
+function validateIdempotencyClassPartition(operationClasses) {
+  const membership = new Map();
+  for (const operationClass of Object.values(operationClasses || {})) {
+    for (const operationId of operationClass?.operations || []) {
+      membership.set(operationId, (membership.get(operationId) || 0) + 1);
+    }
+  }
+  for (const descriptor of OPERATION_DESCRIPTORS) {
+    if (membership.get(descriptor.operationId) !== 1) {
+      fail(`${descriptor.operationId} must belong to exactly one idempotency class`);
+    }
   }
 }
 
@@ -633,17 +744,33 @@ function validateIdempotencyPolicy(doc) {
   if (policy.retention_hours !== 24 || policy.expired_record_reuse !== "new_request") {
     fail("idempotency records must retain replay identity for 24 hours and treat post-expiry reuse as a new request");
   }
-  if (JSON.stringify(policy.scope) !== JSON.stringify(["authenticated_tenant", "client_api_key", "key"])) {
+  if (!exactSet(policy.scope, ["authenticated_tenant", "client_api_key", "key"])) {
     fail("idempotency scope must be authenticated Tenant + Client API Key + key");
   }
-  if (!(policy.request_fingerprint || []).includes("operation_identity")) {
-    fail("idempotency fingerprint must include operation identity");
+  if (!exactSet(policy.request_fingerprint, [
+    "operation_identity",
+    "normalized_path_and_query_inputs",
+    "all_request_inputs_that_can_change_the_side_effect",
+  ])) {
+    fail("idempotency fingerprint must exactly include operation, normalized path/query, and every side-effect-changing input");
   }
   if (policy.cross_operation_key_reuse !== "idempotency_conflict") {
     fail("cross-operation key reuse must produce idempotency_conflict");
   }
+  if (policy.header !== "Idempotency-Key") {
+    fail("idempotency policy header must be Idempotency-Key");
+  }
+  if (policy.standardization_status !== "pixelplus_contract_informed_by_expired_ietf_draft") {
+    fail("idempotency standardization status must remain the stable PixelPlus contract value");
+  }
   if (policy.matching_replay !== "return_original_operation_without_new_side_effect") {
     fail("matching replay must return the original operation without a new side effect");
+  }
+  if (policy.in_progress_replay !== "do_not_call_adapter_or_create_another_side_effect") {
+    fail("in-progress replay must not call the Adapter or create another side effect");
+  }
+  if (policy.fingerprint_mismatch !== "idempotency_conflict_without_changing_original_operation") {
+    fail("fingerprint mismatch must conflict without changing the original operation");
   }
   if (policy.uncertain_owner !== "no_claim_stealing_or_reexecution") {
     fail("uncertain idempotency ownership must forbid claim stealing and re-execution");
@@ -654,76 +781,298 @@ function validateIdempotencyPolicy(doc) {
   if (policy.raw_secret_storage !== "forbidden") {
     fail("idempotency records must forbid raw secret storage");
   }
+  const retryOwners = policy.retry_owners || {};
   if (
-    policy.retry_owners?.chat !== "chat_execution_layer"
-    || policy.retry_owners?.render_job !== "render_job_execution_layer"
-    || policy.retry_owners?.committed_or_unknown !== "replacement_execution_forbidden"
+    retryOwners.chat !== "chat_execution_layer"
+    || retryOwners.render_job !== "render_job_execution_layer"
+    || retryOwners.committed_or_unknown !== "replacement_execution_forbidden"
   ) {
     fail("idempotency policy must assign one execution retry owner and forbid replacement after committed or unknown");
   }
+  if (!exactSet(retryOwners.forbidden_full_execution_retry_owners, [
+    "http_middleware",
+    "adapter",
+    "routing",
+    "queue",
+    "worker_redelivery",
+  ])) {
+    fail("forbidden full-execution retry owners must match the stable set");
+  }
+  if (!exactSet(Object.keys(retryOwners), [
+    "chat",
+    "render_job",
+    "committed_or_unknown",
+    "forbidden_full_execution_retry_owners",
+  ])) {
+    fail("idempotency retry owner fields must match the stable policy");
+  }
   const operationClasses = policy.operation_classes || {};
-  validateOperationClass(
-    operationClasses,
-    "chat_execution",
-    "optional",
-    expectedOperationIds(optionalIdempotencyOperations.keys()),
-  );
-  validateOperationClass(
-    operationClasses,
-    "durable_creation",
-    "required",
-    expectedOperationIds(requiredIdempotencyOperations.keys()),
-  );
-  validateOperationClass(
-    operationClasses,
-    "resource_state_commands",
-    "not_required",
-    expectedOperationIds(resourceStateCommandOperations),
-  );
-  validateOperationClass(
-    operationClasses,
-    "resource_retrieval",
-    "not_applicable",
-    expectedOperationIds(resourceRetrievalOperations),
-  );
-  validateOperationClass(
-    operationClasses,
-    "output_retrieval",
-    "not_applicable",
-    expectedOperationIds(outputRetrievalOperations),
-  );
-  validateOperationClass(
-    operationClasses,
-    "output_delivery_retry",
-    "not_required",
-    expectedOperationIds(outputDeliveryRetryOperations),
-  );
+  for (const [name, rule] of Object.entries(IDEMPOTENCY_CLASS_RULES)) {
+    const operationIds = OPERATION_DESCRIPTORS
+      .filter((descriptor) => descriptor.idempotencyClass === name)
+      .map((descriptor) => descriptor.operationId);
+    validateOperationClass(operationClasses, name, rule, operationIds);
+  }
+  validateIdempotencyClassPartition(operationClasses);
+}
 
-  const resourceStateCommands = operationClasses.resource_state_commands;
-  if (resourceStateCommands?.replay !== "same_resource_state_transition_must_not_duplicate_external_work") {
-    fail("resource-state commands must not duplicate external work");
+function resolveForComparison(node, doc, seen = new Set()) {
+  if (!node || typeof node !== "object" || Array.isArray(node)) return node;
+  if (typeof node.$ref !== "string") return node;
+  if (seen.has(node.$ref)) return node;
+  let resolved;
+  try {
+    resolved = resolvePointer(doc, node.$ref);
+  } catch {
+    return node;
   }
-  const resourceRetrieval = operationClasses.resource_retrieval;
-  if (
-    resourceRetrieval?.header !== "not_applicable"
-    || resourceRetrieval?.replay !== "read_existing_resource_without_provider_or_job_execution"
-  ) {
-    fail("resource retrieval must read existing state without Provider or job execution");
+  const siblings = Object.fromEntries(Object.entries(node).filter(([key]) => key !== "$ref"));
+  return { ...resolveForComparison(resolved, doc, new Set([...seen, node.$ref])), ...siblings };
+}
+
+const COMPATIBILITY_KEYWORDS = [
+  "type",
+  "format",
+  "const",
+  "pattern",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "uniqueItems",
+  "additionalProperties",
+];
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
   }
-  const outputRetrieval = operationClasses.output_retrieval;
+  return JSON.stringify(value);
+}
+
+function compareSchemaCompatibility(currentNode, baselineNode, currentDoc, baselineDoc, label, seen = {
+  refs: new Set(),
+  inlinePairs: new WeakMap(),
+}) {
   if (
-    outputRetrieval?.header !== "not_applicable"
-    || outputRetrieval?.replay !== "read_existing_resource_without_rendering_or_provider_execution"
+    currentNode && baselineNode
+    && typeof currentNode === "object" && typeof baselineNode === "object"
+    && (currentNode.$ref || baselineNode.$ref)
   ) {
-    fail("output retrieval must read existing resources without rendering or Provider execution");
+    const refPair = `${baselineNode.$ref || "inline"}|${currentNode.$ref || "inline"}`;
+    if (seen.refs.has(refPair)) return;
+    seen.refs.add(refPair);
+  } else if (
+    currentNode && baselineNode
+    && typeof currentNode === "object" && typeof baselineNode === "object"
+  ) {
+    let currentNodes = seen.inlinePairs.get(baselineNode);
+    if (!currentNodes) {
+      currentNodes = new WeakSet();
+      seen.inlinePairs.set(baselineNode, currentNodes);
+    }
+    if (currentNodes.has(currentNode)) return;
+    currentNodes.add(currentNode);
   }
-  const outputRetry = operationClasses.output_delivery_retry;
-  if (
-    outputRetry?.replay !== "reuse_existing_manifest_and_placement_identity"
-    || !(outputRetry?.forbidden || []).includes("new_render_job")
-    || !(outputRetry?.forbidden || []).includes("new_provider_execution")
-  ) {
-    fail("output delivery retry must reuse placement identity without a new Render Job or Provider execution");
+
+  const current = resolveForComparison(currentNode, currentDoc);
+  const baseline = resolveForComparison(baselineNode, baselineDoc);
+  if (!current || !baseline || typeof current !== "object" || typeof baseline !== "object") return;
+
+  for (const keyword of COMPATIBILITY_KEYWORDS) {
+    if (!Object.hasOwn(baseline, keyword)) {
+      if ((keyword === "const" || keyword === "pattern") && Object.hasOwn(current, keyword)) {
+        fail(`baseline compatibility: ${label} cannot add ${keyword}`);
+      }
+      continue;
+    }
+    if (!Object.hasOwn(current, keyword) || stableJson(current[keyword]) !== stableJson(baseline[keyword])) {
+      fail(`baseline compatibility: ${label} ${keyword} cannot change`);
+    }
+  }
+  if (!Array.isArray(baseline.enum) && Array.isArray(current.enum)) {
+    fail(`baseline compatibility: ${label} cannot add a closed enum`);
+  }
+  if (Array.isArray(baseline.required) && !exactSet(current.required || [], baseline.required)) {
+    const missing = baseline.required.find((property) => !(current.required || []).includes(property));
+    if (missing) {
+      fail(`baseline compatibility: ${label} required property ${missing} cannot be removed`);
+    } else {
+      fail(`baseline compatibility: ${label} required properties cannot change`);
+    }
+  }
+  if (Array.isArray(baseline.enum) && !exactSet(current.enum, baseline.enum)) {
+    fail(`baseline compatibility: ${label} closed enum must remain unchanged`);
+  }
+
+  for (const [property, baselineProperty] of Object.entries(baseline.properties || {})) {
+    const currentProperty = current.properties?.[property];
+    if (!currentProperty) {
+      fail(`baseline compatibility: ${label} property ${property} cannot be removed`);
+      continue;
+    }
+    compareSchemaCompatibility(
+      currentProperty,
+      baselineProperty,
+      currentDoc,
+      baselineDoc,
+      `${label}.properties.${property}`,
+      seen,
+    );
+  }
+
+  if (baseline.items && current.items) {
+    compareSchemaCompatibility(current.items, baseline.items, currentDoc, baselineDoc, `${label}.items`, seen);
+  }
+  for (const keyword of ["allOf", "oneOf", "anyOf"]) {
+    if (!Array.isArray(baseline[keyword])) continue;
+    if (!Array.isArray(current[keyword]) || current[keyword].length !== baseline[keyword].length) {
+      fail(`baseline compatibility: ${label} ${keyword} structure cannot change`);
+      continue;
+    }
+    baseline[keyword].forEach((schema, index) => compareSchemaCompatibility(
+      current[keyword][index],
+      schema,
+      currentDoc,
+      baselineDoc,
+      `${label}.${keyword}[${index}]`,
+      seen,
+    ));
+  }
+}
+
+function parameterIdentity(parameter) {
+  return `${parameter?.in || "unknown"}:${parameter?.name || "unknown"}`;
+}
+
+function compareOperationCompatibility(currentDoc, baselineDoc, descriptor) {
+  const label = operationKey(descriptor.path, descriptor.method);
+  const currentPathItem = currentDoc.paths?.[descriptor.path];
+  const baselinePathItem = baselineDoc.paths?.[descriptor.path];
+  const current = currentPathItem?.[descriptor.method];
+  const baseline = baselinePathItem?.[descriptor.method];
+  if (!baseline) {
+    fail(`baseline compatibility: ${label} is missing from the stable baseline`);
+    return;
+  }
+  if (!current) {
+    fail(`baseline compatibility: ${label} cannot be removed`);
+    return;
+  }
+  if (current.operationId !== baseline.operationId) {
+    fail(`baseline compatibility: ${label} operationId cannot change`);
+  }
+  if (JSON.stringify(current.security ?? currentDoc.security) !== JSON.stringify(baseline.security ?? baselineDoc.security)) {
+    fail(`baseline compatibility: ${label} security requirement cannot change`);
+  }
+  for (const extension of ["x-required-scopes", "x-required-scope-any-of"]) {
+    const baselineScopes = baseline[extension];
+    if (baselineScopes && !exactSet(current[extension], baselineScopes)) {
+      fail(`baseline compatibility: ${label} authorization scope requirement cannot change`);
+    }
+  }
+
+  const currentParameters = new Map(getParameters(currentPathItem, current).map((raw) => {
+    const parameter = resolveForComparison(raw, currentDoc);
+    return [parameterIdentity(parameter), { raw, parameter }];
+  }));
+  for (const rawBaselineParameter of getParameters(baselinePathItem, baseline)) {
+    const baselineParameter = resolveForComparison(rawBaselineParameter, baselineDoc);
+    const currentParameter = currentParameters.get(parameterIdentity(baselineParameter));
+    if (!currentParameter) {
+      fail(`baseline compatibility: ${label} parameter ${parameterIdentity(baselineParameter)} cannot be removed`);
+      continue;
+    }
+    if (currentParameter.parameter.required !== baselineParameter.required) {
+      fail(`baseline compatibility: ${label} parameter ${parameterIdentity(baselineParameter)} requiredness cannot change`);
+    }
+    compareSchemaCompatibility(
+      currentParameter.parameter.schema,
+      baselineParameter.schema,
+      currentDoc,
+      baselineDoc,
+      `${label} parameter ${parameterIdentity(baselineParameter)}`,
+    );
+  }
+  for (const { parameter } of currentParameters.values()) {
+    if (parameter.required === true) {
+      const baselineHasParameter = getParameters(baselinePathItem, baseline).some((raw) => (
+        parameterIdentity(resolveForComparison(raw, baselineDoc)) === parameterIdentity(parameter)
+      ));
+      if (!baselineHasParameter) {
+        fail(`baseline compatibility: ${label} cannot add required parameter ${parameterIdentity(parameter)}`);
+      }
+    }
+  }
+
+  const currentRequest = resolveForComparison(current.requestBody, currentDoc);
+  const baselineRequest = resolveForComparison(baseline.requestBody, baselineDoc);
+  if (baselineRequest?.required === true && currentRequest?.required !== true) {
+    fail(`baseline compatibility: ${label} request body requiredness cannot change`);
+  }
+  for (const [mediaType, baselineMedia] of Object.entries(baselineRequest?.content || {})) {
+    const currentMedia = currentRequest?.content?.[mediaType];
+    if (!currentMedia) {
+      fail(`baseline compatibility: ${label} request media type ${mediaType} cannot be removed`);
+    } else {
+      compareSchemaCompatibility(currentMedia.schema, baselineMedia.schema, currentDoc, baselineDoc, `${label} request ${mediaType}`);
+    }
+  }
+
+  for (const [status, rawBaselineResponse] of Object.entries(baseline.responses || {})) {
+    const rawCurrentResponse = current.responses?.[status];
+    if (!rawCurrentResponse) {
+      fail(`baseline compatibility: ${label} response status ${status} cannot be removed`);
+      continue;
+    }
+    const currentResponse = resolveForComparison(rawCurrentResponse, currentDoc);
+    const baselineResponse = resolveForComparison(rawBaselineResponse, baselineDoc);
+    for (const [mediaType, baselineMedia] of Object.entries(baselineResponse?.content || {})) {
+      const currentMedia = currentResponse?.content?.[mediaType];
+      if (!currentMedia) {
+        fail(`baseline compatibility: ${label} response ${status} media type ${mediaType} cannot be removed`);
+      } else {
+        compareSchemaCompatibility(
+          currentMedia.schema,
+          baselineMedia.schema,
+          currentDoc,
+          baselineDoc,
+          `${label} response ${status} ${mediaType}`,
+        );
+      }
+    }
+  }
+}
+
+function compareCompatibleSurface(currentDoc) {
+  let baselineDoc;
+  try {
+    baselineDoc = loadDocument(baselinePath);
+  } catch (error) {
+    fail(`stable baseline unavailable: ${error.message}`);
+    return;
+  }
+  for (const descriptor of OPERATION_DESCRIPTORS) {
+    compareOperationCompatibility(currentDoc, baselineDoc, descriptor);
+  }
+  for (const [name, baselineSchema] of Object.entries(baselineDoc.components?.schemas || {})) {
+    const currentSchema = currentDoc.components?.schemas?.[name];
+    if (!currentSchema) {
+      fail(`baseline compatibility: components.schemas.${name} cannot be removed`);
+      continue;
+    }
+    compareSchemaCompatibility(
+      currentSchema,
+      baselineSchema,
+      currentDoc,
+      baselineDoc,
+      `components.schemas.${name}`,
+    );
   }
 }
 
@@ -739,23 +1088,32 @@ function validateContractTestingPolicy(doc) {
   if (policy.composition !== "real_gateway_composition") {
     fail("contract tests must use real_gateway_composition");
   }
-  const controlledPorts = new Set(policy.controlled_implementations_at_ports || []);
-  for (const port of ["adapter", "credential_vault", "persistence", "job_runtime", "clock", "id_generator"]) {
-    if (!controlledPorts.has(port)) fail(`contract tests must allow controlled ${port} implementations at the port`);
+  if (!exactSet(policy.controlled_implementations_at_ports, [
+    "adapter",
+    "credential_vault",
+    "persistence",
+    "job_runtime",
+    "clock",
+    "id_generator",
+  ])) {
+    fail("controlled contract-test ports must match the stable allowlist");
   }
-  const forbiddenSeams = new Set(policy.forbidden_test_seams || []);
-  for (const seam of ["handler_stub", "private_function", "concrete_database_schema", "goroutine_layout"]) {
-    if (!forbiddenSeams.has(seam)) fail(`contract tests must forbid the ${seam} seam`);
+  if (!exactSet(policy.forbidden_test_seams, [
+    "handler_stub",
+    "private_function",
+    "concrete_database_schema",
+    "goroutine_layout",
+  ])) {
+    fail("forbidden contract-test seams must match the stable set");
   }
-  if (
-    !(policy.ownership_rejection_before || []).includes("vault_decrypt")
-    || !(policy.ownership_rejection_before || []).includes("adapter_call")
-    || !(policy.ownership_rejection_before || []).includes("job_enqueue")
-  ) {
-    fail("contract tests must assert ownership rejection before vault decrypt, Adapter call, and job enqueue");
+  if (!exactSet(policy.ownership_rejection_before, [
+    "vault_decrypt",
+    "adapter_call",
+    "job_enqueue",
+  ])) {
+    fail("contract-test ownership rejection boundaries must match the stable set");
   }
-  const requiredObservations = new Set(policy.required_observations || []);
-  for (const observation of [
+  if (!exactSet(policy.required_observations, [
     "http_status_headers_and_body",
     "durable_resource_identity",
     "adapter_call_count",
@@ -763,10 +1121,8 @@ function validateContractTestingPolicy(doc) {
     "persistence_and_job_side_effect_counts",
     "same_tenant_and_non_enumeration_behavior",
     "idempotency_replay_conflict_and_uncertain_outcomes",
-  ]) {
-    if (!requiredObservations.has(observation)) {
-      fail(`contract tests must observe ${observation}`);
-    }
+  ])) {
+    fail("contract tests must observe exactly the stable observation set");
   }
   if (policy.concrete_interface_and_package_layout !== "deferred_to_issue_21") {
     fail("concrete test ports and package layout must remain issue #21 scope");
@@ -785,16 +1141,15 @@ function main() {
     process.exit(1);
   }
 
+  validateOpenApiStructure(path);
+  validateDescriptorIntegrity();
+
   if (doc.openapi !== "3.1.1") fail(`openapi must be 3.1.1, got ${JSON.stringify(doc.openapi)}`);
   if (doc.jsonSchemaDialect !== "https://json-schema.org/draft/2020-12/schema") {
     fail("jsonSchemaDialect must be JSON Schema Draft 2020-12");
   }
-  if (doc.info?.version !== "1.0.0") fail(`info.version must be 1.0.0, got ${JSON.stringify(doc.info?.version)}`);
   if (doc["x-pixelplus-artifact-status"] !== "stable") {
     fail("x-pixelplus-artifact-status must be stable");
-  }
-  if (doc.servers?.length !== 1 || doc.servers[0]?.url !== "/v1") {
-    fail("stable Public API must use the single /v1 server base");
   }
   if (
     doc.components?.securitySchemes?.ClientApiKey?.type !== "http"
@@ -806,6 +1161,7 @@ function main() {
   validateLifecyclePolicy(doc);
   validateIdempotencyPolicy(doc);
   validateContractTestingPolicy(doc);
+  compareCompatibleSurface(doc);
   walkRefs(doc);
 
   const seenOperationIds = new Set();
@@ -814,7 +1170,10 @@ function main() {
     for (const [method, operation] of Object.entries(pathItem || {})) {
       if (!httpMethods.has(method) || !operation) continue;
       operationCount += 1;
-      validateOperationSecurityAndInput(pathKey, method, pathItem, operation);
+      const label = operationKey(pathKey, method);
+      const descriptor = descriptorByLabel.get(label);
+      if (!descriptor) fail(`${label} must have an operation descriptor`);
+      validateOperationSecurityAndInput(pathKey, method, pathItem, operation, descriptor);
       validateSecretBoundaries(pathKey, method, operation);
       if (!operation.operationId) {
         fail(`${operationKey(pathKey, method)} must declare operationId`);
@@ -824,13 +1183,12 @@ function main() {
         seenOperationIds.add(operation.operationId);
       }
 
-      const label = operationKey(pathKey, method);
       const idempotencyParameters = findIdempotencyParameters(pathItem, operation);
-      if (optionalIdempotencyOperations.has(label)) {
-        validateIdempotencyParameter(pathKey, method, pathItem, operation, optionalIdempotencyOperations.get(label), false);
+      if (descriptor?.idempotencyHeader === "optional") {
+        validateIdempotencyParameter(pathKey, method, pathItem, operation, descriptor.headerRef, false);
         validateIdempotencyConflictResponse(pathKey, method, operation);
-      } else if (requiredIdempotencyOperations.has(label)) {
-        validateIdempotencyParameter(pathKey, method, pathItem, operation, requiredIdempotencyOperations.get(label), true);
+      } else if (descriptor?.idempotencyHeader === "required") {
+        validateIdempotencyParameter(pathKey, method, pathItem, operation, descriptor.headerRef, true);
         validateIdempotencyConflictResponse(pathKey, method, operation);
       } else if (idempotencyParameters.length > 0) {
         fail(`${label} must not use Idempotency-Key`);
@@ -838,12 +1196,12 @@ function main() {
     }
   }
 
-  for (const [pathKey, method, operationId] of requiredOperations) {
-    const operation = doc.paths?.[pathKey]?.[method];
+  for (const descriptor of OPERATION_DESCRIPTORS) {
+    const operation = doc.paths?.[descriptor.path]?.[descriptor.method];
     if (!operation) {
-      fail(`missing required operation ${operationKey(pathKey, method)}`);
-    } else if (operation.operationId !== operationId) {
-      fail(`${operationKey(pathKey, method)} operationId must be ${operationId}`);
+      fail(`missing required operation ${operationKey(descriptor.path, descriptor.method)}`);
+    } else if (operation.operationId !== descriptor.operationId) {
+      fail(`${operationKey(descriptor.path, descriptor.method)} operationId must be ${descriptor.operationId}`);
     }
   }
 

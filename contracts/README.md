@@ -10,6 +10,8 @@ Issue #20 hợp nhất inference tracer #18 và management tracer #19 thành m�
 |---|---|
 | Normative versioning, compatibility, deprecation, idempotency, and contract-testing policy | `docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md` |
 | Stable OpenAPI 3.1.1 contract (`/v1`, `info.version=1.0.0`) | `contracts/openapi/pixelplus-public-api-v1.yaml` |
+| Frozen v1.0.0 compatibility baseline | `contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml` |
+| Redocly structural config/plugin | `redocly.yaml`, `scripts/redocly-pixelplus-plugin.mjs` |
 | Stable representation/policy validator | `scripts/validate-public-api-contract.mjs` |
 | Validator mutation suite | `scripts/test-public-api-contract-validator.mjs` |
 | OpenAPI directory notes | `contracts/openapi/README.md` |
@@ -17,6 +19,8 @@ Issue #20 hợp nhất inference tracer #18 và management tracer #19 thành m�
 Validate stable contract từ repository root:
 
 ```bash
+npm install
+npx redocly lint contracts/openapi/pixelplus-public-api-v1.yaml --config redocly.yaml
 node scripts/validate-public-api-contract.mjs
 node scripts/test-public-api-contract-validator.mjs
 ```
@@ -57,4 +61,4 @@ Validate OpenAPI và chạy deterministic management scenarios từ repository r
 node scripts/prototype-management-contract.mjs
 ```
 
-Hai tracer `0.0.0-prototype` là historical evidence, không phải alternative stable client contracts. Các YAML artifact là JSON-compatible để Node parse không cần YAML dependency. Validation cần Python với `jsonschema` Draft 2020-12 đã có sẵn trong environment; repository không thêm package dependency. Đây chưa phải runtime Gateway conformance suite hoặc full external OpenAPI metaschema validation.
+Hai tracer `0.0.0-prototype` là historical evidence, không phải alternative stable client contracts. Các YAML artifact là JSON-compatible để Node parse không cần YAML dependency. Stable validation dùng pinned Redocly CLI cho cấu trúc OpenAPI và cần Python `jsonschema` Draft 2020-12 cho example validation; PixelPlus validator bổ sung frozen-baseline compatibility và product-policy checks. Đây chưa phải runtime Gateway conformance suite.

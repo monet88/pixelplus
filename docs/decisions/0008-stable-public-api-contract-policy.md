@@ -12,17 +12,17 @@ Issues #18 and #19 produced separate inference and management prototype contract
 
 ## Decision
 
-PixelPlus publishes `contracts/openapi/pixelplus-public-api-v1.yaml` as the only stable Public API contract. It uses OpenAPI 3.1.1, JSON Schema Draft 2020-12, URL major `/v1`, and semantic release `1.0.0`. The #18 and #19 `0.0.0-prototype` artifacts remain historical evidence, not competing stable contracts.
+PixelPlus publishes `contracts/openapi/pixelplus-public-api-v1.yaml` as the only stable Public API contract. It uses OpenAPI 3.1.1, JSON Schema Draft 2020-12, URL major `/v1`, and semantic release `1.0.0`. The #18 and #19 `0.0.0-prototype` artifacts remain historical evidence, not competing stable contracts. All 26 stable operations carry exact Client API Key scope metadata, and one validator descriptor matrix owns path, method, operation identity, authorization requirement, and idempotency class/header.
 
-Within `/v1`, releases follow Semantic Versioning 2.0.0 and remain backward-compatible. Changes to authentication/scope, requiredness of idempotency, status semantics, closed enums, or other declared incompatible behavior require a new URL major and semantic MAJOR release. Declared open error extension points permit clients to receive previously unseen tokens without treating every new operation/error as a major change.
+Within `/v1`, releases follow Semantic Versioning 2.0.0 and remain backward-compatible. The frozen `contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml` artifact is the compatibility oracle for operations, schemas, statuses, authorization scopes, and idempotency requiredness. Changes to authentication/scope, requiredness of idempotency, status semantics, closed enums, or other declared incompatible behavior require a new URL major and semantic MAJOR release. Declared open error extension points permit clients to receive previously unseen tokens without treating every new operation/error as a major change.
 
-Deprecation preserves existing behavior and gives at least 180 days of notice. Notices use RFC 9745 `Deprecation`, RFC 8594 `Sunset`, and a migration `Link` with `rel="deprecation"`. Sunset cannot precede deprecation, a generally available successor is required, and removal occurs only in a new major.
+Deprecation preserves existing behavior and gives at least 180 days of notice. Notices use RFC 9745 `Deprecation`, RFC 8594 `Sunset`, and a migration `Link` with `rel="deprecation"`. Sunset cannot precede deprecation, a generally available successor is required, migration instructions must cover request/response/error/authorization/idempotency differences, old and successor contract suites run in parallel through the support window, and removal occurs only in a new major.
 
 HTTP idempotency is a PixelPlus contract using `Idempotency-Key`; it is not presented as a finalized IETF standard. Replay identity is scoped by authenticated Tenant, Client API Key, and key, with operation identity and all side-effect-changing inputs in the fingerprint. Records retain replay ownership for 24 hours. Matching replay returns the original operation without a new side effect; conflicts, in-progress ownership, and uncertain ownership never steal claims or create replacement executions. Secret-bearing fingerprints use only non-reversible keyed digests.
 
 Chat execution and Render Job execution remain the sole full-execution retry owners for their domains. Resource/catalog retrieval and output retrieval read existing state without Provider or job execution; output delivery retries reuse the existing manifest/placement identity.
 
-Future runtime contract tests must enter through the public HTTP surface and real Gateway composition. Controlled implementations may replace Adapter, Credential Vault, persistence, job runtime, clock, and ID generator behavior only at their ports. Handler stubs, private functions, concrete database schemas, and goroutine layouts are forbidden test seams. Exact interfaces, packages, and composition root remain issue #21 scope.
+Future runtime contract tests must enter through the public HTTP surface and real Gateway composition. Controlled implementations may replace Adapter, Credential Vault, persistence, job runtime, clock, and ID generator behavior only at their ports. Handler stubs, private functions, concrete database schemas, and goroutine layouts are forbidden test seams. Exact interfaces, packages, and composition root remain issue #21 scope. The static gate first runs pinned Redocly structural validation, then PixelPlus policy/baseline checks and Python Draft 2020-12 example validation.
 
 ## Alternatives Considered
 
@@ -45,8 +45,8 @@ Tradeoffs:
 
 - Required idempotency keys add client ceremony to costly create/secret-ingress operations.
 - Closed-enum evolution is intentionally conservative and may require a new major.
-- The current executable proof validates the contract representation, not runtime Gateway behavior.
-- Python `jsonschema` remains an environment prerequisite without becoming a repository dependency.
+- The current executable proof validates the contract representation, structure, and frozen compatibility surface, not runtime Gateway behavior.
+- `@redocly/cli` is a pinned development dependency for OpenAPI structural validation; Python `jsonschema` remains an environment prerequisite for schema example validation.
 
 ## Follow-Up
 

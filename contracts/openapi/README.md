@@ -5,6 +5,7 @@
 | Field | Value |
 |---|---|
 | Artifact | `pixelplus-public-api-v1.yaml` |
+| Frozen baseline | `baselines/pixelplus-public-api-v1.0.0.yaml` |
 | OpenAPI | `3.1.1` |
 | `info.version` | `1.0.0` |
 | Status extension | `x-pixelplus-artifact-status: stable` |
@@ -18,11 +19,13 @@ Normative policy: `docs/spec/api-versioning-compatibility-idempotency-contract-t
 Validate from repository root:
 
 ```bash
+npm install
+npx redocly lint contracts/openapi/pixelplus-public-api-v1.yaml --config redocly.yaml
 node scripts/validate-public-api-contract.mjs
 node scripts/test-public-api-contract-validator.mjs
 ```
 
-The stable validator checks the 26 inherited operations, shared Client API Key security, internal `$ref`s, Draft 2020-12 examples, no client `tenant_id`, approved direct-secret ingress only, secret-free responses/examples, unified canonical error/remediation components, compatibility/deprecation rules, operation-specific idempotency requiredness/replay semantics, and future real-composition contract-test policy. The mutation suite proves drift in those rules is rejected through the validator's public CLI seam.
+The stable validator first runs pinned Redocly structural validation (`struct` plus the OAS non-empty Responses Object constraint), then checks the frozen v1.0.0 compatibility baseline, the 26 inherited operations, exact authorization scopes, shared Client API Key security, internal `$ref`s, Draft 2020-12 examples, no client `tenant_id`, approved direct-secret ingress only, secret-free responses/examples, unified canonical error/remediation components, compatibility/deprecation rules, exact operation-specific idempotency/replay semantics, and future real-composition contract-test policy. The mutation suite proves representative structural and semantic drift is rejected through the validator's public CLI seam.
 
 The stable artifact is the only stable client contract. The two `0.0.0-prototype` artifacts remain historical evidence for the tracer decisions that produced it.
 
@@ -63,4 +66,4 @@ node scripts/prototype-management-contract.mjs
 
 The retained management validator and deterministic scenario runner preserve evidence for scopes, lifecycle, credential/OAuth boundaries, enable/reauthentication probe semantics, Capability Snapshots, Routing Policy, non-enumeration, and no-decrypt/no-Adapter side effects on rejected resources.
 
-All validation flows require Python with the `jsonschema` package already available; the repository adds no package dependency. They are not full external OpenAPI metaschema validators. Runtime Gateway composition tests become required when the composition root exists; exact interfaces and package layout remain #21 scope.
+Stable validation requires installed npm development dependencies (including pinned Redocly CLI) and Python with `jsonschema`. Redocly validates the OpenAPI document structure; the PixelPlus validator adds semantic baseline and product-policy checks. Runtime Gateway composition tests become required when the composition root exists; exact interfaces and package layout remain #21 scope.
