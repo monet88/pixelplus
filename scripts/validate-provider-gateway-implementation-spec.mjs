@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +9,18 @@ const defaultManifest =
 const productionContract = {
   issue: 22,
   implementationIssue: 42,
+  specificationPath:
+    "docs/spec/provider-gateway-implementation-ready-specification.md",
+  semanticHashes: {
+    decisions:
+      "c7c43b9ec2cf69927ae6b8c198fa768abfb946425489f3dbc1560be5d7e8cc24",
+    implementationSlices:
+      "2866718ff1f53c87cf4c458e72c353e5b7e9bfe48b8b366caa2547ee3e641189",
+    deferredItems:
+      "b442e659717679cd29a4b40d21b938f43898d92fb750800d55aec528df30041c",
+    specification:
+      "eb1293b2e57b79568c74a38f569fefeddbdfd42197b9cf3d879883b317def23d",
+  },
   canonicalStatuses: [
     "verified",
     "conditionally_supported",
@@ -210,6 +223,22 @@ const productionContract = {
 
 function sortedUnique(values) {
   return [...new Set(values)].sort();
+}
+
+function normalizedText(value) {
+  return value.replace(/\r\n/g, "\n").trimEnd() + "\n";
+}
+
+function semanticHash(value) {
+  const serialized =
+    typeof value === "string" ? normalizedText(value) : JSON.stringify(value);
+  return crypto.createHash("sha256").update(serialized).digest("hex");
+}
+
+function assertSemanticHash(value, expected, message) {
+  if (expected && semanticHash(value) !== expected) {
+    throw new Error(message);
+  }
 }
 
 function assertExactStringSet(actual, expected, label) {
@@ -555,6 +584,11 @@ function validateDecisions(manifest, contract) {
     contract.decisionIds,
     "decision ids",
   );
+  assertSemanticHash(
+    manifest.decisions,
+    contract.semanticHashes?.decisions,
+    "decision ledger does not match validator-owned semantic contract",
+  );
   for (const decisionId of requiredDecisionIds) {
     if (!decisionIds.has(decisionId)) {
       throw new Error(`missing required decision: ${decisionId}`);
@@ -626,6 +660,11 @@ function validateImplementationSlices(manifest, contract) {
     [...knownIds],
     contract.implementationSliceIds,
     "implementation slice ids",
+  );
+  assertSemanticHash(
+    manifest.implementation_slices,
+    contract.semanticHashes?.implementationSlices,
+    "implementation slices do not match validator-owned semantic contract",
   );
   for (const sliceId of requiredSliceIds) {
     if (!knownIds.has(sliceId)) {
@@ -700,6 +739,11 @@ function validateDeferredItems(manifest, contract) {
     [...deferredIds],
     contract.deferredItemIds,
     "deferred item ids",
+  );
+  assertSemanticHash(
+    manifest.deferred_items,
+    contract.semanticHashes?.deferredItems,
+    "deferred register does not match validator-owned semantic contract",
   );
   for (const deferredId of requiredDeferredIds) {
     if (!deferredIds.has(deferredId)) {
@@ -777,6 +821,12 @@ function validateHumanCapabilityLedger(specification, contract) {
 
 async function validateSpecificationSections(root, manifest, contract) {
   requireText(manifest.specification, "specification path is required");
+  if (
+    contract.specificationPath &&
+    manifest.specification !== contract.specificationPath
+  ) {
+    throw new Error("specification path does not match validator-owned contract");
+  }
   const requiredSections = manifest.completion_gate?.required_sections;
   assertExactStringSet(
     requiredSections,
@@ -800,6 +850,11 @@ async function validateSpecificationSections(root, manifest, contract) {
     }
   }
   validateHumanCapabilityLedger(specification, contract);
+  assertSemanticHash(
+    specification,
+    contract.semanticHashes?.specification,
+    "human specification does not match validator-owned semantic contract",
+  );
 }
 
 export async function validateImplementationSpecification({

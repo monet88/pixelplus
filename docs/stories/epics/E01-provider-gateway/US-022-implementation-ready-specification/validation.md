@@ -55,7 +55,7 @@ Recorded on 2026-07-20 against the issue #22 working tree based on `63d6454`:
 
 | Command | Result |
 | --- | --- |
-| `node --test scripts/test-provider-gateway-implementation-spec-validator.mjs` | pass: 18 mutations cover complete package, missing/escaping authority, exact capability vocabulary/matrix/risk/evidence, undeclared evidence/authority, decision dimensions/IDs, slice IDs/dependencies/cycles, deferred requirements/source-owned IDs, self-shrinking gate attempts, human-ledger drift, and unconditional issue identities |
+| `node --test scripts/test-provider-gateway-implementation-spec-validator.mjs` | pass: 22 focused tests, comprising one positive complete-package case and 21 negative mutations covering missing/escaping authority, exact capability vocabulary/matrix/risk/evidence, undeclared evidence/authority, decision dimensions/IDs/semantics, slice IDs/dependencies/cycles/authorities/proof seams, deferred requirements/source-owned IDs/semantics, self-shrinking gate attempts, human-ledger drift, hollow/relocated handoffs, and unconditional issue identities |
 | `node scripts/validate-provider-gateway-implementation-spec.mjs` | pass: issue #22, implementation #42, 30 capability claims, 14 decisions, seven slices, 43 deferred items, 26 authority files |
 | `node scripts/validate-public-api-contract.mjs` | pass: stable contract has 26 operations and 205 Draft 2020-12 examples; worktree pre-release baseline |
 | `node scripts/test-public-api-contract-validator.mjs` | pass: stable Public API validator mutation suite |
@@ -84,7 +84,8 @@ Implementation handoff evidence:
   completion contract validator-owned, checking capability tuples against the
   accepted evidence baseline and human ledger, enforcing issue #22/#42
   identities unconditionally, expanding all source-owned deferrals, and
-  refreshing validation evidence.
+  fingerprinting the accepted decision/slice/deferred/human semantic content,
+  then refreshing validation evidence.
 
 Harness story verification/completion, independent review, and the final
 commit are recorded after this evidence block is written.

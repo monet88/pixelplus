@@ -506,3 +506,90 @@ test("rejects altered gate and implementation issue identities unconditionally",
     /implementation issue must be 42/,
   );
 });
+
+test("rejects placeholder decision semantics despite complete IDs", async () => {
+  const fixture = await createProductionFixture(({ manifest }) => {
+    for (const decision of manifest.decisions) {
+      decision.observable_behavior = "TBD";
+      decision.failure_semantics = "TBD";
+      decision.security_impact = "TBD";
+      decision.dependencies = [manifest.authority.normative_specs[0]];
+    }
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /decision ledger does not match validator-owned semantic contract/,
+  );
+});
+
+test("rejects changed slice order, authority, or proof semantics", async () => {
+  const fixture = await createProductionFixture(({ manifest }) => {
+    for (const slice of manifest.implementation_slices) {
+      slice.depends_on = [];
+      slice.authority = [manifest.authority.architecture_decisions[1]];
+      slice.proof_seam = "TBD";
+    }
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /implementation slices do not match validator-owned semantic contract/,
+  );
+});
+
+test("rejects placeholder deferred reasons, dependencies, and triggers", async () => {
+  const fixture = await createProductionFixture(({ manifest }) => {
+    for (const item of manifest.deferred_items) {
+      item.reason = "TBD";
+      item.dependencies = ["TBD"];
+      item.reopen_trigger = "TBD";
+    }
+  });
+
+  await assert.rejects(
+    validateImplementationSpecification(fixture),
+    /deferred register does not match validator-owned semantic contract/,
+  );
+});
+
+test("rejects a hollow or relocated human implementation handoff", async () => {
+  const hollow = await createProductionFixture((state) => {
+    const capabilityStart = state.specification.indexOf(
+      "## Capability evidence ledger",
+    );
+    const decisionStart = state.specification.indexOf("## Decision ledger");
+    const capabilitySection = state.specification.slice(
+      capabilityStart,
+      decisionStart,
+    );
+    state.specification = [
+      "# Provider Gateway Implementation-Ready Specification",
+      "",
+      "## Authority and conflict resolution",
+      "TBD",
+      capabilitySection.trim(),
+      "## Decision ledger",
+      "TBD",
+      "## Implementation work breakdown",
+      "TBD",
+      "## Deferred item register",
+      "TBD",
+      "## Completion gate",
+      "TBD",
+      "",
+    ].join("\n");
+  });
+  await assert.rejects(
+    validateImplementationSpecification(hollow),
+    /human specification does not match validator-owned semantic contract/,
+  );
+
+  const relocated = await createProductionFixture(({ manifest }) => {
+    manifest.specification = "docs/spec/alternate-implementation-specification.md";
+  });
+  await assert.rejects(
+    validateImplementationSpecification(relocated),
+    /specification path does not match validator-owned contract/,
+  );
+});

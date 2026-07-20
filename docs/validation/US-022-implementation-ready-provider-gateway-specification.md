@@ -33,7 +33,7 @@ scripts/bin/harness-cli.exe story verify US-022
 | Check | Result | Notes |
 | --- | --- | --- |
 | Syntax | pass | Both new Node scripts pass `node --check`. |
-| Unit | pass | 18 mutation cases reject missing/escaping authority, invalid or incomplete capability/risk rows, undeclared sources, incomplete/duplicate decisions, invalid/cyclic slices, incomplete/missing deferrals, self-shrinking gates, evidence/human-ledger capability drift, and altered issue identities. |
+| Unit | pass | 22 focused tests: one positive complete-package case plus 21 negative mutations covering missing/escaping authority, invalid or incomplete capability/risk rows, undeclared sources, incomplete/duplicate decisions, invalid/cyclic slices, incomplete/missing deferrals, self-shrinking gates, evidence/human-ledger capability drift, altered issue identities, placeholder semantics, changed slice proof/order, hollow handoffs, and relocated specifications. |
 | Integration | pass | Real manifest: issue #22, implementation #42, 30 capability claims, 14 decisions, seven slices, 43 required deferred items, and 26 authority files. |
 | Stable contract | pass | 26 `/v1` operations and 205 Draft 2020-12 examples; full validator mutation suite passes. |
 | Prototype inference | pass | 12 operations, 29 schemas, 61 schema-validated examples. |
@@ -79,3 +79,6 @@ Independent review closure:
   baseline and against the human capability ledger.
 - Gate and implementation issue identities are unconditional; the manifest
   cannot disable the separation rule.
+- SHA-256 fingerprints over the accepted decision ledger, slice graph/proof
+  seams, deferred register, and full human handoff prevent placeholder or
+  semantics-removal edits from passing while retaining the same IDs.
