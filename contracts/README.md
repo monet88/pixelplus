@@ -2,30 +2,54 @@
 
 Public OpenAI-compatible HTTP contract giữa Gateway và các client.
 
-## Non-final inference tracer (#18)
+## Stable unified Public API (#20)
+
+Issue #20 hợp nhất inference tracer #18 và management tracer #19 thành một stable package duy nhất:
+
+| Artifact | Path |
+|---|---|
+| Normative versioning, compatibility, deprecation, idempotency, and contract-testing policy | `docs/spec/api-versioning-compatibility-idempotency-contract-testing-policy.md` |
+| Stable OpenAPI 3.1.1 contract (`/v1`, `info.version=1.0.0`) | `contracts/openapi/pixelplus-public-api-v1.yaml` |
+| Frozen v1.0.0 compatibility baseline | `contracts/openapi/baselines/pixelplus-public-api-v1.0.0.yaml` |
+| Redocly structural config/plugin | `redocly.yaml`, `scripts/redocly-pixelplus-plugin.mjs` |
+| Stable representation/policy validator | `scripts/validate-public-api-contract.mjs` |
+| Validator mutation suite | `scripts/test-public-api-contract-validator.mjs` |
+| OpenAPI directory notes | `contracts/openapi/README.md` |
+
+Validate stable contract từ repository root:
+
+```bash
+npm install
+npx redocly lint contracts/openapi/pixelplus-public-api-v1.yaml --config redocly.yaml
+node scripts/validate-public-api-contract.mjs
+node scripts/test-public-api-contract-validator.mjs
+```
+
+Artifact khóa chung 26 operation inference + management, `ClientApiKey`, canonical errors, compatibility/deprecation policy, operation-specific `Idempotency-Key`, secret/non-enumeration boundaries, và yêu cầu future runtime contract tests phải đi qua public HTTP surface + real Gateway composition. Issue #20 không triển khai Gateway; concrete ports/composition root vẫn thuộc #21.
+
+## Retained non-final inference tracer (#18)
 
 Issue #18 giữ một **prototype non-final** cho inference surface (models, chat stream/cancel, assets, image jobs, render-job poll/cancel/output-retry, canonical errors):
 
 | Artifact | Path |
 |---|---|
-| Normative decisions | `docs/spec/openai-compatible-inference-contract.md` |
+| Prototype decisions | `docs/spec/openai-compatible-inference-contract.md` |
 | OpenAPI 3.1.1 tracer (`info.version=0.0.0-prototype`) | `contracts/openapi/pixelplus-public-api-v0alpha.yaml` |
-| OpenAPI directory notes | `contracts/openapi/README.md` |
 | Representation validator | `scripts/validate-openapi-contract.mjs` |
 
-Validate from repository root:
+Validate từ repository root:
 
 ```bash
 node scripts/validate-openapi-contract.mjs contracts/openapi/pixelplus-public-api-v0alpha.yaml
 ```
 
-## Non-final management tracer (#19)
+## Retained non-final management tracer (#19)
 
 Issue #19 giữ một **prototype non-final riêng** cho Provider Account, direct/OAuth credential journey, probe/reauthentication, lifecycle controls, Capability Snapshot và Tenant Routing Policy:
 
 | Artifact | Path |
 |---|---|
-| Normative decisions | `docs/spec/provider-account-and-capability-management-contract.md` |
+| Prototype decisions | `docs/spec/provider-account-and-capability-management-contract.md` |
 | OpenAPI 3.1.1 tracer (`info.version=0.0.0-prototype`) | `contracts/openapi/pixelplus-management-api-v0alpha.yaml` |
 | Representation validator | `scripts/validate-management-openapi-contract.mjs` |
 | Deterministic cause→effect runner | `scripts/run-management-contract-scenarios.mjs` |
@@ -37,8 +61,4 @@ Validate OpenAPI và chạy deterministic management scenarios từ repository r
 node scripts/prototype-management-contract.mjs
 ```
 
-Hai tracer là prototype evidence only. Các YAML artifact là JSON-compatible để Node parse không cần YAML dependency. Validation cần Python với `jsonschema` Draft 2020-12 đã có sẵn trong environment; repository không thêm package dependency. Đây không phải runtime Gateway test và không phải full external OpenAPI metaschema validation.
-
-## Final unified contract (#20)
-
-Final versioned Public API package — hợp nhất inference tracer #18 với management tracer #19 — được defer sang issue **#20**. Không xem `0.0.0-prototype` hoặc path/field hiện tại là stable release surface.
+Hai tracer `0.0.0-prototype` là historical evidence, không phải alternative stable client contracts. Các YAML artifact là JSON-compatible để Node parse không cần YAML dependency. Stable validation dùng pinned Redocly CLI cho cấu trúc OpenAPI và cần Python `jsonschema` Draft 2020-12 cho example validation; PixelPlus validator bổ sung frozen-baseline compatibility và product-policy checks. Đây chưa phải runtime Gateway conformance suite.
