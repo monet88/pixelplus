@@ -77,9 +77,11 @@ operation owner defined by #16. It never parses wire DTOs, constructs SQL,
 knows Provider protocol fields, or handles a raw queue message.
 
 `ports` is owned by the application boundary. Ports use canonical domain and
-application types, not `net/http`, SQL rows, Provider payloads, queue
-messages, or Vault ciphertext. Infrastructure and Adapter packages implement
-these interfaces; the application never imports their concrete packages.
+application-owned intents/receipts, not `net/http`, SQL rows, Provider
+payloads, queue messages, or Vault ciphertext. Infrastructure and Adapter
+packages implement these interfaces; the application never imports their
+concrete packages. Ports may depend on domain values but not on application
+command/query types.
 
 `transport/http` is an outer adapter. It parses unknown HTTP input into typed
 application commands, maps canonical outcomes to the stable OpenAPI contract,
@@ -94,8 +96,9 @@ operation, write durable state, or expose Provider payloads to HTTP.
 `infrastructure/vault` owns ciphertext, envelope/key versions, purpose-bound
 decrypt, rotation, revocation, retention, purge, and redaction. The
 application-facing Vault port exposes protected operations, not ciphertext or
-handles as authority. Credential material is available only for the bounded
-callback that invokes an authorized Adapter/probe operation.
+handles as authority. Credential material is available only inside
+Vault-authorized capability Adapter calls; application never receives
+plaintext.
 
 `infrastructure/persistence` owns the physical store and transactions. It
 implements logical transitions and consistency guarantees, not application
@@ -133,7 +136,9 @@ The allowed compile-time direction is:
 cmd/gateway -> composition -> {transport, application, adapters,
                                infrastructure}
 
-transport -> application -> {domain, ports}
+transport -> {application, domain}
+application -> {domain, ports}
+ports -> domain
 adapters -> {domain, ports}
 infrastructure/* -> {domain, ports}
 contracttest -> composition -> the public HTTP handler
@@ -145,7 +150,9 @@ The reverse edges are forbidden. In particular:
   infrastructure.
 - `application` cannot import an Adapter, concrete Vault, persistence driver,
   queue client, HTTP package, or process configuration.
-- `transport/http` cannot call a repository or Adapter directly.
+- `transport/http` may import application command/query types and the domain
+  values those commands embed, but cannot call a repository or Adapter
+  directly and cannot import infrastructure packages.
 - Provider protocol packages cannot define or replace canonical domain values.
 - `composition` may wire concrete implementations but cannot add policy.
 - `contracttest` may observe HTTP results and controlled port observations, but
@@ -172,14 +179,15 @@ requires it, but may not bypass the port with a concrete dependency.
 | `PublicGateway` | Typed Public API use cases for inference, Assets, Render Jobs, Provider Accounts, capabilities, and Routing Policy | HTTP composition reaches the same application policy used by all clients; no client-supplied Tenant authority |
 | `JobExecutor` | Worker-facing execution of a durable Job reference | Same-Tenant fencing, attempt commit certainty, and #16 retry ownership are applied before Provider execution |
 | `AdapterRegistry` capabilities | Resolve separate Chat, Render, Probe, Capability, and same-attempt Recovery ports for a Provider Account/Auth Mode | Provider protocol stays outside canonical domain; outcomes carry commit certainty and safe diagnostics |
-| `CredentialVault` | Store, authorize, use, revoke, rotate, retain, and purge sensitive material | Purpose/resource/Tenant binding and audit-before-decrypt; plaintext is unavailable to logs, responses, traces, and ordinary records |
-| `PrincipalStore` / `AdmissionStore` | Authenticate key material and read/claim scoped admission state | Tenant and Client API Key scope are derived server-side; unavailable dependencies fail closed |
+| `CredentialVault` | Store, authorize, use, rewrap, revoke, logical-delete, and purge sensitive material; inject plaintext only into capability-specific Adapter calls | Purpose/resource/Tenant binding and audit-before-decrypt; application never receives `SecretMaterial`; plaintext is unavailable to logs, responses, traces, and ordinary records |
+| `PrincipalStore` / `AdmissionStore` | Authenticate key material and read/claim scoped admission and usage/accounting state | Tenant and Client API Key scope are derived server-side; unavailable dependencies fail closed; usage occupancy is reconciled through admission, not a separate vague store |
 | `ReplayStore` | Atomic idempotency claim, fingerprint match/conflict, in-progress and terminal replay | No-steal rule; one accepted owner; replay record lifecycle is independent from resource lifecycle |
-| `AccountStore` / `CapabilityStore` / `HealthStore` / `RoutingPolicyStore` | Logical account, capability, health, cooldown, control, and routing transitions | Tenant scope, credential-version fencing, stale-write rejection, and atomic policy validation |
-| `AssetStore` / `RenderJobStore` | Asset reservation/lifecycle and durable job/attempt/manifest state | Atomic Tenant accounting, worker fencing, immutable manifest, and output placement idempotency |
+| `AccountStore` / `CapabilityStore` / `HealthStore` / `SurfaceCircuitStore` / `RoutingPolicyStore` | Logical account, capability, health, cooldown, recovery-permit, Provider Surface Circuit, control, and routing transitions | Tenant/principal scope, credential-version fencing, CAS/revision fencing, one-per-revision recovery permits, stale-write rejection, and atomic policy validation |
+| `AssetStore` / `RenderJobStore` | Asset metadata/reservation lifecycle and durable job/attempt/manifest state | Atomic Tenant accounting, worker fencing, immutable manifest, and output placement idempotency |
+| `TenantConfidentialStore` / `AssetContentStore` / `RenderStagingStore` | Encrypted prompt/request/replay payloads, Asset content objects, and Render staging bytes as separate data-class boundaries | Distinct encryption contexts, retention classes, and purpose-bound retrieve/use; no content bytes in metadata ports |
 | `JobRuntime` | Enqueue/dequeue and worker lifecycle plumbing | Payloads contain safe references only; at-least-once delivery cannot multiply Provider side effects |
 | `Clock` / `IDGenerator` | Time and identifier creation | All replay, expiry, lease, cooldown, request, job, attempt, and placement identities are controllable in tests |
-| `AuditRecorder` / `TelemetryRecorder` | Secret-free audit and operational observation | Audit failure is a typed dependency outcome; no raw Provider, secret, content, or stack trace crosses the record |
+| `AuditRecorder` / `TelemetryRecorder` / `RequestLogRecorder` | Secret-free audit, operational telemetry, and one canonical JSON request log per HTTP request | Audit failure is a typed dependency outcome; request logs use the fixed field set, are secret-free, and are never authorization proof; no raw Provider, secret, content, or stack trace crosses the record |
 
 The port interfaces must expose logical operations rather than generic
 `Get/Put` methods or storage transactions. Examples include atomic replay
@@ -188,25 +196,38 @@ fencing, same-attempt recovery, scoped health observation, and output
 placement by stable placement key. A physical store may implement these with
 SQL transactions or another mechanism without leaking that mechanism.
 
-The `CredentialVault` port uses a purpose-bound operation such as
-`WithCredential(ctx, accessIntent, use)` rather than returning a general
-secret byte slice to the caller. The callback is scoped to the authorized
-Adapter/probe action and its error is normalized before it reaches another
-boundary. Prompt, Asset bytes, Render staging, and audit-safe records use the
-same principle with data-class-specific intents.
+The `CredentialVault` port never returns decrypted credential material to
+application code. Application submits an already-gated `AccessIntent` plus the
+resolved capability Adapter; the Vault performs audit-before-decrypt, decrypts
+inside its boundary, and invokes the Adapter with a non-exportable
+`SecretMaterial` argument. Adapter methods therefore require that credential
+capability and cannot be called successfully without a Vault-authorized
+injection path. Prompt, Asset content, and Render staging use separate
+data-class ports with their own purpose-bound retrieve/use operations rather
+than a shared secret callback.
 
 The first interface catalogue is deliberately concrete even though the Go
-module is deferred. The package labels below are normative: application owns
-the inbound interfaces, `domain` owns canonical values that cross the
-application/port seam, and `ports` owns infrastructure intents/receipts. The
-examples use explicit `domain.` qualification at both seams; request and
-outcome types are not `map[string]any` or wire DTOs:
+module is deferred. The package labels below are normative:
+
+- `application` owns inbound commands, queries, results/sinks, and the Public
+  Gateway / JobExecutor interfaces;
+- `domain` owns canonical entities, value objects, refs, and Provider-independent
+  outcomes that cross the application/port seam;
+- `ports` owns outbound infrastructure intents, receipts, and Adapter seams.
+
+Public API command/query/result types therefore live under `application`, not
+`domain`. Domain types appear in those commands only as nested values (for
+example refs, identities, and policy objects). Wire DTOs remain outside both
+packages in `transport/http`. The examples use explicit package qualification
+at both seams and are not `map[string]any` or OpenAPI structs:
 
 ```go
 // internal/application
 package application
 
-// domain refers to the sibling internal/domain package.
+// Commands, queries, and results are application-owned types. They may embed
+// domain values, but Public API changes must not force domain package churn.
+// domain refers to the sibling internal/domain package for nested values only.
 
 type PublicGateway interface {
 	ModelsGateway
@@ -218,52 +239,54 @@ type PublicGateway interface {
 }
 
 type ModelsGateway interface {
-	ListModels(context.Context, domain.ModelsQuery) (domain.ModelsResponse, error)
+	ListModels(context.Context, ModelsQuery) (ModelsResult, error)
 }
 
 type ChatGateway interface {
-	CreateChatCompletion(context.Context, domain.ChatRequest) (domain.ChatResponse, error)
-	StreamChat(context.Context, domain.ChatRequest, domain.ChatSink) error
-	CancelChatExecution(context.Context, domain.CancelChatRequest) (domain.CancelChatResponse, error)
+	CreateChatCompletion(context.Context, CreateChatCompletionCommand) (ChatCompletionResult, error)
+	StreamChat(context.Context, CreateChatCompletionCommand, ChatStreamSink) error
+	CancelChatExecution(context.Context, CancelChatExecutionCommand) (CancelChatExecutionResult, error)
 }
 
 type AssetGateway interface {
-	CreateAsset(context.Context, domain.CreateAssetRequest) (domain.AssetResponse, error)
-	GetAsset(context.Context, domain.GetAssetRequest) (domain.AssetResponse, error)
-	GetAssetContent(context.Context, domain.GetAssetContentRequest) (domain.AssetContentResponse, error)
+	CreateAsset(context.Context, CreateAssetCommand) (AssetResult, error)
+	GetAsset(context.Context, GetAssetQuery) (AssetResult, error)
+	GetAssetContent(context.Context, GetAssetContentQuery) (AssetContentResult, error)
 }
 
 type RenderGateway interface {
-	CreateImageGeneration(context.Context, domain.ImageGenerationRequest) (domain.RenderJobResponse, error)
-	CreateImageEdit(context.Context, domain.ImageEditRequest) (domain.RenderJobResponse, error)
-	CreateImageInpaint(context.Context, domain.ImageInpaintRequest) (domain.RenderJobResponse, error)
-	GetRenderJob(context.Context, domain.GetRenderJobRequest) (domain.RenderJobResponse, error)
-	CancelRenderJob(context.Context, domain.CancelRenderJobRequest) (domain.CancelRenderJobResponse, error)
-	RetryRenderJobOutput(context.Context, domain.RetryOutputRequest) (domain.OutputDeliveryResponse, error)
+	CreateImageGeneration(context.Context, CreateImageGenerationCommand) (RenderJobResult, error)
+	CreateImageEdit(context.Context, CreateImageEditCommand) (RenderJobResult, error)
+	CreateImageInpaint(context.Context, CreateImageInpaintCommand) (RenderJobResult, error)
+	GetRenderJob(context.Context, GetRenderJobQuery) (RenderJobResult, error)
+	CancelRenderJob(context.Context, CancelRenderJobCommand) (CancelRenderJobResult, error)
+	RetryRenderJobOutput(context.Context, RetryRenderJobOutputCommand) (OutputDeliveryResult, error)
 }
 
 type ProviderAccountGateway interface {
-	CreateProviderAccount(context.Context, domain.CreateProviderAccountRequest) (domain.ProviderAccountResponse, error)
-	ListProviderAccounts(context.Context, domain.ListProviderAccountsRequest) (domain.ProviderAccountsResponse, error)
-	GetProviderAccount(context.Context, domain.GetProviderAccountRequest) (domain.ProviderAccountResponse, error)
-	DeleteProviderAccount(context.Context, domain.DeleteProviderAccountRequest) (domain.DeleteProviderAccountResponse, error)
-	SubmitProviderCredential(context.Context, domain.SubmitCredentialRequest) (domain.ProviderAccountResponse, error)
-	StartOAuthAuthorization(context.Context, domain.StartOAuthRequest) (domain.OAuthAuthorizationResponse, error)
-	GetOAuthAuthorization(context.Context, domain.GetOAuthRequest) (domain.OAuthAuthorizationResponse, error)
-	ProbeProviderAccount(context.Context, domain.ProbeAccountRequest) (domain.ProviderAccountResponse, error)
-	ReauthenticateProviderAccount(context.Context, domain.ReauthenticateRequest) (domain.ProviderAccountResponse, error)
-	DisableProviderAccount(context.Context, domain.DisableAccountRequest) (domain.ProviderAccountResponse, error)
-	EnableProviderAccount(context.Context, domain.EnableAccountRequest) (domain.ProviderAccountResponse, error)
-	GetCapabilitySnapshot(context.Context, domain.GetCapabilitySnapshotRequest) (domain.CapabilitySnapshotResponse, error)
+	CreateProviderAccount(context.Context, CreateProviderAccountCommand) (ProviderAccountResult, error)
+	ListProviderAccounts(context.Context, ListProviderAccountsQuery) (ProviderAccountsResult, error)
+	GetProviderAccount(context.Context, GetProviderAccountQuery) (ProviderAccountResult, error)
+	DeleteProviderAccount(context.Context, DeleteProviderAccountCommand) (DeleteProviderAccountResult, error)
+	SubmitProviderCredential(context.Context, SubmitProviderCredentialCommand) (ProviderAccountResult, error)
+	StartOAuthAuthorization(context.Context, StartOAuthAuthorizationCommand) (OAuthAuthorizationResult, error)
+	GetOAuthAuthorization(context.Context, GetOAuthAuthorizationQuery) (OAuthAuthorizationResult, error)
+	ProbeProviderAccount(context.Context, ProbeProviderAccountCommand) (ProviderAccountResult, error)
+	ReauthenticateProviderAccount(context.Context, ReauthenticateProviderAccountCommand) (ProviderAccountResult, error)
+	DisableProviderAccount(context.Context, DisableProviderAccountCommand) (ProviderAccountResult, error)
+	EnableProviderAccount(context.Context, EnableProviderAccountCommand) (ProviderAccountResult, error)
+	GetCapabilitySnapshot(context.Context, GetCapabilitySnapshotQuery) (CapabilitySnapshotResult, error)
 }
 
 type RoutingPolicyGateway interface {
-	GetRoutingPolicy(context.Context, domain.GetRoutingPolicyRequest) (domain.RoutingPolicyResponse, error)
-	ReplaceRoutingPolicy(context.Context, domain.ReplaceRoutingPolicyRequest) (domain.RoutingPolicyResponse, error)
+	GetRoutingPolicy(context.Context, GetRoutingPolicyQuery) (RoutingPolicyResult, error)
+	ReplaceRoutingPolicy(context.Context, ReplaceRoutingPolicyCommand) (RoutingPolicyResult, error)
 }
 
 type JobExecutor interface {
-	ExecuteJob(context.Context, domain.JobReference) error
+	// domain.JobRef is the single durable job identity used by stores,
+	// workers, and queue-safe projections.
+	ExecuteJob(context.Context, domain.JobRef) error
 }
 
 ```
@@ -273,6 +296,12 @@ type JobExecutor interface {
 package ports
 
 // domain refers to the sibling internal/domain package.
+// SecretMaterial is non-exportable outside the Vault/Adapter stack frame.
+// Application code cannot construct, copy, or log it.
+// SafeJobReference is a queue-safe projection of domain.JobRef; it may carry
+// only Tenant/job/attempt references and fencing tokens, never secrets or
+// content bytes. JobHandler is the queue consumer adapter that loads a
+// SafeJobReference and calls application.JobExecutor.ExecuteJob.
 
 type AdapterRegistry interface {
 	ResolveChat(context.Context, domain.ProviderAccountRef) (ChatAdapter, error)
@@ -283,30 +312,44 @@ type AdapterRegistry interface {
 }
 
 type ChatAdapter interface {
-	Chat(context.Context, domain.ChatRequest) (domain.ChatOutcome, error)
-	StreamChat(context.Context, domain.ChatRequest, domain.ChatSink) error
+	Chat(context.Context, SecretMaterial, domain.ChatInvocation) (domain.ChatOutcome, error)
+	StreamChat(context.Context, SecretMaterial, domain.ChatInvocation, domain.ChatSink) error
 }
 
 type RenderAdapter interface {
-	Render(context.Context, domain.RenderRequest) (domain.RenderOutcome, error)
+	Render(context.Context, SecretMaterial, domain.RenderInvocation) (domain.RenderOutcome, error)
 }
 
 type RecoveryAdapter interface {
-	Recover(context.Context, domain.RecoveryRequest) (domain.RecoveryOutcome, error)
+	Recover(context.Context, SecretMaterial, domain.RecoveryInvocation) (domain.RecoveryOutcome, error)
 }
 
 type ProbeAdapter interface {
-	Probe(context.Context, domain.ProbeRequest) (domain.ProbeOutcome, error)
+	Probe(context.Context, SecretMaterial, domain.ProbeInvocation) (domain.ProbeOutcome, error)
 }
 
 type CapabilityAdapter interface {
-	ObserveCapabilities(context.Context, domain.CapabilityRequest) (domain.CapabilityOutcome, error)
+	ObserveCapabilities(context.Context, SecretMaterial, domain.CapabilityInvocation) (domain.CapabilityOutcome, error)
 }
 
 type CredentialVault interface {
 	Store(context.Context, StoreSecret) (domain.CredentialRef, error)
-	WithCredential(context.Context, AccessIntent, func(SecretMaterial) error) error
+	// Authorize evaluates purpose/resource/Tenant/version/state and records
+	// audit intent. It returns no plaintext.
+	Authorize(context.Context, AccessIntent) (AuthorizedCredentialUse, error)
+	// Capability-specific use methods inject SecretMaterial into the Adapter
+	// call and normalize the Adapter error before returning to application.
+	Chat(context.Context, AuthorizedCredentialUse, ChatAdapter, domain.ChatInvocation) (domain.ChatOutcome, error)
+	StreamChat(context.Context, AuthorizedCredentialUse, ChatAdapter, domain.ChatInvocation, domain.ChatSink) error
+	Render(context.Context, AuthorizedCredentialUse, RenderAdapter, domain.RenderInvocation) (domain.RenderOutcome, error)
+	Probe(context.Context, AuthorizedCredentialUse, ProbeAdapter, domain.ProbeInvocation) (domain.ProbeOutcome, error)
+	Recover(context.Context, AuthorizedCredentialUse, RecoveryAdapter, domain.RecoveryInvocation) (domain.RecoveryOutcome, error)
+	ObserveCapabilities(context.Context, AuthorizedCredentialUse, CapabilityAdapter, domain.CapabilityInvocation) (domain.CapabilityOutcome, error)
+	// Lifecycle / admin operations keep ciphertext and keys inside the Vault.
+	// Rewrap changes crypto_key_version only; it never changes credential_version.
+	Rewrap(context.Context, RewrapSecret) error
 	Revoke(context.Context, RevokeSecret) error
+	LogicalDelete(context.Context, LogicalDeleteSecret) error
 	Purge(context.Context, PurgeSecret) error
 }
 
@@ -335,8 +378,29 @@ type CapabilityStore interface {
 }
 
 type HealthStore interface {
-	ReadCondition(context.Context, domain.ProviderAccountRef, domain.HealthScope) (domain.HealthCondition, error)
-	Observe(context.Context, HealthObservation) error
+	ReadCondition(context.Context, domain.SecurityPrincipal, domain.ProviderAccountRef, domain.HealthScope) (domain.HealthCondition, error)
+	// Observe applies CAS/revision fencing. Last-write-wins is forbidden.
+	// Actor is either a Tenant principal or an explicit same-Tenant system-job context.
+	Observe(context.Context, domain.SecurityPrincipal, HealthObservation) (domain.HealthCondition, error)
+	// ClaimRecoveryPermit grants at most one half-open permit per
+	// condition_revision for account cooldown recovery.
+	ClaimRecoveryPermit(context.Context, domain.SecurityPrincipal, RecoveryPermitClaim) (RecoveryPermit, error)
+	// ResolveCondition clears only the fenced condition/revision authorized
+	// by a successful recovery permit or matching observation.
+	ResolveCondition(context.Context, domain.SecurityPrincipal, ConditionResolution) (domain.HealthCondition, error)
+}
+
+// SurfaceCircuitStore is separate from per-account HealthStore because a
+// Provider Surface Circuit is deployment/region/Provider/Auth Mode/surface
+// scoped and must not mutate every account Health State.
+type SurfaceCircuitStore interface {
+	ReadCircuit(context.Context, domain.SecurityPrincipal, domain.SurfaceCircuitRef) (domain.SurfaceCircuit, error)
+	Observe(context.Context, domain.SecurityPrincipal, SurfaceCircuitObservation) (domain.SurfaceCircuit, error)
+	// ClaimCanaryPermit grants bounded half-open canary permits per circuit
+	// revision and never increases the fixed single permit of any account
+	// cooldown condition.
+	ClaimCanaryPermit(context.Context, domain.SecurityPrincipal, CircuitCanaryClaim) (CircuitCanaryPermit, error)
+	CloseCircuit(context.Context, domain.SecurityPrincipal, CircuitClose) (domain.SurfaceCircuit, error)
 }
 
 type RoutingPolicyStore interface {
@@ -351,6 +415,35 @@ type AssetStore interface {
 	Release(context.Context, AssetReservation) error
 }
 
+// TenantConfidentialStore owns encrypted prompt/request/replay payloads.
+// It is not a metadata repository and does not store Asset or staging bytes.
+type TenantConfidentialStore interface {
+	Put(context.Context, ConfidentialPut) (domain.ConfidentialRef, error)
+	// Use retrieves and releases plaintext only inside the supplied callback
+	// for an allowlisted purpose such as prompt_execution or replay_or_recovery.
+	Use(context.Context, ConfidentialAccessIntent, func(ConfidentialMaterial) error) error
+	LogicalDelete(context.Context, ConfidentialDelete) error
+	Purge(context.Context, ConfidentialPurge) error
+}
+
+// AssetContentStore owns encrypted immutable Asset object bytes separately
+// from AssetStore metadata and reservation accounting.
+type AssetContentStore interface {
+	Put(context.Context, AssetContentPut) (domain.AssetContentRef, error)
+	Use(context.Context, AssetContentAccessIntent, func(AssetContentMaterial) error) error
+	LogicalDelete(context.Context, AssetContentDelete) error
+	Purge(context.Context, AssetContentPurge) error
+}
+
+// RenderStagingStore owns encrypted temporary result bytes and placement
+// retrieval references for #14. Permanent Asset objects do not live here.
+type RenderStagingStore interface {
+	Put(context.Context, StagingPut) (domain.StagingRef, error)
+	Use(context.Context, StagingAccessIntent, func(StagingMaterial) error) error
+	LogicalDelete(context.Context, StagingDelete) error
+	Purge(context.Context, StagingPurge) error
+}
+
 type RenderJobStore interface {
 	Create(context.Context, RenderJobCreation) (domain.RenderJob, error)
 	ClaimWorker(context.Context, domain.JobRef, WorkerLease) (WorkerClaim, error)
@@ -360,7 +453,10 @@ type RenderJobStore interface {
 }
 
 type JobRuntime interface {
-	Enqueue(context.Context, SafeJobReference) (EnqueueReceipt, error)
+	// Enqueue accepts only a SafeJobReference projection of domain.JobRef.
+	Enqueue(context.Context, domain.SafeJobReference) (EnqueueReceipt, error)
+	// Run starts the consumer loop. JobHandler loads the SafeJobReference and
+	// calls application.JobExecutor.ExecuteJob(domain.JobRef).
 	Run(context.Context, JobHandler) error
 	Close(context.Context) error
 }
@@ -445,8 +541,12 @@ type Dependencies struct {
 	Accounts ports.AccountStore
 	Capabilities ports.CapabilityStore
 	Health ports.HealthStore
+	Circuits ports.SurfaceCircuitStore
 	Routing ports.RoutingPolicyStore
 	Assets ports.AssetStore
+	AssetContent ports.AssetContentStore
+	Confidential ports.TenantConfidentialStore
+	Staging ports.RenderStagingStore
 	Jobs ports.RenderJobStore
 	Adapters ports.AdapterRegistry
 	Vault ports.CredentialVault
@@ -461,6 +561,10 @@ type Dependencies struct {
 func New(Config, Dependencies) (*Runtime, error)
 func (Runtime) Handler() http.Handler
 func (Runtime) Worker() application.JobExecutor
+// RunWorkers starts JobRuntime.Run with a JobHandler that converts each
+// SafeJobReference into domain.JobRef and calls Worker().ExecuteJob. HTTP-only
+// contract fixtures may skip this method; production cmd starts it.
+func (Runtime) RunWorkers(context.Context) error
 func (Runtime) Close(context.Context) error
 ```
 
@@ -569,8 +673,8 @@ Tradeoffs:
   transitions instead of exposing one convenient ORM model.
 - Contract fixtures need controlled fakes that count side effects, which is
   more work than unit-testing private handlers.
-- The Vault callback boundary requires careful memory lifetime and redaction
-  discipline in the implementation.
+- The Vault/Adapter injection boundary requires careful memory lifetime and
+  redaction discipline in the implementation.
 
 ## Follow-Up
 

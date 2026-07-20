@@ -48,14 +48,15 @@ Inbound application ports are typed and operation-oriented:
 
 Outbound ports are grouped by ownership and consistency boundary:
 
-- principal/admission, replay, account, capability, health, routing policy,
-  Asset, Render Job, and usage stores;
+- principal/admission (including usage/accounting reconcile), replay, account,
+  capability, health, surface circuit, routing policy, Asset metadata, Asset
+  content, Tenant-confidential content, Render staging, and Render Job stores;
 - capability-oriented Provider Adapter operations for chat, streaming,
   render, probe, capability observation, and same-attempt recovery;
-- purpose-bound Credential Vault use;
+- purpose-bound Credential Vault authorize/use/rewrap/revoke/logical-delete/purge;
 - JobRuntime enqueue/worker plumbing;
 - controllable Clock and IDGenerator;
-- AuditRecorder and TelemetryRecorder.
+- AuditRecorder, TelemetryRecorder, and RequestLogRecorder.
 
 Each port returns canonical outcomes and safe errors. No port returns a SQL
 transaction, Provider SDK value, raw queue payload, ciphertext, stack trace,
@@ -98,15 +99,18 @@ scoped health observations, stale-write rejection, and output placement by
 stable placement key. Physical tables and transactions remain an
 implementation concern.
 
-The Vault contract is purpose/resource/Tenant-bound. It offers a bounded
-authorized-use operation such as `WithCredential`, rather than treating a
-credential handle or returned `[]byte` as decrypt authority. Secret material
-must not enter response, error, log, metric, trace, audit, queue, snapshot,
-or contract-fixture projections.
+The Vault contract is purpose/resource/Tenant-bound. It authorizes decrypt,
+then injects non-exportable `SecretMaterial` into capability-specific Adapter
+methods rather than returning a general secret byte slice or treating a
+credential handle as authority. Secret material must not enter response,
+error, log, metric, trace, audit, queue, snapshot, or contract-fixture
+projections.
 
-The JobRuntime contract transports safe references and supports at-least-once
-delivery. It does not own Provider retries. The application JobExecutor uses
-the same durable attempt identity and fencing semantics after a redelivery.
+The JobRuntime contract transports only `domain.SafeJobReference` projections
+of the single durable `domain.JobRef` identity and supports at-least-once
+delivery. It does not own Provider retries. Composition exposes `RunWorkers`
+to start the consumer against the same `JobExecutor` policy used by production
+and HTTP fixtures that need durable execution.
 
 ## Data Model
 

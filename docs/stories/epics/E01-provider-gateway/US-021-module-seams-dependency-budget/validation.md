@@ -53,18 +53,37 @@ implementation story.
 
 ## Acceptance Evidence
 
-- The decision record names the seven issue boundaries plus composition and
-  contract-test packages.
-- The dependency graph has no inward edge from domain/application to transport,
-  Provider, concrete infrastructure, queue, or configuration.
-- The budget is standard-library-first with one bounded cryptography slot, one
-  optional cgo-free persistence-driver slot, and at most one direct queue/
-  runtime client outside the application when durable delivery requires it;
-  all other external groups are forbidden by default and every nonzero slot
-  requires implementation-specific rationale.
-- The test seam uses real HTTP composition and controlled ports, with explicit
-  no-private-function/no-concrete-schema/no-goroutine-layout rules.
-- The observability contract includes the canonical request-log fields and
-  keeps operational application logs separate from product/security audit
-  records.
+Recorded on 2026-07-20 against PR #41 review fixes on branch
+`agent/issue-21-pure-go-gateway-seams`:
+
+| Command | Result |
+| --- | --- |
+| `git diff --check` | pass (`exit 0`, no whitespace errors) |
+| `node scripts/validate-public-api-contract.mjs` | pass (`PASS: stable Public API contract (26 operations, 205 Draft 2020-12 examples, baseline_source=worktree:pre-release)`) |
+| `node scripts/validate-openapi-contract.mjs contracts/openapi/pixelplus-public-api-v0alpha.yaml` | pass (`EXIT=0`; OpenAPI 3.1.1 prototype validation) |
+| `node scripts/prototype-management-contract.mjs` | pass (`PASS: 140 management contract actions validated.`) |
+| `scripts/bin/harness-cli.exe story verify US-021` | pass (`Story US-021 verification: pass`) |
+| `scripts/bin/harness-cli.exe decision verify 0009-pure-go-module-seams-and-dependency-budget` | pass (`Decision ... verification: pass`) |
+
+Static review evidence after the PR #41 review fixes:
+
+- Issue #21 seven boundaries remain named; ADR also locks `application`,
+  `ports`, observability recorders (`AuditRecorder`, `TelemetryRecorder`,
+  `RequestLogRecorder`), and `contracttest`.
+- Dependency graph is now explicit: `transport -> {application, domain}`,
+  `application -> {domain, ports}`, `ports -> domain`.
+- Application owns Public API command/query/result types; adapters consume
+  `domain.*Invocation` plus Vault-injected `SecretMaterial`.
+- Vault catalogue includes `Authorize`, capability-specific use, `Rewrap`,
+  `Revoke`, `LogicalDelete`, and `Purge`.
+- Health/circuit catalogue includes principal fencing, recovery permits, and
+  `SurfaceCircuitStore`; protected content has separate stores.
+- Job identity is unified on `domain.JobRef` with `domain.SafeJobReference`
+  queue projection and `Runtime.RunWorkers`.
 - Runtime implementation and contract mutation remain out of scope.
+
+Residual proof gap: `node scripts/test-public-api-contract-validator.mjs` was
+started but hung under local process contention after spawning nested
+`validate-public-api-contract.mjs` mutation workers; it was aborted. The base
+contract validator itself still passes. Re-run the mutation suite in a clean
+process environment before treating validator-regression coverage as green.
