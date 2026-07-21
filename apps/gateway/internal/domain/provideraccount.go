@@ -236,3 +236,13 @@ func (mode AuthMode) SupportsRefresh() bool {
 		return false
 	}
 }
+
+// Prohibited reports whether the Auth Mode is outside the product risk envelope
+// and must never be offered or persisted. Per the Auth Mode risk envelope
+// (#7 sections 4 and 5.5), Grok Web SSO is the sole `prohibited` mode: the xAI
+// AUP explicitly forbids bot/script access, so a create for it fails closed
+// before any durable side effect. Gated/experimental modes are a separate
+// feature-flag + Tenant-acknowledgement concern (#7/#9) and are not gated here.
+func (mode AuthMode) Prohibited() bool {
+	return mode == AuthModeGrokWebSSO
+}

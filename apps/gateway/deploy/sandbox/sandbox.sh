@@ -122,7 +122,12 @@ cmd_probe() {
 cmd_stop() {
   require_docker
   log "stopping and removing ${NAME} (disposable; no state retained)"
-  docker rm -f "${NAME}" >/dev/null 2>&1 || true
+  # Graceful, deterministic shutdown: `docker stop` sends SIGTERM and honors the
+  # container's --stop-timeout 15 grace window so the gateway signal handlers run
+  # their ordered shutdown before removal. `docker rm -f` would send an immediate
+  # SIGKILL and skip that ordered path (#68 deterministic shutdown).
+  docker stop "${NAME}" >/dev/null 2>&1 || true
+  docker rm "${NAME}" >/dev/null 2>&1 || true
 }
 
 cmd_up() {

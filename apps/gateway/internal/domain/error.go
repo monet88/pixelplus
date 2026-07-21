@@ -33,10 +33,39 @@ const (
 	StatusRateLimit        StatusClass = "rate_limit"
 	StatusConcurrencyLimit StatusClass = "concurrency_limit"
 	StatusQuota            StatusClass = "quota"
+	StatusAccountPolicy    StatusClass = "account_policy"
 	StatusConflict         StatusClass = "conflict"
 	StatusDependency       StatusClass = "dependency"
 	StatusInternal         StatusClass = "internal"
 )
+
+// HTTPStatus maps a canonical status class to its HTTP status code. The mapping
+// is a pure value projection owned by the canonical error definition so no
+// stage re-derives it; transport still owns emitting the status to the wire and
+// the application uses it only for the request-log status_code field required by
+// ADR 0009. It never imports net/http so the domain layer stays transport-free.
+func (class StatusClass) HTTPStatus() int {
+	switch class {
+	case StatusUnauthorized:
+		return 401
+	case StatusNotFound:
+		return 404
+	case StatusForbidden:
+		return 403
+	case StatusInvalidRequest:
+		return 400
+	case StatusRequestSize:
+		return 413
+	case StatusRateLimit, StatusConcurrencyLimit, StatusQuota:
+		return 429
+	case StatusAccountPolicy, StatusConflict:
+		return 409
+	case StatusDependency:
+		return 503
+	default:
+		return 500
+	}
+}
 
 // Retryability is one stable retryability class. Values mirror the frozen
 // Public API `CanonicalError.retryability` enum.
@@ -58,15 +87,16 @@ type Remediation string
 
 // Remediation tokens used by the request spine.
 const (
-	RemediationAuthenticate      Remediation = "authenticate"
-	RemediationRequestPermission Remediation = "request_permission"
-	RemediationFixRequest        Remediation = "fix_request"
-	RemediationReducePayload     Remediation = "reduce_payload"
-	RemediationWaitAdmission     Remediation = "wait_admission"
-	RemediationRetrySameKey      Remediation = "retry_same_idempotency_key"
-	RemediationContactOperator   Remediation = "contact_operator"
-	RemediationSubmitCredential  Remediation = "submit_credential"
-	RemediationNone              Remediation = "none"
+	RemediationAuthenticate        Remediation = "authenticate"
+	RemediationRequestPermission   Remediation = "request_permission"
+	RemediationFixRequest          Remediation = "fix_request"
+	RemediationReducePayload       Remediation = "reduce_payload"
+	RemediationWaitAdmission       Remediation = "wait_admission"
+	RemediationRetrySameKey        Remediation = "retry_same_idempotency_key"
+	RemediationContactOperator     Remediation = "contact_operator"
+	RemediationSubmitCredential    Remediation = "submit_credential"
+	RemediationAuthModeUnavailable Remediation = "auth_mode_unavailable"
+	RemediationNone                Remediation = "none"
 )
 
 // FailureStage is the bounded stage where a failure was classified. Values
@@ -79,6 +109,7 @@ const (
 	StageAuthorization     FailureStage = "authorization"
 	StageAdmission         FailureStage = "admission"
 	StageRequestValidation FailureStage = "request_validation"
+	StageRouting           FailureStage = "routing"
 	StageRecovery          FailureStage = "recovery"
 	StageDependency        FailureStage = "dependency"
 	StageInternal          FailureStage = "internal"
@@ -127,6 +158,12 @@ func (canonical CanonicalError) WithRequestID(requestID Identifier) CanonicalErr
 	return canonical
 }
 
+// HTTPStatus returns the HTTP status code for this canonical error's status
+// class. It is a pure projection over StatusClass.HTTPStatus.
+func (canonical CanonicalError) HTTPStatus() int {
+	return canonical.StatusClass.HTTPStatus()
+}
+
 // ResourceReference is a same-Tenant local id projection. It is only populated
 // once ownership is established and is always omitted for foreign/unknown ids.
 type ResourceReference struct {
@@ -154,6 +191,7 @@ const (
 	ErrCodeIdempotencyConflict   ErrorCode = "idempotency_conflict"
 	ErrCodeIdempotencyInProgress ErrorCode = "idempotency_in_progress"
 	ErrCodeIdempotencyUncertain  ErrorCode = "idempotency_uncertain"
+	ErrCodeAuthModeUnavailable   ErrorCode = "auth_mode_unavailable"
 	ErrCodeDependencyUnavailable ErrorCode = "dependency_unavailable"
 	ErrCodeInternal              ErrorCode = "internal_error"
 )
@@ -313,6 +351,22 @@ func NewIdempotencyUncertain() CanonicalError {
 		Remediation:      RemediationContactOperator,
 		FailureStage:     StageRecovery,
 		IdempotencyState: IdempotencyUncertain,
+	}
+}
+
+// NewAuthModeUnavailable builds the fail-closed routing failure returned when a
+// requested Auth Mode is outside the product risk envelope. The MVP spine emits
+// it for a prohibited Auth Mode (auth-mode-risk-envelope-and-kill-criteria.md
+// §5.5: Grok Web SSO); gated/experimental gating (operator flag + Tenant
+// acknowledgement) is owned by #7/#9 and out of scope here.
+func NewAuthModeUnavailable() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeAuthModeUnavailable,
+		Category:     CategoryRouting,
+		StatusClass:  StatusAccountPolicy,
+		Retryability: RetryOperatorActionRequired,
+		Remediation:  RemediationAuthModeUnavailable,
+		FailureStage: StageRouting,
 	}
 }
 

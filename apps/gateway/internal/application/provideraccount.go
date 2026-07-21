@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"time"
+	"unicode/utf8"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
@@ -17,6 +18,11 @@ const (
 	operationGetProviderAccount    domain.OperationToken = "get_provider_account"
 	operationListProviderAccounts  domain.OperationToken = "list_provider_accounts"
 )
+
+// maxIdempotencyKeyLength mirrors the frozen OpenAPI RequiredIdempotencyKey
+// maxLength. A longer key is a request_validation failure so an oversized key
+// never enters the replay scope map.
+const maxIdempotencyKeyLength = 255
 
 // CreateProviderAccountCommand is the typed create request. PresentedKey is the
 // raw bearer material the transport extracted; the application authenticates it
@@ -71,12 +77,24 @@ type ProviderAccountsResult struct {
 	RequestID domain.Identifier
 }
 
+// spineContext bundles the per-request correlation fields that every failure
+// and success projection needs. Grouping them removes the repeated positional
+// arguments that previously threaded through fail/observeSuccess on every error
+// branch (data-clump cleanup). keyID is empty until authentication succeeds.
+type spineContext struct {
+	operation domain.OperationToken
+	requestID domain.Identifier
+	keyID     domain.ClientAPIKeyID
+	start     time.Time
+}
+
 // ProviderAccountService runs the protected Public API request spine for
 // Provider Account drafts. It owns the normative gate order: authenticate (A0),
-// scope and same-Tenant ownership on named ids (A1), then rate/concurrency/
-// quota admission (A3-A5), then replay ownership before any durable side effect
-// (#20 section 5.5). Request-size (A2) is enforced at the transport boundary
-// before this service is reached.
+// scope and same-Tenant ownership on named ids (A1), request-size (A2) and
+// request validation, then a replay ownership claim, then rate/concurrency/
+// quota admission (A3-A5) before any durable side effect (#20 section 5.5).
+// Request-size (A2) and strict decode are observed at the transport boundary
+// but carried as flags so this single normative order is enforced here.
 type ProviderAccountService struct {
 	principal  ports.PrincipalStore
 	admission  ports.AdmissionStore
@@ -140,17 +158,17 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 // CreateProviderAccount runs the full protected spine and persists exactly one
 // draft when this request wins the replay claim.
 func (service *ProviderAccountService) CreateProviderAccount(ctx context.Context, command CreateProviderAccountCommand) (ProviderAccountResult, error) {
-	start := service.clock.Now()
-	requestID := service.resolveRequestID(command.RequestID)
+	sc := spineContext{operation: operationCreateProviderAccount, requestID: service.resolveRequestID(command.RequestID), start: service.clock.Now()}
 
 	principal, canonical, ok := service.authenticate(ctx, ports.PresentedClientAPIKey{Material: command.PresentedKeyMaterial})
 	if !ok {
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, "", "", start, canonical)
+		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
+	sc.keyID = principal.ClientAPIKeyID
 
 	// A1: scope. Create requires accounts.manage.
 	if !principal.Scopes.Has(domain.ScopeAccountsManage) {
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewForbidden())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewForbidden())
 	}
 
 	// A2: request-size. An oversize body is rejected only after authentication
@@ -158,20 +176,33 @@ func (service *ProviderAccountService) CreateProviderAccount(ctx context.Context
 	// unauthenticated oversize request already failed as authentication_failed
 	// (#8 section 6).
 	if command.OversizeBody {
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewRequestTooLarge())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewRequestTooLarge())
 	}
 
 	// Request validation (post-A2): strict decode outcome, required
-	// Idempotency-Key, and enum validity. These run before any capacity
-	// reservation so a malformed authenticated create never debits admission.
+	// Idempotency-Key, key length, and enum validity. These run before any
+	// capacity reservation so a malformed authenticated create never debits
+	// admission.
 	if command.MalformedBody {
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewInvalidRequest())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
 	if command.IdempotencyKey == "" {
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewInvalidRequest())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
+	}
+	if utf8.RuneCountInString(command.IdempotencyKey) > maxIdempotencyKeyLength {
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
 	if !command.Provider.Valid() || !command.AuthMode.Valid() {
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewInvalidRequest())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
+	}
+
+	// A prohibited Auth Mode is outside the product risk envelope and must fail
+	// closed before any replay claim or durable side effect. Only grok_web_sso
+	// is prohibited in this slice (auth-mode risk spec §4/§5.5). Gated and
+	// experimental gating (operator flag + Tenant acknowledgement) is owned by
+	// #7/#9 and is out of scope here.
+	if command.AuthMode.Prohibited() {
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAuthModeUnavailable())
 	}
 
 	// Replay ownership claim BEFORE admission so a terminal/in-progress/conflict
@@ -189,24 +220,29 @@ func (service *ProviderAccountService) CreateProviderAccount(ctx context.Context
 	}
 	decision, err := service.replay.Claim(ctx, identity)
 	if err != nil {
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, service.dependencyCanonical(err))
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
 	switch decision.Outcome {
 	case ports.ReplayClaimed:
 		// Sole executor: fall through to admission then persist.
 	case ports.ReplayTerminal:
+		// A matching terminal replay returns the original draft without a new
+		// durable side effect, so it MUST NOT emit a second
+		// provider_account.created audit event. Only the safe telemetry and the
+		// single request-log line are recorded for the replayed 201.
 		account := decision.TerminalAccount
-		service.observeSuccess(ctx, ports.AuditProviderAccountCreated, operationCreateProviderAccount, requestID, principal, account.ID, 201, start)
-		return ProviderAccountResult{Account: account, RequestID: requestID}, nil
+		service.recordTelemetry(ctx, sc.operation, "", 201)
+		service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), 201, "ok", sc.start)
+		return ProviderAccountResult{Account: account, RequestID: sc.requestID}, nil
 	case ports.ReplayInProgress:
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewIdempotencyInProgress())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyInProgress())
 	case ports.ReplayConflict:
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewIdempotencyConflict())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyConflict())
 	case ports.ReplayUncertain:
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewIdempotencyUncertain())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
 	default:
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewInternalError())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInternalError())
 	}
 
 	// A3-A5: rate, concurrency, quota admission in normative order. A rejection
@@ -214,95 +250,101 @@ func (service *ProviderAccountService) CreateProviderAccount(ctx context.Context
 	reservation, canonical, ok := service.admit(ctx, principal, operationCreateProviderAccount)
 	if !ok {
 		service.abandon(ctx, identity)
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, canonical)
+		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
 
 	accountID, err := service.newAccountID()
 	if err != nil {
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewInternalError())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInternalError())
 	}
-	draft := domain.NewDraftProviderAccount(accountID, command.Provider, command.AuthMode, command.Label, domain.NewTimestamp(start))
+	draft := domain.NewDraftProviderAccount(accountID, command.Provider, command.AuthMode, command.Label, domain.NewTimestamp(sc.start))
 
 	persisted, err := service.accounts.Create(ctx, ports.AccountCreation{Principal: principal, Account: draft})
 	if err != nil {
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, service.dependencyCanonical(err))
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
 	if err := service.replay.Complete(ctx, identity, ports.ReplayResult{Account: persisted}); err != nil {
+		// The draft is already durably persisted, so the create side effect
+		// happened but its terminal replay record is uncertain. Return
+		// idempotency_uncertain (operator_action_required, no-steal) rather than
+		// a dependency error, and do NOT abandon the claim: abandoning would let
+		// a later retry create a duplicate draft for the same scoped key
+		// (#20 section 5.5). The admission reservation is still released.
 		service.release(ctx, reservation)
-		return ProviderAccountResult{}, service.fail(ctx, operationCreateProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, service.dependencyCanonical(err))
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
 	}
 
 	service.release(ctx, reservation)
-	service.observeSuccess(ctx, ports.AuditProviderAccountCreated, operationCreateProviderAccount, requestID, principal, persisted.ID, 201, start)
-	return ProviderAccountResult{Account: persisted, RequestID: requestID}, nil
+	service.observeSuccess(ctx, sc, ports.AuditProviderAccountCreated, principal, persisted.ID, 201)
+	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
 }
 
 // GetProviderAccount reads one owning-Tenant account. Foreign, unknown, and
 // deleted identifiers share the same non-enumerating resource_not_found outcome
 // before any admission or protected access (#6 section 5.1).
 func (service *ProviderAccountService) GetProviderAccount(ctx context.Context, query GetProviderAccountQuery) (ProviderAccountResult, error) {
-	start := service.clock.Now()
-	requestID := service.resolveRequestID(query.RequestID)
+	sc := spineContext{operation: operationGetProviderAccount, requestID: service.resolveRequestID(query.RequestID), start: service.clock.Now()}
 
 	principal, canonical, ok := service.authenticate(ctx, ports.PresentedClientAPIKey{Material: query.PresentedKeyMaterial})
 	if !ok {
-		return ProviderAccountResult{}, service.fail(ctx, operationGetProviderAccount, requestID, "", "", start, canonical)
+		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
+	sc.keyID = principal.ClientAPIKeyID
 
 	// A1: scope then same-Tenant ownership on the named id.
 	if !principal.Scopes.Has(domain.ScopeAccountsRead) {
-		return ProviderAccountResult{}, service.fail(ctx, operationGetProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewForbidden())
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewForbidden())
 	}
 
 	account, err := service.accounts.Visible(ctx, principal, query.AccountID)
 	if err != nil {
-		return ProviderAccountResult{}, service.fail(ctx, operationGetProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, service.visibilityCanonical(err))
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
 	}
 
 	// A3-A5: read admission after ownership is established.
 	reservation, canonical, ok := service.admit(ctx, principal, operationGetProviderAccount)
 	if !ok {
-		return ProviderAccountResult{}, service.fail(ctx, operationGetProviderAccount, requestID, principal.TenantID, principal.ClientAPIKeyID, start, canonical)
+		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
 	service.release(ctx, reservation)
 
-	service.observeSuccess(ctx, ports.AuditProviderAccountRead, operationGetProviderAccount, requestID, principal, account.ID, 200, start)
-	return ProviderAccountResult{Account: account, RequestID: requestID}, nil
+	service.observeSuccess(ctx, sc, ports.AuditProviderAccountRead, principal, account.ID, 200)
+	return ProviderAccountResult{Account: account, RequestID: sc.requestID}, nil
 }
 
 // ListProviderAccounts returns only the authenticated Tenant's accounts.
 func (service *ProviderAccountService) ListProviderAccounts(ctx context.Context, query ListProviderAccountsQuery) (ProviderAccountsResult, error) {
-	start := service.clock.Now()
-	requestID := service.resolveRequestID(query.RequestID)
+	sc := spineContext{operation: operationListProviderAccounts, requestID: service.resolveRequestID(query.RequestID), start: service.clock.Now()}
 
 	principal, canonical, ok := service.authenticate(ctx, ports.PresentedClientAPIKey{Material: query.PresentedKeyMaterial})
 	if !ok {
-		return ProviderAccountsResult{}, service.failList(ctx, operationListProviderAccounts, requestID, "", "", start, canonical)
+		return ProviderAccountsResult{}, service.fail(ctx, sc, canonical)
 	}
+	sc.keyID = principal.ClientAPIKeyID
 
 	if !principal.Scopes.Has(domain.ScopeAccountsRead) {
-		return ProviderAccountsResult{}, service.failList(ctx, operationListProviderAccounts, requestID, principal.TenantID, principal.ClientAPIKeyID, start, domain.NewForbidden())
+		return ProviderAccountsResult{}, service.fail(ctx, sc, domain.NewForbidden())
 	}
 
 	reservation, canonical, ok := service.admit(ctx, principal, operationListProviderAccounts)
 	if !ok {
-		return ProviderAccountsResult{}, service.failList(ctx, operationListProviderAccounts, requestID, principal.TenantID, principal.ClientAPIKeyID, start, canonical)
+		return ProviderAccountsResult{}, service.fail(ctx, sc, canonical)
 	}
 
 	accounts, err := service.accounts.List(ctx, principal)
 	if err != nil {
 		service.release(ctx, reservation)
-		return ProviderAccountsResult{}, service.failList(ctx, operationListProviderAccounts, requestID, principal.TenantID, principal.ClientAPIKeyID, start, service.dependencyCanonical(err))
+		return ProviderAccountsResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	service.release(ctx, reservation)
 
-	service.observeSuccess(ctx, ports.AuditProviderAccountListed, operationListProviderAccounts, requestID, principal, "", 200, start)
-	return ProviderAccountsResult{Accounts: accounts, RequestID: requestID}, nil
+	service.observeSuccess(ctx, sc, ports.AuditProviderAccountListed, principal, "", 200)
+	return ProviderAccountsResult{Accounts: accounts, RequestID: sc.requestID}, nil
 }
 
 // authenticate resolves the Security Principal. All authentication failures map
@@ -372,34 +414,32 @@ func (service *ProviderAccountService) dependencyCanonical(err error) domain.Can
 	return domain.NewInternalError()
 }
 
-// fail records safe telemetry, audit-safe request log, and returns the canonical
-// error for single-result operations.
-func (service *ProviderAccountService) fail(ctx context.Context, operation domain.OperationToken, requestID domain.Identifier, tenantID domain.TenantID, keyID domain.ClientAPIKeyID, start time.Time, canonical domain.CanonicalError) domain.CanonicalError {
-	canonical = canonical.WithRequestID(requestID)
-	statusCode := statusCodeFor(canonical.StatusClass)
-	service.recordTelemetry(ctx, operation, canonical.Code, statusCode)
-	service.recordRequestLog(ctx, requestID, keyID, string(operation), statusCode, string(canonical.Code), start)
+// fail records safe telemetry and the audit-safe request log, then returns the
+// canonical error carrying the server-owned request id. The HTTP status code is
+// projected from the canonical status class; transport owns emitting it to the
+// wire while the application uses it only for the request-log status_code field
+// required by ADR 0009.
+func (service *ProviderAccountService) fail(ctx context.Context, sc spineContext, canonical domain.CanonicalError) domain.CanonicalError {
+	canonical = canonical.WithRequestID(sc.requestID)
+	statusCode := canonical.HTTPStatus()
+	service.recordTelemetry(ctx, sc.operation, canonical.Code, statusCode)
+	service.recordRequestLog(ctx, sc.requestID, sc.keyID, string(sc.operation), statusCode, string(canonical.Code), sc.start)
 	return canonical
-}
-
-// failList mirrors fail for list results.
-func (service *ProviderAccountService) failList(ctx context.Context, operation domain.OperationToken, requestID domain.Identifier, tenantID domain.TenantID, keyID domain.ClientAPIKeyID, start time.Time, canonical domain.CanonicalError) domain.CanonicalError {
-	return service.fail(ctx, operation, requestID, tenantID, keyID, start, canonical)
 }
 
 // observeSuccess records the audit, telemetry, and request-log projections for
 // a successful operation.
-func (service *ProviderAccountService) observeSuccess(ctx context.Context, action ports.AuditAction, operation domain.OperationToken, requestID domain.Identifier, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, statusCode int, start time.Time) {
+func (service *ProviderAccountService) observeSuccess(ctx context.Context, sc spineContext, action ports.AuditAction, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, statusCode int) {
 	_ = service.audit.Record(ctx, ports.AuditEvent{
 		Action:            action,
 		TenantID:          principal.TenantID,
 		ClientAPIKeyID:    principal.ClientAPIKeyID,
 		ProviderAccountID: accountID,
-		RequestID:         requestID,
+		RequestID:         sc.requestID,
 		Outcome:           "success",
 	})
-	service.recordTelemetry(ctx, operation, "", statusCode)
-	service.recordRequestLog(ctx, requestID, principal.ClientAPIKeyID, string(operation), statusCode, "ok", start)
+	service.recordTelemetry(ctx, sc.operation, "", statusCode)
+	service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), statusCode, "ok", sc.start)
 }
 
 func (service *ProviderAccountService) recordTelemetry(ctx context.Context, operation domain.OperationToken, code domain.ErrorCode, statusCode int) {
@@ -455,34 +495,4 @@ func (service *ProviderAccountService) newAccountID() (domain.ProviderAccountID,
 // can change the durable side effect. A repeat with different inputs conflicts.
 func createFingerprint(command CreateProviderAccountCommand) domain.Fingerprint {
 	return domain.NewCreateProviderAccountFingerprint(command.Provider, command.AuthMode, command.Label)
-}
-
-// statusCodeFor maps a canonical status class to its HTTP status code. The
-// mapping is owned here so transport does not re-derive it.
-func statusCodeFor(class domain.StatusClass) int {
-	switch class {
-	case domain.StatusUnauthorized:
-		return 401
-	case domain.StatusNotFound:
-		return 404
-	case domain.StatusForbidden:
-		return 403
-	case domain.StatusInvalidRequest:
-		return 400
-	case domain.StatusRequestSize:
-		return 413
-	case domain.StatusRateLimit, domain.StatusConcurrencyLimit, domain.StatusQuota:
-		return 429
-	case domain.StatusConflict:
-		return 409
-	case domain.StatusDependency:
-		return 503
-	default:
-		return 500
-	}
-}
-
-// StatusCodeFor exposes the canonical status-class-to-HTTP mapping to transport.
-func StatusCodeFor(class domain.StatusClass) int {
-	return statusCodeFor(class)
 }

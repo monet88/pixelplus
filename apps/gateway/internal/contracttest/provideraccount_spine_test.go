@@ -3,6 +3,7 @@ package contracttest_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -383,8 +384,17 @@ func TestCreateAdmissionOrderIsNormative(t *testing.T) {
 func TestGetNonEnumerationIsIndistinguishable(t *testing.T) {
 	t.Parallel()
 
-	// Seed a tenant_b account so the "foreign" id genuinely exists elsewhere.
-	foreign := domain.NewDraftProviderAccount("pa_foreign", domain.ProviderChatGPT, domain.AuthModeChatGPTCodexOAuth, "b", domain.NewTimestamp(time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)))
+	// Seed a tenant_b account so the "foreign" id genuinely exists elsewhere,
+	// and a deleted account under the requesting tenant_a so a logically deleted
+	// own resource is as non-enumerating as a foreign or unknown id.
+	foreign := domain.NewDraftProviderAccount("pa_foreign", domain.ProviderChatGPT, domain.AuthModeChatGPTCodexOAuth, "b", domain.NewTimestamp(spineFixtureTime))
+	deleted := domain.NewDraftProviderAccount("pa_deleted", domain.ProviderChatGPT, domain.AuthModeChatGPTCodexOAuth, "gone", domain.NewTimestamp(spineFixtureTime))
+	deleted.Lifecycle = domain.LifecycleDeleted
+
+	seedNonEnumeration := func(h *spineHarness) {
+		h.accounts.seed("tenant_b", foreign)
+		h.accounts.seed("tenant_a", deleted)
+	}
 
 	cases := []struct {
 		name string
@@ -392,13 +402,12 @@ func TestGetNonEnumerationIsIndistinguishable(t *testing.T) {
 	}{
 		{name: "foreign", id: "pa_foreign"},
 		{name: "unknown", id: "pa_missing"},
+		{name: "deleted", id: "pa_deleted"},
 	}
 
 	var bodies []string
 	for _, testCase := range cases {
-		harness := newSpineHarness(t, func(h *spineHarness) {
-			h.accounts.seed("tenant_b", foreign)
-		})
+		harness := newSpineHarness(t, seedNonEnumeration)
 		response, payload := harness.do(t, requestSpec{
 			method: http.MethodGet,
 			path:   "/v1/provider-accounts/" + testCase.id,
@@ -422,8 +431,10 @@ func TestGetNonEnumerationIsIndistinguishable(t *testing.T) {
 		normalized, _ := json.Marshal(body)
 		bodies = append(bodies, string(normalized))
 	}
-	if bodies[0] != bodies[1] {
-		t.Fatalf("foreign and unknown are distinguishable:\n %s\n %s", bodies[0], bodies[1])
+	for index := 1; index < len(bodies); index++ {
+		if bodies[index] != bodies[0] {
+			t.Fatalf("non-enumeration outcomes are distinguishable:\n %s\n %s", bodies[0], bodies[index])
+		}
 	}
 }
 
@@ -571,5 +582,202 @@ func TestSafeFieldsOnlyAndSingleRequestLog(t *testing.T) {
 	}
 	if telemetry[0].Operation == "" {
 		t.Fatal("telemetry missing operation label")
+	}
+}
+
+// manageOnlyKey authenticates to tenant_a but is granted accounts.manage only,
+// so it can create but must be denied the accounts.read-scoped list/get reads.
+const manageOnlyKey = "sk-pxp_locatorM_secretM"
+
+// withManageOnlyKey adds a manage-only principal for tenant_a to the harness.
+func withManageOnlyKey(h *spineHarness) {
+	h.principal.principals[manageOnlyKey] = domain.SecurityPrincipal{
+		TenantID:       "tenant_a",
+		ClientAPIKeyID: "key_m",
+		Scopes:         domain.NewScopeSet(domain.ScopeAccountsManage),
+	}
+}
+
+// createDraft drives a create through HTTP and returns the created account body.
+func (harness *spineHarness) createDraft(t *testing.T, bearer, idemKey, body string) map[string]any {
+	t.Helper()
+	response, payload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts",
+		bearer:  bearer,
+		idemKey: idemKey,
+		body:    body,
+	})
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", response.StatusCode, payload)
+	}
+	var envelope struct {
+		Account map[string]any `json:"account"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	return envelope.Account
+}
+
+// GW-045 Product Contract: an authenticated Tenant lists only its own accounts.
+// A create then list returns the new draft, and a foreign Tenant's account never
+// appears in the requesting Tenant's list.
+func TestListReturnsOnlyOwningTenantAccounts(t *testing.T) {
+	t.Parallel()
+
+	foreign := domain.NewDraftProviderAccount("pa_foreign", domain.ProviderChatGPT, domain.AuthModeChatGPTCodexOAuth, "b", domain.NewTimestamp(spineFixtureTime))
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_b", foreign)
+	})
+
+	created := harness.createDraft(t, tenantAKey, "idem-list-1", validCreateBody)
+	createdID, _ := created["provider_account_id"].(string)
+	if createdID == "" {
+		t.Fatal("created account missing provider_account_id")
+	}
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+
+	var list struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &list); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if len(list.Data) != 1 {
+		t.Fatalf("list returned %d accounts, want exactly 1 owning-Tenant draft", len(list.Data))
+	}
+	if id := list.Data[0]["provider_account_id"]; id != createdID {
+		t.Fatalf("list account id = %v, want %q", id, createdID)
+	}
+	for _, account := range list.Data {
+		if id := account["provider_account_id"]; id == "pa_foreign" {
+			t.Fatal("list leaked a foreign Tenant's account")
+		}
+		if _, leaked := account["tenant_id"]; leaked {
+			t.Fatal("list account leaked tenant_id")
+		}
+	}
+}
+
+// GW-045 scope gate: list requires accounts.read. A key authenticated to the
+// Tenant but without accounts.read is denied with forbidden before any list read.
+func TestListRequiresReadScope(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, withManageOnlyKey)
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts",
+		bearer: manageOnlyKey,
+	})
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("list status = %d, want 403 (body=%s)", response.StatusCode, payload)
+	}
+	if body := decodeError(t, payload); body["code"] != "forbidden" {
+		t.Fatalf("code = %v, want forbidden", body["code"])
+	}
+	if calls := harness.accounts.listCalls.Load(); calls != 0 {
+		t.Fatalf("account.List ran %d times on scope denial, want 0", calls)
+	}
+}
+
+// GW-045 Product Contract: a Tenant reads back its own freshly created draft over
+// HTTP through the same composition, proving create then get is coherent.
+func TestCreateThenGetReturnsSameAccount(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, nil)
+	created := harness.createDraft(t, tenantAKey, "idem-get-1", validCreateBody)
+	createdID, _ := created["provider_account_id"].(string)
+	if createdID == "" {
+		t.Fatal("created account missing provider_account_id")
+	}
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/" + createdID,
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var account map[string]any
+	if err := json.Unmarshal(payload, &account); err != nil {
+		t.Fatalf("decode get response: %v", err)
+	}
+	if id := account["provider_account_id"]; id != createdID {
+		t.Fatalf("get account id = %v, want %q", id, createdID)
+	}
+	if state := account["lifecycle_state"]; state != "draft" {
+		t.Fatalf("lifecycle_state = %v, want draft", state)
+	}
+}
+
+// A prohibited Auth Mode (Grok Web SSO, §5.5) fails closed with
+// auth_mode_unavailable before any replay claim or durable create.
+func TestCreateProhibitedAuthModeIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, nil)
+	response, payload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts",
+		bearer:  tenantAKey,
+		idemKey: "idem-prohibited",
+		body:    `{"provider":"grok","auth_mode":"grok_web_sso","label":"x"}`,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	if body := decodeError(t, payload); body["code"] != "auth_mode_unavailable" {
+		t.Fatalf("code = %v, want auth_mode_unavailable", body["code"])
+	}
+	if calls := harness.replay.claimCalls.Load(); calls != 0 {
+		t.Fatalf("replay.Claim ran %d times on prohibited auth mode, want 0", calls)
+	}
+	if calls := harness.accounts.createCalls.Load(); calls != 0 {
+		t.Fatalf("account.Create ran %d times on prohibited auth mode, want 0", calls)
+	}
+}
+
+// When the durable draft is created but the replay Complete fails, the outcome is
+// idempotency_uncertain (commit certainty unavailable): the fresh claim is NOT
+// abandoned so a retry cannot create a second draft, and the draft that was
+// already persisted is left for operator recovery rather than duplicated.
+func TestCreateCompleteFailureIsUncertain(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.replay.completeErr = errors.New("replay complete failed")
+	})
+	response, payload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts",
+		bearer:  tenantAKey,
+		idemKey: "idem-complete-fail",
+		body:    validCreateBody,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	if body := decodeError(t, payload); body["code"] != "idempotency_uncertain" {
+		t.Fatalf("code = %v, want idempotency_uncertain", body["code"])
+	}
+	// The durable draft was created exactly once before Complete failed.
+	if calls := harness.accounts.createCalls.Load(); calls != 1 {
+		t.Fatalf("account.Create ran %d times, want exactly 1", calls)
+	}
+	// A committed side effect must never be abandoned, or a retry would duplicate.
+	if calls := harness.replay.abandonCalls.Load(); calls != 0 {
+		t.Fatalf("replay.Abandon ran %d times after a durable create, want 0", calls)
 	}
 }

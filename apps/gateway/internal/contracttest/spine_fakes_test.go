@@ -98,6 +98,7 @@ type stubReplayStore struct {
 	records       map[domain.ReplayScope]*stubReplayRecord
 	forced        ports.ReplayOutcome
 	forcedAccount domain.ProviderAccount
+	completeErr   error
 	claimCalls    atomic.Int32
 	completeCalls atomic.Int32
 	abandonCalls  atomic.Int32
@@ -135,6 +136,9 @@ func (store *stubReplayStore) Complete(_ context.Context, identity domain.Replay
 	store.log.add("replay.complete")
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.completeErr != nil {
+		return store.completeErr
+	}
 	record, ok := store.records[identity.Scope]
 	if !ok {
 		record = &stubReplayRecord{fingerprint: identity.Fingerprint}

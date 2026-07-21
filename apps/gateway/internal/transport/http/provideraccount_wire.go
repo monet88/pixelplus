@@ -184,7 +184,7 @@ func writeCanonical(writer http.ResponseWriter, canonical domain.CanonicalError)
 	if body.RequestID == "" {
 		body.RequestID = "req_unavailable"
 	}
-	writeJSON(writer, application.StatusCodeFor(canonical.StatusClass), body)
+	writeJSON(writer, canonical.HTTPStatus(), body)
 }
 
 func writeJSON(writer http.ResponseWriter, statusCode int, payload any) {
