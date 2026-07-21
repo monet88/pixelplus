@@ -1,0 +1,39 @@
+# Keep the Docker build context minimal and free of anything that is not a
+# tracked production source. Only go.mod, cmd/, and internal/ are COPYied by the
+# Dockerfile; this file is defense in depth so stray local state, secrets, or
+# test scaffolding can never enter an image layer even if the Dockerfile changes.
+
+# Tests and scaffolding are never part of the production image.
+**/*_test.go
+
+# Docs and deploy assets are not build inputs.
+README.md
+deploy/
+Dockerfile
+.dockerignore
+
+# Local runtime, secrets, and agent/code-intelligence state (belt and braces;
+# these live at the repo root, outside this module context, but are excluded
+# explicitly in case of future layout changes).
+.env
+.env.*
+secrets/
+credentials/
+auths/
+data/
+*.db
+*.db-shm
+*.db-wal
+.ref/
+.scratch/
+.codegraph/
+.codex/
+.claude/
+.agents/
+
+# Build artifacts.
+bin/
+dist/
+coverage.out
+*.test
+*.prof

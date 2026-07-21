@@ -7,6 +7,9 @@ type IdentifierKind string
 const (
 	IdentifierKindRequest IdentifierKind = "request"
 	IdentifierKindJob     IdentifierKind = "job"
+	// IdentifierKindProviderAccount namespaces server-owned Provider Account
+	// identities. The generated value is prefixed with `pa_` by the port.
+	IdentifierKindProviderAccount IdentifierKind = "pa"
 )
 
 // Identifier is a server-owned opaque identifier.

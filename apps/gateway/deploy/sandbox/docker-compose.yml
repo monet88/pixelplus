@@ -1,0 +1,74 @@
+# Disposable Docker live-probe sandbox for the Pure-Go Provider Gateway (#68).
+#
+# This is NOT the inner development loop. Direct `go run` / `go test` remain the
+# fast path. This sandbox exists only for runtime parity, isolation, and
+# authorized live-probe sessions. It starts the SAME production composition
+# entrypoint built by apps/gateway/Dockerfile (cmd/gateway from #44).
+#
+# Security envelope (all enforced below, per #68 required boundaries):
+#   - Published port bound to host loopback (127.0.0.1) only; never host network.
+#   - Non-root user, read-only root filesystem, all Linux capabilities dropped.
+#   - no-new-privileges so the process can never gain privilege via setuid.
+#   - Bounded CPU, memory, and PIDs.
+#   - No Docker socket, user home, repository-wide, or `.ref/` mount.
+#   - No Provider Credential via CLI, image layer, Compose, generic .env, or log.
+#     The only authorized credential path is Public API -> Vault -> Adapter,
+#     which does not exist in this slice, so no credential can enter here.
+
+services:
+  gateway-sandbox:
+    build:
+      # Build context is the gateway module directory ONLY. The repo root,
+      # `.ref/`, secrets/, credentials/, and auths/ are outside this context and
+      # cannot be copied into any image layer.
+      context: ../..
+      dockerfile: Dockerfile
+    image: pixelplus/gateway-sandbox:local
+    # Deterministic name so build/start/probe/stop commands are reproducible.
+    container_name: pixelplus-gateway-sandbox
+
+    # Publish to host loopback only. Host networking and privileged mode are
+    # never used. Container-internal listener is isolated in its own netns.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    # Non-secret process settings only. No credential-bearing variable exists.
+    environment:
+      PIXELPLUS_GATEWAY_ADDR: "0.0.0.0:8080"
+      PIXELPLUS_GATEWAY_STARTUP_TIMEOUT: "10s"
+      PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT: "10s"
+
+    # Run unprivileged and lock down privilege escalation.
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # A single narrowly-named ephemeral writable volume, non-executable and
+    # size-bounded, only for the process temp dir. The root filesystem stays
+    # read-only. No host path is mounted.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+
+    # Bounded resources so a runaway probe cannot exhaust the host.
+    pids_limit: 128
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 1.0
+
+    # Explicit readiness on the fail-closed /readyz probe. Deterministic
+    # shutdown is handled by the process signal handler (#44) plus stop_grace.
+    healthcheck:
+      # Uses the container's own binary indirectly is not possible (distroless
+      # has no shell); instead rely on the wrapper script's HTTP readiness poll
+      # from the host. This compose healthcheck is a best-effort TCP-free no-op
+      # placeholder documented in README; host-side probe.sh is authoritative.
+      disable: true
+
+    stop_grace_period: 15s
+    restart: "no"
+
+# Disposable by default: no named volumes, no persistence. `down` removes the
+# container and its anonymous tmpfs, leaving no state behind.

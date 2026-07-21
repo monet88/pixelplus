@@ -35,19 +35,26 @@ type statusResponse struct {
 	ObservedAt string `json:"observed_at"`
 }
 
-// NewStatusHandler returns only operational probes. Product routes are added
-// by later slices through the stable /v1 composition.
-func NewStatusHandler(clock clock, ids idGenerator, status Status) http.Handler {
+// NewHandler composes the full public HTTP surface: the operational probes and
+// the stable /v1 product routes. Composition is the only caller so the route
+// table stays owned by the transport layer while wiring stays in composition.
+func NewHandler(clock clock, ids idGenerator, status Status, gateway ProviderAccountGateway) http.Handler {
+	mux := http.NewServeMux()
+	registerStatusRoutes(mux, clock, ids, status)
+	registerProviderAccountRoutes(mux, gateway, ids)
+	return mux
+}
+
+// registerStatusRoutes attaches the unversioned operational probes. They never
+// authorize product work.
+func registerStatusRoutes(mux *http.ServeMux, clock clock, ids idGenerator, status Status) {
 	handler := statusHandler{
 		clock:  clock,
 		ids:    ids,
 		status: status,
 	}
-
-	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handler.health)
 	mux.HandleFunc("GET /readyz", handler.readiness)
-	return mux
 }
 
 func (handler statusHandler) health(writer http.ResponseWriter, _ *http.Request) {

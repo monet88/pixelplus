@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/application"
+	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/observability"
+	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/persistence"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 	httptransport "github.com/monet88/pixelplus/apps/gateway/internal/transport/http"
 )
@@ -33,6 +35,19 @@ type Dependencies struct {
 	Clock   ports.Clock
 	IDs     ports.IDGenerator
 	Logger  *slog.Logger
+
+	// Provider Account request-spine ports (#45). When a port is nil, New
+	// substitutes the production foundation implementation so the real
+	// production composition constructor is safe and fail-closed by default.
+	// Contract tests inject controlled fakes through these same fields to
+	// exercise the protected spine through real composition.
+	Principal  ports.PrincipalStore
+	Admission  ports.AdmissionStore
+	Replay     ports.ReplayStore
+	Accounts   ports.AccountStore
+	Audit      ports.AuditRecorder
+	Telemetry  ports.TelemetryRecorder
+	RequestLog ports.RequestLogRecorder
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -94,9 +109,61 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	} else {
 		runtime.ready.Store(true)
 	}
-	runtime.handler = httptransport.NewStatusHandler(dependencies.Clock, dependencies.IDs, runtime)
+
+	service, err := newProviderAccountService(dependencies)
+	if err != nil {
+		return nil, err
+	}
+	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service)
 
 	return runtime, nil
+}
+
+// newProviderAccountService wires the Provider Account request-spine service.
+// Each nil port falls back to the fail-closed/foundation production
+// implementation so the real production composition constructor is safe by
+// default; contract tests override any subset through Dependencies.
+func newProviderAccountService(dependencies Dependencies) (*application.ProviderAccountService, error) {
+	principal := dependencies.Principal
+	if principal == nil {
+		principal = persistence.NewFailClosedPrincipalStore()
+	}
+	admission := dependencies.Admission
+	if admission == nil {
+		admission = persistence.NewAlwaysAdmitStore()
+	}
+	replay := dependencies.Replay
+	if replay == nil {
+		replay = persistence.NewMemoryReplayStore()
+	}
+	accounts := dependencies.Accounts
+	if accounts == nil {
+		accounts = persistence.NewMemoryAccountStore()
+	}
+	audit := dependencies.Audit
+	if audit == nil {
+		audit = observability.NewSlogAuditRecorder(dependencies.Logger)
+	}
+	telemetry := dependencies.Telemetry
+	if telemetry == nil {
+		telemetry = observability.NewSlogTelemetryRecorder(dependencies.Logger)
+	}
+	requestLog := dependencies.RequestLog
+	if requestLog == nil {
+		requestLog = observability.NewSlogRequestLogRecorder(dependencies.Logger)
+	}
+
+	return application.NewProviderAccountService(application.ProviderAccountDependencies{
+		Principal:  principal,
+		Admission:  admission,
+		Replay:     replay,
+		Accounts:   accounts,
+		Audit:      audit,
+		Telemetry:  telemetry,
+		RequestLog: requestLog,
+		Clock:      dependencies.Clock,
+		IDs:        dependencies.IDs,
+	})
 }
 
 // Handler returns the real composed HTTP surface.
