@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,7 @@ type Dependencies struct {
 	Runtime ports.JobRuntime
 	Clock   ports.Clock
 	IDs     ports.IDGenerator
+	Logger  *slog.Logger
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -38,6 +40,7 @@ type Runtime struct {
 	handler http.Handler
 	worker  application.JobExecutor
 	jobs    ports.JobRuntime
+	logger  *slog.Logger
 
 	healthy atomic.Bool
 	ready   atomic.Bool
@@ -69,9 +72,15 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		return nil, errors.New("composition: startup timeout must be positive")
 	}
 
+	logger := dependencies.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	runtime := &Runtime{
 		worker: application.NewFoundationJobExecutor(),
 		jobs:   dependencies.Runtime,
+		logger: logger,
 		done:   make(chan struct{}),
 	}
 	runtime.healthy.Store(true)
@@ -79,7 +88,12 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancelStartup()
 
-	runtime.ready.Store(runtime.jobs.Restore(startupContext) == nil)
+	if err := runtime.jobs.Restore(startupContext); err != nil {
+		logger.Error("gateway startup recovery failed; readiness stays closed", "error", err)
+		runtime.ready.Store(false)
+	} else {
+		runtime.ready.Store(true)
+	}
 	runtime.handler = httptransport.NewStatusHandler(dependencies.Clock, dependencies.IDs, runtime)
 
 	return runtime, nil
@@ -127,9 +141,16 @@ func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 	err := runtime.jobs.Run(workerContext, func(ctx context.Context, reference ports.SafeJobReference) error {
 		job, err := reference.JobRef()
 		if err != nil {
-			return err
+			runtime.logger.Warn("discarding invalid queue reference", "error", err)
+			return nil
 		}
-		return runtime.worker.ExecuteJob(ctx, job)
+		if err := runtime.worker.ExecuteJob(ctx, job); err != nil {
+			runtime.logger.Warn("discarding failed job",
+				"tenant_id", string(job.TenantID),
+				"job_id", string(job.JobID),
+				"error", err)
+		}
+		return nil
 	})
 	cancelWorkers()
 	<-bridgeDone

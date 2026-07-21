@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -280,5 +281,105 @@ func (runtime *blockingProcessRuntime) RunWorkers(ctx context.Context) error {
 }
 
 func (*blockingProcessRuntime) Close(context.Context) error {
+	return nil
+}
+
+func TestServeListenerDrainsInFlightRequestOnShutdown(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve test address: %v", err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release test address: %v", err)
+	}
+
+	runtime := newDrainingProcessRuntime()
+	serveResult := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		serveResult <- serveListener(ctx, processConfig{
+			address:         address,
+			shutdownTimeout: 2 * time.Second,
+		}, runtime, mustListen(t, address))
+	}()
+
+	statusResult := make(chan int, 1)
+	requestErr := make(chan error, 1)
+	go func() {
+		client := &http.Client{Timeout: 3 * time.Second}
+		response, err := client.Get("http://" + address + "/healthz")
+		if err != nil {
+			requestErr <- err
+			return
+		}
+		defer response.Body.Close()
+		statusResult <- response.StatusCode
+	}()
+
+	select {
+	case <-runtime.requestStarted:
+	case err := <-requestErr:
+		t.Fatalf("request failed before start: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not start")
+	}
+
+	// Begin shutdown while the request is still in flight.
+	cancel()
+
+	select {
+	case status := <-statusResult:
+		if status != http.StatusOK {
+			t.Fatalf("in-flight request status = %d, want %d (request was canceled instead of drained)", status, http.StatusOK)
+		}
+	case err := <-requestErr:
+		t.Fatalf("in-flight request was canceled during shutdown instead of draining: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("in-flight request neither completed nor failed")
+	}
+
+	if err := <-serveResult; err != nil {
+		t.Fatalf("serveListener() error = %v", err)
+	}
+}
+
+func mustListen(t *testing.T, address string) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", address, err)
+	}
+	return listener
+}
+
+type drainingProcessRuntime struct {
+	requestStarted chan struct{}
+	startedOnce    sync.Once
+}
+
+func newDrainingProcessRuntime() *drainingProcessRuntime {
+	return &drainingProcessRuntime{
+		requestStarted: make(chan struct{}),
+	}
+}
+
+func (runtime *drainingProcessRuntime) Handler() http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		runtime.startedOnce.Do(func() {
+			close(runtime.requestStarted)
+		})
+		time.Sleep(200 * time.Millisecond)
+		writer.WriteHeader(http.StatusOK)
+	})
+}
+
+func (*drainingProcessRuntime) RunWorkers(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (*drainingProcessRuntime) Close(context.Context) error {
 	return nil
 }

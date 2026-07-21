@@ -76,8 +76,16 @@ func serve(ctx context.Context, config processConfig, runtime processRuntime) er
 }
 
 func serveListener(ctx context.Context, config processConfig, runtime processRuntime, listener net.Listener) error {
-	processContext, cancelProcess := context.WithCancel(ctx)
-	defer cancelProcess()
+	// requestContext backs in-flight HTTP requests. It is intentionally not
+	// derived from ctx so a shutdown signal does not cancel active requests
+	// before server.Shutdown drains them within the grace period.
+	requestContext, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+
+	// workerContext tracks process lifecycle and is canceled as soon as
+	// shutdown begins so background work stops promptly.
+	workerContext, cancelWorkers := context.WithCancel(ctx)
+	defer cancelWorkers()
 
 	server := &http.Server{
 		Handler:           runtime.Handler(),
@@ -86,7 +94,7 @@ func serveListener(ctx context.Context, config processConfig, runtime processRun
 		WriteTimeout:      serverWriteTimeout,
 		IdleTimeout:       serverIdleTimeout,
 		BaseContext: func(net.Listener) context.Context {
-			return processContext
+			return requestContext
 		},
 	}
 	serverErrors := make(chan error, 1)
@@ -96,12 +104,12 @@ func serveListener(ctx context.Context, config processConfig, runtime processRun
 
 	workerErrors := make(chan error, 1)
 	go func() {
-		workerErrors <- runtime.RunWorkers(processContext)
+		workerErrors <- runtime.RunWorkers(workerContext)
 	}()
 
 	var runError error
 	select {
-	case <-processContext.Done():
+	case <-workerContext.Done():
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
 			runError = fmt.Errorf("serve HTTP: %w", err)
@@ -112,7 +120,7 @@ func serveListener(ctx context.Context, config processConfig, runtime processRun
 		}
 		if errors.Is(err, composition.ErrNotReady) {
 			select {
-			case <-processContext.Done():
+			case <-workerContext.Done():
 			case err := <-serverErrors:
 				if !errors.Is(err, http.ErrServerClosed) {
 					runError = fmt.Errorf("serve HTTP: %w", err)
@@ -120,11 +128,14 @@ func serveListener(ctx context.Context, config processConfig, runtime processRun
 			}
 		}
 	}
-	cancelProcess()
+	cancelWorkers()
 
+	// Drain in-flight HTTP requests before canceling their context so
+	// well-behaved handlers can complete within the shutdown grace period.
 	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), config.shutdownTimeout)
 	shutdownError := server.Shutdown(shutdownContext)
 	cancelShutdown()
+	cancelRequests()
 
 	closeContext, cancelClose := context.WithTimeout(context.Background(), config.shutdownTimeout)
 	closeError := runtime.Close(closeContext)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -97,6 +98,91 @@ func TestRuntimeCloseRetriesOwnedResourceAfterTimeout(t *testing.T) {
 	if calls := jobs.closeCalls.Load(); calls != 2 {
 		t.Fatalf("JobRuntime.Close() calls = %d, want 2", calls)
 	}
+}
+
+func TestRunWorkersDoesNotPropagateHandlerErrors(t *testing.T) {
+	t.Parallel()
+
+	jobs := &deliveringJobRuntime{
+		references: []ports.SafeJobReference{
+			{},
+			{TenantID: domain.Identifier("tenant_1"), JobID: domain.Identifier("job_1")},
+		},
+		delivered: make(chan struct{}),
+	}
+	runtime, err := composition.New(composition.Config{}, composition.Dependencies{
+		Runtime: jobs,
+		Clock:   inertClock{},
+		IDs:     inertIDs{},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	workerResult := make(chan error, 1)
+	go func() {
+		workerResult <- runtime.RunWorkers(ctx)
+	}()
+
+	select {
+	case <-jobs.delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job references were not delivered")
+	}
+	cancel()
+
+	if err := <-workerResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunWorkers() error = %v, want context.Canceled", err)
+	}
+	if results := jobs.handlerResults(); len(results) != 2 {
+		t.Fatalf("handler invocations = %d, want 2", len(results))
+	} else {
+		for index, result := range results {
+			if result != nil {
+				t.Fatalf("handler result[%d] = %v, want nil (errors must not reach the runtime loop)", index, result)
+			}
+		}
+	}
+}
+
+type deliveringJobRuntime struct {
+	references []ports.SafeJobReference
+	delivered  chan struct{}
+
+	mu      sync.Mutex
+	results []error
+}
+
+func (*deliveringJobRuntime) Restore(context.Context) error {
+	return nil
+}
+
+func (*deliveringJobRuntime) Enqueue(_ context.Context, reference ports.SafeJobReference) (ports.EnqueueReceipt, error) {
+	return ports.EnqueueReceipt{Reference: reference}, nil
+}
+
+func (runtime *deliveringJobRuntime) Run(ctx context.Context, handler ports.JobHandler) error {
+	for _, reference := range runtime.references {
+		result := handler(ctx, reference)
+		runtime.mu.Lock()
+		runtime.results = append(runtime.results, result)
+		runtime.mu.Unlock()
+	}
+	close(runtime.delivered)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (*deliveringJobRuntime) Close(context.Context) error {
+	return nil
+}
+
+func (runtime *deliveringJobRuntime) handlerResults() []error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return append([]error(nil), runtime.results...)
 }
 
 type inertClock struct{}
