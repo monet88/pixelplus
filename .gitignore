@@ -26,6 +26,7 @@ dist/
 coverage.out
 *.test
 *.prof
+*.exe
 
 # Node/UXP artifacts
 node_modules/
