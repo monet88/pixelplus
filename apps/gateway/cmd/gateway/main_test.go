@@ -204,3 +204,81 @@ func (runtime *failingProcessRuntime) RunWorkers(ctx context.Context) error {
 func (*failingProcessRuntime) Close(context.Context) error {
 	return nil
 }
+
+func TestServeListenerCancelsWorkersWhenServerFails(t *testing.T) {
+	serverError := errors.New("listener failed")
+	release := make(chan struct{})
+	listener := &erroringListener{release: release, acceptError: serverError}
+	runtime := newBlockingProcessRuntime()
+
+	serveResult := make(chan error, 1)
+	go func() {
+		serveResult <- serveListener(context.Background(), processConfig{
+			shutdownTimeout: time.Second,
+		}, runtime, listener)
+	}()
+
+	close(release)
+
+	select {
+	case <-runtime.workersCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("workers were not canceled after server failure")
+	}
+
+	if err := <-serveResult; !errors.Is(err, serverError) {
+		t.Fatalf("serveListener() error = %v, want server failure", err)
+	}
+}
+
+type erroringListener struct {
+	release     chan struct{}
+	acceptError error
+}
+
+func (listener *erroringListener) Accept() (net.Conn, error) {
+	<-listener.release
+	return nil, listener.acceptError
+}
+
+func (*erroringListener) Close() error {
+	return nil
+}
+
+func (*erroringListener) Addr() net.Addr {
+	return fakeAddr{}
+}
+
+type fakeAddr struct{}
+
+func (fakeAddr) Network() string {
+	return "tcp"
+}
+
+func (fakeAddr) String() string {
+	return "127.0.0.1:0"
+}
+
+type blockingProcessRuntime struct {
+	workersCanceled chan struct{}
+}
+
+func newBlockingProcessRuntime() *blockingProcessRuntime {
+	return &blockingProcessRuntime{
+		workersCanceled: make(chan struct{}),
+	}
+}
+
+func (*blockingProcessRuntime) Handler() http.Handler {
+	return http.NewServeMux()
+}
+
+func (runtime *blockingProcessRuntime) RunWorkers(ctx context.Context) error {
+	<-ctx.Done()
+	close(runtime.workersCanceled)
+	return ctx.Err()
+}
+
+func (*blockingProcessRuntime) Close(context.Context) error {
+	return nil
+}

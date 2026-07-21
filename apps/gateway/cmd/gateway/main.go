@@ -21,6 +21,13 @@ const (
 	defaultShutdownTimeout = 10 * time.Second
 )
 
+const (
+	serverReadHeaderTimeout = 5 * time.Second
+	serverReadTimeout       = 10 * time.Second
+	serverWriteTimeout      = 10 * time.Second
+	serverIdleTimeout       = 60 * time.Second
+)
+
 type processConfig struct {
 	address         string
 	startupTimeout  time.Duration
@@ -59,19 +66,25 @@ type processRuntime interface {
 }
 
 func serve(ctx context.Context, config processConfig, runtime processRuntime) error {
-	processContext, cancelProcess := context.WithCancel(ctx)
-	defer cancelProcess()
-
 	listener, err := net.Listen("tcp", config.address)
 	if err != nil {
 		closeContext, cancelClose := context.WithTimeout(context.Background(), config.shutdownTimeout)
 		defer cancelClose()
 		return errors.Join(fmt.Errorf("listen on %s: %w", config.address, err), runtime.Close(closeContext))
 	}
+	return serveListener(ctx, config, runtime, listener)
+}
+
+func serveListener(ctx context.Context, config processConfig, runtime processRuntime, listener net.Listener) error {
+	processContext, cancelProcess := context.WithCancel(ctx)
+	defer cancelProcess()
 
 	server := &http.Server{
 		Handler:           runtime.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
 		BaseContext: func(net.Listener) context.Context {
 			return processContext
 		},
