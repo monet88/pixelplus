@@ -21,6 +21,17 @@ var fixtureStartTime = time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)
 type Options struct {
 	RecoveryError       error
 	JobRuntimeCloseGate <-chan struct{}
+
+	// Provider Account request-spine ports (#45). A nil port keeps the
+	// production foundation implementation composition substitutes by default;
+	// a controlled fake proves the protected spine through real composition.
+	Principal  ports.PrincipalStore
+	Admission  ports.AdmissionStore
+	Replay     ports.ReplayStore
+	Accounts   ports.AccountStore
+	Audit      ports.AuditRecorder
+	Telemetry  ports.TelemetryRecorder
+	RequestLog ports.RequestLogRecorder
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -44,6 +55,14 @@ func NewFixture(options Options) (*Fixture, error) {
 		Runtime: jobs,
 		Clock:   &controlledClock{next: fixtureStartTime},
 		IDs:     &controlledIDs{},
+
+		Principal:  options.Principal,
+		Admission:  options.Admission,
+		Replay:     options.Replay,
+		Accounts:   options.Accounts,
+		Audit:      options.Audit,
+		Telemetry:  options.Telemetry,
+		RequestLog: options.RequestLog,
 	})
 	if err != nil {
 		return nil, err
