@@ -84,7 +84,23 @@ proof is the container build plus `sandbox.sh smoke`.
 - `git diff --check` passed.
 - `go -C apps/gateway build ./cmd/gateway` builds the same production entrypoint
   the image uses.
-- BLOCKED: `docker build` and `sandbox.sh smoke` were not executed because the
-  Docker daemon is unavailable in this environment (Docker Desktop paused;
-  `docker info` did not respond). The image and hardened profile are complete
-  and ready to build/run where a Docker daemon is reachable.
+- `go -C apps/gateway test -race ./...` passed (composition + contract suites,
+  race detector clean).
+- `docker build` via `sandbox.sh` succeeded on Docker Desktop 4.79.0
+  (engine 29.5.3): reproducible multi-stage build from the module context,
+  final image `pixelplus/gateway-sandbox:local` (3.45MB content, distroless
+  static:nonroot).
+- `sandbox.sh start` + `docker inspect` confirmed the full security envelope on
+  the live container: `User=65532:65532`, `ReadOnlyRootfs=true`,
+  `CapDrop=[ALL]`, `Privileged=false`, `SecurityOpt=[no-new-privileges]`,
+  `PortBindings=8080/tcp -> 127.0.0.1:8080` (loopback only), `PidsLimit=128`,
+  `Memory=256m`, `MemorySwap=256m`, `NanoCpus=1e9`, single
+  `Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=16m`, and `Mounts=[]` / `Binds=<nil>`
+  (no docker socket, home, `.ref/`, or repo bind).
+- `sandbox.sh probe` smoke passed: `/healthz` and `/readyz` answered and
+  `POST /v1/provider-accounts` returned `401 authentication_failed` from the
+  fail-closed foundation principal store, proving the spine is wired with no
+  Provider secret. Container config carried no credential-bearing env var and
+  logs projected an empty `user_id` with no secret material.
+- `sandbox.sh stop` (docker stop -> rm) tore down deterministically; no
+  container or state remained (disposable).
