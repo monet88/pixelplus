@@ -38,10 +38,11 @@ type statusResponse struct {
 // NewHandler composes the full public HTTP surface: the operational probes and
 // the stable /v1 product routes. Composition is the only caller so the route
 // table stays owned by the transport layer while wiring stays in composition.
-func NewHandler(clock clock, ids idGenerator, status Status, gateway ProviderAccountGateway) http.Handler {
+func NewHandler(clock clock, ids idGenerator, status Status, gateway ProviderAccountGateway, assets AssetGateway) http.Handler {
 	mux := http.NewServeMux()
 	registerStatusRoutes(mux, clock, ids, status)
 	registerProviderAccountRoutes(mux, gateway, ids)
+	registerAssetRoutes(mux, assets, ids)
 	return mux
 }
 

@@ -33,6 +33,14 @@ type Options struct {
 	Telemetry  ports.TelemetryRecorder
 	RequestLog ports.RequestLogRecorder
 
+	// Asset exchange request-spine ports (#53). A nil port keeps the production
+	// foundation implementation composition substitutes by default; a controlled
+	// fake proves the protected Asset spine through real composition.
+	AssetReplay   ports.AssetReplayStore
+	AssetMetadata ports.AssetMetadataStore
+	AssetContent  ports.AssetContentStore
+	AssetAudit    ports.AssetAuditRecorder
+
 	// Provider Credential Vault and Probe Adapter ports (#46). A nil port keeps
 	// the production fail-closed foundation composition substitutes by default; a
 	// controlled fake proves the credential-submit and probe spines through real
@@ -70,6 +78,11 @@ func NewFixture(options Options) (*Fixture, error) {
 		Audit:      options.Audit,
 		Telemetry:  options.Telemetry,
 		RequestLog: options.RequestLog,
+
+		AssetReplay:   options.AssetReplay,
+		AssetMetadata: options.AssetMetadata,
+		AssetContent:  options.AssetContent,
+		AssetAudit:    options.AssetAudit,
 
 		Vault: options.Vault,
 		Probe: options.Probe,

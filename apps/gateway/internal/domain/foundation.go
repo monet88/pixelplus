@@ -10,6 +10,10 @@ const (
 	// IdentifierKindProviderAccount namespaces server-owned Provider Account
 	// identities. The generated value is prefixed with `pa_` by the port.
 	IdentifierKindProviderAccount IdentifierKind = "pa"
+	// IdentifierKindAsset namespaces server-owned Asset identities. The
+	// generated value is prefixed with `asset_` by the port so the wire id
+	// matches the frozen Public API example shape.
+	IdentifierKindAsset IdentifierKind = "asset"
 )
 
 // Identifier is a server-owned opaque identifier.

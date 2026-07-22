@@ -35,8 +35,12 @@ const (
 	StatusQuota            StatusClass = "quota"
 	StatusAccountPolicy    StatusClass = "account_policy"
 	StatusConflict         StatusClass = "conflict"
-	StatusDependency       StatusClass = "dependency"
-	StatusInternal         StatusClass = "internal"
+	// StatusCapacity is the durable Tenant storage-cap outcome. It is distinct
+	// from the per-request request_size class and the admission quota class so a
+	// storage-cap rejection is never relabeled as either (#13 I-ASSET-SIZE-DISTINCT).
+	StatusCapacity   StatusClass = "capacity"
+	StatusDependency StatusClass = "dependency"
+	StatusInternal   StatusClass = "internal"
 )
 
 // HTTPStatus maps a canonical status class to its HTTP status code. The mapping
@@ -60,6 +64,8 @@ func (class StatusClass) HTTPStatus() int {
 		return 429
 	case StatusAccountPolicy, StatusConflict:
 		return 409
+	case StatusCapacity:
+		return 507
 	case StatusDependency:
 		return 503
 	default:
@@ -111,7 +117,10 @@ const (
 	// when a Provider Account is not usable for the requested operation
 	// (frozen ErrorAccountNotUsable example).
 	RemediationAccountRemediation Remediation = "account_remediation"
-	RemediationNone               Remediation = "none"
+	// RemediationDeleteAssetsOrWaitExpiry is the storage-cap remediation: the
+	// Tenant deletes Assets or waits for expiry to reclaim headroom (#13 section 6.1).
+	RemediationDeleteAssetsOrWaitExpiry Remediation = "delete_assets_or_wait_expiry"
+	RemediationNone                     Remediation = "none"
 )
 
 // FailureStage is the bounded stage where a failure was classified. Values
@@ -125,9 +134,12 @@ const (
 	StageAdmission         FailureStage = "admission"
 	StageRequestValidation FailureStage = "request_validation"
 	StageRouting           FailureStage = "routing"
-	StageRecovery          FailureStage = "recovery"
-	StageDependency        FailureStage = "dependency"
-	StageInternal          FailureStage = "internal"
+	// StageAsset classifies a failure raised during Asset validation or storage
+	// lifecycle (#13). It mirrors the frozen CanonicalError.failure_stage enum.
+	StageAsset      FailureStage = "asset"
+	StageRecovery   FailureStage = "recovery"
+	StageDependency FailureStage = "dependency"
+	StageInternal   FailureStage = "internal"
 )
 
 // IdempotencyState is the bounded replay state. Values mirror the frozen
@@ -210,6 +222,14 @@ const (
 	ErrCodeAccountNotUsable      ErrorCode = "account_not_usable"
 	ErrCodeDependencyUnavailable ErrorCode = "dependency_unavailable"
 	ErrCodeInternal              ErrorCode = "internal_error"
+	// Asset validation and storage-cap codes (#13 sections 4.4, 6). Each is a
+	// distinct canonical outcome so raw-byte size (request_too_large),
+	// content validation, and durable storage cap are never relabeled as one
+	// another (I-ASSET-SIZE-DISTINCT).
+	ErrCodeUnsupportedFormat  ErrorCode = "unsupported_format"
+	ErrCodeInvalidImage       ErrorCode = "invalid_image"
+	ErrCodeInvalidDimensions  ErrorCode = "invalid_dimensions"
+	ErrCodeStorageCapExceeded ErrorCode = "storage_cap_exceeded"
 )
 
 // Error satisfies the error interface so a CanonicalError can flow through Go
@@ -431,5 +451,63 @@ func NewInternalError() CanonicalError {
 		Retryability: RetryNotRetryable,
 		Remediation:  RemediationNone,
 		FailureStage: StageInternal,
+	}
+}
+
+// NewUnsupportedFormat builds the canonical outcome for an Asset upload whose
+// declared media type is outside the supported canonical set (#13 section 4.1).
+func NewUnsupportedFormat() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeUnsupportedFormat,
+		Category:     CategoryValidation,
+		StatusClass:  StatusInvalidRequest,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationFixRequest,
+		FailureStage: StageAsset,
+	}
+}
+
+// NewInvalidImage builds the canonical outcome for an Asset upload that cannot
+// be decoded as a valid image of its declared type, including a declared type
+// that does not match the actual content (smuggling defense, #13 section 4.1).
+func NewInvalidImage() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeInvalidImage,
+		Category:     CategoryValidation,
+		StatusClass:  StatusInvalidRequest,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationFixRequest,
+		FailureStage: StageAsset,
+	}
+}
+
+// NewInvalidDimensions builds the canonical outcome for an Asset whose pixel
+// dimensions fall outside the canonical bounds. It is distinct from a raw-byte
+// size violation: a small file can still be dimensionally out of range (#13
+// section 4.2).
+func NewInvalidDimensions() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeInvalidDimensions,
+		Category:     CategoryValidation,
+		StatusClass:  StatusInvalidRequest,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationFixRequest,
+		FailureStage: StageAsset,
+	}
+}
+
+// NewStorageCapExceeded builds the durable Tenant storage-cap outcome. It is
+// distinct from the per-request request_too_large (413) and admission
+// quota_exhausted (429): a Tenant can be under both yet over its committed +
+// reserved storage cap. Remediation is to delete Assets or wait for expiry
+// (#13 section 6, I-ASSET-STORAGE-CAP, I-ASSET-SIZE-DISTINCT).
+func NewStorageCapExceeded() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeStorageCapExceeded,
+		Category:     CategoryAdmission,
+		StatusClass:  StatusCapacity,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationDeleteAssetsOrWaitExpiry,
+		FailureStage: StageAsset,
 	}
 }
