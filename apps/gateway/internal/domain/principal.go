@@ -15,6 +15,11 @@ type Scope string
 const (
 	ScopeAccountsRead   Scope = "accounts.read"
 	ScopeAccountsManage Scope = "accounts.manage"
+	// Asset scopes (#8 section 5.2, consumed by the Asset exchange spine).
+	// Read/list/download/reference require assets.read; upload/delete require
+	// assets.write.
+	ScopeAssetsRead  Scope = "assets.read"
+	ScopeAssetsWrite Scope = "assets.write"
 )
 
 // ScopeSet is the set of operation ids granted to a Security Principal.

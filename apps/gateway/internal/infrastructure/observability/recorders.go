@@ -95,3 +95,35 @@ var (
 	_ ports.TelemetryRecorder  = (*SlogTelemetryRecorder)(nil)
 	_ ports.RequestLogRecorder = (*SlogRequestLogRecorder)(nil)
 )
+
+// SlogAssetAuditRecorder emits the secret-free Asset product/security audit
+// projection to the structured logger. It records only safe actor, Tenant,
+// resource, and outcome fields; no Asset bytes, prompt, credential, or foreign
+// id can reach it because the port type carries none (#13 section 8.5,
+// I-ASSET-REDACT).
+type SlogAssetAuditRecorder struct {
+	logger *slog.Logger
+}
+
+// NewSlogAssetAuditRecorder builds an Asset audit recorder over the given logger.
+func NewSlogAssetAuditRecorder(logger *slog.Logger) *SlogAssetAuditRecorder {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &SlogAssetAuditRecorder{logger: logger}
+}
+
+// Record writes one safe Asset audit event.
+func (recorder *SlogAssetAuditRecorder) Record(_ context.Context, event ports.AssetAuditEvent) error {
+	recorder.logger.Info("gateway.audit",
+		"action", string(event.Action),
+		"tenant_id", string(event.TenantID),
+		"client_api_key_id", string(event.ClientAPIKeyID),
+		"asset_id", string(event.AssetID),
+		"request_id", string(event.RequestID),
+		"outcome", event.Outcome,
+	)
+	return nil
+}
+
+var _ ports.AssetAuditRecorder = (*SlogAssetAuditRecorder)(nil)

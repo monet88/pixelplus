@@ -1,5 +1,7 @@
 package domain
 
+import "strconv"
+
 // ReplayScope is the scope that isolates an idempotency record. It binds a
 // record to exactly one Tenant and Client API Key so a replayed key from
 // another Tenant can never reach this record (#6 A7, #20 section 5.2).
@@ -54,4 +56,19 @@ func NewSubmitCredentialFingerprint(accountID ProviderAccountID, class Credentia
 	return Fingerprint("submit_provider_credential" + separator +
 		string(accountID) + separator +
 		string(class))
+}
+
+// NewCreateAssetFingerprint builds a stable fingerprint over the upload inputs
+// that determine the durable side effect: the operation identity, Asset kind,
+// content checksum, and byte size. The same scoped idempotency key with any of
+// these changed produces a different fingerprint and therefore an idempotency
+// conflict rather than a replay (#20 section 5.2). The value is a bounded,
+// non-secret projection; the upload command carries no secret input and the
+// checksum is an explicitly non-secret content digest (#13 section 3.1).
+func NewCreateAssetFingerprint(kind AssetKind, checksum string, byteSize int64) Fingerprint {
+	const separator = "\x1f"
+	return Fingerprint("create_asset" + separator +
+		string(kind) + separator +
+		checksum + separator +
+		strconv.FormatInt(byteSize, 10))
 }

@@ -56,6 +56,16 @@ type Dependencies struct {
 	// Provider probe adapter land; contract tests inject controlled fakes.
 	Vault ports.CredentialVault
 	Probe ports.ProbeAdapter
+
+	// Asset exchange request-spine ports (#53). When a port is nil, New
+	// substitutes the production foundation implementation so the real
+	// production composition constructor is safe and fail-closed by default.
+	// Contract tests inject controlled fakes through these same fields to
+	// exercise the protected Asset spine through real composition.
+	AssetReplay   ports.AssetReplayStore
+	AssetMetadata ports.AssetMetadataStore
+	AssetContent  ports.AssetContentStore
+	AssetAudit    ports.AssetAuditRecorder
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -122,7 +132,12 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service)
+
+	assetService, err := newAssetService(dependencies)
+	if err != nil {
+		return nil, err
+	}
+	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService)
 
 	return runtime, nil
 }
@@ -177,6 +192,61 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 		Accounts:   accounts,
 		Vault:      vault,
 		Probe:      probe,
+		Audit:      audit,
+		Telemetry:  telemetry,
+		RequestLog: requestLog,
+		Clock:      dependencies.Clock,
+		IDs:        dependencies.IDs,
+	})
+}
+
+// newAssetService wires the immutable Asset exchange request-spine service.
+// It reuses the same Principal, Admission, Telemetry, and RequestLog
+// foundations as the Provider Account slice and adds the Asset-owned replay,
+// metadata, content, and audit foundations. Each nil port falls back to the
+// fail-closed/foundation production implementation so the real production
+// composition constructor is safe by default; contract tests override any
+// subset through Dependencies.
+func newAssetService(dependencies Dependencies) (*application.AssetService, error) {
+	principal := dependencies.Principal
+	if principal == nil {
+		principal = persistence.NewFailClosedPrincipalStore()
+	}
+	admission := dependencies.Admission
+	if admission == nil {
+		admission = persistence.NewAlwaysAdmitStore()
+	}
+	replay := dependencies.AssetReplay
+	if replay == nil {
+		replay = persistence.NewMemoryAssetReplayStore()
+	}
+	metadata := dependencies.AssetMetadata
+	if metadata == nil {
+		metadata = persistence.NewMemoryAssetMetadataStore(dependencies.Clock)
+	}
+	content := dependencies.AssetContent
+	if content == nil {
+		content = persistence.NewMemoryAssetContentStore()
+	}
+	audit := dependencies.AssetAudit
+	if audit == nil {
+		audit = observability.NewSlogAssetAuditRecorder(dependencies.Logger)
+	}
+	telemetry := dependencies.Telemetry
+	if telemetry == nil {
+		telemetry = observability.NewSlogTelemetryRecorder(dependencies.Logger)
+	}
+	requestLog := dependencies.RequestLog
+	if requestLog == nil {
+		requestLog = observability.NewSlogRequestLogRecorder(dependencies.Logger)
+	}
+
+	return application.NewAssetService(application.AssetDependencies{
+		Principal:  principal,
+		Admission:  admission,
+		Replay:     replay,
+		Metadata:   metadata,
+		Content:    content,
 		Audit:      audit,
 		Telemetry:  telemetry,
 		RequestLog: requestLog,
