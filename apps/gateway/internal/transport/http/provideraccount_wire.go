@@ -187,6 +187,13 @@ func writeCanonical(writer http.ResponseWriter, canonical domain.CanonicalError)
 	writeJSON(writer, canonical.HTTPStatus(), body)
 }
 
+// writeNoContent emits a 204 with no body for the delete operation. The frozen
+// deleteProviderAccount 204 response carries no schema, so no JSON is written.
+func writeNoContent(writer http.ResponseWriter) {
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.WriteHeader(http.StatusNoContent)
+}
+
 func writeJSON(writer http.ResponseWriter, statusCode int, payload any) {
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("Content-Type", "application/json")
