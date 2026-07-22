@@ -32,6 +32,11 @@ func (*FailClosedCredentialVault) Validate(context.Context, ports.CredentialVali
 	return ports.CredentialValidationResult{}, ports.ErrDependencyUnavailable
 }
 
+// Revoke fails closed because no credential store is configured.
+func (*FailClosedCredentialVault) Revoke(context.Context, ports.CredentialValidation) error {
+	return ports.ErrDependencyUnavailable
+}
+
 // FailClosedProbeAdapter is the production foundation Probe Adapter. No real
 // Provider probe surface is wired yet, so every probe fails closed with
 // ErrDependencyUnavailable. It never reports Authenticated=false (which would

@@ -273,7 +273,7 @@ func (service *ProviderAccountService) GetOAuthAuthorization(ctx context.Context
 				return OAuthAuthorizationResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
 			}
 			switch {
-			case latest.Credential.Version > 0:
+			case latest.Credential.Version > 0 && polled.Authorization.Purpose == domain.OAuthPurposeConnect:
 				if latest.ActiveOAuthAuthorizationID == polled.Authorization.ID {
 					cleared := latest.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
 					if _, err := service.accounts.Update(ctx, ports.AccountUpdate{
@@ -285,7 +285,34 @@ func (service *ProviderAccountService) GetOAuthAuthorization(ctx context.Context
 					}
 				}
 			case polled.ExchangedMaterial != "":
-				nextVersion := latest.Credential.Version + 1
+				var pending domain.ProviderAccount
+				nextVersion := latest.PendingCredentialVersion
+				if polled.Authorization.Purpose == domain.OAuthPurposeReauthenticate && nextVersion == 0 {
+					// Fence the allocated version before handing material to the Vault.
+					// A retry after Vault success can then reuse this exact pending
+					// version instead of allocating another one.
+					pending = latest.WithReplacementCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
+					var stageErr error
+					pending, stageErr = service.accounts.Update(ctx, ports.AccountUpdate{
+						Principal:          principal,
+						Account:            pending,
+						RequireOAuthMarker: polled.Authorization.ID,
+					})
+					if stageErr != nil {
+						if errors.Is(stageErr, ports.ErrAccountUpdateConflict) {
+							return OAuthAuthorizationResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+						}
+						return OAuthAuthorizationResult{}, service.fail(ctx, sc, service.dependencyCanonical(stageErr))
+					}
+					latest = pending
+					nextVersion = pending.PendingCredentialVersion
+				}
+				if nextVersion == 0 {
+					nextVersion = latest.Credential.LastAllocatedVersion + 1
+					if nextVersion <= latest.Credential.Version {
+						nextVersion = latest.Credential.Version + 1
+					}
+				}
 				if err := service.vault.Put(ctx, ports.CredentialIntake{
 					Principal: principal,
 					AccountID: latest.ID,
@@ -294,16 +321,39 @@ func (service *ProviderAccountService) GetOAuthAuthorization(ctx context.Context
 					Version:   nextVersion,
 					Material:  polled.ExchangedMaterial,
 				}); err != nil {
+					if polled.Authorization.Purpose == domain.OAuthPurposeReauthenticate && latest.PendingCredentialVersion > 0 {
+						restored := latest.WithPendingCredentialRejected(domain.NewTimestamp(sc.start)).WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+						_, _ = service.accounts.Update(ctx, ports.AccountUpdate{
+							Principal:             principal,
+							Account:               restored,
+							RequireOAuthMarker:    polled.Authorization.ID,
+							RequirePendingVersion: latest.PendingCredentialVersion,
+						})
+					}
 					return OAuthAuthorizationResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 				}
 				// Consume material immediately; never retain on the result projection.
 				polled.ExchangedMaterial = ""
-				submitted := latest.WithSubmittedCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
-				submitted = submitted.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+				var submitted domain.ProviderAccount
+				if polled.Authorization.Purpose == domain.OAuthPurposeReauthenticate {
+					if latest.PendingCredentialVersion == 0 {
+						return OAuthAuthorizationResult{}, service.fail(ctx, sc, domain.NewInternalError())
+					}
+					submitted = latest.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+				} else {
+					submitted = latest.WithSubmittedCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
+					submitted = submitted.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+				}
 				if _, err := service.accounts.Update(ctx, ports.AccountUpdate{
 					Principal:          principal,
 					Account:            submitted,
 					RequireOAuthMarker: polled.Authorization.ID,
+					RequirePendingVersion: func() int {
+						if polled.Authorization.Purpose == domain.OAuthPurposeReauthenticate {
+							return nextVersion
+						}
+						return 0
+					}(),
 				}); err != nil {
 					if errors.Is(err, ports.ErrAccountUpdateConflict) {
 						// Another poll already settled this journey.
@@ -334,7 +384,7 @@ func (service *ProviderAccountService) GetOAuthAuthorization(ctx context.Context
 				// Failed first connect restores pure draft and keeps version zero.
 				restored = account.WithOAuthConnectFailed(domain.NewTimestamp(sc.start))
 			} else {
-				restored = account.WithCredentialRejected(domain.NewTimestamp(sc.start)).WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+				restored = account.WithOAuthReauthenticationFailed(domain.NewTimestamp(sc.start))
 			}
 			if _, err := service.accounts.Update(ctx, ports.AccountUpdate{
 				Principal:          principal,
@@ -376,6 +426,9 @@ func (service *ProviderAccountService) oauthStartSoftGate(account domain.Provide
 	}
 	if !account.AuthMode.SupportsServerOwnedOAuth() {
 		return domain.NewInvalidRequest(), false
+	}
+	if account.PendingCredentialVersion > 0 {
+		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
 	}
 	if !account.Lifecycle.AcceptsOAuthStart(purpose) {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false

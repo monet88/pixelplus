@@ -180,6 +180,9 @@ func (store *MemoryAccountStore) Update(_ context.Context, update ports.AccountU
 	if update.RequireDraftLifecycle && existing.Lifecycle != domain.LifecycleDraft {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
+	if update.RequirePendingVersion > 0 && existing.PendingCredentialVersion != update.RequirePendingVersion {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
 }

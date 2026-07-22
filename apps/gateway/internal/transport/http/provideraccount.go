@@ -25,6 +25,7 @@ type ProviderAccountGateway interface {
 	GetProviderAccount(context.Context, application.GetProviderAccountQuery) (application.ProviderAccountResult, error)
 	ListProviderAccounts(context.Context, application.ListProviderAccountsQuery) (application.ProviderAccountsResult, error)
 	SubmitProviderCredential(context.Context, application.SubmitProviderCredentialCommand) (application.ProviderAccountResult, error)
+	ReauthenticateProviderAccount(context.Context, application.SubmitProviderCredentialCommand) (application.ProviderAccountResult, error)
 	ProbeProviderAccount(context.Context, application.ProbeProviderAccountCommand) (application.ProviderAccountResult, error)
 	StartOAuthAuthorization(context.Context, application.StartOAuthAuthorizationCommand) (application.OAuthAuthorizationResult, error)
 	GetOAuthAuthorization(context.Context, application.GetOAuthAuthorizationQuery) (application.OAuthAuthorizationResult, error)
@@ -45,6 +46,7 @@ func registerProviderAccountRoutes(mux *http.ServeMux, gateway ProviderAccountGa
 	mux.HandleFunc("GET /v1/provider-accounts", handler.list)
 	mux.HandleFunc("GET /v1/provider-accounts/{provider_account_id}", handler.get)
 	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/credentials", handler.submitCredential)
+	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/reauthentication", handler.reauthenticate)
 	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/probe", handler.probe)
 	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/oauth-authorizations", handler.startOAuth)
 	mux.HandleFunc("GET /v1/provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}", handler.getOAuth)
@@ -124,6 +126,14 @@ type credentialSubmissionRequest struct {
 }
 
 func (handler providerAccountHandler) submitCredential(writer http.ResponseWriter, request *http.Request) {
+	handler.submitCredentialFor(writer, request, false)
+}
+
+func (handler providerAccountHandler) reauthenticate(writer http.ResponseWriter, request *http.Request) {
+	handler.submitCredentialFor(writer, request, true)
+}
+
+func (handler providerAccountHandler) submitCredentialFor(writer http.ResponseWriter, request *http.Request, replacement bool) {
 	requestID := handler.newRequestID()
 	presented, _ := bearerMaterial(request)
 	accountID := request.PathValue("provider_account_id")
@@ -154,7 +164,13 @@ func (handler providerAccountHandler) submitCredential(writer http.ResponseWrite
 		MalformedBody:        malformed,
 	}
 
-	result, err := handler.gateway.SubmitProviderCredential(request.Context(), command)
+	var result application.ProviderAccountResult
+	var err error
+	if replacement {
+		result, err = handler.gateway.ReauthenticateProviderAccount(request.Context(), command)
+	} else {
+		result, err = handler.gateway.SubmitProviderCredential(request.Context(), command)
+	}
 	if err != nil {
 		writeGatewayError(writer, err)
 		return

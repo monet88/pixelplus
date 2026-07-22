@@ -28,6 +28,15 @@ type SubmitProviderCredentialCommand struct {
 	RequestID            domain.Identifier
 	OversizeBody         bool
 	MalformedBody        bool
+	Replacement          bool
+}
+
+// ReauthenticateProviderAccount stages direct replacement material through the
+// same protected credential path while selecting the stable reauthentication
+// operation identity and pending-version semantics.
+func (service *ProviderAccountService) ReauthenticateProviderAccount(ctx context.Context, command SubmitProviderCredentialCommand) (ProviderAccountResult, error) {
+	command.Replacement = true
+	return service.submitCredential(ctx, command)
 }
 
 // ProbeProviderAccountCommand is the typed controlled probe request. The probe
@@ -53,7 +62,16 @@ type ProbeProviderAccountCommand struct {
 // Gateway state, logs, audit, or any response (connection lifecycle spec §4.4,
 // §9; credential vault spec §3.3).
 func (service *ProviderAccountService) SubmitProviderCredential(ctx context.Context, command SubmitProviderCredentialCommand) (ProviderAccountResult, error) {
-	sc := spineContext{operation: operationSubmitProviderCredential, requestID: service.resolveRequestID(command.RequestID), start: service.clock.Now()}
+	command.Replacement = false
+	return service.submitCredential(ctx, command)
+}
+
+func (service *ProviderAccountService) submitCredential(ctx context.Context, command SubmitProviderCredentialCommand) (ProviderAccountResult, error) {
+	operation := operationSubmitProviderCredential
+	if command.Replacement {
+		operation = operationReauthenticateProviderAccount
+	}
+	sc := spineContext{operation: operation, requestID: service.resolveRequestID(command.RequestID), start: service.clock.Now()}
 
 	principal, canonical, ok := service.authenticate(ctx, ports.PresentedClientAPIKey{Material: command.PresentedKeyMaterial})
 	if !ok {
@@ -103,7 +121,7 @@ func (service *ProviderAccountService) SubmitProviderCredential(ctx context.Cont
 	// that does not match the Auth Mode all reject with account_not_usable BEFORE
 	// any Vault use (connection lifecycle spec §4.2, §4.4, §5.2; risk envelope
 	// §5.5, §6.1).
-	if canonical, ok := service.submissionGate(account, command.CredentialClass); !ok {
+	if canonical, ok := service.submissionGate(account, command.CredentialClass, command.Replacement); !ok {
 		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
 
@@ -117,7 +135,7 @@ func (service *ProviderAccountService) SubmitProviderCredential(ctx context.Cont
 			ClientAPIKeyID: principal.ClientAPIKeyID,
 			Key:            command.IdempotencyKey,
 		},
-		Fingerprint: domain.NewSubmitCredentialFingerprint(account.ID, command.CredentialClass),
+		Fingerprint: domain.NewSubmitCredentialFingerprint(account.ID, command.CredentialClass, command.Replacement),
 	}
 	decision, err := service.replay.Claim(ctx, identity)
 	if err != nil {
@@ -143,7 +161,7 @@ func (service *ProviderAccountService) SubmitProviderCredential(ctx context.Cont
 
 	// A3-A5: admission after the fresh claim. A rejection abandons the claim so
 	// this request stored nothing and debited nothing durable.
-	reservation, canonical, ok := service.admit(ctx, principal, operationSubmitProviderCredential)
+	reservation, canonical, ok := service.admit(ctx, principal, operation)
 	if !ok {
 		service.abandon(ctx, identity)
 		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
@@ -163,17 +181,46 @@ func (service *ProviderAccountService) SubmitProviderCredential(ctx context.Cont
 		service.abandon(ctx, identity)
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationCompleteOAuth))
 	}
-	if !latest.Lifecycle.AcceptsCredentialSubmission() {
+	if !command.Replacement && !latest.Lifecycle.AcceptsCredentialSubmission() {
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationAccountRemediation))
 	}
 	account = latest
+	var replacementMarker domain.OAuthAuthorizationID
+	if command.Replacement {
+		id, idErr := service.newOAuthAuthorizationID()
+		if idErr != nil {
+			service.release(ctx, reservation)
+			service.abandon(ctx, identity)
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInternalError())
+		}
+		replacementMarker = id
+		claimed := latest.WithOAuthJourneyStarted(replacementMarker, domain.NewTimestamp(sc.start))
+		if claimed.PendingCredentialVersion == 0 {
+			claimed = claimed.WithReplacementCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
+		}
+		if _, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: claimed, RequireEmptyOAuthMarker: true}); err != nil {
+			service.release(ctx, reservation)
+			service.abandon(ctx, identity)
+			if errors.Is(err, ports.ErrAccountUpdateConflict) {
+				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationCompleteOAuth))
+			}
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		}
+		account = claimed
+	}
 
 	// Store the material through the Vault under the next credential version.
 	// The application forwards the secret without inspecting or retaining it and
 	// receives nothing secret back.
-	nextVersion := account.Credential.Version + 1
+	nextVersion := account.PendingCredentialVersion
+	if nextVersion == 0 {
+		nextVersion = account.Credential.LastAllocatedVersion + 1
+		if nextVersion <= account.Credential.Version {
+			nextVersion = account.Credential.Version + 1
+		}
+	}
 	intake := ports.CredentialIntake{
 		Principal: principal,
 		AccountID: account.ID,
@@ -183,18 +230,71 @@ func (service *ProviderAccountService) SubmitProviderCredential(ctx context.Cont
 		Material:  command.Material,
 	}
 	if err := service.vault.Put(ctx, intake); err != nil {
+		if replacementMarker != "" {
+			// Fence was claimed before Vault storage. Restore must succeed before
+			// the idempotency claim can be abandoned; otherwise a same-key or
+			// new-key retry can race an incomplete replacement fence.
+			restored := account.WithPendingCredentialRejected(domain.NewTimestamp(service.clock.Now())).WithOAuthJourneyCleared(domain.NewTimestamp(service.clock.Now()))
+			if _, restoreErr := service.accounts.Update(ctx, ports.AccountUpdate{
+				Principal:             principal,
+				Account:               restored,
+				RequireOAuthMarker:    replacementMarker,
+				RequirePendingVersion: account.PendingCredentialVersion,
+			}); restoreErr != nil {
+				service.release(ctx, reservation)
+				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
+			}
+		}
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
-	submitted := account.WithSubmittedCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
+	var submitted domain.ProviderAccount
+	if command.Replacement {
+		if account.PendingCredentialVersion == 0 {
+			service.release(ctx, reservation)
+			service.abandon(ctx, identity)
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInternalError())
+		}
+		submitted = account.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+	} else {
+		submitted = account.WithSubmittedCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
+		submitted = submitted.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+	}
 	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
 		Principal:               principal,
 		Account:                 submitted,
-		RequireEmptyOAuthMarker: true,
+		RequireEmptyOAuthMarker: replacementMarker == "",
+		RequireOAuthMarker:      replacementMarker,
+		RequirePendingVersion:   account.PendingCredentialVersion,
 	})
 	if err != nil {
+		if replacementMarker != "" {
+			// Vault already accepted the material. Revoke the staged version and
+			// restore the origin before abandoning replay; otherwise a fresh
+			// request could overwrite the same version with different material.
+			revokeErr := service.vault.Revoke(ctx, ports.CredentialValidation{
+				Principal: principal,
+				AccountID: account.ID,
+				AuthMode:  account.AuthMode,
+				Version:   account.PendingCredentialVersion,
+			})
+			if revokeErr != nil {
+				service.release(ctx, reservation)
+				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
+			}
+			restored := account.WithPendingCredentialRejected(domain.NewTimestamp(service.clock.Now())).WithOAuthJourneyCleared(domain.NewTimestamp(service.clock.Now()))
+			if _, restoreErr := service.accounts.Update(ctx, ports.AccountUpdate{
+				Principal:             principal,
+				Account:               restored,
+				RequireOAuthMarker:    replacementMarker,
+				RequirePendingVersion: account.PendingCredentialVersion,
+			}); restoreErr != nil {
+				service.release(ctx, reservation)
+				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
+			}
+		}
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
 		if errors.Is(err, ports.ErrAccountUpdateConflict) {
@@ -272,16 +372,23 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 	// never spends probe budget. A validation failure moves the account to
 	// reauth_required and returns without calling the Adapter (validation failure
 	// prevents probe: connection lifecycle spec §4.5, §4.6).
+	probeVersion := account.Credential.Version
+	if account.PendingCredentialVersion > 0 {
+		probeVersion = account.PendingCredentialVersion
+	}
 	validation, err := service.vault.Validate(ctx, ports.CredentialValidation{
 		Principal: principal,
 		AccountID: account.ID,
 		AuthMode:  account.AuthMode,
-		Version:   account.Credential.Version,
+		Version:   probeVersion,
 	})
 	if err != nil {
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	if !validation.Valid {
+		if account.PendingCredentialVersion > 0 {
+			return service.pendingProbeRejected(ctx, sc, principal, account)
+		}
 		return service.probeRejected(ctx, sc, principal, account)
 	}
 	validated := account.WithValidatedCredential(domain.NewTimestamp(sc.start))
@@ -294,7 +401,7 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		Principal: principal,
 		AccountID: validated.ID,
 		AuthMode:  validated.AuthMode,
-		Version:   validated.Credential.Version,
+		Version:   probeVersion,
 		Scope:     command.Scope,
 	})
 	if err != nil {
@@ -304,23 +411,46 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	if !outcome.Authenticated {
+		if account.PendingCredentialVersion > 0 {
+			return service.pendingProbeRejected(ctx, sc, principal, validated)
+		}
 		return service.probeRejected(ctx, sc, principal, validated)
 	}
 
 	// Mint the credential-version-bound Capability Snapshot before activation so
 	// an active account never authorizes work without published evidence for this
 	// version (capability semantics section 9; I-CAP-VERSION-BIND).
-	if err := service.mintCapabilitySnapshot(ctx, principal, validated); err != nil {
+	evidence := validated
+	evidence.Credential.Version = probeVersion
+	if err := service.mintCapabilitySnapshot(ctx, principal, evidence); err != nil {
 		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: validated})
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
 	// Validation + probe succeeded for the current version and every gate passed:
 	// this is the only transition into `active` in this slice.
-	activated := validated.WithProbeActivated(domain.NewTimestamp(sc.start))
-	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: activated})
+	var activated domain.ProviderAccount
+	var priorVersion int
+	if account.PendingCredentialVersion > 0 {
+		priorVersion = account.Credential.Version
+		activated = validated.WithReplacementProbeActivated(domain.NewTimestamp(sc.start))
+	} else {
+		activated = validated.WithProbeActivated(domain.NewTimestamp(sc.start))
+	}
+	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
+		Principal:             principal,
+		Account:               activated,
+		RequirePendingVersion: account.PendingCredentialVersion,
+	})
 	if err != nil {
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	if priorVersion > 0 {
+		// Cutover is already public (credential.version advanced, origin lifecycle
+		// restored). A revoke failure leaves decryptable prior material longer than
+		// dual-version prefers, but must not surface as a client error that invites
+		// a second full reauth; reconcile is idempotent (ADR 0011 residue tradeoff).
+		_ = service.vault.Revoke(ctx, ports.CredentialValidation{Principal: principal, AccountID: persisted.ID, AuthMode: persisted.AuthMode, Version: priorVersion})
 	}
 	service.observeSuccess(ctx, sc, ports.AuditProviderAccountActivated, principal, persisted.ID, 200)
 	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
@@ -340,14 +470,42 @@ func (service *ProviderAccountService) probeRejected(ctx context.Context, sc spi
 	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
 }
 
+func (service *ProviderAccountService) pendingProbeRejected(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, account domain.ProviderAccount) (ProviderAccountResult, error) {
+	pendingVersion := account.PendingCredentialVersion
+	// Persist the fence first so a concurrent reauth cannot re-Put under a version
+	// the product already considers failed. Vault revoke is then best-effort and
+	// idempotent cleanup of ciphertext that is no longer advertised as pending.
+	rejected := account.WithPendingCredentialRejected(domain.NewTimestamp(sc.start)).WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: rejected, RequirePendingVersion: pendingVersion})
+	if err != nil {
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	_ = service.vault.Revoke(ctx, ports.CredentialValidation{Principal: principal, AccountID: account.ID, AuthMode: account.AuthMode, Version: pendingVersion})
+	service.observeSuccess(ctx, sc, ports.AuditProviderAccountProbed, principal, persisted.ID, 200)
+	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
+}
+
 // submissionGate applies the shared connection usability gates for a direct
 // credential submission. It returns the canonical failure and false when the
 // account cannot accept the submission, always before any Vault use.
-func (service *ProviderAccountService) submissionGate(account domain.ProviderAccount, class domain.CredentialClass) (domain.CanonicalError, bool) {
+func (service *ProviderAccountService) submissionGate(account domain.ProviderAccount, class domain.CredentialClass, replacement bool) (domain.CanonicalError, bool) {
 	if canonical, ok := service.authModeGate(account); !ok {
 		return canonical, false
 	}
-	if !account.Lifecycle.AcceptsCredentialSubmission() {
+	if replacement {
+		// Any in-flight pending version owns the single-flight replacement window
+		// (same as oauthStartSoftGate). A fresh reauth must never re-Put under an
+		// already-allocated pending version; recovery uses the same idempotency
+		// claim only.
+		if account.PendingCredentialVersion > 0 {
+			return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+		}
+		switch account.Lifecycle {
+		case domain.LifecycleActive, domain.LifecycleDisabled, domain.LifecycleReauthRequired, domain.LifecycleRevoked:
+		default:
+			return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+		}
+	} else if !account.Lifecycle.AcceptsCredentialSubmission() {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
 	}
 	// A server-owned OAuth journey already in flight owns the replacement window.
@@ -371,7 +529,13 @@ func (service *ProviderAccountService) probeGate(account domain.ProviderAccount)
 	if canonical, ok := service.authModeGate(account); !ok {
 		return canonical, false
 	}
-	if !account.Lifecycle.AcceptsProbe() {
+	// A replacement marker means Vault may not yet hold the pending version (or
+	// a write is in flight). Fail closed before Validate/Probe so a concurrent
+	// probe cannot revoke/restore mid-stage and leave a stuck fence.
+	if account.ActiveOAuthAuthorizationID != "" {
+		return domain.NewAccountNotUsable(domain.RemediationCompleteOAuth), false
+	}
+	if !account.Lifecycle.AcceptsProbe() && account.PendingCredentialVersion == 0 {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
 	}
 	// A probe proves a stored credential; an account that never stored one

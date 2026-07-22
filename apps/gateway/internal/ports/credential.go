@@ -57,6 +57,9 @@ type CredentialValidationResult struct {
 type CredentialVault interface {
 	Put(context.Context, CredentialIntake) error
 	Validate(context.Context, CredentialValidation) (CredentialValidationResult, error)
+	// Revoke makes a credential version unavailable for new decrypts. Revoke is
+	// idempotent so recovery can safely repeat after a failed cutover.
+	Revoke(context.Context, CredentialValidation) error
 }
 
 // ProbeCommand authorizes a controlled, cost-minimal, auth-proving probe of a

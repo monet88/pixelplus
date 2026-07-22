@@ -289,6 +289,9 @@ func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpd
 	if update.RequireDraftLifecycle && existing.Lifecycle != domain.LifecycleDraft {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
+	if update.RequirePendingVersion > 0 && existing.PendingCredentialVersion != update.RequirePendingVersion {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
 }
@@ -369,6 +372,7 @@ type stubCredentialVault struct {
 	// recovery re-hands of the same version are idempotent and do not count as
 	// a second durable put.
 	versions map[domain.ProviderAccountID]int
+	revoked  map[domain.ProviderAccountID]map[int]bool
 }
 
 func newStubCredentialVault(log *spineLog) *stubCredentialVault {
@@ -376,6 +380,7 @@ func newStubCredentialVault(log *spineLog) *stubCredentialVault {
 		log:         log,
 		validResult: ports.CredentialValidationResult{Valid: true},
 		versions:    make(map[domain.ProviderAccountID]int),
+		revoked:     make(map[domain.ProviderAccountID]map[int]bool),
 	}
 }
 
@@ -405,6 +410,28 @@ func (vault *stubCredentialVault) Validate(_ context.Context, _ ports.Credential
 		return ports.CredentialValidationResult{}, vault.validateErr
 	}
 	return vault.validResult, nil
+}
+
+func (vault *stubCredentialVault) Revoke(_ context.Context, validation ports.CredentialValidation) error {
+	vault.log.add("vault.revoke")
+	if vault.validateErr != nil {
+		return vault.validateErr
+	}
+	vault.mu.Lock()
+	defer vault.mu.Unlock()
+	versions := vault.revoked[validation.AccountID]
+	if versions == nil {
+		versions = make(map[int]bool)
+		vault.revoked[validation.AccountID] = versions
+	}
+	versions[validation.Version] = true
+	return nil
+}
+
+func (vault *stubCredentialVault) wasRevoked(accountID domain.ProviderAccountID, version int) bool {
+	vault.mu.Lock()
+	defer vault.mu.Unlock()
+	return vault.revoked[accountID][version]
 }
 
 func (vault *stubCredentialVault) intake() ports.CredentialIntake {
