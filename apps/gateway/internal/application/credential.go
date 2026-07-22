@@ -307,6 +307,14 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		return service.probeRejected(ctx, sc, principal, validated)
 	}
 
+	// Mint the credential-version-bound Capability Snapshot before activation so
+	// an active account never authorizes work without published evidence for this
+	// version (capability semantics section 9; I-CAP-VERSION-BIND).
+	if err := service.mintCapabilitySnapshot(ctx, principal, validated); err != nil {
+		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: validated})
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+
 	// Validation + probe succeeded for the current version and every gate passed:
 	// this is the only transition into `active` in this slice.
 	activated := validated.WithProbeActivated(domain.NewTimestamp(sc.start))

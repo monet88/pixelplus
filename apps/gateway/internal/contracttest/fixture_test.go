@@ -133,13 +133,16 @@ func TestFixtureDoesNotExposeProductOperationsThroughReadiness(t *testing.T) {
 
 	getStatus(t, fixture, "/readyz", http.StatusOK)
 
+	// The models route is now a real product surface (#50). Readiness never
+	// authorizes it: an unauthenticated call still fails closed as 401 rather
+	// than being treated as an operational probe.
 	response, err := fixture.Client().Get(fixture.URL() + "/v1/models")
 	if err != nil {
 		t.Fatalf("GET /v1/models error = %v", err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusNotFound {
-		t.Fatalf("GET /v1/models status = %d, want %d", response.StatusCode, http.StatusNotFound)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET /v1/models status = %d, want %d", response.StatusCode, http.StatusUnauthorized)
 	}
 }
 

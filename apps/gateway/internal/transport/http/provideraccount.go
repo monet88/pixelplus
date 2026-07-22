@@ -28,6 +28,8 @@ type ProviderAccountGateway interface {
 	ProbeProviderAccount(context.Context, application.ProbeProviderAccountCommand) (application.ProviderAccountResult, error)
 	StartOAuthAuthorization(context.Context, application.StartOAuthAuthorizationCommand) (application.OAuthAuthorizationResult, error)
 	GetOAuthAuthorization(context.Context, application.GetOAuthAuthorizationQuery) (application.OAuthAuthorizationResult, error)
+	GetCapabilitySnapshot(context.Context, application.GetCapabilitySnapshotQuery) (application.CapabilitySnapshotResult, error)
+	ListModels(context.Context, application.ListModelsQuery) (application.ModelListResult, error)
 }
 
 type providerAccountHandler struct {

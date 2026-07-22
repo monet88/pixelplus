@@ -61,6 +61,12 @@ type Dependencies struct {
 	// until a Provider OAuth surface lands; contract tests inject controlled fakes.
 	OAuth ports.OAuthExchangeAdapter
 
+	// Capability Snapshot ports (#50). A nil port keeps the fail-closed
+	// foundation implementation composition substitutes by default so production
+	// never invents model evidence; contract tests inject controlled fakes.
+	Capabilities ports.CapabilityStore
+	Capability   ports.CapabilityAdapter
+
 	// Asset exchange request-spine ports (#53). When a port is nil, New
 	// substitutes the production foundation implementation so the real
 	// production composition constructor is safe and fail-closed by default.
@@ -141,7 +147,7 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService)
+	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service)
 
 	return runtime, nil
 }
@@ -192,20 +198,30 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 	if oauth == nil {
 		oauth = vaultpkg.NewFailClosedOAuthExchangeAdapter()
 	}
+	capabilities := dependencies.Capabilities
+	if capabilities == nil {
+		capabilities = vaultpkg.NewFailClosedCapabilityStore()
+	}
+	capability := dependencies.Capability
+	if capability == nil {
+		capability = vaultpkg.NewFailClosedCapabilityAdapter()
+	}
 
 	return application.NewProviderAccountService(application.ProviderAccountDependencies{
-		Principal:  principal,
-		Admission:  admission,
-		Replay:     replay,
-		Accounts:   accounts,
-		Vault:      vault,
-		Probe:      probe,
-		OAuth:      oauth,
-		Audit:      audit,
-		Telemetry:  telemetry,
-		RequestLog: requestLog,
-		Clock:      dependencies.Clock,
-		IDs:        dependencies.IDs,
+		Principal:    principal,
+		Admission:    admission,
+		Replay:       replay,
+		Accounts:     accounts,
+		Vault:        vault,
+		Probe:        probe,
+		OAuth:        oauth,
+		Capabilities: capabilities,
+		Capability:   capability,
+		Audit:        audit,
+		Telemetry:    telemetry,
+		RequestLog:   requestLog,
+		Clock:        dependencies.Clock,
+		IDs:          dependencies.IDs,
 	})
 }
 

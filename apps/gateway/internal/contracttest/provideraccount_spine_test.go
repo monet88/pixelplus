@@ -23,18 +23,20 @@ var spineFixtureTime = time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)
 // spineHarness bundles the controlled ports so a test can assert side-effect
 // counts and ordering after driving the real composed HTTP surface.
 type spineHarness struct {
-	fixture   *contracttest.Fixture
-	log       *spineLog
-	principal *stubPrincipalStore
-	admission *stubAdmissionStore
-	replay    *stubReplayStore
-	accounts  *stubAccountStore
-	audit     *captureAudit
-	telemetry *captureTelemetry
-	reqLog    *captureRequestLog
-	vault     *stubCredentialVault
-	probe     *stubProbeAdapter
-	oauth     *stubOAuthExchangeAdapter
+	fixture      *contracttest.Fixture
+	log          *spineLog
+	principal    *stubPrincipalStore
+	admission    *stubAdmissionStore
+	replay       *stubReplayStore
+	accounts     *stubAccountStore
+	audit        *captureAudit
+	telemetry    *captureTelemetry
+	reqLog       *captureRequestLog
+	vault        *stubCredentialVault
+	probe        *stubProbeAdapter
+	oauth        *stubOAuthExchangeAdapter
+	capabilities *stubCapabilityStore
+	capability   *stubCapabilityAdapter
 }
 
 const (
@@ -57,7 +59,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 			tenantAKey: {
 				TenantID:       "tenant_a",
 				ClientAPIKeyID: "key_a",
-				Scopes:         domain.NewScopeSet(domain.ScopeAccountsRead, domain.ScopeAccountsManage),
+				Scopes:         domain.NewScopeSet(domain.ScopeAccountsRead, domain.ScopeAccountsManage, domain.ScopeCapabilitiesRead),
 			},
 			readOnly: {
 				TenantID:       "tenant_a",
@@ -67,38 +69,42 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 			tenantBKey: {
 				TenantID:       "tenant_b",
 				ClientAPIKeyID: "key_b",
-				Scopes:         domain.NewScopeSet(domain.ScopeAccountsRead, domain.ScopeAccountsManage),
+				Scopes:         domain.NewScopeSet(domain.ScopeAccountsRead, domain.ScopeAccountsManage, domain.ScopeCapabilitiesRead),
 			},
 		},
 	}
 	harness := &spineHarness{
-		log:       log,
-		principal: principal,
-		admission: &stubAdmissionStore{log: log},
-		replay:    newStubReplayStore(log),
-		accounts:  newStubAccountStore(log),
-		audit:     &captureAudit{},
-		telemetry: &captureTelemetry{},
-		reqLog:    &captureRequestLog{},
-		vault:     newStubCredentialVault(log),
-		probe:     newStubProbeAdapter(log),
-		oauth:     newStubOAuthExchangeAdapter(log),
+		log:          log,
+		principal:    principal,
+		admission:    &stubAdmissionStore{log: log},
+		replay:       newStubReplayStore(log),
+		accounts:     newStubAccountStore(log),
+		audit:        &captureAudit{},
+		telemetry:    &captureTelemetry{},
+		reqLog:       &captureRequestLog{},
+		vault:        newStubCredentialVault(log),
+		probe:        newStubProbeAdapter(log),
+		oauth:        newStubOAuthExchangeAdapter(log),
+		capabilities: newStubCapabilityStore(log),
+		capability:   newStubCapabilityAdapter(log),
 	}
 	if configure != nil {
 		configure(harness)
 	}
 
 	fixture, err := contracttest.NewFixture(contracttest.Options{
-		Principal:  harness.principal,
-		Admission:  harness.admission,
-		Replay:     harness.replay,
-		Accounts:   harness.accounts,
-		Audit:      harness.audit,
-		Telemetry:  harness.telemetry,
-		RequestLog: harness.reqLog,
-		Vault:      harness.vault,
-		Probe:      harness.probe,
-		OAuth:      harness.oauth,
+		Principal:    harness.principal,
+		Admission:    harness.admission,
+		Replay:       harness.replay,
+		Accounts:     harness.accounts,
+		Audit:        harness.audit,
+		Telemetry:    harness.telemetry,
+		RequestLog:   harness.reqLog,
+		Vault:        harness.vault,
+		Probe:        harness.probe,
+		OAuth:        harness.oauth,
+		Capabilities: harness.capabilities,
+		Capability:   harness.capability,
 	})
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)

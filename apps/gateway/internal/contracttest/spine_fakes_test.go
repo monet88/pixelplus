@@ -437,6 +437,147 @@ func (adapter *stubProbeAdapter) Probe(_ context.Context, _ ports.ProbeCommand) 
 	return adapter.outcome, nil
 }
 
+// stubCapabilityStore is a controlled Tenant-partitioned Capability Snapshot
+// store. Tests seed snapshots and assert put/get counts to prove minting and
+// non-disclosure of foreign Tenant evidence.
+type stubCapabilityStore struct {
+	log       *spineLog
+	mu        sync.Mutex
+	byTenant  map[domain.TenantID]map[domain.ProviderAccountID]domain.CapabilitySnapshot
+	getCalls  atomic.Int32
+	listCalls atomic.Int32
+	putCalls  atomic.Int32
+	putErr    error
+}
+
+func newStubCapabilityStore(log *spineLog) *stubCapabilityStore {
+	return &stubCapabilityStore{log: log, byTenant: make(map[domain.TenantID]map[domain.ProviderAccountID]domain.CapabilitySnapshot)}
+}
+
+func (store *stubCapabilityStore) seed(tenant domain.TenantID, snapshot domain.CapabilitySnapshot) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	accounts, ok := store.byTenant[tenant]
+	if !ok {
+		accounts = make(map[domain.ProviderAccountID]domain.CapabilitySnapshot)
+		store.byTenant[tenant] = accounts
+	}
+	accounts[snapshot.ProviderAccountID] = snapshot
+}
+
+func (store *stubCapabilityStore) Get(_ context.Context, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID) (domain.CapabilitySnapshot, error) {
+	store.getCalls.Add(1)
+	store.log.add("capability.get")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	accounts, ok := store.byTenant[principal.TenantID]
+	if !ok {
+		return domain.CapabilitySnapshot{}, ports.ErrCapabilitySnapshotNotFound
+	}
+	snapshot, ok := accounts[accountID]
+	if !ok {
+		return domain.CapabilitySnapshot{}, ports.ErrCapabilitySnapshotNotFound
+	}
+	return snapshot, nil
+}
+
+func (store *stubCapabilityStore) List(_ context.Context, principal domain.SecurityPrincipal) ([]domain.CapabilitySnapshot, error) {
+	store.listCalls.Add(1)
+	store.log.add("capability.list")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	accounts := store.byTenant[principal.TenantID]
+	result := make([]domain.CapabilitySnapshot, 0, len(accounts))
+	for _, snapshot := range accounts {
+		result = append(result, snapshot)
+	}
+	return result, nil
+}
+
+func (store *stubCapabilityStore) Put(_ context.Context, principal domain.SecurityPrincipal, snapshot domain.CapabilitySnapshot) error {
+	store.putCalls.Add(1)
+	store.log.add("capability.put")
+	if store.putErr != nil {
+		return store.putErr
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	accounts, ok := store.byTenant[principal.TenantID]
+	if !ok {
+		accounts = make(map[domain.ProviderAccountID]domain.CapabilitySnapshot)
+		store.byTenant[principal.TenantID] = accounts
+	}
+	accounts[snapshot.ProviderAccountID] = snapshot
+	return nil
+}
+
+// stubCapabilityAdapter returns a configurable observation used to mint
+// snapshots after a successful probe.
+type stubCapabilityAdapter struct {
+	log         *spineLog
+	observation ports.CapabilityObservation
+	observeErr  error
+	callCount   atomic.Int32
+}
+
+func newStubCapabilityAdapter(log *spineLog) *stubCapabilityAdapter {
+	return &stubCapabilityAdapter{
+		log: log,
+		observation: ports.CapabilityObservation{
+			ProbeSurface: "/backend-api/models",
+			Operations: map[domain.CapabilityOperation]domain.CapabilityFact{
+				domain.CapabilityOpChat: {
+					Status:        domain.CapabilityVerified,
+					EvidenceClass: domain.EvidenceLiveProbe,
+					ProbeSurface:  "/backend-api/models",
+				},
+				domain.CapabilityOpChatStreaming: {
+					Status:         domain.CapabilityVerified,
+					EvidenceClass:  domain.EvidenceLiveProbe,
+					ProbeSurface:   "/backend-api/models",
+					StreamingClass: domain.StreamingReal,
+				},
+				domain.CapabilityOpImageGeneration: {
+					Status:        domain.CapabilityConditionallySupported,
+					EvidenceClass: domain.EvidenceLiveProbe,
+					ProbeSurface:  "/backend-api/models",
+				},
+				domain.CapabilityOpImageEdit: {
+					Status:        domain.CapabilityConditionallySupported,
+					EvidenceClass: domain.EvidenceLiveProbe,
+					ProbeSurface:  "/backend-api/models",
+				},
+				domain.CapabilityOpInpaint: {
+					Status:        domain.CapabilityUnsupported,
+					EvidenceClass: domain.EvidenceLiveProbe,
+					ProbeSurface:  "/backend-api/models",
+				},
+			},
+			Models: []domain.ModelCapability{{
+				ModelSlug: "gpt-4o-mini",
+				Operations: map[domain.CapabilityOperation]domain.CapabilityStatus{
+					domain.CapabilityOpChat:            domain.CapabilityVerified,
+					domain.CapabilityOpChatStreaming:   domain.CapabilityVerified,
+					domain.CapabilityOpImageGeneration: domain.CapabilityUnsupported,
+					domain.CapabilityOpImageEdit:       domain.CapabilityUnsupported,
+					domain.CapabilityOpInpaint:         domain.CapabilityUnsupported,
+				},
+				SurfaceBinding: "chatgpt_web",
+				ObservedAt:     domain.NewTimestamp(spineFixtureTime),
+			}},
+		},
+	}
+}
+
+func (adapter *stubCapabilityAdapter) Observe(_ context.Context, _ ports.CapabilityObservationCommand) (ports.CapabilityObservation, error) {
+	adapter.callCount.Add(1)
+	adapter.log.add("capability.observe")
+	if adapter.observeErr != nil {
+		return ports.CapabilityObservation{}, adapter.observeErr
+	}
+	return adapter.observation, nil
+}
+
 var (
 	_ ports.PrincipalStore     = (*stubPrincipalStore)(nil)
 	_ ports.AdmissionStore     = (*stubAdmissionStore)(nil)
@@ -447,6 +588,8 @@ var (
 	_ ports.RequestLogRecorder = (*captureRequestLog)(nil)
 	_ ports.CredentialVault    = (*stubCredentialVault)(nil)
 	_ ports.ProbeAdapter       = (*stubProbeAdapter)(nil)
+	_ ports.CapabilityStore    = (*stubCapabilityStore)(nil)
+	_ ports.CapabilityAdapter  = (*stubCapabilityAdapter)(nil)
 )
 
 // replayOutcome adapts a test string to the ports.ReplayOutcome value the stub

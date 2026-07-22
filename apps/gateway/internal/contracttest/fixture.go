@@ -51,6 +51,12 @@ type Options struct {
 	// fail-closed foundation; a controlled fake proves start/poll through real
 	// composition without releasing exchange secrets on the wire.
 	OAuth ports.OAuthExchangeAdapter
+
+	// Capability Snapshot ports (#50). A nil port keeps the production fail-closed
+	// foundation composition substitutes by default; a controlled fake proves
+	// snapshot minting and model listing through real composition.
+	Capabilities ports.CapabilityStore
+	Capability   ports.CapabilityAdapter
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -91,6 +97,9 @@ func NewFixture(options Options) (*Fixture, error) {
 		Vault: options.Vault,
 		Probe: options.Probe,
 		OAuth: options.OAuth,
+
+		Capabilities: options.Capabilities,
+		Capability:   options.Capability,
 	})
 	if err != nil {
 		return nil, err
