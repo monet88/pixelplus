@@ -173,9 +173,11 @@ type stubAccountStore struct {
 	mu           sync.Mutex
 	byTenant     map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
 	createErr    error
+	updateErr    error
 	createCalls  atomic.Int32
 	visibleCalls atomic.Int32
 	listCalls    atomic.Int32
+	updateCalls  atomic.Int32
 }
 
 func newStubAccountStore(log *spineLog) *stubAccountStore {
@@ -243,6 +245,30 @@ func (store *stubAccountStore) List(_ context.Context, principal domain.Security
 	return result, nil
 }
 
+// Update persists a mutated account for the owning Tenant, mirroring the
+// non-enumerating visibility contract: a foreign, unknown, or deleted id
+// resolves to ErrAccountNotVisible so a lifecycle transition can never target a
+// resource the principal cannot see (#6 section 5.1).
+func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpdate) (domain.ProviderAccount, error) {
+	store.updateCalls.Add(1)
+	store.log.add("account.update")
+	if store.updateErr != nil {
+		return domain.ProviderAccount{}, store.updateErr
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	accounts, ok := store.byTenant[update.Principal.TenantID]
+	if !ok {
+		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	existing, ok := accounts[update.Account.ID]
+	if !ok || existing.Lifecycle == domain.LifecycleDeleted {
+		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	accounts[update.Account.ID] = update.Account
+	return update.Account, nil
+}
+
 // captureAudit records the safe audit projections emitted by the spine.
 type captureAudit struct {
 	mu     sync.Mutex
@@ -300,6 +326,78 @@ func (recorder *captureRequestLog) snapshot() []ports.RequestLog {
 	return append([]ports.RequestLog(nil), recorder.logs...)
 }
 
+// stubCredentialVault is a controlled Credential Vault. Put records the intake
+// binding it received (never released to a response) so a test can prove the
+// application forwarded the material once under the right Tenant/account/version
+// binding; Validate returns a configurable pass/fail projection. Both count
+// calls so a test can prove a pre-Vault gate rejection never reached the
+// protected boundary.
+type stubCredentialVault struct {
+	log         *spineLog
+	mu          sync.Mutex
+	putErr      error
+	validateErr error
+	validResult ports.CredentialValidationResult
+	putCalls    atomic.Int32
+	validCalls  atomic.Int32
+	lastIntake  ports.CredentialIntake
+}
+
+func newStubCredentialVault(log *spineLog) *stubCredentialVault {
+	return &stubCredentialVault{log: log, validResult: ports.CredentialValidationResult{Valid: true}}
+}
+
+func (vault *stubCredentialVault) Put(_ context.Context, intake ports.CredentialIntake) error {
+	vault.putCalls.Add(1)
+	vault.log.add("vault.put")
+	if vault.putErr != nil {
+		return vault.putErr
+	}
+	vault.mu.Lock()
+	defer vault.mu.Unlock()
+	vault.lastIntake = intake
+	return nil
+}
+
+func (vault *stubCredentialVault) Validate(_ context.Context, _ ports.CredentialValidation) (ports.CredentialValidationResult, error) {
+	vault.validCalls.Add(1)
+	vault.log.add("vault.validate")
+	if vault.validateErr != nil {
+		return ports.CredentialValidationResult{}, vault.validateErr
+	}
+	return vault.validResult, nil
+}
+
+func (vault *stubCredentialVault) intake() ports.CredentialIntake {
+	vault.mu.Lock()
+	defer vault.mu.Unlock()
+	return vault.lastIntake
+}
+
+// stubProbeAdapter is a controlled Probe Adapter. Probe returns a configurable
+// outcome (authenticated true/false) or a fail-closed dependency error, and
+// counts calls so a test can prove a validation failure prevented the probe and
+// a probe failure never activated the account.
+type stubProbeAdapter struct {
+	log       *spineLog
+	probeErr  error
+	outcome   ports.ProbeOutcome
+	callCount atomic.Int32
+}
+
+func newStubProbeAdapter(log *spineLog) *stubProbeAdapter {
+	return &stubProbeAdapter{log: log, outcome: ports.ProbeOutcome{Authenticated: true}}
+}
+
+func (adapter *stubProbeAdapter) Probe(_ context.Context, _ ports.ProbeCommand) (ports.ProbeOutcome, error) {
+	adapter.callCount.Add(1)
+	adapter.log.add("probe")
+	if adapter.probeErr != nil {
+		return ports.ProbeOutcome{}, adapter.probeErr
+	}
+	return adapter.outcome, nil
+}
+
 var (
 	_ ports.PrincipalStore     = (*stubPrincipalStore)(nil)
 	_ ports.AdmissionStore     = (*stubAdmissionStore)(nil)
@@ -308,6 +406,8 @@ var (
 	_ ports.AuditRecorder      = (*captureAudit)(nil)
 	_ ports.TelemetryRecorder  = (*captureTelemetry)(nil)
 	_ ports.RequestLogRecorder = (*captureRequestLog)(nil)
+	_ ports.CredentialVault    = (*stubCredentialVault)(nil)
+	_ ports.ProbeAdapter       = (*stubProbeAdapter)(nil)
 )
 
 // replayOutcome adapts a test string to the ports.ReplayOutcome value the stub

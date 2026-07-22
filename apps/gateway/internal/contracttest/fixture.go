@@ -32,6 +32,13 @@ type Options struct {
 	Audit      ports.AuditRecorder
 	Telemetry  ports.TelemetryRecorder
 	RequestLog ports.RequestLogRecorder
+
+	// Provider Credential Vault and Probe Adapter ports (#46). A nil port keeps
+	// the production fail-closed foundation composition substitutes by default; a
+	// controlled fake proves the credential-submit and probe spines through real
+	// composition without releasing secret material.
+	Vault ports.CredentialVault
+	Probe ports.ProbeAdapter
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -63,6 +70,9 @@ func NewFixture(options Options) (*Fixture, error) {
 		Audit:      options.Audit,
 		Telemetry:  options.Telemetry,
 		RequestLog: options.RequestLog,
+
+		Vault: options.Vault,
+		Probe: options.Probe,
 	})
 	if err != nil {
 		return nil, err

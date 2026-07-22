@@ -96,7 +96,22 @@ const (
 	RemediationContactOperator     Remediation = "contact_operator"
 	RemediationSubmitCredential    Remediation = "submit_credential"
 	RemediationAuthModeUnavailable Remediation = "auth_mode_unavailable"
-	RemediationNone                Remediation = "none"
+	// RemediationReauthenticate asks the Tenant to submit replacement credential
+	// material for an existing account after a validation or probe auth failure
+	// (connection lifecycle spec §5.3 B, §4.6).
+	RemediationReauthenticate Remediation = "reauthenticate"
+	// RemediationAckRisk asks the Tenant to record the required residual-risk
+	// acknowledgement before a `gated`/`experimental` Auth Mode credential may
+	// become usable (risk envelope §6.1, connection lifecycle spec §5.3 D).
+	RemediationAckRisk Remediation = "ack_risk"
+	// RemediationEnableAccount asks the Tenant to re-enable a disabled account
+	// before it can serve work (connection lifecycle spec §4.10).
+	RemediationEnableAccount Remediation = "enable_account"
+	// RemediationAccountRemediation is the account-policy remediation returned
+	// when a Provider Account is not usable for the requested operation
+	// (frozen ErrorAccountNotUsable example).
+	RemediationAccountRemediation Remediation = "account_remediation"
+	RemediationNone               Remediation = "none"
 )
 
 // FailureStage is the bounded stage where a failure was classified. Values
@@ -192,6 +207,7 @@ const (
 	ErrCodeIdempotencyInProgress ErrorCode = "idempotency_in_progress"
 	ErrCodeIdempotencyUncertain  ErrorCode = "idempotency_uncertain"
 	ErrCodeAuthModeUnavailable   ErrorCode = "auth_mode_unavailable"
+	ErrCodeAccountNotUsable      ErrorCode = "account_not_usable"
 	ErrCodeDependencyUnavailable ErrorCode = "dependency_unavailable"
 	ErrCodeInternal              ErrorCode = "internal_error"
 )
@@ -366,6 +382,27 @@ func NewAuthModeUnavailable() CanonicalError {
 		StatusClass:  StatusAccountPolicy,
 		Retryability: RetryOperatorActionRequired,
 		Remediation:  RemediationAuthModeUnavailable,
+		FailureStage: StageRouting,
+	}
+}
+
+// NewAccountNotUsable builds the account-policy failure returned when a
+// Provider Account exists and is visible to the owning Tenant but cannot serve
+// the requested credential/probe operation because a durable usability gate is
+// unmet (wrong lifecycle state for the transition, Auth Mode execution
+// disabled, or a `gated`/`experimental` mode without the required Tenant risk
+// acknowledgement). It fails closed before any Vault use or Probe Adapter call
+// (connection lifecycle spec §5.2, §4.2). The caller supplies the closed-set
+// remediation token the Tenant needs (submit_credential, ack_risk,
+// reauthenticate, enable_account, or account_remediation); the frozen 409
+// ErrorAccountNotUsable example uses account_remediation as the generic form.
+func NewAccountNotUsable(remediation Remediation) CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeAccountNotUsable,
+		Category:     CategoryRouting,
+		StatusClass:  StatusAccountPolicy,
+		Retryability: RetryNotRetryable,
+		Remediation:  remediation,
 		FailureStage: StageRouting,
 	}
 }

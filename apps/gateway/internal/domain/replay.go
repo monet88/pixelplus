@@ -40,3 +40,18 @@ func NewCreateProviderAccountFingerprint(provider Provider, mode AuthMode, label
 		string(mode) + separator +
 		label)
 }
+
+// NewSubmitCredentialFingerprint builds a stable fingerprint over the direct
+// credential submission inputs that determine the durable side effect: the
+// operation identity, the target account id, and the credential class. The
+// submitted secret material is deliberately excluded so a legitimate retry with
+// the same Idempotency-Key replays the terminal result rather than conflicting,
+// while a class change (a different credential lifecycle) conflicts. The value
+// is a bounded, non-secret projection and never carries the material
+// (#20 section 5.2, connection lifecycle spec §9.1).
+func NewSubmitCredentialFingerprint(accountID ProviderAccountID, class CredentialClass) Fingerprint {
+	const separator = "\x1f"
+	return Fingerprint("submit_provider_credential" + separator +
+		string(accountID) + separator +
+		string(class))
+}
