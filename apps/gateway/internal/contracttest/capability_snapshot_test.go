@@ -136,6 +136,12 @@ func TestProbeSuccessMintsCapabilitySnapshot(t *testing.T) {
 	if model["model_slug"] != "gpt-4o-mini" {
 		t.Fatalf("model_slug = %v, want gpt-4o-mini", model["model_slug"])
 	}
+	modelOps, _ := model["operations"].(map[string]any)
+	for _, op := range []string{"chat", "chat_streaming", "image_generation", "image_edit", "inpaint"} {
+		if _, ok := modelOps[op]; !ok {
+			t.Fatalf("model operations missing %s", op)
+		}
+	}
 }
 
 // AC: missing snapshot returns capability_unverified without vault decrypt.
@@ -201,13 +207,21 @@ func TestGetCapabilitySnapshotForeignNotFound(t *testing.T) {
 func TestGetCapabilitySnapshotScopeAnyOf(t *testing.T) {
 	t.Parallel()
 
-	const capsOnly = "sk-pxp_locatorC_secretC"
+	const (
+		capsOnly   = "sk-pxp_locatorC_secretC"
+		assetsOnly = "sk-pxp_locatorZ_secretZ"
+	)
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		h.principal.principals[capsOnly] = domain.SecurityPrincipal{
 			TenantID:       "tenant_a",
 			ClientAPIKeyID: "key_c",
 			Scopes:         domain.NewScopeSet(domain.ScopeCapabilitiesRead),
+		}
+		h.principal.principals[assetsOnly] = domain.SecurityPrincipal{
+			TenantID:       "tenant_a",
+			ClientAPIKeyID: "key_z",
+			Scopes:         domain.NewScopeSet(domain.ScopeAssetsRead, domain.ScopeAssetsWrite),
 		}
 		h.accounts.seed("tenant_a", activeProbedAccount("pa_scope", domain.AuthModeChatGPTCodexOAuth))
 		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_scope", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
@@ -231,6 +245,20 @@ func TestGetCapabilitySnapshotScopeAnyOf(t *testing.T) {
 	})
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("capabilities.read status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+
+	// neither accounts.read nor capabilities.read
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_scope/capability-snapshot",
+		bearer: assetsOnly,
+	})
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("missing both scopes status = %d, want 403 (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeError(t, payload)
+	if body["code"] != "forbidden" {
+		t.Fatalf("code = %v, want forbidden", body["code"])
 	}
 }
 
@@ -301,6 +329,194 @@ func TestListModelsOnlyFreshOfferablePairs(t *testing.T) {
 	}
 }
 
+// AC: version-mismatched snapshot remains inspectable but never offerable.
+func TestListModelsOmitsCredentialVersionMismatch(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount("pa_version_bind", domain.AuthModeChatGPTCodexOAuth)
+		// Current account is version 2; stored snapshot is still bound to v1.
+		account.Credential.Version = 2
+		h.accounts.seed("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_version_bind", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/models",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	data, _ := body["data"].([]any)
+	if len(data) != 0 {
+		t.Fatalf("data len = %d, want 0 for version-mismatched snapshot", len(data))
+	}
+
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_version_bind/capability-snapshot",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("snapshot status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(payload, &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if version, _ := snapshot["credential_version"].(float64); version != 1 {
+		t.Fatalf("credential_version = %v, want 1 stored evidence", snapshot["credential_version"])
+	}
+}
+
+// AC: hard-block health / drain / quarantine keep /v1/models empty even when
+// the lifecycle is still active and the snapshot is fresh.
+func TestListModelsOmitsNonRoutableActiveAccounts(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		mut  func(*domain.ProviderAccount)
+	}{
+		{
+			name: "blocked",
+			mut: func(account *domain.ProviderAccount) {
+				account.Health.SummaryState = domain.HealthBlocked
+				account.Health.Conditions = []domain.HealthCondition{{
+					Scope: domain.HealthScope{Kind: domain.HealthScopeAccount},
+					State: domain.HealthBlocked,
+				}}
+			},
+		},
+		{
+			name: "cooling_down",
+			mut: func(account *domain.ProviderAccount) {
+				account.Health.SummaryState = domain.HealthCoolingDown
+				account.Health.Conditions = []domain.HealthCondition{{
+					Scope: domain.HealthScope{Kind: domain.HealthScopeAccount},
+					State: domain.HealthCoolingDown,
+				}}
+			},
+		},
+		{
+			name: "draining",
+			mut: func(account *domain.ProviderAccount) {
+				account.Controls.Drain = domain.DrainDraining
+			},
+		},
+		{
+			name: "quarantined",
+			mut: func(account *domain.ProviderAccount) {
+				account.Controls.Quarantine = domain.QuarantineQuarantined
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			accountID := domain.ProviderAccountID("pa_nonroute_" + tc.name)
+			harness := newSpineHarness(t, func(h *spineHarness) {
+				account := activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
+				tc.mut(&account)
+				h.accounts.seed("tenant_a", account)
+				h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+			})
+
+			response, payload := harness.do(t, requestSpec{
+				method: http.MethodGet,
+				path:   "/v1/models",
+				bearer: tenantAKey,
+			})
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(payload, &body); err != nil {
+				t.Fatalf("decode models: %v", err)
+			}
+			data, _ := body["data"].([]any)
+			if len(data) != 0 {
+				t.Fatalf("data len = %d, want 0 for non-routable account %s", len(data), tc.name)
+			}
+
+			// Inspect remains available, but fact-level offerable is false.
+			response, payload = harness.do(t, requestSpec{
+				method: http.MethodGet,
+				path:   "/v1/provider-accounts/" + string(accountID) + "/capability-snapshot",
+				bearer: tenantAKey,
+			})
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("snapshot status = %d, want 200 (body=%s)", response.StatusCode, payload)
+			}
+			var snapshot map[string]any
+			if err := json.Unmarshal(payload, &snapshot); err != nil {
+				t.Fatalf("decode snapshot: %v", err)
+			}
+			operations, _ := snapshot["operations"].(map[string]any)
+			chat, _ := operations["chat"].(map[string]any)
+			if chat["offerable"] != false {
+				t.Fatalf("chat.offerable = %v, want false for non-usable account", chat["offerable"])
+			}
+		})
+	}
+}
+
+// AC: dual-level status projection advertises the weaker of model and op facts.
+func TestListModelsProjectsWeakerOperationStatus(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount("pa_weaker", domain.AuthModeChatGPTCodexOAuth)
+		h.accounts.seed("tenant_a", account)
+		snapshot := sampleObservationSnapshot("pa_weaker", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime)
+		// Model says verified chat; account-level chat fact is only conditional.
+		snapshot.Operations[domain.CapabilityOpChat] = domain.CapabilityFact{
+			Status:        domain.CapabilityConditionallySupported,
+			EvidenceClass: domain.EvidenceLiveProbe,
+			ProbeSurface:  "/backend-api/models",
+		}
+		h.capabilities.seed("tenant_a", snapshot)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/models",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	data, _ := body["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("data len = %d, want 1", len(data))
+	}
+	model, _ := data[0].(map[string]any)
+	x, _ := model["x_pixelplus"].(map[string]any)
+	offers, _ := x["offers"].([]any)
+	var chatStatus string
+	for _, raw := range offers {
+		offer, _ := raw.(map[string]any)
+		if offer["operation"] == "chat" {
+			chatStatus, _ = offer["operation_status"].(string)
+		}
+	}
+	if chatStatus != "conditionally_supported" {
+		t.Fatalf("chat operation_status = %q, want conditionally_supported", chatStatus)
+	}
+}
+
 // AC: listModels requires capabilities.read; accounts.read alone is forbidden.
 func TestListModelsRequiresCapabilitiesRead(t *testing.T) {
 	t.Parallel()
@@ -360,6 +576,63 @@ func TestProbeCapabilityObservationFailurePreventsActivation(t *testing.T) {
 	}
 	if account["lifecycle_state"] == "active" {
 		t.Fatalf("lifecycle_state became active after observation failure")
+	}
+}
+
+// AC: CapabilityStore.Put failure after successful Observe still blocks activation
+// and leaves the account non-authorizing for offers.
+func TestProbeCapabilityStorePutFailurePreventsActivation(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", probeableAccount("pa_put_fail", domain.AuthModeChatGPTCodexOAuth))
+		h.capabilities.putErr = ports.ErrDependencyUnavailable
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_put_fail/probe",
+		bearer: tenantAKey,
+		body:   `{}`,
+	})
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", response.StatusCode, payload)
+	}
+	if calls := harness.capability.callCount.Load(); calls != 1 {
+		t.Fatalf("capability.Observe ran %d times, want 1", calls)
+	}
+	if calls := harness.capabilities.putCalls.Load(); calls != 1 {
+		t.Fatalf("capability.Put ran %d times, want 1", calls)
+	}
+
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_put_fail",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var account map[string]any
+	if err := json.Unmarshal(payload, &account); err != nil {
+		t.Fatalf("decode account: %v", err)
+	}
+	if account["lifecycle_state"] == "active" {
+		t.Fatalf("lifecycle_state became active after capability put failure")
+	}
+
+	// No durable authorizing snapshot was published.
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_put_fail/capability-snapshot",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("snapshot status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeError(t, payload)
+	if body["code"] != "capability_unverified" {
+		t.Fatalf("code = %v, want capability_unverified", body["code"])
 	}
 }
 

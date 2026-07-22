@@ -39,6 +39,18 @@ func (status CapabilityStatus) Offerable() bool {
 	return status == CapabilityVerified || status == CapabilityConditionallySupported
 }
 
+// WeakerOfferableStatus projects the more restrictive of two offerable statuses.
+// Callers must only pass statuses already known to be in the offerable set.
+func WeakerOfferableStatus(left, right CapabilityStatus) CapabilityStatus {
+	if left == CapabilityConditionallySupported || right == CapabilityConditionallySupported {
+		return CapabilityConditionallySupported
+	}
+	if left == CapabilityVerified {
+		return right
+	}
+	return left
+}
+
 // SnapshotFreshness is the derived lifecycle of a Capability Snapshot.
 type SnapshotFreshness string
 
@@ -174,9 +186,27 @@ func (snapshot CapabilitySnapshot) IsOfferablePair(op CapabilityOperation, model
 
 // WithDerivedFreshness returns a copy with Freshness and per-op offerable flags recomputed.
 func (snapshot CapabilitySnapshot) WithDerivedFreshness(now time.Time) CapabilitySnapshot {
+	// Always clone reference maps so derived recomputation never mutates the
+	// store-owned snapshot or a shared observation map (data-race / corruption).
+	snapshot.Operations = cloneOperationFacts(snapshot.Operations)
+	snapshot.Models = cloneModelCapabilities(snapshot.Models)
 	snapshot.Freshness = DeriveFreshness(snapshot.VerifiedAt, snapshot.TTLClass, snapshot.Invalidated, now)
 	for op, fact := range snapshot.Operations {
 		fact.Offerable = snapshot.Freshness == SnapshotFresh && fact.Status.Offerable()
+		snapshot.Operations[op] = fact
+	}
+	return snapshot
+}
+
+// WithAccountOfferGate ANDs fact-level offerable with account usability so
+// management inspect and listModels share the same authorization signal.
+func (snapshot CapabilitySnapshot) WithAccountOfferGate(allows bool) CapabilitySnapshot {
+	if allows {
+		return snapshot
+	}
+	snapshot.Operations = cloneOperationFacts(snapshot.Operations)
+	for op, fact := range snapshot.Operations {
+		fact.Offerable = false
 		snapshot.Operations[op] = fact
 	}
 	return snapshot
@@ -192,9 +222,8 @@ func NewLiveProbeSnapshot(
 	models []ModelCapability,
 	probeSurface string,
 ) CapabilitySnapshot {
-	if operations == nil {
-		operations = map[CapabilityOperation]CapabilityFact{}
-	}
+	// Clone before fill/default so minting never mutates adapter-owned maps.
+	operations = cloneOperationFacts(operations)
 	for _, op := range PrimaryCapabilityOperations() {
 		if _, ok := operations[op]; !ok {
 			operations[op] = CapabilityFact{
@@ -203,6 +232,12 @@ func NewLiveProbeSnapshot(
 				ProbeSurface:  probeSurface,
 			}
 		}
+	}
+	// Model rows must always carry all five primary operation keys so wire
+	// serialization matches the frozen ModelCapability schema.
+	normalizedModels := cloneModelCapabilities(models)
+	for i := range normalizedModels {
+		normalizedModels[i].Operations = normalizeModelOperations(normalizedModels[i].Operations)
 	}
 	snapshot := CapabilitySnapshot{
 		ProviderAccountID: accountID,
@@ -216,7 +251,42 @@ func NewLiveProbeSnapshot(
 			ObservedAt:    verifiedAt,
 		}},
 		Operations: operations,
-		Models:     models,
+		Models:     normalizedModels,
 	}
 	return snapshot.WithDerivedFreshness(verifiedAt.Time())
+}
+
+func cloneOperationFacts(source map[CapabilityOperation]CapabilityFact) map[CapabilityOperation]CapabilityFact {
+	if source == nil {
+		return map[CapabilityOperation]CapabilityFact{}
+	}
+	cloned := make(map[CapabilityOperation]CapabilityFact, len(source))
+	for op, fact := range source {
+		cloned[op] = fact
+	}
+	return cloned
+}
+
+func cloneModelCapabilities(source []ModelCapability) []ModelCapability {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make([]ModelCapability, len(source))
+	for i, model := range source {
+		model.Operations = normalizeModelOperations(model.Operations)
+		cloned[i] = model
+	}
+	return cloned
+}
+
+func normalizeModelOperations(source map[CapabilityOperation]CapabilityStatus) map[CapabilityOperation]CapabilityStatus {
+	normalized := make(map[CapabilityOperation]CapabilityStatus, len(PrimaryCapabilityOperations()))
+	for _, op := range PrimaryCapabilityOperations() {
+		if status, ok := source[op]; ok {
+			normalized[op] = status
+			continue
+		}
+		normalized[op] = CapabilityUnverified
+	}
+	return normalized
 }

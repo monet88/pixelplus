@@ -77,9 +77,10 @@ func (service *ProviderAccountService) GetCapabilitySnapshot(ctx context.Context
 		return CapabilitySnapshotResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
-	// Management read recomputes freshness at observation time so operators can
-	// inspect stale/invalid evidence without authorizing execution.
-	snapshot = snapshot.WithDerivedFreshness(sc.start)
+	// Management read recomputes freshness and ANDs fact-level offerable with
+	// account usability so inspect never advertises authorization for a
+	// non-usable account while listModels omits the same pairs.
+	snapshot = snapshot.WithDerivedFreshness(sc.start).WithAccountOfferGate(service.accountAllowsOffers(account))
 	service.observeSuccess(ctx, sc, ports.AuditCapabilitySnapshotRead, principal, account.ID, 200)
 	return CapabilitySnapshotResult{Snapshot: snapshot, RequestID: sc.requestID}, nil
 }
@@ -148,11 +149,17 @@ func (service *ProviderAccountService) ListModels(ctx context.Context, query Lis
 				if !derived.IsOfferablePair(op, model, sc.start) {
 					continue
 				}
-				status := model.Operations[op]
+				modelStatus := model.Operations[op]
+				operationStatus := modelStatus
+				if fact, ok := derived.Operations[op]; ok {
+					// Dual-level enforcement: wire status must not claim stronger
+					// than the weaker of model-level and operation-level facts.
+					operationStatus = domain.WeakerOfferableStatus(modelStatus, fact.Status)
+				}
 				offer := domain.ModelOffer{
 					ProviderAccountID: derived.ProviderAccountID,
 					Operation:         op,
-					OperationStatus:   status,
+					OperationStatus:   operationStatus,
 					ModelSlug:         model.ModelSlug,
 					Offerable:         true,
 					Freshness:         domain.SnapshotFresh,
@@ -188,7 +195,43 @@ func (service *ProviderAccountService) accountAllowsOffers(account domain.Provid
 	if account.AuthMode.RequiresRiskAck() && !account.RiskAcknowledged {
 		return false
 	}
+	// Administrative controls block selection independently of lifecycle.
+	if account.Controls.Drain == domain.DrainDraining {
+		return false
+	}
+	if account.Controls.Quarantine == domain.QuarantineQuarantined {
+		return false
+	}
+	// Account-scoped hard-block and temporary non-routable health conditions
+	// consume #9 §5.1 usability so /v1/models never advertises unusable pairs.
+	if accountHasNonRoutableAccountHealth(account) {
+		return false
+	}
 	return true
+}
+
+func accountHasNonRoutableAccountHealth(account domain.ProviderAccount) bool {
+	if isNonRoutableHealthState(account.Health.SummaryState) {
+		return true
+	}
+	for _, condition := range account.Health.Conditions {
+		if condition.Scope.Kind != domain.HealthScopeAccount {
+			continue
+		}
+		if isNonRoutableHealthState(condition.State) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNonRoutableHealthState(state domain.HealthState) bool {
+	switch state {
+	case domain.HealthBlocked, domain.HealthExpired, domain.HealthChallenged, domain.HealthCoolingDown:
+		return true
+	default:
+		return false
+	}
 }
 
 // mintCapabilitySnapshot observes and stores a credential-version-bound
