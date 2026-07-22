@@ -19,6 +19,8 @@ const (
 	operationListProviderAccounts     domain.OperationToken = "list_provider_accounts"
 	operationSubmitProviderCredential domain.OperationToken = "submit_provider_credential"
 	operationProbeProviderAccount     domain.OperationToken = "probe_provider_account"
+	operationStartOAuthAuthorization  domain.OperationToken = "start_oauth_authorization"
+	operationGetOAuthAuthorization    domain.OperationToken = "get_oauth_authorization"
 )
 
 // maxIdempotencyKeyLength mirrors the frozen OpenAPI RequiredIdempotencyKey
@@ -104,6 +106,7 @@ type ProviderAccountService struct {
 	accounts   ports.AccountStore
 	vault      ports.CredentialVault
 	probe      ports.ProbeAdapter
+	oauth      ports.OAuthExchangeAdapter
 	audit      ports.AuditRecorder
 	telemetry  ports.TelemetryRecorder
 	requestLog ports.RequestLogRecorder
@@ -119,6 +122,7 @@ type ProviderAccountDependencies struct {
 	Accounts   ports.AccountStore
 	Vault      ports.CredentialVault
 	Probe      ports.ProbeAdapter
+	OAuth      ports.OAuthExchangeAdapter
 	Audit      ports.AuditRecorder
 	Telemetry  ports.TelemetryRecorder
 	RequestLog ports.RequestLogRecorder
@@ -141,6 +145,8 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		return nil, errors.New("application: credential vault is required")
 	case dependencies.Probe == nil:
 		return nil, errors.New("application: probe adapter is required")
+	case dependencies.OAuth == nil:
+		return nil, errors.New("application: oauth exchange adapter is required")
 	case dependencies.Audit == nil:
 		return nil, errors.New("application: audit recorder is required")
 	case dependencies.Telemetry == nil:
@@ -159,6 +165,7 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		accounts:   dependencies.Accounts,
 		vault:      dependencies.Vault,
 		probe:      dependencies.Probe,
+		oauth:      dependencies.OAuth,
 		audit:      dependencies.Audit,
 		telemetry:  dependencies.Telemetry,
 		requestLog: dependencies.RequestLog,

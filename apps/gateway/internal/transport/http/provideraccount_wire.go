@@ -193,3 +193,32 @@ func writeJSON(writer http.ResponseWriter, statusCode int, payload any) {
 	writer.WriteHeader(statusCode)
 	_ = json.NewEncoder(writer).Encode(payload)
 }
+
+type oauthAuthorizationWire struct {
+	AuthorizationID   string `json:"authorization_id"`
+	ProviderAccountID string `json:"provider_account_id"`
+	Purpose           string `json:"purpose"`
+	Flow              string `json:"flow"`
+	Status            string `json:"status"`
+	VerificationURI   string `json:"verification_uri,omitempty"`
+	UserCode          string `json:"user_code,omitempty"`
+	ExpiresAt         string `json:"expires_at"`
+	Remediation       string `json:"remediation,omitempty"`
+}
+
+func writeOAuthAuthorization(writer http.ResponseWriter, statusCode int, authorization domain.OAuthAuthorization) {
+	body := oauthAuthorizationWire{
+		AuthorizationID:   string(authorization.ID),
+		ProviderAccountID: string(authorization.ProviderAccountID),
+		Purpose:           string(authorization.Purpose),
+		Flow:              string(authorization.Flow),
+		Status:            string(authorization.Status),
+		VerificationURI:   authorization.VerificationURI,
+		UserCode:          authorization.UserCode,
+		ExpiresAt:         timestampString(authorization.ExpiresAt),
+	}
+	if authorization.Remediation != "" {
+		body.Remediation = string(authorization.Remediation)
+	}
+	writeJSON(writer, statusCode, body)
+}

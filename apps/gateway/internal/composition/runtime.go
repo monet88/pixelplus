@@ -56,6 +56,10 @@ type Dependencies struct {
 	// Provider probe adapter land; contract tests inject controlled fakes.
 	Vault ports.CredentialVault
 	Probe ports.ProbeAdapter
+	// OAuth exchange adapter port (#47). A nil port keeps the fail-closed
+	// foundation implementation so production cannot start a real OAuth journey
+	// until a Provider OAuth surface lands; contract tests inject controlled fakes.
+	OAuth ports.OAuthExchangeAdapter
 
 	// Asset exchange request-spine ports (#53). When a port is nil, New
 	// substitutes the production foundation implementation so the real
@@ -184,6 +188,10 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 	if probe == nil {
 		probe = vaultpkg.NewFailClosedProbeAdapter()
 	}
+	oauth := dependencies.OAuth
+	if oauth == nil {
+		oauth = vaultpkg.NewFailClosedOAuthExchangeAdapter()
+	}
 
 	return application.NewProviderAccountService(application.ProviderAccountDependencies{
 		Principal:  principal,
@@ -192,6 +200,7 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 		Accounts:   accounts,
 		Vault:      vault,
 		Probe:      probe,
+		OAuth:      oauth,
 		Audit:      audit,
 		Telemetry:  telemetry,
 		RequestLog: requestLog,

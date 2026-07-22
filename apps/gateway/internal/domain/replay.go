@@ -72,3 +72,16 @@ func NewCreateAssetFingerprint(kind AssetKind, checksum string, byteSize int64) 
 		checksum + separator +
 		strconv.FormatInt(byteSize, 10))
 }
+
+// NewStartOAuthAuthorizationFingerprint builds a stable fingerprint over the
+// OAuth start inputs that determine the durable side effect: the operation
+// identity, the target account id, purpose, and flow preference. Secret exchange
+// material is never part of the fingerprint because it is server-owned and never
+// client-supplied (#20 section 5.2, management contract §4.3).
+func NewStartOAuthAuthorizationFingerprint(accountID ProviderAccountID, purpose OAuthPurpose, flow OAuthFlow) Fingerprint {
+	const separator = "\x1f"
+	return Fingerprint("start_oauth_authorization" + separator +
+		string(accountID) + separator +
+		string(purpose) + separator +
+		string(flow))
+}

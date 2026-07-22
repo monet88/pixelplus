@@ -93,14 +93,18 @@ type Remediation string
 
 // Remediation tokens used by the request spine.
 const (
-	RemediationAuthenticate        Remediation = "authenticate"
-	RemediationRequestPermission   Remediation = "request_permission"
-	RemediationFixRequest          Remediation = "fix_request"
-	RemediationReducePayload       Remediation = "reduce_payload"
-	RemediationWaitAdmission       Remediation = "wait_admission"
-	RemediationRetrySameKey        Remediation = "retry_same_idempotency_key"
-	RemediationContactOperator     Remediation = "contact_operator"
-	RemediationSubmitCredential    Remediation = "submit_credential"
+	RemediationAuthenticate      Remediation = "authenticate"
+	RemediationRequestPermission Remediation = "request_permission"
+	RemediationFixRequest        Remediation = "fix_request"
+	RemediationReducePayload     Remediation = "reduce_payload"
+	RemediationWaitAdmission     Remediation = "wait_admission"
+	RemediationRetrySameKey      Remediation = "retry_same_idempotency_key"
+	RemediationContactOperator   Remediation = "contact_operator"
+	RemediationSubmitCredential  Remediation = "submit_credential"
+	// RemediationCompleteOAuth asks the Tenant to complete the provider browser
+	// or device consent for the active server-owned OAuth journey (connection
+	// lifecycle spec §5.3, management contract §4.3).
+	RemediationCompleteOAuth       Remediation = "complete_oauth"
 	RemediationAuthModeUnavailable Remediation = "auth_mode_unavailable"
 	// RemediationReauthenticate asks the Tenant to submit replacement credential
 	// material for an existing account after a validation or probe auth failure

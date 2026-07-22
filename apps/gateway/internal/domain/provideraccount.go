@@ -200,6 +200,11 @@ type ProviderAccount struct {
 	// additional properties). A stored credential MUST NOT become usable while
 	// this is false for a mode that RequiresRiskAck.
 	RiskAcknowledged bool
+	// ActiveOAuthAuthorizationID is the private single-flight marker for the
+	// server-owned OAuth journey currently in flight on this account. It is never
+	// projected on the Public API ProviderAccount wire (frozen schema has no such
+	// field). An empty value means no OAuth journey is active.
+	ActiveOAuthAuthorizationID OAuthAuthorizationID
 }
 
 // CredentialMetadata is the safe, non-secret credential projection. It never

@@ -22,6 +22,11 @@ var (
 	// ErrDependencyUnavailable reports that a required backend could not satisfy
 	// its fail-closed contract, so admission must not proceed.
 	ErrDependencyUnavailable = errors.New("required dependency unavailable")
+	// ErrAccountUpdateConflict reports that a conditional account mutation lost
+	// its atomic claim (for example a single-flight OAuth marker was already set
+	// by a concurrent writer). The application maps this to the matching
+	// account_not_usable outcome rather than inventing a second journey.
+	ErrAccountUpdateConflict = errors.New("provider account update conflict")
 )
 
 // PresentedClientAPIKey is the raw bearer material extracted from a request.
@@ -106,12 +111,18 @@ const (
 type ReplayDecision struct {
 	Outcome         ReplayOutcome
 	TerminalAccount domain.ProviderAccount
+	// TerminalOAuth carries the prior durable OAuth journey when Outcome is
+	// ReplayTerminal for a startOAuthAuthorization claim.
+	TerminalOAuth domain.OAuthAuthorization
 }
 
 // ReplayResult is the terminal projection recorded once an owning request
 // completes its durable side effect, so later matching replays are stable.
 type ReplayResult struct {
 	Account domain.ProviderAccount
+	// OAuth carries the terminal server-owned OAuth journey projection for a
+	// startOAuthAuthorization claim. It is empty for non-OAuth replay results.
+	OAuth domain.OAuthAuthorization
 }
 
 // ReplayStore performs the atomic idempotency claim, fingerprint match, and
@@ -155,9 +166,24 @@ type AccountStore interface {
 
 // AccountUpdate is the typed command to persist a mutated Provider Account for
 // the owning Tenant. Account carries the already-transitioned safe projection.
+// Optional preconditions make single-flight OAuth marker claims durable without
+// inventing a revision field on the Public API projection.
 type AccountUpdate struct {
 	Principal domain.SecurityPrincipal
 	Account   domain.ProviderAccount
+	// RequireEmptyOAuthMarker rejects the write unless the currently stored
+	// ActiveOAuthAuthorizationID is empty. Used to claim a single-flight OAuth
+	// journey before the exchange adapter runs.
+	RequireEmptyOAuthMarker bool
+	// RequireOAuthMarker, when non-empty, rejects the write unless the currently
+	// stored ActiveOAuthAuthorizationID equals this value. Used so a terminal
+	// poll only clears/settles the journey it owns.
+	RequireOAuthMarker domain.OAuthAuthorizationID
+	// RequireDraftLifecycle rejects the write unless the currently stored
+	// lifecycle is still draft. Combined with RequireEmptyOAuthMarker this
+	// prevents a concurrent direct credential submit from being overwritten by a
+	// late OAuth start write.
+	RequireDraftLifecycle bool
 }
 
 // AuditAction names a product/security audit event.
@@ -178,6 +204,12 @@ const (
 	// AuditProviderAccountActivated records the transition into `active` after a
 	// required probe succeeds (connection lifecycle spec §4.7).
 	AuditProviderAccountActivated AuditAction = "provider_account.activated"
+	// AuditProviderOAuthStarted records a successful server-owned OAuth start.
+	// It carries the account id and outcome only, never codes or tokens.
+	AuditProviderOAuthStarted AuditAction = "provider_oauth.started"
+	// AuditProviderOAuthPolled records a successful OAuth status poll and its
+	// safe terminal or pending outcome, never exchange material.
+	AuditProviderOAuthPolled AuditAction = "provider_oauth.polled"
 )
 
 // AuditEvent is a secret-free product/security audit projection. It carries

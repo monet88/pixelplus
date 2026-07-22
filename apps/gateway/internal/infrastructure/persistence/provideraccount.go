@@ -65,6 +65,7 @@ type replayRecord struct {
 	fingerprint domain.Fingerprint
 	terminal    bool
 	account     domain.ProviderAccount
+	oauth       domain.OAuthAuthorization
 }
 
 // NewMemoryReplayStore builds an empty foundation replay store.
@@ -86,7 +87,7 @@ func (store *MemoryReplayStore) Claim(_ context.Context, identity domain.ReplayI
 		return ports.ReplayDecision{Outcome: ports.ReplayConflict}, nil
 	}
 	if existing.terminal {
-		return ports.ReplayDecision{Outcome: ports.ReplayTerminal, TerminalAccount: existing.account}, nil
+		return ports.ReplayDecision{Outcome: ports.ReplayTerminal, TerminalAccount: existing.account, TerminalOAuth: existing.oauth}, nil
 	}
 	return ports.ReplayDecision{Outcome: ports.ReplayInProgress}, nil
 }
@@ -103,6 +104,7 @@ func (store *MemoryReplayStore) Complete(_ context.Context, identity domain.Repl
 	}
 	record.terminal = true
 	record.account = result.Account
+	record.oauth = result.OAuth
 	return nil
 }
 
@@ -168,6 +170,15 @@ func (store *MemoryAccountStore) Update(_ context.Context, update ports.AccountU
 	existing, ok := accounts[update.Account.ID]
 	if !ok || existing.Lifecycle == domain.LifecycleDeleted {
 		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	if update.RequireEmptyOAuthMarker && existing.ActiveOAuthAuthorizationID != "" {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireOAuthMarker != "" && existing.ActiveOAuthAuthorizationID != update.RequireOAuthMarker {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireDraftLifecycle && existing.Lifecycle != domain.LifecycleDraft {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
