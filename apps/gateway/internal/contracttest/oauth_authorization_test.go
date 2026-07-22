@@ -2,18 +2,29 @@ package contracttest_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
+	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
 const oauthExchangedMaterial = "oauth_exchanged_material_secret"
 
 func oauthStartBody(purpose, flow string) string {
 	return `{"purpose":"` + purpose + `","flow_preference":"` + flow + `"}`
+}
+
+func managePrincipal() domain.SecurityPrincipal {
+	return domain.SecurityPrincipal{
+		TenantID:       "tenant_a",
+		ClientAPIKeyID: "key_a",
+		Scopes:         domain.NewScopeSet(domain.ScopeAccountsManage),
+	}
 }
 
 func decodeOAuth(t *testing.T, payload []byte) map[string]any {
@@ -77,7 +88,7 @@ func TestOAuthStartConnectAcceptedCreatesPendingJourney(t *testing.T) {
 		t.Fatalf("vault.Put ran %d times on start, want 0", calls)
 	}
 	// Account remains draft and non-usable; single-flight marker is private.
-	account, err := harness.accounts.Visible(t.Context(), domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Scopes: domain.NewScopeSet(domain.ScopeAccountsManage)}, "pa_oauth")
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth")
 	if err != nil {
 		t.Fatalf("visible account: %v", err)
 	}
@@ -183,7 +194,7 @@ func TestOAuthPollSucceededStoresCredentialWithoutActivating(t *testing.T) {
 		t.Fatalf("vault intake binding = %#v", intake)
 	}
 
-	account, err := harness.accounts.Visible(t.Context(), domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Scopes: domain.NewScopeSet(domain.ScopeAccountsManage)}, "pa_oauth_ok")
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_ok")
 	if err != nil {
 		t.Fatalf("visible: %v", err)
 	}
@@ -250,7 +261,7 @@ func TestOAuthPollFailedRestoresDraftWithoutVault(t *testing.T) {
 	if calls := harness.vault.putCalls.Load(); calls != 0 {
 		t.Fatalf("vault.Put ran %d times on failed journey, want 0", calls)
 	}
-	account, err := harness.accounts.Visible(t.Context(), domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Scopes: domain.NewScopeSet(domain.ScopeAccountsManage)}, "pa_oauth_fail")
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_fail")
 	if err != nil {
 		t.Fatalf("visible: %v", err)
 	}
@@ -561,7 +572,7 @@ func TestOAuthPollExpiredRestoresDraftWithoutVault(t *testing.T) {
 	if calls := harness.vault.putCalls.Load(); calls != 0 {
 		t.Fatalf("vault.Put ran %d times on expired journey, want 0", calls)
 	}
-	account, err := harness.accounts.Visible(t.Context(), domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Scopes: domain.NewScopeSet(domain.ScopeAccountsManage)}, "pa_oauth_exp")
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_exp")
 	if err != nil {
 		t.Fatalf("visible: %v", err)
 	}
@@ -570,5 +581,441 @@ func TestOAuthPollExpiredRestoresDraftWithoutVault(t *testing.T) {
 	}
 	if account.ActiveOAuthAuthorizationID != "" {
 		t.Fatalf("journey marker still set after expiry: %q", account.ActiveOAuthAuthorizationID)
+	}
+}
+
+// AC: concurrent starts with distinct idempotency keys claim exactly one marker
+// and call oauth.Start exactly once (TOCTOU single-flight).
+func TestOAuthStartConcurrentDistinctKeysSingleOwner(t *testing.T) {
+	t.Parallel()
+
+	hold := make(chan struct{})
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", usableDraft("pa_oauth_race_start", domain.AuthModeChatGPTCodexOAuth))
+		h.oauth.startHold = hold
+	})
+
+	const racers = 8
+	var wg sync.WaitGroup
+	statuses := make([]int, racers)
+	payloads := make([][]byte, racers)
+	wg.Add(racers)
+	for index := 0; index < racers; index++ {
+		go func(slot int) {
+			defer wg.Done()
+			response, payload := harness.do(t, requestSpec{
+				method:  http.MethodPost,
+				path:    "/v1/provider-accounts/pa_oauth_race_start/oauth-authorizations",
+				bearer:  tenantAKey,
+				idemKey: fmt.Sprintf("idem-oauth-race-%d", slot),
+				body:    oauthStartBody("connect", "device"),
+			})
+			statuses[slot] = response.StatusCode
+			payloads[slot] = payload
+		}(index)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if harness.oauth.startCalls.Load() >= 1 || harness.accounts.updateCalls.Load() >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(hold)
+	wg.Wait()
+
+	accepted := 0
+	rejected := 0
+	var acceptedID string
+	for index, status := range statuses {
+		switch status {
+		case http.StatusAccepted:
+			accepted++
+			id, _ := decodeOAuth(t, payloads[index])["authorization_id"].(string)
+			if acceptedID == "" {
+				acceptedID = id
+			} else if id != acceptedID {
+				t.Fatalf("multiple authorization ids accepted: %q vs %q", acceptedID, id)
+			}
+		case http.StatusConflict:
+			rejected++
+			body := decodeError(t, payloads[index])
+			if body["code"] != "account_not_usable" {
+				t.Fatalf("rejected code = %v, want account_not_usable (body=%s)", body["code"], payloads[index])
+			}
+		default:
+			t.Fatalf("unexpected concurrent start status %d body=%s", status, payloads[index])
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("accepted starts = %d, want exactly 1", accepted)
+	}
+	if rejected != racers-1 {
+		t.Fatalf("rejected starts = %d, want %d", rejected, racers-1)
+	}
+	if calls := harness.oauth.startCalls.Load(); calls != 1 {
+		t.Fatalf("oauth.Start ran %d times under race, want 1", calls)
+	}
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_race_start")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if account.ActiveOAuthAuthorizationID != domain.OAuthAuthorizationID(acceptedID) {
+		t.Fatalf("marker = %q, want %q", account.ActiveOAuthAuthorizationID, acceptedID)
+	}
+}
+
+// AC: concurrent start vs direct credential submit has exactly one durable winner.
+func TestOAuthStartVsDirectSubmitRace(t *testing.T) {
+	t.Parallel()
+
+	hold := make(chan struct{})
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", usableDraft("pa_oauth_vs_submit", domain.AuthModeChatGPTCodexOAuth))
+		h.oauth.startHold = hold
+	})
+
+	type outcome struct {
+		status  int
+		payload []byte
+		kind    string
+	}
+	results := make(chan outcome, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		response, payload := harness.do(t, requestSpec{
+			method:  http.MethodPost,
+			path:    "/v1/provider-accounts/pa_oauth_vs_submit/oauth-authorizations",
+			bearer:  tenantAKey,
+			idemKey: "idem-oauth-vs-submit-start",
+			body:    oauthStartBody("connect", "device"),
+		})
+		results <- outcome{status: response.StatusCode, payload: payload, kind: "start"}
+	}()
+	go func() {
+		defer wg.Done()
+		time.Sleep(20 * time.Millisecond)
+		response, payload := harness.do(t, requestSpec{
+			method:  http.MethodPost,
+			path:    "/v1/provider-accounts/pa_oauth_vs_submit/credentials",
+			bearer:  tenantAKey,
+			idemKey: "idem-oauth-vs-submit-direct",
+			body:    submitBody(domain.CredentialClassOAuthTokenImport),
+		})
+		results <- outcome{status: response.StatusCode, payload: payload, kind: "submit"}
+	}()
+	time.Sleep(40 * time.Millisecond)
+	close(hold)
+	wg.Wait()
+	close(results)
+
+	var startStatus, submitStatus int
+	for result := range results {
+		switch result.kind {
+		case "start":
+			startStatus = result.status
+		case "submit":
+			submitStatus = result.status
+		}
+	}
+
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_vs_submit")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+
+	switch {
+	case startStatus == http.StatusAccepted && submitStatus == http.StatusConflict:
+		if account.ActiveOAuthAuthorizationID == "" {
+			t.Fatalf("start won but marker empty")
+		}
+		if account.Lifecycle != domain.LifecycleDraft {
+			t.Fatalf("start won lifecycle = %s, want draft", account.Lifecycle)
+		}
+		if calls := harness.vault.putCalls.Load(); calls != 0 {
+			t.Fatalf("vault.Put ran after blocked submit, want 0")
+		}
+	case submitStatus == http.StatusAccepted && startStatus == http.StatusConflict:
+		if account.Lifecycle != domain.LifecyclePendingValidation {
+			t.Fatalf("submit won lifecycle = %s, want pending_validation", account.Lifecycle)
+		}
+		if account.ActiveOAuthAuthorizationID != "" {
+			t.Fatalf("submit won but oauth marker set: %q", account.ActiveOAuthAuthorizationID)
+		}
+		if calls := harness.oauth.startCalls.Load(); calls != 0 {
+			t.Fatalf("oauth.Start ran after submit won, want 0")
+		}
+	default:
+		t.Fatalf("unexpected race outcomes start=%d submit=%d account=%#v", startStatus, submitStatus, account)
+	}
+}
+
+// AC: concurrent success polls land exactly one vault put and stable pending_validation.
+func TestOAuthPollConcurrentSuccessOneVaultPut(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", usableDraft("pa_oauth_race_poll", domain.AuthModeChatGPTCodexOAuth))
+		h.oauth.nextStatus = domain.OAuthStatusSucceeded
+		h.oauth.material = oauthExchangedMaterial
+	})
+	startResp, startPayload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts/pa_oauth_race_poll/oauth-authorizations",
+		bearer:  tenantAKey,
+		idemKey: "idem-oauth-race-poll-start",
+		body:    oauthStartBody("connect", "device"),
+	})
+	if startResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start status = %d (body=%s)", startResp.StatusCode, startPayload)
+	}
+	authID, _ := decodeOAuth(t, startPayload)["authorization_id"].(string)
+
+	const racers = 8
+	var wg sync.WaitGroup
+	statuses := make([]int, racers)
+	wg.Add(racers)
+	for index := 0; index < racers; index++ {
+		go func(slot int) {
+			defer wg.Done()
+			response, _ := harness.do(t, requestSpec{
+				method: http.MethodGet,
+				path:   "/v1/provider-accounts/pa_oauth_race_poll/oauth-authorizations/" + authID,
+				bearer: tenantAKey,
+			})
+			statuses[slot] = response.StatusCode
+		}(index)
+	}
+	wg.Wait()
+
+	ok := 0
+	for _, status := range statuses {
+		switch status {
+		case http.StatusOK:
+			ok++
+		case http.StatusServiceUnavailable, http.StatusConflict:
+			// Retryable settlement races are acceptable for losers.
+		default:
+			t.Fatalf("unexpected concurrent poll status %d", status)
+		}
+	}
+	if ok < 1 {
+		t.Fatalf("no successful poll settled the journey")
+	}
+	if calls := harness.vault.putCalls.Load(); calls != 1 {
+		t.Fatalf("vault.Put ran %d times under concurrent poll, want 1", calls)
+	}
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_race_poll")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if account.Lifecycle != domain.LifecyclePendingValidation {
+		t.Fatalf("lifecycle = %s, want pending_validation", account.Lifecycle)
+	}
+	if account.Credential.Version != 1 {
+		t.Fatalf("credential.version = %d, want 1", account.Credential.Version)
+	}
+	if account.ActiveOAuthAuthorizationID != "" {
+		t.Fatalf("marker still set after concurrent success: %q", account.ActiveOAuthAuthorizationID)
+	}
+}
+
+// AC: terminal same-key start replay returns the original authorization without a
+// second oauth.Start, even while the journey marker is still active.
+func TestOAuthStartTerminalReplayReturnsSameAuthorization(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", usableDraft("pa_oauth_replay", domain.AuthModeChatGPTCodexOAuth))
+	})
+	first, firstPayload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts/pa_oauth_replay/oauth-authorizations",
+		bearer:  tenantAKey,
+		idemKey: "idem-oauth-terminal-replay",
+		body:    oauthStartBody("connect", "device"),
+	})
+	if first.StatusCode != http.StatusAccepted {
+		t.Fatalf("first status = %d (body=%s)", first.StatusCode, firstPayload)
+	}
+	firstID, _ := decodeOAuth(t, firstPayload)["authorization_id"].(string)
+
+	second, secondPayload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts/pa_oauth_replay/oauth-authorizations",
+		bearer:  tenantAKey,
+		idemKey: "idem-oauth-terminal-replay",
+		body:    oauthStartBody("connect", "device"),
+	})
+	if second.StatusCode != http.StatusAccepted {
+		t.Fatalf("replay status = %d, want 202 (body=%s)", second.StatusCode, secondPayload)
+	}
+	secondID, _ := decodeOAuth(t, secondPayload)["authorization_id"].(string)
+	if secondID != firstID {
+		t.Fatalf("replay authorization_id = %q, want %q", secondID, firstID)
+	}
+	if calls := harness.oauth.startCalls.Load(); calls != 1 {
+		t.Fatalf("oauth.Start ran %d times, want 1", calls)
+	}
+}
+
+// AC: fingerprint mismatch and in-progress claims never start a second journey.
+func TestOAuthStartReplayOutcomesNeverDuplicateWork(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		outcome ports.ReplayOutcome
+		code    string
+		status  int
+	}{
+		{name: "conflict", outcome: ports.ReplayConflict, code: "idempotency_conflict", status: http.StatusConflict},
+		{name: "in_progress", outcome: ports.ReplayInProgress, code: "idempotency_in_progress", status: http.StatusConflict},
+	}
+	for _, testCase := range cases {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			harness := newSpineHarness(t, func(h *spineHarness) {
+				h.accounts.seed("tenant_a", usableDraft("pa_oauth_replay_"+testCase.name, domain.AuthModeChatGPTCodexOAuth))
+				h.replay.forced = testCase.outcome
+			})
+			response, payload := harness.do(t, requestSpec{
+				method:  http.MethodPost,
+				path:    "/v1/provider-accounts/pa_oauth_replay_" + testCase.name + "/oauth-authorizations",
+				bearer:  tenantAKey,
+				idemKey: "idem-oauth-" + testCase.name,
+				body:    oauthStartBody("connect", "device"),
+			})
+			if response.StatusCode != testCase.status {
+				t.Fatalf("status = %d, want %d (body=%s)", response.StatusCode, testCase.status, payload)
+			}
+			body := decodeError(t, payload)
+			if body["code"] != testCase.code {
+				t.Fatalf("code = %v, want %s", body["code"], testCase.code)
+			}
+			if calls := harness.oauth.startCalls.Load(); calls != 0 {
+				t.Fatalf("oauth.Start ran %d times on %s, want 0", calls, testCase.name)
+			}
+		})
+	}
+}
+
+// AC: account update failure after vault put is retryable, and a later poll
+// finishes settlement without permanently 500ing.
+func TestOAuthPollRecoversAfterAccountUpdateFailure(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", usableDraft("pa_oauth_recover", domain.AuthModeChatGPTCodexOAuth))
+		h.oauth.nextStatus = domain.OAuthStatusSucceeded
+		h.oauth.material = oauthExchangedMaterial
+	})
+	startResp, startPayload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts/pa_oauth_recover/oauth-authorizations",
+		bearer:  tenantAKey,
+		idemKey: "idem-oauth-recover-start",
+		body:    oauthStartBody("connect", "device"),
+	})
+	if startResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start status = %d (body=%s)", startResp.StatusCode, startPayload)
+	}
+	authID, _ := decodeOAuth(t, startPayload)["authorization_id"].(string)
+
+	// Force only the first settlement Update after a successful start to fail.
+	harness.accounts.updateFailTimes.Store(1)
+	harness.accounts.updateErr = ports.ErrDependencyUnavailable
+
+	first, firstPayload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_oauth_recover/oauth-authorizations/" + authID,
+		bearer: tenantAKey,
+	})
+	if first.StatusCode != http.StatusOK && first.StatusCode != http.StatusServiceUnavailable && first.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("first poll status = %d (body=%s)", first.StatusCode, firstPayload)
+	}
+
+	harness.accounts.updateFailTimes.Store(0)
+	harness.accounts.updateErr = nil
+
+	second, secondPayload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_oauth_recover/oauth-authorizations/" + authID,
+		bearer: tenantAKey,
+	})
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("retry poll status = %d, want 200 (body=%s)", second.StatusCode, secondPayload)
+	}
+	body := decodeOAuth(t, secondPayload)
+	if body["status"] != "succeeded" {
+		t.Fatalf("retry status = %v, want succeeded", body["status"])
+	}
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_recover")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if account.Lifecycle != domain.LifecyclePendingValidation {
+		t.Fatalf("lifecycle after recovery = %s, want pending_validation", account.Lifecycle)
+	}
+	if account.Credential.Version != 1 {
+		t.Fatalf("credential.version after recovery = %d, want 1", account.Credential.Version)
+	}
+	if account.ActiveOAuthAuthorizationID != "" {
+		t.Fatalf("marker still set after recovery: %q", account.ActiveOAuthAuthorizationID)
+	}
+}
+
+// AC: pending journeys with zero expiry fail closed and restore draft so the
+// marker cannot stick forever.
+func TestOAuthPollZeroExpiryFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", usableDraft("pa_oauth_zero_exp", domain.AuthModeChatGPTCodexOAuth))
+		h.oauth.nextStatus = domain.OAuthStatusAuthorizationPending
+	})
+	startResp, startPayload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts/pa_oauth_zero_exp/oauth-authorizations",
+		bearer:  tenantAKey,
+		idemKey: "idem-oauth-zero-exp",
+		body:    oauthStartBody("connect", "device"),
+	})
+	if startResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start status = %d (body=%s)", startResp.StatusCode, startPayload)
+	}
+	authID, _ := decodeOAuth(t, startPayload)["authorization_id"].(string)
+
+	harness.oauth.mu.Lock()
+	if record, ok := harness.oauth.records[domain.OAuthAuthorizationID(authID)]; ok {
+		record.authorization.ExpiresAt = domain.Timestamp{}
+	}
+	harness.oauth.mu.Unlock()
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_oauth_zero_exp/oauth-authorizations/" + authID,
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeOAuth(t, payload)
+	if body["status"] != "failed" {
+		t.Fatalf("status = %v, want failed", body["status"])
+	}
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_zero_exp")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if account.Lifecycle != domain.LifecycleDraft {
+		t.Fatalf("lifecycle = %s, want draft", account.Lifecycle)
+	}
+	if account.ActiveOAuthAuthorizationID != "" {
+		t.Fatalf("marker still set after zero-expiry fail-closed: %q", account.ActiveOAuthAuthorizationID)
 	}
 }

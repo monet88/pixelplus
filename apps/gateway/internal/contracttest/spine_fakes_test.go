@@ -173,15 +173,19 @@ func (store *stubReplayStore) Abandon(_ context.Context, identity domain.ReplayI
 // unknown, and deleted identifiers all return ErrAccountNotVisible so the
 // outcome is indistinguishable (#6 section 5.1).
 type stubAccountStore struct {
-	log          *spineLog
-	mu           sync.Mutex
-	byTenant     map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
-	createErr    error
-	updateErr    error
-	createCalls  atomic.Int32
-	visibleCalls atomic.Int32
-	listCalls    atomic.Int32
-	updateCalls  atomic.Int32
+	log       *spineLog
+	mu        sync.Mutex
+	byTenant  map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
+	createErr error
+	updateErr error
+	// updateFailTimes forces the next N Update calls to return updateErr (or
+	// ErrDependencyUnavailable when updateErr is nil) so partial-success recovery
+	// after vault put can be contract-tested.
+	updateFailTimes atomic.Int32
+	createCalls     atomic.Int32
+	visibleCalls    atomic.Int32
+	listCalls       atomic.Int32
+	updateCalls     atomic.Int32
 }
 
 func newStubAccountStore(log *spineLog) *stubAccountStore {
@@ -256,6 +260,13 @@ func (store *stubAccountStore) List(_ context.Context, principal domain.Security
 func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpdate) (domain.ProviderAccount, error) {
 	store.updateCalls.Add(1)
 	store.log.add("account.update")
+	if remaining := store.updateFailTimes.Load(); remaining > 0 {
+		store.updateFailTimes.Add(-1)
+		if store.updateErr != nil {
+			return domain.ProviderAccount{}, store.updateErr
+		}
+		return domain.ProviderAccount{}, ports.ErrDependencyUnavailable
+	}
 	if store.updateErr != nil {
 		return domain.ProviderAccount{}, store.updateErr
 	}
@@ -268,6 +279,15 @@ func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpd
 	existing, ok := accounts[update.Account.ID]
 	if !ok || existing.Lifecycle == domain.LifecycleDeleted {
 		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	if update.RequireEmptyOAuthMarker && existing.ActiveOAuthAuthorizationID != "" {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireOAuthMarker != "" && existing.ActiveOAuthAuthorizationID != update.RequireOAuthMarker {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireDraftLifecycle && existing.Lifecycle != domain.LifecycleDraft {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
@@ -345,20 +365,35 @@ type stubCredentialVault struct {
 	putCalls    atomic.Int32
 	validCalls  atomic.Int32
 	lastIntake  ports.CredentialIntake
+	// versions records the first successful put per account so concurrent or
+	// recovery re-hands of the same version are idempotent and do not count as
+	// a second durable put.
+	versions map[domain.ProviderAccountID]int
 }
 
 func newStubCredentialVault(log *spineLog) *stubCredentialVault {
-	return &stubCredentialVault{log: log, validResult: ports.CredentialValidationResult{Valid: true}}
+	return &stubCredentialVault{
+		log:         log,
+		validResult: ports.CredentialValidationResult{Valid: true},
+		versions:    make(map[domain.ProviderAccountID]int),
+	}
 }
 
 func (vault *stubCredentialVault) Put(_ context.Context, intake ports.CredentialIntake) error {
-	vault.putCalls.Add(1)
 	vault.log.add("vault.put")
 	if vault.putErr != nil {
+		vault.putCalls.Add(1)
 		return vault.putErr
 	}
 	vault.mu.Lock()
 	defer vault.mu.Unlock()
+	if existing, ok := vault.versions[intake.AccountID]; ok && existing >= intake.Version {
+		// Idempotent re-hand of an already-stored version.
+		vault.lastIntake = intake
+		return nil
+	}
+	vault.putCalls.Add(1)
+	vault.versions[intake.AccountID] = intake.Version
 	vault.lastIntake = intake
 	return nil
 }
@@ -447,6 +482,12 @@ type stubOAuthExchangeAdapter struct {
 	pollErr    error
 	nextStatus domain.OAuthStatus
 	material   string
+	// startHold, when non-nil, blocks Start after the call is counted until the
+	// channel closes. Contract tests use it to force concurrent start races.
+	startHold <-chan struct{}
+	// pollHold, when non-nil, blocks Poll after the call is counted until the
+	// channel closes so concurrent settlement races can be observed.
+	pollHold   <-chan struct{}
 	startCalls atomic.Int32
 	pollCalls  atomic.Int32
 	records    map[domain.OAuthAuthorizationID]*stubOAuthRecord
@@ -470,11 +511,17 @@ func newStubOAuthExchangeAdapter(log *spineLog) *stubOAuthExchangeAdapter {
 func (adapter *stubOAuthExchangeAdapter) Start(_ context.Context, command ports.OAuthStartCommand) (ports.OAuthStartResult, error) {
 	adapter.startCalls.Add(1)
 	adapter.log.add("oauth.start")
+	if adapter.startHold != nil {
+		<-adapter.startHold
+	}
 	if adapter.startErr != nil {
 		return ports.OAuthStartResult{}, adapter.startErr
 	}
 	sequence := adapter.seq.Add(1)
-	id := domain.OAuthAuthorizationID(fmt.Sprintf("oauth_%04d", sequence))
+	id := command.AuthorizationID
+	if id == "" {
+		id = domain.OAuthAuthorizationID(fmt.Sprintf("oauth_%04d", sequence))
+	}
 	verificationURI := "https://provider.example/device"
 	userCode := fmt.Sprintf("USER-%04d", sequence)
 	if command.Flow == domain.OAuthFlowBrowser {
@@ -499,6 +546,9 @@ func (adapter *stubOAuthExchangeAdapter) Start(_ context.Context, command ports.
 func (adapter *stubOAuthExchangeAdapter) Poll(_ context.Context, command ports.OAuthPollCommand) (ports.OAuthPollResult, error) {
 	adapter.pollCalls.Add(1)
 	adapter.log.add("oauth.poll")
+	if adapter.pollHold != nil {
+		<-adapter.pollHold
+	}
 	if adapter.pollErr != nil {
 		return ports.OAuthPollResult{}, adapter.pollErr
 	}
@@ -509,6 +559,15 @@ func (adapter *stubOAuthExchangeAdapter) Poll(_ context.Context, command ports.O
 		return ports.OAuthPollResult{}, ports.ErrOAuthAuthorizationNotVisible
 	}
 	if record.authorization.Status.Terminal() {
+		// Succeeded journeys re-hand material so a retry after vault put + failed
+		// account update can still finish settlement. Failed journeys never carry
+		// material.
+		if record.authorization.Status == domain.OAuthStatusSucceeded {
+			return ports.OAuthPollResult{
+				Authorization:     record.authorization,
+				ExchangedMaterial: adapter.material,
+			}, nil
+		}
 		return ports.OAuthPollResult{Authorization: record.authorization}, nil
 	}
 	status := adapter.nextStatus
@@ -521,13 +580,12 @@ func (adapter *stubOAuthExchangeAdapter) Poll(_ context.Context, command ports.O
 		record.authorization.Remediation = domain.RemediationNone
 		record.authorization.UserCode = ""
 		record.authorization.VerificationURI = ""
-		if !record.consumed {
-			record.consumed = true
-			return ports.OAuthPollResult{
-				Authorization:     record.authorization,
-				ExchangedMaterial: adapter.material,
-			}, nil
-		}
+		// Re-hand material until account settlement succeeds. A one-shot consume
+		// would permanently 500 a retry after vault put + failed account update.
+		return ports.OAuthPollResult{
+			Authorization:     record.authorization,
+			ExchangedMaterial: adapter.material,
+		}, nil
 	case domain.OAuthStatusFailed:
 		record.authorization.Remediation = domain.RemediationCompleteOAuth
 		record.authorization.UserCode = ""

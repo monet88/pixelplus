@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"unicode/utf8"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
@@ -148,6 +149,27 @@ func (service *ProviderAccountService) SubmitProviderCredential(ctx context.Cont
 		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
 
+	// Re-check single-flight OAuth marker immediately before Vault use so a
+	// concurrent OAuth start that claimed the account cannot be overwritten by a
+	// stale direct submit snapshot (management contract §4.3).
+	latest, err := service.accounts.Visible(ctx, principal, account.ID)
+	if err != nil {
+		service.release(ctx, reservation)
+		service.abandon(ctx, identity)
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
+	}
+	if latest.ActiveOAuthAuthorizationID != "" {
+		service.release(ctx, reservation)
+		service.abandon(ctx, identity)
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationCompleteOAuth))
+	}
+	if !latest.Lifecycle.AcceptsCredentialSubmission() {
+		service.release(ctx, reservation)
+		service.abandon(ctx, identity)
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationAccountRemediation))
+	}
+	account = latest
+
 	// Store the material through the Vault under the next credential version.
 	// The application forwards the secret without inspecting or retaining it and
 	// receives nothing secret back.
@@ -167,10 +189,17 @@ func (service *ProviderAccountService) SubmitProviderCredential(ctx context.Cont
 	}
 
 	submitted := account.WithSubmittedCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
-	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: submitted})
+	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
+		Principal:               principal,
+		Account:                 submitted,
+		RequireEmptyOAuthMarker: true,
+	})
 	if err != nil {
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
+		if errors.Is(err, ports.ErrAccountUpdateConflict) {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationCompleteOAuth))
+		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 

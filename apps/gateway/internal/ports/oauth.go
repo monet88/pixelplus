@@ -18,9 +18,13 @@ var ErrOAuthAuthorizationNotVisible = errors.New("oauth authorization not visibl
 type OAuthStartCommand struct {
 	Principal domain.SecurityPrincipal
 	AccountID domain.ProviderAccountID
-	AuthMode  domain.AuthMode
-	Purpose   domain.OAuthPurpose
-	Flow      domain.OAuthFlow
+	// AuthorizationID is the server-owned journey identity claimed before Start.
+	// The adapter MUST mint the journey under this identity so a single-flight
+	// marker can be written before any Provider exchange begins.
+	AuthorizationID domain.OAuthAuthorizationID
+	AuthMode        domain.AuthMode
+	Purpose         domain.OAuthPurpose
+	Flow            domain.OAuthFlow
 }
 
 // OAuthStartResult is the safe start projection plus the server-owned journey

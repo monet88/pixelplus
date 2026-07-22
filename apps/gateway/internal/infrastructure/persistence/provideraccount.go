@@ -171,6 +171,15 @@ func (store *MemoryAccountStore) Update(_ context.Context, update ports.AccountU
 	if !ok || existing.Lifecycle == domain.LifecycleDeleted {
 		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
 	}
+	if update.RequireEmptyOAuthMarker && existing.ActiveOAuthAuthorizationID != "" {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireOAuthMarker != "" && existing.ActiveOAuthAuthorizationID != update.RequireOAuthMarker {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireDraftLifecycle && existing.Lifecycle != domain.LifecycleDraft {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
 }
