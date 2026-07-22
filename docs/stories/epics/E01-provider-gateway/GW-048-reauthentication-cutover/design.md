@@ -2,11 +2,11 @@
 
 ## Domain Model
 
-`CredentialMetadata.Version` remains the monotonically allocated version shown
-by existing safe projections. New internal fields distinguish `ActiveVersion`,
-`PendingVersion`, and `PendingOrigin`. A replacement increments `Version`, sets
-`PendingVersion`, and leaves `ActiveVersion` unchanged until the pending version
-is validated and probed.
+`CredentialMetadata.Version` remains the publicly projected active/authorized
+version. Allocation advances only via `LastAllocatedVersion`. A replacement sets
+internal `PendingCredentialVersion` (and `PendingOrigin`) without changing public
+`credential.version` until validation and probe promote the pending version
+(ADR 0011 dual-version).
 
 ## Application Flow
 

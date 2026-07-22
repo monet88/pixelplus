@@ -42,7 +42,10 @@ git diff --check
 - Public HTTP composition tests passed for direct active/disabled replacement,
   OAuth reauthentication, pending-version cutover, prior-version revocation,
   failed replacement restoration, monotonic failed-version allocation, OAuth
-  failure origin preservation, and retry reuse of a staged pending version.
+  failure origin preservation, retry reuse of a staged pending version,
+  disabled-origin single-flight (second reauth blocked while pending),
+  reauthentication non-enumeration, probe reject while replacement marker held,
+  and stale RequirePendingVersion promotion fencing.
 - `node scripts/validate-public-api-contract.mjs` passed: 26 operations and
   205 Draft 2020-12 examples.
 - `go -C apps/gateway test ./...` passed.

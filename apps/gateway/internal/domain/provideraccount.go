@@ -502,6 +502,7 @@ func (account ProviderAccount) withProbeActivated(now Timestamp, replacement boo
 		account.PendingCredentialVersion = 0
 	}
 	account.PendingOrigin = ""
+	account.PendingOriginHealth = HealthSummary{}
 	account.Credential.LastProbedAt = now
 	account.Health = HealthSummary{
 		SummaryState: HealthHealthy,

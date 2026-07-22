@@ -2,11 +2,13 @@ package contracttest_test
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
+	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
 // The direct credential submission material used across these tests. It is a
@@ -505,6 +507,213 @@ func TestDisabledReauthenticationStaysDisabledAfterCutover(t *testing.T) {
 	account := decodeAccount(t, payload)
 	if account["lifecycle_state"] != string(domain.LifecycleDisabled) {
 		t.Fatalf("disabled origin became usable: %s", payload)
+	}
+}
+
+// Disabled-origin reauth keeps lifecycle=disabled with a non-zero pending
+// version. A second direct reauth with a fresh Idempotency-Key must hit the
+// shared single-flight gate (pending version owns the window) and never re-Put.
+func TestDisabledReauthenticationSecondKeyBlockedWhilePending(t *testing.T) {
+	t.Parallel()
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := probeableAccount("pa_reauth_disabled_singleflight", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleDisabled
+		account.Credential.Version = 1
+		account.Credential.LastAllocatedVersion = 1
+		h.accounts.seed("tenant_a", account)
+	})
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_reauth_disabled_singleflight/reauthentication",
+		bearer: tenantAKey, idemKey: "idem-reauth-disabled-sf-1",
+		body: submitBody(domain.CredentialClassOAuthTokenImport),
+	})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("first reauth status = %d, want 202 (body=%s)", response.StatusCode, payload)
+	}
+	if calls := harness.vault.putCalls.Load(); calls != 1 {
+		t.Fatalf("first reauth vault.Put ran %d times, want 1", calls)
+	}
+
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_reauth_disabled_singleflight/reauthentication",
+		bearer: tenantAKey, idemKey: "idem-reauth-disabled-sf-2",
+		body: submitBody(domain.CredentialClassOAuthTokenImport),
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("second reauth status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	if body := decodeError(t, payload); body["code"] != "account_not_usable" {
+		t.Fatalf("second reauth code = %v, want account_not_usable", body["code"])
+	}
+	if calls := harness.vault.putCalls.Load(); calls != 1 {
+		t.Fatalf("second reauth vault.Put ran (total=%d), want still 1", calls)
+	}
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_reauth_disabled_singleflight")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if account.PendingCredentialVersion != 2 || account.Credential.Version != 1 {
+		t.Fatalf("pending/current versions changed under second reauth: pending=%d current=%d", account.PendingCredentialVersion, account.Credential.Version)
+	}
+}
+
+// Direct reauthentication non-enumeration: foreign, unknown, and deleted ids
+// are indistinguishable resource_not_found before any Vault use.
+func TestReauthenticationNonEnumerationIsIndistinguishable(t *testing.T) {
+	t.Parallel()
+
+	foreign := probeableAccount("pa_reauth_foreign", domain.AuthModeChatGPTCodexOAuth)
+	foreign.Lifecycle = domain.LifecycleActive
+	foreign.Credential.Version = 1
+	foreign.Credential.LastAllocatedVersion = 1
+	deleted := probeableAccount("pa_reauth_deleted", domain.AuthModeChatGPTCodexOAuth)
+	deleted.Lifecycle = domain.LifecycleDeleted
+	deleted.Credential.Version = 1
+	deleted.Credential.LastAllocatedVersion = 1
+	seed := func(h *spineHarness) {
+		h.accounts.seed("tenant_b", foreign)
+		h.accounts.seed("tenant_a", deleted)
+	}
+
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{name: "foreign", id: "pa_reauth_foreign"},
+		{name: "unknown", id: "pa_reauth_missing"},
+		{name: "deleted", id: "pa_reauth_deleted"},
+	}
+
+	var bodies []string
+	for _, testCase := range cases {
+		harness := newSpineHarness(t, seed)
+		response, payload := harness.do(t, requestSpec{
+			method:  http.MethodPost,
+			path:    "/v1/provider-accounts/" + testCase.id + "/reauthentication",
+			bearer:  tenantAKey,
+			idemKey: "idem-reauth-missing-" + testCase.name,
+			body:    submitBody(domain.CredentialClassOAuthTokenImport),
+		})
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s: status = %d, want 404 (body=%s)", testCase.name, response.StatusCode, payload)
+		}
+		body := decodeError(t, payload)
+		if body["code"] != "resource_not_found" {
+			t.Fatalf("%s: code = %v, want resource_not_found", testCase.name, body["code"])
+		}
+		if _, ok := body["resource_reference"]; ok {
+			t.Fatalf("%s: non-enumeration leaked resource_reference", testCase.name)
+		}
+		if calls := harness.vault.putCalls.Load(); calls != 0 {
+			t.Fatalf("%s: vault.Put ran before ownership resolved, want 0", testCase.name)
+		}
+		delete(body, "request_id")
+		normalized, _ := json.Marshal(body)
+		bodies = append(bodies, string(normalized))
+	}
+	for index := 1; index < len(bodies); index++ {
+		if bodies[index] != bodies[0] {
+			t.Fatalf("non-enumeration outcomes are distinguishable:\n %s\n %s", bodies[0], bodies[index])
+		}
+	}
+}
+
+// While the replacement marker is held (pending allocated, Vault write not yet
+// settled), probe must reject before Validate so it cannot revoke/restore mid-stage.
+func TestProbeRejectedWhileReplacementMarkerHeld(t *testing.T) {
+	t.Parallel()
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := probeableAccount("pa_reauth_marker_probe", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleActive
+		account.Credential.Version = 1
+		account.Credential.LastAllocatedVersion = 2
+		account.PendingCredentialVersion = 2
+		account.PendingOrigin = domain.LifecycleActive
+		account.ActiveOAuthAuthorizationID = "oauth_auth_inflight_reauth"
+		h.accounts.seed("tenant_a", account)
+	})
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_reauth_marker_probe/probe",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	if body := decodeError(t, payload); body["code"] != "account_not_usable" {
+		t.Fatalf("code = %v, want account_not_usable", body["code"])
+	}
+	if calls := harness.vault.validCalls.Load(); calls != 0 {
+		t.Fatalf("vault.Validate ran %d times while marker held, want 0", calls)
+	}
+	if calls := harness.probe.callCount.Load(); calls != 0 {
+		t.Fatalf("probe ran %d times while marker held, want 0", calls)
+	}
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_reauth_marker_probe")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if account.PendingCredentialVersion != 2 || account.ActiveOAuthAuthorizationID == "" {
+		t.Fatalf("probe mutated in-flight fence: pending=%d marker=%q", account.PendingCredentialVersion, account.ActiveOAuthAuthorizationID)
+	}
+}
+
+// After promotion clears pending, a stale writer fenced on the old pending
+// version must conflict and must not rewrite the cutover row.
+func TestStalePendingPromotionFenceConflicts(t *testing.T) {
+	t.Parallel()
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := probeableAccount("pa_reauth_stale_fence", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleActive
+		account.Credential.Version = 1
+		account.Credential.LastAllocatedVersion = 1
+		h.accounts.seed("tenant_a", account)
+	})
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_reauth_stale_fence/reauthentication",
+		bearer: tenantAKey, idemKey: "idem-reauth-stale-fence",
+		body: submitBody(domain.CredentialClassOAuthTokenImport),
+	})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("reauth status = %d, want 202 (body=%s)", response.StatusCode, payload)
+	}
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_reauth_stale_fence/probe",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	promoted, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_reauth_stale_fence")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if promoted.PendingCredentialVersion != 0 || promoted.Credential.Version != 2 {
+		t.Fatalf("cutover state unexpected: pending=%d version=%d", promoted.PendingCredentialVersion, promoted.Credential.Version)
+	}
+
+	// Stale promotion writer still carries RequirePendingVersion=2 after the
+	// winning writer cleared pending.
+	stale := promoted
+	stale.Credential.Version = 99
+	_, err = harness.accounts.Update(t.Context(), ports.AccountUpdate{
+		Principal:             managePrincipal(),
+		Account:               stale,
+		RequirePendingVersion: 2,
+	})
+	if !errors.Is(err, ports.ErrAccountUpdateConflict) {
+		t.Fatalf("stale fence error = %v, want ErrAccountUpdateConflict", err)
+	}
+	current, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_reauth_stale_fence")
+	if err != nil {
+		t.Fatalf("visible after stale: %v", err)
+	}
+	if current.Credential.Version != 2 {
+		t.Fatalf("stale writer rewrote cutover version = %d, want 2", current.Credential.Version)
 	}
 }
 
