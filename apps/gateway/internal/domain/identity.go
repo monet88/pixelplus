@@ -33,6 +33,12 @@ const (
 	// OperationGetOAuthAuthorization names the server-owned OAuth poll
 	// operation (getOAuthAuthorization). It requires accounts.manage.
 	OperationGetOAuthAuthorization OperationToken = "get_oauth_authorization"
+	// OperationGetCapabilitySnapshot names the per-account Capability Snapshot
+	// read (getCapabilitySnapshot). It accepts accounts.read or capabilities.read.
+	OperationGetCapabilitySnapshot OperationToken = "get_capability_snapshot"
+	// OperationListModels names the offerable model list (listModels). It
+	// requires capabilities.read.
+	OperationListModels OperationToken = "list_models"
 )
 
 // NewTimestamp wraps a concrete instant.

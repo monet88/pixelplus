@@ -100,34 +100,38 @@ type spineContext struct {
 // Request-size (A2) and strict decode are observed at the transport boundary
 // but carried as flags so this single normative order is enforced here.
 type ProviderAccountService struct {
-	principal  ports.PrincipalStore
-	admission  ports.AdmissionStore
-	replay     ports.ReplayStore
-	accounts   ports.AccountStore
-	vault      ports.CredentialVault
-	probe      ports.ProbeAdapter
-	oauth      ports.OAuthExchangeAdapter
-	audit      ports.AuditRecorder
-	telemetry  ports.TelemetryRecorder
-	requestLog ports.RequestLogRecorder
-	clock      ports.Clock
-	ids        ports.IDGenerator
+	principal    ports.PrincipalStore
+	admission    ports.AdmissionStore
+	replay       ports.ReplayStore
+	accounts     ports.AccountStore
+	vault        ports.CredentialVault
+	probe        ports.ProbeAdapter
+	oauth        ports.OAuthExchangeAdapter
+	capabilities ports.CapabilityStore
+	capability   ports.CapabilityAdapter
+	audit        ports.AuditRecorder
+	telemetry    ports.TelemetryRecorder
+	requestLog   ports.RequestLogRecorder
+	clock        ports.Clock
+	ids          ports.IDGenerator
 }
 
 // ProviderAccountDependencies bundles the controlled ports this slice owns.
 type ProviderAccountDependencies struct {
-	Principal  ports.PrincipalStore
-	Admission  ports.AdmissionStore
-	Replay     ports.ReplayStore
-	Accounts   ports.AccountStore
-	Vault      ports.CredentialVault
-	Probe      ports.ProbeAdapter
-	OAuth      ports.OAuthExchangeAdapter
-	Audit      ports.AuditRecorder
-	Telemetry  ports.TelemetryRecorder
-	RequestLog ports.RequestLogRecorder
-	Clock      ports.Clock
-	IDs        ports.IDGenerator
+	Principal    ports.PrincipalStore
+	Admission    ports.AdmissionStore
+	Replay       ports.ReplayStore
+	Accounts     ports.AccountStore
+	Vault        ports.CredentialVault
+	Probe        ports.ProbeAdapter
+	OAuth        ports.OAuthExchangeAdapter
+	Capabilities ports.CapabilityStore
+	Capability   ports.CapabilityAdapter
+	Audit        ports.AuditRecorder
+	Telemetry    ports.TelemetryRecorder
+	RequestLog   ports.RequestLogRecorder
+	Clock        ports.Clock
+	IDs          ports.IDGenerator
 }
 
 // NewProviderAccountService validates and wires the request spine dependencies.
@@ -147,6 +151,10 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		return nil, errors.New("application: probe adapter is required")
 	case dependencies.OAuth == nil:
 		return nil, errors.New("application: oauth exchange adapter is required")
+	case dependencies.Capabilities == nil:
+		return nil, errors.New("application: capability store is required")
+	case dependencies.Capability == nil:
+		return nil, errors.New("application: capability adapter is required")
 	case dependencies.Audit == nil:
 		return nil, errors.New("application: audit recorder is required")
 	case dependencies.Telemetry == nil:
@@ -159,18 +167,20 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		return nil, errors.New("application: ID generator is required")
 	}
 	return &ProviderAccountService{
-		principal:  dependencies.Principal,
-		admission:  dependencies.Admission,
-		replay:     dependencies.Replay,
-		accounts:   dependencies.Accounts,
-		vault:      dependencies.Vault,
-		probe:      dependencies.Probe,
-		oauth:      dependencies.OAuth,
-		audit:      dependencies.Audit,
-		telemetry:  dependencies.Telemetry,
-		requestLog: dependencies.RequestLog,
-		clock:      dependencies.Clock,
-		ids:        dependencies.IDs,
+		principal:    dependencies.Principal,
+		admission:    dependencies.Admission,
+		replay:       dependencies.Replay,
+		accounts:     dependencies.Accounts,
+		vault:        dependencies.Vault,
+		probe:        dependencies.Probe,
+		oauth:        dependencies.OAuth,
+		capabilities: dependencies.Capabilities,
+		capability:   dependencies.Capability,
+		audit:        dependencies.Audit,
+		telemetry:    dependencies.Telemetry,
+		requestLog:   dependencies.RequestLog,
+		clock:        dependencies.Clock,
+		ids:          dependencies.IDs,
 	}, nil
 }
 

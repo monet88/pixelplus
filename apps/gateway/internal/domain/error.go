@@ -35,6 +35,9 @@ const (
 	StatusQuota            StatusClass = "quota"
 	StatusAccountPolicy    StatusClass = "account_policy"
 	StatusConflict         StatusClass = "conflict"
+	// StatusCapability is the pre-upstream capability evidence class (frozen
+	// CanonicalError.status_class capability; HTTP 409).
+	StatusCapability StatusClass = "capability"
 	// StatusCapacity is the durable Tenant storage-cap outcome. It is distinct
 	// from the per-request request_size class and the admission quota class so a
 	// storage-cap rejection is never relabeled as either (#13 I-ASSET-SIZE-DISTINCT).
@@ -63,6 +66,8 @@ func (class StatusClass) HTTPStatus() int {
 	case StatusRateLimit, StatusConcurrencyLimit, StatusQuota:
 		return 429
 	case StatusAccountPolicy, StatusConflict:
+		return 409
+	case StatusCapability:
 		return 409
 	case StatusCapacity:
 		return 507
@@ -121,6 +126,15 @@ const (
 	// when a Provider Account is not usable for the requested operation
 	// (frozen ErrorAccountNotUsable example).
 	RemediationAccountRemediation Remediation = "account_remediation"
+	// RemediationCapabilityUnverified asks the Tenant to wait for / trigger a
+	// probe because no usable Capability Snapshot exists yet.
+	RemediationCapabilityUnverified Remediation = "capability_unverified"
+	// RemediationSnapshotStale asks the Tenant to re-probe because the
+	// Capability Snapshot is past its TTL class.
+	RemediationSnapshotStale Remediation = "snapshot_stale"
+	// RemediationCapabilityUnsupported tells the Tenant the operation is not
+	// supported for this account/model and must not be attempted.
+	RemediationCapabilityUnsupported Remediation = "capability_unsupported"
 	// RemediationDeleteAssetsOrWaitExpiry is the storage-cap remediation: the
 	// Tenant deletes Assets or waits for expiry to reclaim headroom (#13 section 6.1).
 	RemediationDeleteAssetsOrWaitExpiry Remediation = "delete_assets_or_wait_expiry"
@@ -140,7 +154,10 @@ const (
 	StageRouting           FailureStage = "routing"
 	// StageAsset classifies a failure raised during Asset validation or storage
 	// lifecycle (#13). It mirrors the frozen CanonicalError.failure_stage enum.
-	StageAsset      FailureStage = "asset"
+	StageAsset FailureStage = "asset"
+	// StageCapability classifies a capability evidence rejection before
+	// upstream execution (capability semantics section 9/10).
+	StageCapability FailureStage = "capability"
 	StageRecovery   FailureStage = "recovery"
 	StageDependency FailureStage = "dependency"
 	StageInternal   FailureStage = "internal"
@@ -226,6 +243,11 @@ const (
 	ErrCodeAccountNotUsable      ErrorCode = "account_not_usable"
 	ErrCodeDependencyUnavailable ErrorCode = "dependency_unavailable"
 	ErrCodeInternal              ErrorCode = "internal_error"
+	// Capability evidence codes (capability semantics section 10; frozen OpenAPI
+	// ErrorCapabilityUnverified / ErrorSnapshotStale / ErrorCapabilityUnsupported).
+	ErrCodeCapabilityUnverified  ErrorCode = "capability_unverified"
+	ErrCodeSnapshotStale         ErrorCode = "snapshot_stale"
+	ErrCodeCapabilityUnsupported ErrorCode = "capability_unsupported"
 	// Asset validation and storage-cap codes (#13 sections 4.4, 6). Each is a
 	// distinct canonical outcome so raw-byte size (request_too_large),
 	// content validation, and durable storage cap are never relabeled as one
@@ -428,6 +450,51 @@ func NewAccountNotUsable(remediation Remediation) CanonicalError {
 		Retryability: RetryNotRetryable,
 		Remediation:  remediation,
 		FailureStage: StageRouting,
+	}
+}
+
+// NewCapabilityUnverified builds the capability failure returned when no
+// Capability Snapshot exists yet for a same-Tenant account, or a requested
+// operation remains unverified. Management snapshot reads use this for the
+// missing-snapshot case (frozen getCapabilitySnapshot 409).
+func NewCapabilityUnverified() CanonicalError {
+	return CanonicalError{
+		Code:            ErrCodeCapabilityUnverified,
+		Category:        CategoryCapability,
+		StatusClass:     StatusCapability,
+		Retryability:    RetryAfter,
+		Remediation:     RemediationCapabilityUnverified,
+		FailureStage:    StageCapability,
+		RetryAfterClass: "capability_reprobe",
+	}
+}
+
+// NewSnapshotStale builds the capability failure returned when a Capability
+// Snapshot is past its TTL class and therefore non-authorizing for
+// capability-bearing work (capability semantics section 6.1/10).
+func NewSnapshotStale() CanonicalError {
+	return CanonicalError{
+		Code:            ErrCodeSnapshotStale,
+		Category:        CategoryCapability,
+		StatusClass:     StatusCapability,
+		Retryability:    RetryAfter,
+		Remediation:     RemediationSnapshotStale,
+		FailureStage:    StageCapability,
+		RetryAfterClass: "capability_reprobe",
+	}
+}
+
+// NewCapabilityUnsupported builds the capability failure for an unsupported
+// operation/model pair. It is not_retryable: the Tenant must choose a
+// supported operation rather than re-probe (capability semantics section 10).
+func NewCapabilityUnsupported() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeCapabilityUnsupported,
+		Category:     CategoryCapability,
+		StatusClass:  StatusCapability,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationCapabilityUnsupported,
+		FailureStage: StageCapability,
 	}
 }
 

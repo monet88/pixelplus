@@ -210,6 +210,11 @@ const (
 	// AuditProviderOAuthPolled records a successful OAuth status poll and its
 	// safe terminal or pending outcome, never exchange material.
 	AuditProviderOAuthPolled AuditAction = "provider_oauth.polled"
+	// AuditCapabilitySnapshotRead records a same-Tenant Capability Snapshot
+	// inspection. It never carries credential material.
+	AuditCapabilitySnapshotRead AuditAction = "capability_snapshot.read"
+	// AuditModelsListed records a Tenant-owned offerable model list projection.
+	AuditModelsListed AuditAction = "models.listed"
 )
 
 // AuditEvent is a secret-free product/security audit projection. It carries

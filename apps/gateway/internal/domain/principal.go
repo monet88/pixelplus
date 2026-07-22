@@ -20,6 +20,9 @@ const (
 	// assets.write.
 	ScopeAssetsRead  Scope = "assets.read"
 	ScopeAssetsWrite Scope = "assets.write"
+	// ScopeCapabilitiesRead authorizes Capability Snapshot inspection and the
+	// offerable model list (capability semantics section 11; OpenAPI x-required-scopes).
+	ScopeCapabilitiesRead Scope = "capabilities.read"
 )
 
 // ScopeSet is the set of operation ids granted to a Security Principal.
