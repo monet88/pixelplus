@@ -27,6 +27,12 @@ const (
 	// OperationProbeProviderAccount names the controlled probe operation
 	// (probeProviderAccount). It requires accounts.manage.
 	OperationProbeProviderAccount OperationToken = "probe_provider_account"
+	// OperationStartOAuthAuthorization names the server-owned OAuth start
+	// operation (startOAuthAuthorization). It requires accounts.manage.
+	OperationStartOAuthAuthorization OperationToken = "start_oauth_authorization"
+	// OperationGetOAuthAuthorization names the server-owned OAuth poll
+	// operation (getOAuthAuthorization). It requires accounts.manage.
+	OperationGetOAuthAuthorization OperationToken = "get_oauth_authorization"
 )
 
 // NewTimestamp wraps a concrete instant.

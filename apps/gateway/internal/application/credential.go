@@ -313,6 +313,12 @@ func (service *ProviderAccountService) submissionGate(account domain.ProviderAcc
 	if !account.Lifecycle.AcceptsCredentialSubmission() {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
 	}
+	// A server-owned OAuth journey already in flight owns the replacement window.
+	// Direct submission must not overwrite or orphan that journey (management
+	// contract §4.3 single-flight replacement gate).
+	if account.ActiveOAuthAuthorizationID != "" {
+		return domain.NewAccountNotUsable(domain.RemediationCompleteOAuth), false
+	}
 	// The submitted credential class MUST match the Auth Mode so Web and
 	// OAuth/CLI credential lifecycles never mix on one account (I-NO-WEB-OAUTH-MIX).
 	if class != account.AuthMode.RequiredCredentialClass() {

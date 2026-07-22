@@ -26,6 +26,8 @@ type ProviderAccountGateway interface {
 	ListProviderAccounts(context.Context, application.ListProviderAccountsQuery) (application.ProviderAccountsResult, error)
 	SubmitProviderCredential(context.Context, application.SubmitProviderCredentialCommand) (application.ProviderAccountResult, error)
 	ProbeProviderAccount(context.Context, application.ProbeProviderAccountCommand) (application.ProviderAccountResult, error)
+	StartOAuthAuthorization(context.Context, application.StartOAuthAuthorizationCommand) (application.OAuthAuthorizationResult, error)
+	GetOAuthAuthorization(context.Context, application.GetOAuthAuthorizationQuery) (application.OAuthAuthorizationResult, error)
 }
 
 type providerAccountHandler struct {
@@ -42,6 +44,8 @@ func registerProviderAccountRoutes(mux *http.ServeMux, gateway ProviderAccountGa
 	mux.HandleFunc("GET /v1/provider-accounts/{provider_account_id}", handler.get)
 	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/credentials", handler.submitCredential)
 	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/probe", handler.probe)
+	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/oauth-authorizations", handler.startOAuth)
+	mux.HandleFunc("GET /v1/provider-accounts/{provider_account_id}/oauth-authorizations/{authorization_id}", handler.getOAuth)
 }
 
 // newRequestID creates the server-owned request id at the Public API boundary
@@ -290,4 +294,62 @@ func decodeStrictJSON(body []byte, target any) error {
 		return errors.New("unexpected trailing content")
 	}
 	return nil
+}
+
+type oauthStartRequest struct {
+	Purpose        string `json:"purpose"`
+	FlowPreference string `json:"flow_preference"`
+}
+
+func (handler providerAccountHandler) startOAuth(writer http.ResponseWriter, request *http.Request) {
+	requestID := handler.newRequestID()
+	presented, _ := bearerMaterial(request)
+	accountID := request.PathValue("provider_account_id")
+	idempotencyKey := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
+
+	body, oversize := readLimitedBody(request)
+	var parsed oauthStartRequest
+	malformed := false
+	if !oversize {
+		if err := decodeStrictJSON(body, &parsed); err != nil {
+			malformed = true
+		}
+	}
+
+	command := application.StartOAuthAuthorizationCommand{
+		RequestID:            requestID,
+		PresentedKeyMaterial: presented,
+		AccountID:            domain.ProviderAccountID(accountID),
+		Purpose:              domain.OAuthPurpose(parsed.Purpose),
+		FlowPreference:       domain.OAuthFlow(parsed.FlowPreference),
+		IdempotencyKey:       idempotencyKey,
+		OversizeBody:         oversize,
+		MalformedBody:        malformed,
+	}
+	result, err := handler.gateway.StartOAuthAuthorization(request.Context(), command)
+	if err != nil {
+		writeGatewayError(writer, err)
+		return
+	}
+	writeOAuthAuthorization(writer, http.StatusAccepted, result.Authorization)
+}
+
+func (handler providerAccountHandler) getOAuth(writer http.ResponseWriter, request *http.Request) {
+	requestID := handler.newRequestID()
+	presented, _ := bearerMaterial(request)
+	accountID := request.PathValue("provider_account_id")
+	authorizationID := request.PathValue("authorization_id")
+
+	query := application.GetOAuthAuthorizationQuery{
+		RequestID:            requestID,
+		PresentedKeyMaterial: presented,
+		AccountID:            domain.ProviderAccountID(accountID),
+		AuthorizationID:      domain.OAuthAuthorizationID(authorizationID),
+	}
+	result, err := handler.gateway.GetOAuthAuthorization(request.Context(), query)
+	if err != nil {
+		writeGatewayError(writer, err)
+		return
+	}
+	writeOAuthAuthorization(writer, http.StatusOK, result.Authorization)
 }

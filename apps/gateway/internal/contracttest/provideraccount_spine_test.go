@@ -34,6 +34,7 @@ type spineHarness struct {
 	reqLog    *captureRequestLog
 	vault     *stubCredentialVault
 	probe     *stubProbeAdapter
+	oauth     *stubOAuthExchangeAdapter
 }
 
 const (
@@ -81,6 +82,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		reqLog:    &captureRequestLog{},
 		vault:     newStubCredentialVault(log),
 		probe:     newStubProbeAdapter(log),
+		oauth:     newStubOAuthExchangeAdapter(log),
 	}
 	if configure != nil {
 		configure(harness)
@@ -96,6 +98,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		RequestLog: harness.reqLog,
 		Vault:      harness.vault,
 		Probe:      harness.probe,
+		OAuth:      harness.oauth,
 	})
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)

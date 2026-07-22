@@ -2,6 +2,7 @@ package contracttest_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -86,6 +87,7 @@ type stubReplayRecord struct {
 	fingerprint domain.Fingerprint
 	terminal    bool
 	account     domain.ProviderAccount
+	oauth       domain.OAuthAuthorization
 }
 
 // stubReplayStore performs a real atomic claim so the concurrency acceptance
@@ -98,6 +100,7 @@ type stubReplayStore struct {
 	records       map[domain.ReplayScope]*stubReplayRecord
 	forced        ports.ReplayOutcome
 	forcedAccount domain.ProviderAccount
+	forcedOAuth   domain.OAuthAuthorization
 	completeErr   error
 	claimCalls    atomic.Int32
 	completeCalls atomic.Int32
@@ -115,7 +118,7 @@ func (store *stubReplayStore) Claim(_ context.Context, identity domain.ReplayIde
 	defer store.mu.Unlock()
 
 	if store.forced != "" {
-		return ports.ReplayDecision{Outcome: store.forced, TerminalAccount: store.forcedAccount}, nil
+		return ports.ReplayDecision{Outcome: store.forced, TerminalAccount: store.forcedAccount, TerminalOAuth: store.forcedOAuth}, nil
 	}
 	existing, ok := store.records[identity.Scope]
 	if !ok {
@@ -126,7 +129,7 @@ func (store *stubReplayStore) Claim(_ context.Context, identity domain.ReplayIde
 		return ports.ReplayDecision{Outcome: ports.ReplayConflict}, nil
 	}
 	if existing.terminal {
-		return ports.ReplayDecision{Outcome: ports.ReplayTerminal, TerminalAccount: existing.account}, nil
+		return ports.ReplayDecision{Outcome: ports.ReplayTerminal, TerminalAccount: existing.account, TerminalOAuth: existing.oauth}, nil
 	}
 	return ports.ReplayDecision{Outcome: ports.ReplayInProgress}, nil
 }
@@ -146,6 +149,7 @@ func (store *stubReplayStore) Complete(_ context.Context, identity domain.Replay
 	}
 	record.terminal = true
 	record.account = result.Account
+	record.oauth = result.OAuth
 	return nil
 }
 
@@ -430,3 +434,108 @@ func equalPrefix(got, want []string) bool {
 	}
 	return true
 }
+
+// stubOAuthExchangeAdapter is a controlled OAuth exchange surface. Start records
+// one journey; Poll returns a configurable pending/succeeded/failed outcome and
+// hands exchanged material once on first success. Counts let tests prove reject
+// paths never reached the adapter and successful exchange material never leaked
+// onto the wire.
+type stubOAuthExchangeAdapter struct {
+	log        *spineLog
+	mu         sync.Mutex
+	startErr   error
+	pollErr    error
+	nextStatus domain.OAuthStatus
+	material   string
+	startCalls atomic.Int32
+	pollCalls  atomic.Int32
+	records    map[domain.OAuthAuthorizationID]*stubOAuthRecord
+	seq        atomic.Uint64
+}
+
+type stubOAuthRecord struct {
+	authorization domain.OAuthAuthorization
+	consumed      bool
+}
+
+func newStubOAuthExchangeAdapter(log *spineLog) *stubOAuthExchangeAdapter {
+	return &stubOAuthExchangeAdapter{
+		log:        log,
+		nextStatus: domain.OAuthStatusAuthorizationPending,
+		material:   "oauth_exchanged_material_secret",
+		records:    make(map[domain.OAuthAuthorizationID]*stubOAuthRecord),
+	}
+}
+
+func (adapter *stubOAuthExchangeAdapter) Start(_ context.Context, command ports.OAuthStartCommand) (ports.OAuthStartResult, error) {
+	adapter.startCalls.Add(1)
+	adapter.log.add("oauth.start")
+	if adapter.startErr != nil {
+		return ports.OAuthStartResult{}, adapter.startErr
+	}
+	sequence := adapter.seq.Add(1)
+	id := domain.OAuthAuthorizationID(fmt.Sprintf("oauth_%04d", sequence))
+	verificationURI := "https://provider.example/device"
+	userCode := fmt.Sprintf("USER-%04d", sequence)
+	if command.Flow == domain.OAuthFlowBrowser {
+		userCode = ""
+		verificationURI = "https://provider.example/authorize"
+	}
+	authorization := domain.NewOAuthAuthorizationPending(
+		id,
+		command.AccountID,
+		command.Purpose,
+		command.Flow,
+		verificationURI,
+		userCode,
+		domain.DefaultOAuthExpiry(spineFixtureTime),
+	)
+	adapter.mu.Lock()
+	adapter.records[id] = &stubOAuthRecord{authorization: authorization}
+	adapter.mu.Unlock()
+	return ports.OAuthStartResult{Authorization: authorization}, nil
+}
+
+func (adapter *stubOAuthExchangeAdapter) Poll(_ context.Context, command ports.OAuthPollCommand) (ports.OAuthPollResult, error) {
+	adapter.pollCalls.Add(1)
+	adapter.log.add("oauth.poll")
+	if adapter.pollErr != nil {
+		return ports.OAuthPollResult{}, adapter.pollErr
+	}
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	record, ok := adapter.records[command.AuthorizationID]
+	if !ok || record.authorization.ProviderAccountID != command.AccountID {
+		return ports.OAuthPollResult{}, ports.ErrOAuthAuthorizationNotVisible
+	}
+	if record.authorization.Status.Terminal() {
+		return ports.OAuthPollResult{Authorization: record.authorization}, nil
+	}
+	status := adapter.nextStatus
+	if status == "" {
+		status = domain.OAuthStatusAuthorizationPending
+	}
+	record.authorization.Status = status
+	switch status {
+	case domain.OAuthStatusSucceeded:
+		record.authorization.Remediation = domain.RemediationNone
+		record.authorization.UserCode = ""
+		record.authorization.VerificationURI = ""
+		if !record.consumed {
+			record.consumed = true
+			return ports.OAuthPollResult{
+				Authorization:     record.authorization,
+				ExchangedMaterial: adapter.material,
+			}, nil
+		}
+	case domain.OAuthStatusFailed:
+		record.authorization.Remediation = domain.RemediationCompleteOAuth
+		record.authorization.UserCode = ""
+		record.authorization.VerificationURI = ""
+	default:
+		record.authorization.Remediation = domain.RemediationCompleteOAuth
+	}
+	return ports.OAuthPollResult{Authorization: record.authorization}, nil
+}
+
+var _ ports.OAuthExchangeAdapter = (*stubOAuthExchangeAdapter)(nil)

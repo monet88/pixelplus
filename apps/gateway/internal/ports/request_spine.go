@@ -106,12 +106,18 @@ const (
 type ReplayDecision struct {
 	Outcome         ReplayOutcome
 	TerminalAccount domain.ProviderAccount
+	// TerminalOAuth carries the prior durable OAuth journey when Outcome is
+	// ReplayTerminal for a startOAuthAuthorization claim.
+	TerminalOAuth domain.OAuthAuthorization
 }
 
 // ReplayResult is the terminal projection recorded once an owning request
 // completes its durable side effect, so later matching replays are stable.
 type ReplayResult struct {
 	Account domain.ProviderAccount
+	// OAuth carries the terminal server-owned OAuth journey projection for a
+	// startOAuthAuthorization claim. It is empty for non-OAuth replay results.
+	OAuth domain.OAuthAuthorization
 }
 
 // ReplayStore performs the atomic idempotency claim, fingerprint match, and
@@ -178,6 +184,12 @@ const (
 	// AuditProviderAccountActivated records the transition into `active` after a
 	// required probe succeeds (connection lifecycle spec §4.7).
 	AuditProviderAccountActivated AuditAction = "provider_account.activated"
+	// AuditProviderOAuthStarted records a successful server-owned OAuth start.
+	// It carries the account id and outcome only, never codes or tokens.
+	AuditProviderOAuthStarted AuditAction = "provider_oauth.started"
+	// AuditProviderOAuthPolled records a successful OAuth status poll and its
+	// safe terminal or pending outcome, never exchange material.
+	AuditProviderOAuthPolled AuditAction = "provider_oauth.polled"
 )
 
 // AuditEvent is a secret-free product/security audit projection. It carries

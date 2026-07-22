@@ -47,6 +47,10 @@ type Options struct {
 	// composition without releasing secret material.
 	Vault ports.CredentialVault
 	Probe ports.ProbeAdapter
+	// OAuth exchange adapter port (#47). A nil port keeps the production
+	// fail-closed foundation; a controlled fake proves start/poll through real
+	// composition without releasing exchange secrets on the wire.
+	OAuth ports.OAuthExchangeAdapter
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -86,6 +90,7 @@ func NewFixture(options Options) (*Fixture, error) {
 
 		Vault: options.Vault,
 		Probe: options.Probe,
+		OAuth: options.OAuth,
 	})
 	if err != nil {
 		return nil, err
