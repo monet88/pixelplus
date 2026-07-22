@@ -159,3 +159,18 @@ func NewOAuthAuthorizationPending(
 func DefaultOAuthExpiry(now time.Time) Timestamp {
 	return NewTimestamp(now.Add(15 * time.Minute))
 }
+
+// WithOAuthConnectFailed returns the account after a first-connect OAuth journey
+// fails or expires. It restores a pure draft shell (no stored credential version)
+// and clears the private single-flight marker so a later connect can start cleanly
+// (management contract §4.3: connect failure restores draft).
+func (account ProviderAccount) WithOAuthConnectFailed(now Timestamp) ProviderAccount {
+	restored := NewDraftProviderAccount(account.ID, account.Provider, account.AuthMode, account.Label, now)
+	// Preserve create-time identity fields that NewDraft would rewrite.
+	restored.CreatedAt = account.CreatedAt
+	restored.RiskAcknowledged = account.RiskAcknowledged
+	restored.Controls = account.Controls
+	restored.ActiveOAuthAuthorizationID = ""
+	restored.UpdatedAt = now
+	return restored
+}

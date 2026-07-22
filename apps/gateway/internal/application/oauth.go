@@ -243,16 +243,13 @@ func (service *ProviderAccountService) GetOAuthAuthorization(ctx context.Context
 				}
 			}
 		case domain.OAuthStatusFailed:
-			restored := account
+			var restored domain.ProviderAccount
 			if polled.Authorization.Purpose == domain.OAuthPurposeConnect {
 				// Failed first connect restores pure draft and keeps version zero.
-				restored.Lifecycle = domain.LifecycleDraft
-				restored.Credential = domain.CredentialMetadata{RefreshSupported: account.AuthMode.SupportsRefresh()}
-				restored.Health = domain.NewDraftProviderAccount(account.ID, account.Provider, account.AuthMode, account.Label, domain.NewTimestamp(sc.start)).Health
+				restored = account.WithOAuthConnectFailed(domain.NewTimestamp(sc.start))
 			} else {
-				restored = account.WithCredentialRejected(domain.NewTimestamp(sc.start))
+				restored = account.WithCredentialRejected(domain.NewTimestamp(sc.start)).WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
 			}
-			restored = restored.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
 			if _, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: restored}); err != nil {
 				return OAuthAuthorizationResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 			}

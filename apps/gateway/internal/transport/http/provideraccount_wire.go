@@ -217,10 +217,8 @@ func writeOAuthAuthorization(writer http.ResponseWriter, statusCode int, authori
 		UserCode:          authorization.UserCode,
 		ExpiresAt:         timestampString(authorization.ExpiresAt),
 	}
-	if authorization.Remediation != "" && authorization.Remediation != domain.RemediationNone {
+	if authorization.Remediation != "" {
 		body.Remediation = string(authorization.Remediation)
-	} else if authorization.Remediation == domain.RemediationNone {
-		body.Remediation = string(domain.RemediationNone)
 	}
 	writeJSON(writer, statusCode, body)
 }

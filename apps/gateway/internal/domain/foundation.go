@@ -14,10 +14,6 @@ const (
 	// generated value is prefixed with `asset_` by the port so the wire id
 	// matches the frozen Public API example shape.
 	IdentifierKindAsset IdentifierKind = "asset"
-	// IdentifierKindOAuthAuthorization namespaces server-owned OAuth journey
-	// identities. The generated value is prefixed with `oauth_` by the port so the
-	// wire id matches the frozen Public API pattern.
-	IdentifierKindOAuthAuthorization IdentifierKind = "oauth"
 )
 
 // Identifier is a server-owned opaque identifier.
