@@ -450,6 +450,106 @@ func TestProbeSuccessActivatesAccount(t *testing.T) {
 	}
 }
 
+func TestDirectReauthenticationCutsOverPendingVersion(t *testing.T) {
+	t.Parallel()
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := probeableAccount("pa_reauth_direct", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleActive
+		account.Credential.Version = 1
+		account.Credential.LastAllocatedVersion = 1
+		h.accounts.seed("tenant_a", account)
+	})
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_reauth_direct/reauthentication",
+		bearer: tenantAKey, idemKey: "idem-reauth-direct",
+		body: submitBody(domain.CredentialClassOAuthTokenImport),
+	})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body=%s)", response.StatusCode, payload)
+	}
+	staged := decodeAccount(t, payload)
+	if staged["lifecycle_state"] != string(domain.LifecyclePendingValidation) || staged["credential"].(map[string]any)["version"] != float64(1) {
+		t.Fatalf("staged account exposed wrong current version/lifecycle: %s", payload)
+	}
+	response, payload = harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_direct/probe", bearer: tenantAKey})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	activated := decodeAccount(t, payload)
+	if activated["lifecycle_state"] != string(domain.LifecycleActive) || activated["credential"].(map[string]any)["version"] != float64(2) {
+		t.Fatalf("cutover account = %s", payload)
+	}
+	if !harness.vault.wasRevoked("pa_reauth_direct", 1) {
+		t.Fatal("prior credential version was not revoked")
+	}
+}
+
+func TestDisabledReauthenticationStaysDisabledAfterCutover(t *testing.T) {
+	t.Parallel()
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := probeableAccount("pa_reauth_disabled", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleDisabled
+		account.Credential.Version = 1
+		account.Credential.LastAllocatedVersion = 1
+		h.accounts.seed("tenant_a", account)
+	})
+	response, _ := harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_disabled/reauthentication", bearer: tenantAKey, idemKey: "idem-reauth-disabled", body: submitBody(domain.CredentialClassOAuthTokenImport)})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("reauth status = %d, want 202", response.StatusCode)
+	}
+	response, payload := harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_disabled/probe", bearer: tenantAKey})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	account := decodeAccount(t, payload)
+	if account["lifecycle_state"] != string(domain.LifecycleDisabled) {
+		t.Fatalf("disabled origin became usable: %s", payload)
+	}
+}
+
+func TestFailedReauthenticationConsumesVersionAndRestoresOrigin(t *testing.T) {
+	t.Parallel()
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := probeableAccount("pa_reauth_failed", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleActive
+		account.Credential.Version = 1
+		account.Credential.LastAllocatedVersion = 1
+		h.accounts.seed("tenant_a", account)
+		h.vault.validResult.Valid = false
+	})
+	response, payload := harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_failed/reauthentication", bearer: tenantAKey, idemKey: "idem-reauth-failed", body: submitBody(domain.CredentialClassOAuthTokenImport)})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("reauth status = %d, want 202 (body=%s)", response.StatusCode, payload)
+	}
+	response, payload = harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_failed/probe", bearer: tenantAKey})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	account := decodeAccount(t, payload)
+	if account["lifecycle_state"] != string(domain.LifecycleActive) {
+		t.Fatalf("origin lifecycle changed: %s", payload)
+	}
+	if account["credential"].(map[string]any)["version"] != float64(1) {
+		t.Fatalf("failed replacement changed current version: %s", payload)
+	}
+	if !harness.vault.wasRevoked("pa_reauth_failed", 2) {
+		t.Fatal("failed pending version was not revoked")
+	}
+
+	// A retry with a fresh idempotency key must allocate version 3, never reuse
+	// the failed version 2.
+	harness.vault.validResult.Valid = true
+	response, payload = harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_failed/reauthentication", bearer: tenantAKey, idemKey: "idem-reauth-failed-retry", body: submitBody(domain.CredentialClassOAuthTokenImport)})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("retry status = %d, want 202 (body=%s)", response.StatusCode, payload)
+	}
+	intake := harness.vault.intake()
+	if intake.Version != 3 {
+		t.Fatalf("retry allocated version = %d, want 3", intake.Version)
+	}
+}
+
 // AC (a lifecycle state that cannot be probed rejects before Vault/Adapter): a
 // probe on a `draft` account (no stored credential) is account_not_usable and
 // never touches the Vault or the Adapter.

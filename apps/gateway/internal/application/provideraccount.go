@@ -14,13 +14,14 @@ import (
 // Operation tokens for the Provider Account request spine. They match the
 // stable operation ids consumed by telemetry and admission.
 const (
-	operationCreateProviderAccount    domain.OperationToken = "create_provider_account"
-	operationGetProviderAccount       domain.OperationToken = "get_provider_account"
-	operationListProviderAccounts     domain.OperationToken = "list_provider_accounts"
-	operationSubmitProviderCredential domain.OperationToken = "submit_provider_credential"
-	operationProbeProviderAccount     domain.OperationToken = "probe_provider_account"
-	operationStartOAuthAuthorization  domain.OperationToken = "start_oauth_authorization"
-	operationGetOAuthAuthorization    domain.OperationToken = "get_oauth_authorization"
+	operationCreateProviderAccount         domain.OperationToken = "create_provider_account"
+	operationGetProviderAccount            domain.OperationToken = "get_provider_account"
+	operationListProviderAccounts          domain.OperationToken = "list_provider_accounts"
+	operationSubmitProviderCredential      domain.OperationToken = "submit_provider_credential"
+	operationReauthenticateProviderAccount domain.OperationToken = "reauthenticate_provider_account"
+	operationProbeProviderAccount          domain.OperationToken = "probe_provider_account"
+	operationStartOAuthAuthorization       domain.OperationToken = "start_oauth_authorization"
+	operationGetOAuthAuthorization         domain.OperationToken = "get_oauth_authorization"
 )
 
 // maxIdempotencyKeyLength mirrors the frozen OpenAPI RequiredIdempotencyKey

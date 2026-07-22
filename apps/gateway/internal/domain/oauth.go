@@ -105,7 +105,7 @@ func (state LifecycleState) AcceptsOAuthStart(purpose OAuthPurpose) bool {
 	case OAuthPurposeConnect:
 		return state == LifecycleDraft
 	case OAuthPurposeReauthenticate:
-		return state == LifecycleReauthRequired
+		return state == LifecycleActive || state == LifecycleDisabled || state == LifecycleReauthRequired || state == LifecycleRevoked
 	default:
 		return false
 	}
@@ -127,6 +127,14 @@ func (account ProviderAccount) WithOAuthJourneyCleared(now Timestamp) ProviderAc
 	account.ActiveOAuthAuthorizationID = ""
 	account.UpdatedAt = now
 	return account
+}
+
+// WithOAuthReauthenticationFailed clears a failed replacement journey without
+// changing the lifecycle or health of the credential that was active before the
+// journey started. A failed replacement must never demote an active or disabled
+// origin to reauth_required.
+func (account ProviderAccount) WithOAuthReauthenticationFailed(now Timestamp) ProviderAccount {
+	return account.WithOAuthJourneyCleared(now)
 }
 
 // NewOAuthAuthorizationPending builds the safe authorization_pending projection

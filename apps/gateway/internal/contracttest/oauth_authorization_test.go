@@ -465,6 +465,171 @@ func TestDirectSubmitRejectedWhileOAuthJourneyInFlight(t *testing.T) {
 	}
 }
 
+func TestOAuthReauthenticationStagesAndCutsOverPendingVersion(t *testing.T) {
+	t.Parallel()
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := probeableAccount("pa_oauth_reauth", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleActive
+		account.Credential.Version = 1
+		account.Credential.LastAllocatedVersion = 1
+		h.accounts.seed("tenant_a", account)
+		h.oauth.nextStatus = domain.OAuthStatusSucceeded
+	})
+	startResp, startPayload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_oauth_reauth/oauth-authorizations",
+		bearer: tenantAKey, idemKey: "idem-oauth-reauth-start",
+		body: oauthStartBody("reauthenticate", "device"),
+	})
+	if startResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start status = %d (body=%s)", startResp.StatusCode, startPayload)
+	}
+	authID, _ := decodeOAuth(t, startPayload)["authorization_id"].(string)
+	pollResp, pollPayload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_oauth_reauth/oauth-authorizations/" + authID,
+		bearer: tenantAKey,
+	})
+	if pollResp.StatusCode != http.StatusOK {
+		t.Fatalf("poll status = %d (body=%s)", pollResp.StatusCode, pollPayload)
+	}
+	accountResp, accountPayload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_oauth_reauth",
+		bearer: tenantAKey,
+	})
+	if accountResp.StatusCode != http.StatusOK {
+		t.Fatalf("account status = %d (body=%s)", accountResp.StatusCode, accountPayload)
+	}
+	var account map[string]any
+	if err := json.Unmarshal(accountPayload, &account); err != nil {
+		t.Fatalf("decode account: %v", err)
+	}
+	if account["lifecycle_state"] != string(domain.LifecyclePendingValidation) {
+		t.Fatalf("oauth reauth lifecycle = %v, want pending_validation", account["lifecycle_state"])
+	}
+	if account["credential"].(map[string]any)["version"] != float64(1) {
+		t.Fatalf("oauth reauth exposed pending version as current: %s", accountPayload)
+	}
+	probeResp, probePayload := harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_oauth_reauth/probe", bearer: tenantAKey})
+	if probeResp.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d (body=%s)", probeResp.StatusCode, probePayload)
+	}
+	if !harness.vault.wasRevoked("pa_oauth_reauth", 1) {
+		t.Fatal("oauth reauth did not revoke old version")
+	}
+}
+
+func TestOAuthReauthenticationFailurePreservesOriginLifecycle(t *testing.T) {
+	t.Parallel()
+	for _, origin := range []domain.LifecycleState{domain.LifecycleActive, domain.LifecycleDisabled} {
+		origin := origin
+		t.Run(string(origin), func(t *testing.T) {
+			t.Parallel()
+			harness := newSpineHarness(t, func(h *spineHarness) {
+				account := probeableAccount("pa_oauth_reauth_fail_"+string(origin), domain.AuthModeChatGPTCodexOAuth)
+				account.Lifecycle = origin
+				account.Credential.Version = 1
+				account.Credential.LastAllocatedVersion = 1
+				h.accounts.seed("tenant_a", account)
+				h.oauth.nextStatus = domain.OAuthStatusFailed
+			})
+			accountID := "pa_oauth_reauth_fail_" + string(origin)
+			startResp, startPayload := harness.do(t, requestSpec{
+				method: http.MethodPost,
+				path:   "/v1/provider-accounts/" + accountID + "/oauth-authorizations",
+				bearer: tenantAKey, idemKey: "idem-oauth-reauth-fail-" + string(origin),
+				body: oauthStartBody("reauthenticate", "device"),
+			})
+			if startResp.StatusCode != http.StatusAccepted {
+				t.Fatalf("start status = %d (body=%s)", startResp.StatusCode, startPayload)
+			}
+			authID, _ := decodeOAuth(t, startPayload)["authorization_id"].(string)
+			pollResp, pollPayload := harness.do(t, requestSpec{
+				method: http.MethodGet,
+				path:   "/v1/provider-accounts/" + accountID + "/oauth-authorizations/" + authID,
+				bearer: tenantAKey,
+			})
+			if pollResp.StatusCode != http.StatusOK {
+				t.Fatalf("poll status = %d (body=%s)", pollResp.StatusCode, pollPayload)
+			}
+			account, err := harness.accounts.Visible(t.Context(), managePrincipal(), domain.ProviderAccountID(accountID))
+			if err != nil {
+				t.Fatalf("visible: %v", err)
+			}
+			if account.Lifecycle != origin {
+				t.Fatalf("lifecycle after failed reauthentication = %s, want %s", account.Lifecycle, origin)
+			}
+			if account.ActiveOAuthAuthorizationID != "" {
+				t.Fatal("failed reauthentication left the OAuth marker set")
+			}
+		})
+	}
+}
+
+func TestOAuthReauthenticationPollRetryReusesPendingVersion(t *testing.T) {
+	t.Parallel()
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := probeableAccount("pa_oauth_reauth_recover", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleActive
+		account.Credential.Version = 1
+		account.Credential.LastAllocatedVersion = 1
+		h.accounts.seed("tenant_a", account)
+		h.oauth.nextStatus = domain.OAuthStatusSucceeded
+		h.oauth.material = oauthExchangedMaterial
+	})
+	startResp, startPayload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_oauth_reauth_recover/oauth-authorizations",
+		bearer: tenantAKey, idemKey: "idem-oauth-reauth-recover-start",
+		body: oauthStartBody("reauthenticate", "device"),
+	})
+	if startResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start status = %d (body=%s)", startResp.StatusCode, startPayload)
+	}
+	authID, _ := decodeOAuth(t, startPayload)["authorization_id"].(string)
+	// Seed the staged replacement marker as if the first poll had completed the
+	// durable stage immediately before Vault.Put. The public poll path must reuse
+	// this pending version after a settlement write failure.
+	account, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_reauth_recover")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	account = account.WithReplacementCredential(domain.NewTimestamp(spineFixtureTime), domain.Timestamp{}).
+		WithOAuthJourneyStarted(domain.OAuthAuthorizationID(authID), domain.NewTimestamp(spineFixtureTime))
+	harness.accounts.seed("tenant_a", account)
+	harness.accounts.updateFailTimes.Store(1)
+	harness.accounts.updateErr = ports.ErrDependencyUnavailable
+
+	first, _ := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_oauth_reauth_recover/oauth-authorizations/" + authID,
+		bearer: tenantAKey,
+	})
+	if first.StatusCode != http.StatusServiceUnavailable && first.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("first poll status = %d, want retryable failure", first.StatusCode)
+	}
+	harness.accounts.updateErr = nil
+	second, secondPayload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_oauth_reauth_recover/oauth-authorizations/" + authID,
+		bearer: tenantAKey,
+	})
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("retry poll status = %d (body=%s)", second.StatusCode, secondPayload)
+	}
+	account, err = harness.accounts.Visible(t.Context(), managePrincipal(), "pa_oauth_reauth_recover")
+	if err != nil {
+		t.Fatalf("visible after retry: %v", err)
+	}
+	if account.PendingCredentialVersion != 2 || account.Credential.Version != 1 {
+		t.Fatalf("retry changed pending/current versions: pending=%d current=%d", account.PendingCredentialVersion, account.Credential.Version)
+	}
+	if calls := harness.vault.putCalls.Load(); calls != 1 {
+		t.Fatalf("vault.Put ran %d times, want 1 idempotent pending handoff", calls)
+	}
+}
+
 // AC: Poll foreign/unknown authorization ids are non-enumerating resource_not_found
 // before any Vault use.
 func TestOAuthPollNonEnumeration(t *testing.T) {

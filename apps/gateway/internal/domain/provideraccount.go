@@ -189,10 +189,17 @@ type ProviderAccount struct {
 	Label      string
 	Lifecycle  LifecycleState
 	Credential CredentialMetadata
-	Health     HealthSummary
-	Controls   AdministrativeControls
-	CreatedAt  Timestamp
-	UpdatedAt  Timestamp
+	// PendingCredentialVersion is a monotonic version stored for validation and
+	// probe. It is never an execution source until promotion succeeds.
+	PendingCredentialVersion int
+	// PendingOrigin preserves the lifecycle state that must survive a failed
+	// replacement or a successful replacement of a disabled account.
+	PendingOrigin       LifecycleState
+	PendingOriginHealth HealthSummary
+	Health              HealthSummary
+	Controls            AdministrativeControls
+	CreatedAt           Timestamp
+	UpdatedAt           Timestamp
 	// RiskAcknowledged records whether the owning Tenant accepted the residual
 	// risk themes a `gated`/`experimental` Auth Mode requires (risk envelope
 	// §6.1). It is server-owned account state, never projected to the Public API
@@ -213,6 +220,9 @@ type CredentialMetadata struct {
 	// Version is the business credential lifecycle version. It is absent (zero)
 	// for a draft that has never stored a credential.
 	Version int
+	// LastAllocatedVersion is the monotonic business counter. It is internal and
+	// never projected on the Public API.
+	LastAllocatedVersion int
 	// RefreshSupported is derived from the Auth Mode credential class.
 	RefreshSupported bool
 	ExpiresAt        Timestamp
@@ -383,9 +393,37 @@ func (state LifecycleState) AcceptsProbe() bool {
 // frozen 202 lands pending_validation with credential.version 1). It carries no
 // secret material; the version and expiry hint are the only safe projections.
 func (account ProviderAccount) WithSubmittedCredential(now Timestamp, expiresAt Timestamp) ProviderAccount {
-	account.Credential.Version++
+	return account.withPendingCredential(now, expiresAt, false)
+}
+
+// WithReplacementCredential stages a new credential version without changing
+// the version authorized for new work. The account remains observable as a
+// pending replacement (or disabled while a disabled-origin replacement is
+// validated).
+func (account ProviderAccount) WithReplacementCredential(now Timestamp, expiresAt Timestamp) ProviderAccount {
+	return account.withPendingCredential(now, expiresAt, true)
+}
+
+func (account ProviderAccount) withPendingCredential(now Timestamp, expiresAt Timestamp, replacement bool) ProviderAccount {
+	nextVersion := account.Credential.LastAllocatedVersion
+	if nextVersion < account.Credential.Version {
+		nextVersion = account.Credential.Version
+	}
+	nextVersion++
+	account.Credential.LastAllocatedVersion = nextVersion
+	if replacement {
+		account.PendingCredentialVersion = nextVersion
+		account.PendingOrigin = account.Lifecycle
+		account.PendingOriginHealth = account.Health
+		if account.Lifecycle != LifecycleDisabled {
+			account.Lifecycle = LifecyclePendingValidation
+		}
+	} else {
+		account.Credential.Version = nextVersion
+		account.PendingOrigin = LifecycleDraft
+		account.Lifecycle = LifecyclePendingValidation
+	}
 	account.Credential.ExpiresAt = expiresAt
-	account.Lifecycle = LifecyclePendingValidation
 	account.Health = HealthSummary{
 		SummaryState: HealthUnknown,
 		Conditions: []HealthCondition{{
@@ -407,7 +445,9 @@ func (account ProviderAccount) WithSubmittedCredential(now Timestamp, expiresAt 
 // account; a required probe must still succeed (connection lifecycle spec §4.5,
 // I-NO-ACTIVE-ON-FAIL).
 func (account ProviderAccount) WithValidatedCredential(now Timestamp) ProviderAccount {
-	account.Lifecycle = LifecyclePendingProbe
+	if account.PendingCredentialVersion == 0 || account.PendingOrigin != LifecycleDisabled {
+		account.Lifecycle = LifecyclePendingProbe
+	}
 	account.Credential.LastValidatedAt = now
 	account.UpdatedAt = now
 	return account
@@ -442,7 +482,26 @@ func (account ProviderAccount) WithCredentialRejected(now Timestamp) ProviderAcc
 // usability gate has already passed (connection lifecycle spec §4.7, §5.1
 // I-USABLE-GATE).
 func (account ProviderAccount) WithProbeActivated(now Timestamp) ProviderAccount {
-	account.Lifecycle = LifecycleActive
+	return account.withProbeActivated(now, false)
+}
+
+// WithReplacementProbeActivated promotes the pending credential version. A
+// disabled-origin account remains disabled; all other origins become active.
+func (account ProviderAccount) WithReplacementProbeActivated(now Timestamp) ProviderAccount {
+	return account.withProbeActivated(now, true)
+}
+
+func (account ProviderAccount) withProbeActivated(now Timestamp, replacement bool) ProviderAccount {
+	if replacement && account.PendingOrigin == LifecycleDisabled {
+		account.Lifecycle = LifecycleDisabled
+	} else {
+		account.Lifecycle = LifecycleActive
+	}
+	if account.PendingCredentialVersion > 0 {
+		account.Credential.Version = account.PendingCredentialVersion
+		account.PendingCredentialVersion = 0
+	}
+	account.PendingOrigin = ""
 	account.Credential.LastProbedAt = now
 	account.Health = HealthSummary{
 		SummaryState: HealthHealthy,
@@ -453,6 +512,41 @@ func (account ProviderAccount) WithProbeActivated(now Timestamp) ProviderAccount
 			CredentialVersion: account.Credential.Version,
 			ObservedAt:        now,
 			Remediation:       RemediationNone,
+		}},
+	}
+	account.UpdatedAt = now
+	return account
+}
+
+// WithPendingCredentialRejected discards the pending version and restores the
+// origin lifecycle. First-connect failures become reauth_required; planned
+// active/disabled replacements do not demote the prior usable/admin state.
+func (account ProviderAccount) WithPendingCredentialRejected(now Timestamp) ProviderAccount {
+	origin := account.PendingOrigin
+	originHealth := account.PendingOriginHealth
+	account.PendingCredentialVersion = 0
+	account.PendingOrigin = ""
+	account.PendingOriginHealth = HealthSummary{}
+	switch origin {
+	case LifecycleActive, LifecycleDisabled:
+		account.Lifecycle = origin
+		account.Health = originHealth
+		account.UpdatedAt = now
+		return account
+	case LifecycleRevoked:
+		account.Lifecycle = LifecycleRevoked
+	default:
+		account.Lifecycle = LifecycleReauthRequired
+	}
+	account.Health = HealthSummary{
+		SummaryState: HealthExpired,
+		Conditions: []HealthCondition{{
+			Scope:             HealthScope{Kind: HealthScopeAccount},
+			State:             HealthExpired,
+			Reason:            HealthReasonCredentialRejected,
+			CredentialVersion: account.Credential.Version,
+			ObservedAt:        now,
+			Remediation:       RemediationReauthenticate,
 		}},
 	}
 	account.UpdatedAt = now

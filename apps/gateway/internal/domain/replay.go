@@ -43,17 +43,20 @@ func NewCreateProviderAccountFingerprint(provider Provider, mode AuthMode, label
 		label)
 }
 
-// NewSubmitCredentialFingerprint builds a stable fingerprint over the direct
+// NewSubmitCredentialFingerprint builds a stable fingerprint over direct
 // credential submission inputs that determine the durable side effect: the
-// operation identity, the target account id, and the credential class. The
-// submitted secret material is deliberately excluded so a legitimate retry with
-// the same Idempotency-Key replays the terminal result rather than conflicting,
-// while a class change (a different credential lifecycle) conflicts. The value
-// is a bounded, non-secret projection and never carries the material
-// (#20 section 5.2, connection lifecycle spec §9.1).
-func NewSubmitCredentialFingerprint(accountID ProviderAccountID, class CredentialClass) Fingerprint {
+// operation identity, target account id, and credential class. Direct first
+// submission and reauthentication deliberately have different operation
+// identities even when they target the same account and class. Secret material
+// is excluded so retries replay the terminal result without storing a secret in
+// the replay record (#20 section 5.2, connection lifecycle spec §9.1).
+func NewSubmitCredentialFingerprint(accountID ProviderAccountID, class CredentialClass, replacement bool) Fingerprint {
 	const separator = "\x1f"
-	return Fingerprint("submit_provider_credential" + separator +
+	operation := "submit_provider_credential"
+	if replacement {
+		operation = "reauthenticate_provider_account"
+	}
+	return Fingerprint(operation + separator +
 		string(accountID) + separator +
 		string(class))
 }

@@ -184,6 +184,9 @@ type AccountUpdate struct {
 	// prevents a concurrent direct credential submit from being overwritten by a
 	// late OAuth start write.
 	RequireDraftLifecycle bool
+	// RequirePendingVersion fences promotion/settlement to the version this
+	// request validated. A stale writer cannot promote another replacement.
+	RequirePendingVersion int
 }
 
 // AuditAction names a product/security audit event.
