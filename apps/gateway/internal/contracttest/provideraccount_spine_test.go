@@ -32,6 +32,8 @@ type spineHarness struct {
 	audit     *captureAudit
 	telemetry *captureTelemetry
 	reqLog    *captureRequestLog
+	vault     *stubCredentialVault
+	probe     *stubProbeAdapter
 }
 
 const (
@@ -77,6 +79,8 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		audit:     &captureAudit{},
 		telemetry: &captureTelemetry{},
 		reqLog:    &captureRequestLog{},
+		vault:     newStubCredentialVault(log),
+		probe:     newStubProbeAdapter(log),
 	}
 	if configure != nil {
 		configure(harness)
@@ -90,6 +94,8 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		Audit:      harness.audit,
 		Telemetry:  harness.telemetry,
 		RequestLog: harness.reqLog,
+		Vault:      harness.vault,
+		Probe:      harness.probe,
 	})
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)

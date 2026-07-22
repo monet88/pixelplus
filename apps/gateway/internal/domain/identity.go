@@ -21,6 +21,12 @@ const (
 	OperationCreateProviderAccount OperationToken = "create_provider_account"
 	OperationListProviderAccounts  OperationToken = "list_provider_accounts"
 	OperationGetProviderAccount    OperationToken = "get_provider_account"
+	// OperationSubmitProviderCredential names the direct credential submission
+	// operation (submitProviderCredential). It requires accounts.manage.
+	OperationSubmitProviderCredential OperationToken = "submit_provider_credential"
+	// OperationProbeProviderAccount names the controlled probe operation
+	// (probeProviderAccount). It requires accounts.manage.
+	OperationProbeProviderAccount OperationToken = "probe_provider_account"
 )
 
 // NewTimestamp wraps a concrete instant.

@@ -14,9 +14,11 @@ import (
 // Operation tokens for the Provider Account request spine. They match the
 // stable operation ids consumed by telemetry and admission.
 const (
-	operationCreateProviderAccount domain.OperationToken = "create_provider_account"
-	operationGetProviderAccount    domain.OperationToken = "get_provider_account"
-	operationListProviderAccounts  domain.OperationToken = "list_provider_accounts"
+	operationCreateProviderAccount    domain.OperationToken = "create_provider_account"
+	operationGetProviderAccount       domain.OperationToken = "get_provider_account"
+	operationListProviderAccounts     domain.OperationToken = "list_provider_accounts"
+	operationSubmitProviderCredential domain.OperationToken = "submit_provider_credential"
+	operationProbeProviderAccount     domain.OperationToken = "probe_provider_account"
 )
 
 // maxIdempotencyKeyLength mirrors the frozen OpenAPI RequiredIdempotencyKey
@@ -100,6 +102,8 @@ type ProviderAccountService struct {
 	admission  ports.AdmissionStore
 	replay     ports.ReplayStore
 	accounts   ports.AccountStore
+	vault      ports.CredentialVault
+	probe      ports.ProbeAdapter
 	audit      ports.AuditRecorder
 	telemetry  ports.TelemetryRecorder
 	requestLog ports.RequestLogRecorder
@@ -113,6 +117,8 @@ type ProviderAccountDependencies struct {
 	Admission  ports.AdmissionStore
 	Replay     ports.ReplayStore
 	Accounts   ports.AccountStore
+	Vault      ports.CredentialVault
+	Probe      ports.ProbeAdapter
 	Audit      ports.AuditRecorder
 	Telemetry  ports.TelemetryRecorder
 	RequestLog ports.RequestLogRecorder
@@ -131,6 +137,10 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		return nil, errors.New("application: replay store is required")
 	case dependencies.Accounts == nil:
 		return nil, errors.New("application: account store is required")
+	case dependencies.Vault == nil:
+		return nil, errors.New("application: credential vault is required")
+	case dependencies.Probe == nil:
+		return nil, errors.New("application: probe adapter is required")
 	case dependencies.Audit == nil:
 		return nil, errors.New("application: audit recorder is required")
 	case dependencies.Telemetry == nil:
@@ -147,6 +157,8 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		admission:  dependencies.Admission,
 		replay:     dependencies.Replay,
 		accounts:   dependencies.Accounts,
+		vault:      dependencies.Vault,
+		probe:      dependencies.Probe,
 		audit:      dependencies.Audit,
 		telemetry:  dependencies.Telemetry,
 		requestLog: dependencies.RequestLog,

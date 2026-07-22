@@ -50,6 +50,86 @@ func (mode AuthMode) Valid() bool {
 	}
 }
 
+// CredentialClass names the class-specific credential set a direct submission
+// carries. Values mirror the frozen Public API `CredentialSubmission`
+// credential_class enum. Web Access modes submit a `web_session` set; OAuth/CLI
+// modes accept an `oauth_token_import` set for the lab direct-submit path.
+type CredentialClass string
+
+// Supported credential classes.
+const (
+	CredentialClassWebSession       CredentialClass = "web_session"
+	CredentialClassOAuthTokenImport CredentialClass = "oauth_token_import"
+)
+
+// Valid reports whether the credential class is a known enum value.
+func (class CredentialClass) Valid() bool {
+	switch class {
+	case CredentialClassWebSession, CredentialClassOAuthTokenImport:
+		return true
+	default:
+		return false
+	}
+}
+
+// RequiredCredentialClass returns the single credential class a direct
+// submission MUST carry for this Auth Mode. Web Access modes require a
+// `web_session` set; OAuth/CLI modes require an `oauth_token_import` set. A
+// submission that carries any other class is rejected before the Vault is used
+// so Web and OAuth/CLI credential lifecycles never mix on one account
+// (connection lifecycle spec §8, I-NO-WEB-OAUTH-MIX).
+func (mode AuthMode) RequiredCredentialClass() CredentialClass {
+	switch mode {
+	case AuthModeChatGPTCodexOAuth, AuthModeGeminiAntigravityOAuth, AuthModeGrokXAIOAuth:
+		return CredentialClassOAuthTokenImport
+	default:
+		return CredentialClassWebSession
+	}
+}
+
+// RiskStatus is the product risk envelope status of an Auth Mode. Values follow
+// the auth-mode risk envelope §2/§5 vocabulary. It is server-owned policy and
+// never crosses the Public API wire.
+type RiskStatus string
+
+// Auth Mode risk statuses.
+const (
+	RiskAllowed      RiskStatus = "allowed"
+	RiskGated        RiskStatus = "gated"
+	RiskExperimental RiskStatus = "experimental"
+	RiskProhibited   RiskStatus = "prohibited"
+)
+
+// RiskStatus classifies the Auth Mode against the product risk envelope. The
+// mapping mirrors auth-mode-risk-envelope-and-kill-criteria.md §5: no mode is
+// currently `allowed`; the OAuth/CLI modes are `gated`, the consumer Web modes
+// are `experimental`, and Grok Web SSO is `prohibited`. An unknown mode fails
+// closed to `prohibited` so it can never be connected.
+func (mode AuthMode) RiskStatus() RiskStatus {
+	switch mode {
+	case AuthModeChatGPTCodexOAuth, AuthModeGeminiAntigravityOAuth, AuthModeGrokXAIOAuth:
+		return RiskGated
+	case AuthModeChatGPTWebAccess, AuthModeGeminiWebCookie:
+		return RiskExperimental
+	default:
+		return RiskProhibited
+	}
+}
+
+// RequiresRiskAck reports whether the Auth Mode requires an explicit Tenant
+// residual-risk acknowledgement before a stored credential may become usable.
+// Every `gated` and `experimental` mode requires it (risk envelope §6.1); a
+// `prohibited` mode is never connectable so the question does not arise, and no
+// mode is `allowed` in the current revision.
+func (mode AuthMode) RequiresRiskAck() bool {
+	switch mode.RiskStatus() {
+	case RiskGated, RiskExperimental:
+		return true
+	default:
+		return false
+	}
+}
+
 // LifecycleState is the durable Provider Account connection state. Values
 // mirror the frozen Public API contract enum.
 type LifecycleState string
@@ -113,6 +193,13 @@ type ProviderAccount struct {
 	Controls   AdministrativeControls
 	CreatedAt  Timestamp
 	UpdatedAt  Timestamp
+	// RiskAcknowledged records whether the owning Tenant accepted the residual
+	// risk themes a `gated`/`experimental` Auth Mode requires (risk envelope
+	// §6.1). It is server-owned account state, never projected to the Public API
+	// wire (the frozen ProviderAccount schema has no such field and forbids
+	// additional properties). A stored credential MUST NOT become usable while
+	// this is false for a mode that RequiresRiskAck.
+	RiskAcknowledged bool
 }
 
 // CredentialMetadata is the safe, non-secret credential projection. It never
@@ -137,6 +224,12 @@ type HealthReason string
 const (
 	HealthReasonInitialUnprobed HealthReason = "initial_unprobed"
 	HealthReasonProbeSucceeded  HealthReason = "probe_succeeded"
+	// HealthReasonCredentialRejected marks an auth-class probe or validation
+	// failure: the stored credential was rejected by the Auth Mode surface, so
+	// the account is not usable until reauthentication (connection lifecycle
+	// spec §4.6 rule 5, §5.3 Example B). Values mirror the frozen HealthReason
+	// enum.
+	HealthReasonCredentialRejected HealthReason = "credential_rejected"
 )
 
 // HealthScopeKind names the breadth of a health condition. Values mirror the
@@ -245,4 +338,118 @@ func (mode AuthMode) SupportsRefresh() bool {
 // feature-flag + Tenant-acknowledgement concern (#7/#9) and are not gated here.
 func (mode AuthMode) Prohibited() bool {
 	return mode == AuthModeGrokWebSSO
+}
+
+// AcceptsCredentialSubmission reports whether a direct credential submission is
+// allowed from this lifecycle state. The connection lifecycle spec §4.4 accepts
+// a first submit from `draft` and a reauth submit from `reauth_required` or
+// `revoked`. All other states (already `pending_*`, `active`, `disabled`, or
+// `deleted`) reject the direct-submit path in this slice; rotate-while-active,
+// enable, and disable/revoke transitions are owned by later tickets.
+func (state LifecycleState) AcceptsCredentialSubmission() bool {
+	switch state {
+	case LifecycleDraft, LifecycleReauthRequired, LifecycleRevoked:
+		return true
+	default:
+		return false
+	}
+}
+
+// AcceptsProbe reports whether a controlled probe is allowed from this state. A
+// probe proves credential usability, so it is allowed once a credential has
+// been submitted and validation is pending (`pending_validation`), a prior
+// validation succeeded (`pending_probe`), or an already-`active` account is
+// re-probed (connection lifecycle spec §4.6). Draft, disabled, revoked,
+// reauth_required, and deleted reject before any Vault use or Adapter call.
+func (state LifecycleState) AcceptsProbe() bool {
+	switch state {
+	case LifecyclePendingValidation, LifecyclePendingProbe, LifecycleActive:
+		return true
+	default:
+		return false
+	}
+}
+
+// WithSubmittedCredential returns the account after a successful direct
+// credential submission. It advances to `pending_validation`, bumps the
+// credential version, records the stored expiry hint, and refreshes the account
+// health condition to unknown/initial_unprobed for the new version. The
+// submission never activates the account (connection lifecycle spec §4.4 rule 5,
+// frozen 202 lands pending_validation with credential.version 1). It carries no
+// secret material; the version and expiry hint are the only safe projections.
+func (account ProviderAccount) WithSubmittedCredential(now Timestamp, expiresAt Timestamp) ProviderAccount {
+	account.Credential.Version++
+	account.Credential.ExpiresAt = expiresAt
+	account.Lifecycle = LifecyclePendingValidation
+	account.Health = HealthSummary{
+		SummaryState: HealthUnknown,
+		Conditions: []HealthCondition{{
+			Scope:             HealthScope{Kind: HealthScopeAccount},
+			State:             HealthUnknown,
+			Reason:            HealthReasonInitialUnprobed,
+			CredentialVersion: account.Credential.Version,
+			ObservedAt:        now,
+			Remediation:       RemediationNone,
+		}},
+	}
+	account.UpdatedAt = now
+	return account
+}
+
+// WithValidatedCredential returns the account after required validation
+// succeeds for the current credential version. It advances to `pending_probe`
+// and records last_validated_at. Validation success alone never activates the
+// account; a required probe must still succeed (connection lifecycle spec §4.5,
+// I-NO-ACTIVE-ON-FAIL).
+func (account ProviderAccount) WithValidatedCredential(now Timestamp) ProviderAccount {
+	account.Lifecycle = LifecyclePendingProbe
+	account.Credential.LastValidatedAt = now
+	account.UpdatedAt = now
+	return account
+}
+
+// WithCredentialRejected returns the account after required validation or an
+// auth-class probe fails for the current version. It moves to `reauth_required`
+// with health expired/credential_rejected and remediation reauthenticate, and
+// never activates (connection lifecycle spec §4.6 rule 5, §5.3 B). The credential
+// version is preserved so the Tenant knows which version was rejected.
+func (account ProviderAccount) WithCredentialRejected(now Timestamp) ProviderAccount {
+	account.Lifecycle = LifecycleReauthRequired
+	account.Health = HealthSummary{
+		SummaryState: HealthExpired,
+		Conditions: []HealthCondition{{
+			Scope:             HealthScope{Kind: HealthScopeAccount},
+			State:             HealthExpired,
+			Reason:            HealthReasonCredentialRejected,
+			CredentialVersion: account.Credential.Version,
+			ObservedAt:        now,
+			Remediation:       RemediationReauthenticate,
+		}},
+	}
+	account.UpdatedAt = now
+	return account
+}
+
+// WithProbeActivated returns the account after validation plus a required probe
+// succeed for the current version. It transitions to `active`, records
+// last_probed_at, and sets health healthy/probe_succeeded. This is the only
+// transition into `active` in this slice, and it is reached only after every
+// usability gate has already passed (connection lifecycle spec §4.7, §5.1
+// I-USABLE-GATE).
+func (account ProviderAccount) WithProbeActivated(now Timestamp) ProviderAccount {
+	account.Lifecycle = LifecycleActive
+	account.Credential.LastProbedAt = now
+	account.Health = HealthSummary{
+		SummaryState: HealthHealthy,
+		Conditions: []HealthCondition{{
+			Scope:             HealthScope{Kind: HealthScopeAccount},
+			State:             HealthHealthy,
+			Reason:            HealthReasonProbeSucceeded,
+			CredentialVersion: account.Credential.Version,
+			ObservedAt:        now,
+			Remediation:       RemediationNone,
+		}},
+	}
+	account.UpdatedAt = now
+	return account
 }

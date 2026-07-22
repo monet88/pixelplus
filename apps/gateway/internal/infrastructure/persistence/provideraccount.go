@@ -152,6 +152,27 @@ func (store *MemoryAccountStore) Create(_ context.Context, creation ports.Accoun
 	return creation.Account, nil
 }
 
+// Update persists a mutated account for the owning Tenant. It rejects an
+// account that is not already visible under the principal's Tenant so a
+// mutation can never create a cross-Tenant row or resurrect a deleted account
+// (#6 section 5.1). Foreign, unknown, and deleted ids return the single
+// non-enumerating visibility failure.
+func (store *MemoryAccountStore) Update(_ context.Context, update ports.AccountUpdate) (domain.ProviderAccount, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	accounts, ok := store.byTenant[update.Principal.TenantID]
+	if !ok {
+		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	existing, ok := accounts[update.Account.ID]
+	if !ok || existing.Lifecycle == domain.LifecycleDeleted {
+		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	accounts[update.Account.ID] = update.Account
+	return update.Account, nil
+}
+
 // Visible returns the owning-Tenant account or the single non-enumerating
 // visibility failure for foreign, unknown, and deleted identifiers.
 func (store *MemoryAccountStore) Visible(_ context.Context, principal domain.SecurityPrincipal, id domain.ProviderAccountID) (domain.ProviderAccount, error) {

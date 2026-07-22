@@ -145,6 +145,19 @@ type AccountStore interface {
 	Create(context.Context, AccountCreation) (domain.ProviderAccount, error)
 	Visible(context.Context, domain.SecurityPrincipal, domain.ProviderAccountID) (domain.ProviderAccount, error)
 	List(context.Context, domain.SecurityPrincipal) ([]domain.ProviderAccount, error)
+	// Update persists a mutated account for the owning Tenant. It is the durable
+	// side effect of a lifecycle transition (credential submit, validation, probe
+	// activation, or credential rejection). The principal derives Tenant identity
+	// server-side; a foreign, unknown, or deleted id MUST return
+	// ErrAccountNotVisible so the outcome stays non-enumerating (#6 section 5.1).
+	Update(context.Context, AccountUpdate) (domain.ProviderAccount, error)
+}
+
+// AccountUpdate is the typed command to persist a mutated Provider Account for
+// the owning Tenant. Account carries the already-transitioned safe projection.
+type AccountUpdate struct {
+	Principal domain.SecurityPrincipal
+	Account   domain.ProviderAccount
 }
 
 // AuditAction names a product/security audit event.
@@ -155,6 +168,16 @@ const (
 	AuditProviderAccountCreated AuditAction = "provider_account.created"
 	AuditProviderAccountRead    AuditAction = "provider_account.read"
 	AuditProviderAccountListed  AuditAction = "provider_account.listed"
+	// AuditProviderCredentialSubmitted records a direct credential submission.
+	// It carries the account id and outcome only, never material (connection
+	// lifecycle spec §4.4 rule 6).
+	AuditProviderCredentialSubmitted AuditAction = "provider_credential.submitted"
+	// AuditProviderAccountProbed records a controlled probe attempt and its safe
+	// outcome (activated or rejected), never a raw provider payload.
+	AuditProviderAccountProbed AuditAction = "provider_account.probed"
+	// AuditProviderAccountActivated records the transition into `active` after a
+	// required probe succeeds (connection lifecycle spec §4.7).
+	AuditProviderAccountActivated AuditAction = "provider_account.activated"
 )
 
 // AuditEvent is a secret-free product/security audit projection. It carries

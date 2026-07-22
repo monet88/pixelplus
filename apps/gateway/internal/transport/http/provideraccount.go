@@ -24,6 +24,8 @@ type ProviderAccountGateway interface {
 	CreateProviderAccount(context.Context, application.CreateProviderAccountCommand) (application.ProviderAccountResult, error)
 	GetProviderAccount(context.Context, application.GetProviderAccountQuery) (application.ProviderAccountResult, error)
 	ListProviderAccounts(context.Context, application.ListProviderAccountsQuery) (application.ProviderAccountsResult, error)
+	SubmitProviderCredential(context.Context, application.SubmitProviderCredentialCommand) (application.ProviderAccountResult, error)
+	ProbeProviderAccount(context.Context, application.ProbeProviderAccountCommand) (application.ProviderAccountResult, error)
 }
 
 type providerAccountHandler struct {
@@ -38,6 +40,8 @@ func registerProviderAccountRoutes(mux *http.ServeMux, gateway ProviderAccountGa
 	mux.HandleFunc("POST /v1/provider-accounts", handler.create)
 	mux.HandleFunc("GET /v1/provider-accounts", handler.list)
 	mux.HandleFunc("GET /v1/provider-accounts/{provider_account_id}", handler.get)
+	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/credentials", handler.submitCredential)
+	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/probe", handler.probe)
 }
 
 // newRequestID creates the server-owned request id at the Public API boundary
@@ -98,6 +102,114 @@ func (handler providerAccountHandler) create(writer http.ResponseWriter, request
 		return
 	}
 	writeAccountOperation(writer, http.StatusCreated, result)
+}
+
+// directCredentialSubmissionRequest mirrors the frozen
+// DirectCredentialSubmissionRequest wire schema. Unknown fields are rejected so
+// a client cannot smuggle a tenant_id or extra field past the typed contract.
+// The material is writeOnly: it enters here once over TLS and is never echoed.
+type directCredentialSubmissionRequest struct {
+	Credential credentialSubmissionRequest `json:"credential"`
+}
+
+type credentialSubmissionRequest struct {
+	CredentialClass string `json:"credential_class"`
+	Material        string `json:"material"`
+}
+
+func (handler providerAccountHandler) submitCredential(writer http.ResponseWriter, request *http.Request) {
+	requestID := handler.newRequestID()
+	presented, _ := bearerMaterial(request)
+	accountID := request.PathValue("provider_account_id")
+	idempotencyKey := strings.TrimSpace(request.Header.Get("Idempotency-Key"))
+
+	// Like create, the transport observes A2 request-size and strict-decode
+	// outcomes but forwards them as flags so the application enforces the single
+	// normative order A0 auth -> A1 scope -> A2 size -> request validation. The
+	// credential material is never logged and never re-serialized.
+	body, oversize := readLimitedBody(request)
+
+	var parsed directCredentialSubmissionRequest
+	malformed := false
+	if !oversize {
+		if err := decodeStrictJSON(body, &parsed); err != nil {
+			malformed = true
+		}
+	}
+
+	command := application.SubmitProviderCredentialCommand{
+		RequestID:            requestID,
+		PresentedKeyMaterial: presented,
+		AccountID:            domain.ProviderAccountID(accountID),
+		CredentialClass:      domain.CredentialClass(parsed.Credential.CredentialClass),
+		Material:             parsed.Credential.Material,
+		IdempotencyKey:       idempotencyKey,
+		OversizeBody:         oversize,
+		MalformedBody:        malformed,
+	}
+
+	result, err := handler.gateway.SubmitProviderCredential(request.Context(), command)
+	if err != nil {
+		writeGatewayError(writer, err)
+		return
+	}
+	writeAccountOperation(writer, http.StatusAccepted, result)
+}
+
+// probeRequest mirrors the frozen ProbeRequest wire schema. The optional scope
+// selects the breadth of the probe; unknown fields are rejected.
+type probeRequest struct {
+	Scope *probeScopeRequest `json:"scope"`
+}
+
+type probeScopeRequest struct {
+	Kind      string `json:"kind"`
+	Operation string `json:"operation"`
+	ModelSlug string `json:"model_slug"`
+}
+
+func (handler providerAccountHandler) probe(writer http.ResponseWriter, request *http.Request) {
+	requestID := handler.newRequestID()
+	presented, _ := bearerMaterial(request)
+	accountID := request.PathValue("provider_account_id")
+
+	// The probe body is optional. An empty body is a bare account-scope probe; a
+	// present body must strictly decode. A2 size is observed and forwarded like
+	// the other routes so the normative order holds.
+	body, oversize := readLimitedBody(request)
+
+	var parsed probeRequest
+	malformed := false
+	if !oversize && len(body) > 0 {
+		if err := decodeStrictJSON(body, &parsed); err != nil {
+			malformed = true
+		}
+	}
+
+	scope := domain.HealthScope{Kind: domain.HealthScopeAccount}
+	if parsed.Scope != nil {
+		scope = domain.HealthScope{
+			Kind:      domain.HealthScopeKind(parsed.Scope.Kind),
+			Operation: parsed.Scope.Operation,
+			ModelSlug: parsed.Scope.ModelSlug,
+		}
+	}
+
+	command := application.ProbeProviderAccountCommand{
+		RequestID:            requestID,
+		PresentedKeyMaterial: presented,
+		AccountID:            domain.ProviderAccountID(accountID),
+		Scope:                scope,
+		OversizeBody:         oversize,
+		MalformedBody:        malformed,
+	}
+
+	result, err := handler.gateway.ProbeProviderAccount(request.Context(), command)
+	if err != nil {
+		writeGatewayError(writer, err)
+		return
+	}
+	writeAccountOperation(writer, http.StatusOK, result)
 }
 
 func (handler providerAccountHandler) get(writer http.ResponseWriter, request *http.Request) {

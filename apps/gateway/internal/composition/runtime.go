@@ -14,6 +14,7 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/application"
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/observability"
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/persistence"
+	vaultpkg "github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/vault"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 	httptransport "github.com/monet88/pixelplus/apps/gateway/internal/transport/http"
 )
@@ -48,6 +49,13 @@ type Dependencies struct {
 	Audit      ports.AuditRecorder
 	Telemetry  ports.TelemetryRecorder
 	RequestLog ports.RequestLogRecorder
+
+	// Provider Credential Vault and Probe Adapter ports (#46). A nil port keeps
+	// the fail-closed foundation implementation composition substitutes by
+	// default so no account can activate in production until a real Vault and
+	// Provider probe adapter land; contract tests inject controlled fakes.
+	Vault ports.CredentialVault
+	Probe ports.ProbeAdapter
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -153,11 +161,22 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 		requestLog = observability.NewSlogRequestLogRecorder(dependencies.Logger)
 	}
 
+	vault := dependencies.Vault
+	if vault == nil {
+		vault = vaultpkg.NewFailClosedCredentialVault()
+	}
+	probe := dependencies.Probe
+	if probe == nil {
+		probe = vaultpkg.NewFailClosedProbeAdapter()
+	}
+
 	return application.NewProviderAccountService(application.ProviderAccountDependencies{
 		Principal:  principal,
 		Admission:  admission,
 		Replay:     replay,
 		Accounts:   accounts,
+		Vault:      vault,
+		Probe:      probe,
 		Audit:      audit,
 		Telemetry:  telemetry,
 		RequestLog: requestLog,
