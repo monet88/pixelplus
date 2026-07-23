@@ -74,7 +74,7 @@ func (store *stubAdmissionStore) Admit(_ context.Context, request ports.Admissio
 		return ports.AdmissionDecision{Admitted: false, Stage: store.rejectStage}, ports.AdmissionReservation{}, nil
 	}
 	return ports.AdmissionDecision{Admitted: true},
-		ports.AdmissionReservation{Principal: request.Principal, Operation: request.Operation},
+		ports.AdmissionReservation(request),
 		nil
 }
 
@@ -780,7 +780,6 @@ type stubOAuthExchangeAdapter struct {
 
 type stubOAuthRecord struct {
 	authorization domain.OAuthAuthorization
-	consumed      bool
 }
 
 func newStubOAuthExchangeAdapter(log *spineLog) *stubOAuthExchangeAdapter {

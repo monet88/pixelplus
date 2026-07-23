@@ -45,7 +45,7 @@ func NewAlwaysAdmitStore() *AlwaysAdmitStore {
 // Admit accepts the request and returns a reservation bound to the operation.
 func (*AlwaysAdmitStore) Admit(_ context.Context, request ports.AdmissionRequest) (ports.AdmissionDecision, ports.AdmissionReservation, error) {
 	return ports.AdmissionDecision{Admitted: true},
-		ports.AdmissionReservation{Principal: request.Principal, Operation: request.Operation},
+		ports.AdmissionReservation(request),
 		nil
 }
 

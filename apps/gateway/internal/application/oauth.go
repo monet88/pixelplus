@@ -436,18 +436,6 @@ func (service *ProviderAccountService) oauthStartSoftGate(account domain.Provide
 	return domain.CanonicalError{}, true
 }
 
-// oauthStartGate is retained for call sites that need the full pre-adapter gate
-// including the single-flight marker (for example diagnostics).
-func (service *ProviderAccountService) oauthStartGate(account domain.ProviderAccount, purpose domain.OAuthPurpose) (domain.CanonicalError, bool) {
-	if canonical, ok := service.oauthStartSoftGate(account, purpose); !ok {
-		return canonical, false
-	}
-	if account.ActiveOAuthAuthorizationID != "" {
-		return domain.NewAccountNotUsable(domain.RemediationCompleteOAuth), false
-	}
-	return domain.CanonicalError{}, true
-}
-
 // oauthVisibilityCanonical maps an OAuth adapter not-found outcome to the
 // single non-enumerating resource_not_found, or a fail-closed dependency error.
 func (service *ProviderAccountService) oauthVisibilityCanonical(err error) domain.CanonicalError {
