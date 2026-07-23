@@ -3,7 +3,9 @@ package httptransport
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/application"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
@@ -47,6 +49,7 @@ type healthConditionWire struct {
 	Reason            string          `json:"reason"`
 	CredentialVersion int             `json:"credential_version"`
 	ObservedAt        string          `json:"observed_at"`
+	RetryAfterSeconds int             `json:"retry_after_seconds,omitempty"`
 	Remediation       string          `json:"remediation"`
 }
 
@@ -74,15 +77,16 @@ type providerAccountListWire struct {
 // canonicalErrorWire mirrors the frozen CanonicalError schema. Optional fields
 // are omitted so foreign/unknown identifiers never carry a resource_reference.
 type canonicalErrorWire struct {
-	Code             string `json:"code"`
-	Category         string `json:"category"`
-	StatusClass      string `json:"status_class"`
-	Retryability     string `json:"retryability"`
-	Remediation      string `json:"remediation"`
-	RequestID        string `json:"request_id"`
-	FailureStage     string `json:"failure_stage,omitempty"`
-	RetryAfterClass  string `json:"retry_after_class,omitempty"`
-	IdempotencyState string `json:"idempotency_state,omitempty"`
+	Code              string `json:"code"`
+	Category          string `json:"category"`
+	StatusClass       string `json:"status_class"`
+	Retryability      string `json:"retryability"`
+	Remediation       string `json:"remediation"`
+	RequestID         string `json:"request_id"`
+	FailureStage      string `json:"failure_stage,omitempty"`
+	RetryAfterClass   string `json:"retry_after_class,omitempty"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+	IdempotencyState  string `json:"idempotency_state,omitempty"`
 }
 
 func timestampString(timestamp domain.Timestamp) string {
@@ -92,10 +96,11 @@ func timestampString(timestamp domain.Timestamp) string {
 	return timestamp.Time().UTC().Format("2006-01-02T15:04:05Z07:00")
 }
 
-func toProviderAccountWire(account domain.ProviderAccount) providerAccountWire {
+func toProviderAccountWire(account domain.ProviderAccount, responseTime time.Time) providerAccountWire {
+	retryTimingAllowed := accountAllowsRetryTiming(account)
 	conditions := make([]healthConditionWire, 0, len(account.Health.Conditions))
 	for _, condition := range account.Health.Conditions {
-		conditions = append(conditions, healthConditionWire{
+		wire := healthConditionWire{
 			Scope: healthScopeWire{
 				Kind:      string(condition.Scope.Kind),
 				Operation: condition.Scope.Operation,
@@ -106,7 +111,16 @@ func toProviderAccountWire(account domain.ProviderAccount) providerAccountWire {
 			CredentialVersion: condition.CredentialVersion,
 			ObservedAt:        timestampString(condition.ObservedAt),
 			Remediation:       string(condition.Remediation),
-		})
+		}
+		if retryTimingAllowed && condition.State == domain.HealthCoolingDown &&
+			!condition.RetryNotBefore.IsZero() && responseTime.Before(condition.RetryNotBefore.Time()) {
+			seconds := int(math.Ceil(condition.RetryNotBefore.Time().Sub(responseTime).Seconds()))
+			if seconds < 1 {
+				seconds = 1
+			}
+			wire.RetryAfterSeconds = seconds
+		}
+		conditions = append(conditions, wire)
 	}
 	return providerAccountWire{
 		ProviderAccountID: string(account.ID),
@@ -135,21 +149,38 @@ func toProviderAccountWire(account domain.ProviderAccount) providerAccountWire {
 	}
 }
 
-func writeAccountOperation(writer http.ResponseWriter, statusCode int, result application.ProviderAccountResult) {
+func accountAllowsRetryTiming(account domain.ProviderAccount) bool {
+	switch account.Lifecycle {
+	case domain.LifecycleDisabled, domain.LifecycleRevoked, domain.LifecycleDeleted, domain.LifecycleReauthRequired:
+		return false
+	}
+	if account.Controls.Quarantine == domain.QuarantineQuarantined || !account.Controls.AuthModeExecutionEnabled {
+		return false
+	}
+	for _, condition := range account.Health.Conditions {
+		switch condition.State {
+		case domain.HealthExpired, domain.HealthChallenged, domain.HealthBlocked:
+			return false
+		}
+	}
+	return true
+}
+
+func writeAccountOperation(writer http.ResponseWriter, statusCode int, result application.ProviderAccountResult, responseTime time.Time) {
 	writeJSON(writer, statusCode, accountOperationResponseWire{
-		Account:   toProviderAccountWire(result.Account),
+		Account:   toProviderAccountWire(result.Account, responseTime),
 		RequestID: string(result.RequestID),
 	})
 }
 
-func writeAccount(writer http.ResponseWriter, statusCode int, account domain.ProviderAccount) {
-	writeJSON(writer, statusCode, toProviderAccountWire(account))
+func writeAccount(writer http.ResponseWriter, statusCode int, account domain.ProviderAccount, responseTime time.Time) {
+	writeJSON(writer, statusCode, toProviderAccountWire(account, responseTime))
 }
 
-func writeAccountList(writer http.ResponseWriter, accounts []domain.ProviderAccount) {
+func writeAccountList(writer http.ResponseWriter, accounts []domain.ProviderAccount, responseTime time.Time) {
 	data := make([]providerAccountWire, 0, len(accounts))
 	for _, account := range accounts {
-		data = append(data, toProviderAccountWire(account))
+		data = append(data, toProviderAccountWire(account, responseTime))
 	}
 	writeJSON(writer, http.StatusOK, providerAccountListWire{Data: data})
 }
@@ -171,15 +202,16 @@ func writeGatewayError(writer http.ResponseWriter, err error) {
 func writeCanonical(writer http.ResponseWriter, canonical domain.CanonicalError) {
 	requestID := string(canonical.RequestID)
 	body := canonicalErrorWire{
-		Code:             string(canonical.Code),
-		Category:         string(canonical.Category),
-		StatusClass:      string(canonical.StatusClass),
-		Retryability:     string(canonical.Retryability),
-		Remediation:      string(canonical.Remediation),
-		RequestID:        requestID,
-		FailureStage:     string(canonical.FailureStage),
-		RetryAfterClass:  canonical.RetryAfterClass,
-		IdempotencyState: string(canonical.IdempotencyState),
+		Code:              string(canonical.Code),
+		Category:          string(canonical.Category),
+		StatusClass:       string(canonical.StatusClass),
+		Retryability:      string(canonical.Retryability),
+		Remediation:       string(canonical.Remediation),
+		RequestID:         requestID,
+		FailureStage:      string(canonical.FailureStage),
+		RetryAfterClass:   canonical.RetryAfterClass,
+		RetryAfterSeconds: canonical.RetryAfterSeconds,
+		IdempotencyState:  string(canonical.IdempotencyState),
 	}
 	if body.RequestID == "" {
 		body.RequestID = "req_unavailable"

@@ -2,7 +2,10 @@ package application
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"hash/fnv"
+	"time"
 	"unicode/utf8"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
@@ -12,7 +15,17 @@ import (
 // minCredentialMaterialLength mirrors the frozen CredentialSubmission.material
 // minLength. A shorter material is a request_validation failure so an obviously
 // truncated secret never reaches the Vault.
-const minCredentialMaterialLength = 8
+const (
+	minCredentialMaterialLength = 8
+
+	transientCooldownBase = 30 * time.Second
+	transientCooldownMax  = 15 * time.Minute
+	quotaCooldownBase     = 15 * time.Minute
+	quotaCooldownMax      = 24 * time.Hour
+
+	providerRateHintMaxPlausible  = 24 * time.Hour
+	providerQuotaHintMaxPlausible = 31 * 24 * time.Hour
+)
 
 // SubmitProviderCredentialCommand is the typed direct credential submission. The
 // transport extracts the raw bearer material and the writeOnly credential
@@ -346,6 +359,9 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 	if command.MalformedBody {
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
+	if !validProbeScope(command.Scope) {
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
+	}
 
 	// Same-Tenant ownership before any gate, Vault use, or Adapter call.
 	account, err := service.accounts.Visible(ctx, principal, command.AccountID)
@@ -368,6 +384,57 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 	}
 	defer service.release(ctx, reservation)
 
+	// Provider Surface Circuit state is a shared new-work gate, distinct from
+	// account Health. Resolve its upstream surface from the current credential-
+	// version-bound Capability Snapshot when available so connection probes and
+	// model selection query the same coordinate. Missing/stale evidence uses an
+	// empty safe query coordinate that overlaps any concrete surface in the bounded
+	// Provider/Auth Mode domain; unreadable evidence fails closed. Tenant/account identity and client-selected URLs never
+	// enter the shared key. Designated operator canaries require a separate
+	// purpose-bound command and are intentionally not represented here.
+	circuitSurface, err := service.probeCircuitSurface(ctx, principal, account, command.Scope)
+	if err != nil {
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	circuit, err := service.circuits.SurfaceOpen(ctx, circuitSurface)
+	if err != nil {
+		if errors.Is(err, ports.ErrCircuitUnavailable) {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+		}
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	if circuit.Open {
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewProviderCooldownBlocked(0))
+	}
+
+	// A cooldown recovery must atomically own the exact scope/revision/version
+	// before Vault validation or the Adapter runs. Before retry_not_before it stays
+	// closed; after expiry exactly one request can claim the durable marker.
+	var recoveryPermit domain.RecoveryPermit
+	if account.Lifecycle == domain.LifecycleActive {
+		decision := account.ScopedRecoveryPermit(domain.NewTimestamp(sc.start), command.Scope, sc.requestID)
+		if decision.Cooling && !decision.Eligible {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewProviderCooldownBlocked(decision.RetryAfterSeconds))
+		}
+		if decision.Eligible {
+			claimed := account.WithRecoveryPermitClaimed(decision.Permit)
+			account, err = service.accounts.Update(ctx, ports.AccountUpdate{
+				Principal:                  principal,
+				Account:                    claimed,
+				RequireEmptyPendingVersion: true,
+				RequireEmptyRecoveryPermit: true,
+				RequireRecoveryCondition:   decision.Permit,
+			})
+			if err != nil {
+				if errors.Is(err, ports.ErrAccountUpdateConflict) {
+					return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+				}
+				return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+			}
+			recoveryPermit = decision.Permit
+		}
+	}
+
 	// Required validation runs BEFORE the probe so a malformed stored credential
 	// never spends probe budget. A validation failure moves the account to
 	// reauth_required and returns without calling the Adapter (validation failure
@@ -383,13 +450,17 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		Version:   probeVersion,
 	})
 	if err != nil {
+		// Vault dependency failure is not an authoritative Provider observation.
+		// Keep the claimed revision occupied: releasing it here would grant a second
+		// half-open attempt for the same condition revision and permit unbounded
+		// retries. Recovery/reclamation requires a separately specified owner.
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	if !validation.Valid {
 		if account.PendingCredentialVersion > 0 {
 			return service.pendingProbeRejected(ctx, sc, principal, account)
 		}
-		return service.probeRejected(ctx, sc, principal, account)
+		return service.probeRejected(ctx, sc, principal, account, recoveryPermit)
 	}
 	validated := account.WithValidatedCredential(domain.NewTimestamp(sc.start))
 
@@ -405,26 +476,36 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		Scope:     command.Scope,
 	})
 	if err != nil {
-		// Persist the validated state so last_validated_at is durable, then
-		// surface the fail-closed dependency error.
-		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: validated})
+		// Persist validation evidence without releasing the claimed Health revision.
+		// A dependency failure did not produce a Provider outcome, so allowing a new
+		// owner to reclaim the same revision would create unlimited half-open probes.
+		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{
+			Principal:                  principal,
+			Account:                    validated,
+			RequireRecoveryPermitOwner: recoveryPermit.Owner,
+			RequireRecoveryCondition:   recoveryPermit,
+		})
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	if !outcome.Authenticated {
 		if account.PendingCredentialVersion > 0 {
 			return service.pendingProbeRejected(ctx, sc, principal, validated)
 		}
-		return service.probeRejected(ctx, sc, principal, validated)
+		return service.probeRejected(ctx, sc, principal, validated, recoveryPermit)
 	}
 
 	// Mint the credential-version-bound Capability Snapshot before activation so
 	// an active account never authorizes work without published evidence for this
-	// version (capability semantics section 9; I-CAP-VERSION-BIND).
-	evidence := validated
-	evidence.Credential.Version = probeVersion
-	if err := service.mintCapabilitySnapshot(ctx, principal, evidence); err != nil {
-		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: validated})
-		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	// version (capability semantics section 9; I-CAP-VERSION-BIND). A scoped
+	// cooldown recovery does not mint capability evidence from identity success
+	// alone (§9.11); it only settles the fenced Health Condition.
+	if recoveryPermit.Owner == "" {
+		evidence := validated
+		evidence.Credential.Version = probeVersion
+		if err := service.mintCapabilitySnapshot(ctx, principal, evidence); err != nil {
+			_, _ = service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: validated})
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		}
 	}
 
 	// Validation + probe succeeded for the version this request proved. Re-read
@@ -467,11 +548,80 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		// Concurrent lifecycle transition (e.g. revoke/delete path edge) rejected
 		// activation after the probe ran; fail closed without promoting use.
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationAccountRemediation))
+	case latest.Lifecycle == domain.LifecycleActive:
+		// Re-probe of an already-active account is a recovery observation, not a
+		// first activation: it MUST NOT wipe scoped health evidence and re-assert a
+		// blanket healthy summary. An authenticated probe with no fresh rate/quota
+		// signal is an authoritative scoped success that resolves only the probed
+		// scope (§9.12, §11); the cooldown overlay below still renews/adds a scope
+		// when a fresh signal is present, so an out-of-scope cooldown survives
+		// (§4 rules 4-5, §7.9, I-HEALTH-NO-STALE-CLEAR).
+		if outcome.Signal == ports.ProbeSignalNone {
+			if recoveryPermit.Owner != "" {
+				activated = base.WithScopedRecovery(now, recoveryPermit)
+			} else {
+				activated = base
+				activated.Credential.LastProbedAt = now
+				activated.UpdatedAt = now
+			}
+		} else {
+			// A fresh rate/quota signal keeps the existing evidence untouched; the
+			// overlay below renews the matching scope. Only record the probe time.
+			activated = base
+			activated.Credential.LastProbedAt = now
+			activated.UpdatedAt = now
+		}
+		// Fence against a concurrent replacement staging after this load. A claimed
+		// cooldown recovery additionally settles only its owner and exact condition.
+		update.RequireEmptyPendingVersion = true
+		if recoveryPermit.Owner != "" {
+			update.RequireRecoveryPermitOwner = recoveryPermit.Owner
+			update.RequireRecoveryCondition = recoveryPermit
+		}
 	default:
 		activated = base.WithProbeActivated(now)
 		// Fence against a concurrent replacement staging after this load.
 		update.RequireEmptyPendingVersion = true
 	}
+
+	// A validated Provider rate/quota signal surfaced during an otherwise
+	// authenticated probe overlays a durable scoped cooldown. Auth was proven, so
+	// the account still activates; the cooldown is an orthogonal scoped overlay at
+	// the narrowest proven bucket (unknown → account) and never rewrites lifecycle
+	// (health/cooldown spec §6, §20 I-HEALTH-ORTHOGONAL). Credential-rejected,
+	// challenge, and ban outcomes are NOT signals here: they arrive as
+	// Authenticated=false and are already handled above (§6 rule 4).
+	if reason, ok := cooldownReasonForSignal(outcome.Signal); ok {
+		// A fresh signal means the claimed recovery did not succeed. When its
+		// evidenced scope differs, renew the claimed scope first so the consumed
+		// revision cannot be reclaimed, then overlay the new signal scope. A matching
+		// signal is renewed once by the ordinary overlay below.
+		if recoveryPermit.Owner != "" && !recoveryPermit.MatchesScope(outcome.SignalScope) {
+			retryNotBefore := defaultCooldownRetryNotBefore(activated, recoveryPermit.Scope, reason, now)
+			activated = activated.WithScopedCooldown(now, recoveryPermit.Scope, reason, retryNotBefore)
+		}
+		retryNotBefore, malformedHint := providerRetryNotBefore(
+			activated,
+			outcome.SignalScope,
+			reason,
+			outcome.RetryAfterSeconds,
+			now,
+		)
+		if malformedHint {
+			// Retain only an operator-visible safe classification. The raw Provider
+			// value is neither persisted nor logged (§7.4-§7.6).
+			_ = service.audit.Record(ctx, ports.AuditEvent{
+				Action:            ports.AuditProviderHintMalformed,
+				TenantID:          principal.TenantID,
+				ClientAPIKeyID:    principal.ClientAPIKeyID,
+				ProviderAccountID: activated.ID,
+				RequestID:         sc.requestID,
+				Outcome:           "malformed_provider_hint",
+			})
+		}
+		activated = activated.WithScopedCooldown(now, outcome.SignalScope, reason, retryNotBefore)
+	}
+
 	update.Account = activated
 	persisted, err := service.accounts.Update(ctx, update)
 	if err != nil {
@@ -495,10 +645,18 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 // non-activating result as a 200 success projection (the account exists and the
 // operation ran; the observable outcome is the resulting non-active account with
 // remediation reauthenticate). It records the probe audit without secrets.
-func (service *ProviderAccountService) probeRejected(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, account domain.ProviderAccount) (ProviderAccountResult, error) {
+func (service *ProviderAccountService) probeRejected(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, account domain.ProviderAccount, recoveryPermit domain.RecoveryPermit) (ProviderAccountResult, error) {
 	rejected := account.WithCredentialRejected(domain.NewTimestamp(sc.start))
-	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: rejected})
+	update := ports.AccountUpdate{Principal: principal, Account: rejected}
+	if recoveryPermit.Owner != "" {
+		update.RequireRecoveryPermitOwner = recoveryPermit.Owner
+		update.RequireRecoveryCondition = recoveryPermit
+	}
+	persisted, err := service.accounts.Update(ctx, update)
 	if err != nil {
+		if errors.Is(err, ports.ErrAccountUpdateConflict) {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	service.observeSuccess(ctx, sc, ports.AuditProviderAccountProbed, principal, persisted.ID, 200)
@@ -564,6 +722,12 @@ func (service *ProviderAccountService) probeGate(account domain.ProviderAccount)
 	if canonical, ok := service.authModeGate(account); !ok {
 		return canonical, false
 	}
+	// Quarantine blocks generic Tenant probes, Vault decrypt/validation, and
+	// Adapter work. Only a distinct privileged incident-remediation purpose may
+	// bypass it; this public probe command intentionally carries no such purpose.
+	if account.Controls.Quarantine == domain.QuarantineQuarantined {
+		return domain.NewAccountNotUsable(domain.RemediationContactOperator), false
+	}
 	// A replacement marker means Vault may not yet hold the pending version (or
 	// a write is in flight). Fail closed before Validate/Probe so a concurrent
 	// probe cannot revoke/restore mid-stage and leave a stuck fence.
@@ -581,20 +745,161 @@ func (service *ProviderAccountService) probeGate(account domain.ProviderAccount)
 	return domain.CanonicalError{}, true
 }
 
+// validProbeScope accepts only account scope or a fully specified operation/model
+// scope using the frozen capability operation vocabulary. Client input never
+// creates a new shared circuit coordinate.
+func validProbeScope(scope domain.HealthScope) bool {
+	switch scope.Kind {
+	case domain.HealthScopeAccount:
+		return scope.Operation == "" && scope.ModelSlug == ""
+	case domain.HealthScopeOperation:
+		return scope.ModelSlug == "" && domain.CapabilityOperation(scope.Operation).Valid()
+	case domain.HealthScopeModel:
+		return scope.ModelSlug != "" && domain.CapabilityOperation(scope.Operation).Valid()
+	default:
+		return false
+	}
+}
+
+// probeCircuitSurface derives the shared circuit coordinates this Tenant probe
+// can prove without trusting client-selected URLs. Once current-version Capability
+// evidence exists, it uses the same operation ProbeSurface consumed by /v1/models;
+// before first activation or when evidence is stale, an empty safe coordinate
+// asks the evaluator about any concrete surface in the Provider/Auth Mode domain.
+func (service *ProviderAccountService) probeCircuitSurface(
+	ctx context.Context,
+	principal domain.SecurityPrincipal,
+	account domain.ProviderAccount,
+	scope domain.HealthScope,
+) (ports.CircuitSurface, error) {
+	surface := ports.CircuitSurface{
+		Provider: account.Provider,
+		AuthMode: account.AuthMode,
+	}
+	if scope.Kind == domain.HealthScopeOperation || scope.Kind == domain.HealthScopeModel {
+		surface.Operation = domain.CapabilityOperation(scope.Operation)
+	}
+
+	snapshot, err := service.capabilities.Get(ctx, principal, account.ID)
+	if err != nil {
+		if errors.Is(err, ports.ErrCapabilitySnapshotNotFound) {
+			return surface, nil
+		}
+		return ports.CircuitSurface{}, err
+	}
+	if snapshot.CredentialVersion != account.Credential.Version || snapshot.AuthMode != account.AuthMode {
+		return surface, nil
+	}
+	if fact, ok := snapshot.Operations[surface.Operation]; ok && fact.ProbeSurface != "" {
+		surface.Surface = fact.ProbeSurface
+	}
+	return surface, nil
+}
+
 // authModeGate rejects a prohibited Auth Mode, a disabled Auth Mode execution
 // control, and a gated/experimental mode without the required Tenant risk
-// acknowledgement, in that order. A prohibited mode is auth_mode_unavailable;
-// the others are account_not_usable with the remediation the Tenant needs
-// (risk envelope §5.5, §6.1; connection lifecycle spec §4.2, §5.1).
+// acknowledgement, in that order. A prohibited or execution-disabled mode is
+// auth_mode_unavailable; missing Tenant risk acknowledgement remains
+// account_not_usable/ack_risk (risk envelope §3.5, §5.5, §6.1; connection
+// lifecycle spec §4.2, §5.1).
 func (service *ProviderAccountService) authModeGate(account domain.ProviderAccount) (domain.CanonicalError, bool) {
 	if account.AuthMode.Prohibited() {
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if !account.Controls.AuthModeExecutionEnabled {
-		return domain.NewAccountNotUsable(domain.RemediationEnableAccount), false
+		return domain.NewAuthModeUnavailable(), false
 	}
 	if account.AuthMode.RequiresRiskAck() && !account.RiskAcknowledged {
 		return domain.NewAccountNotUsable(domain.RemediationAckRisk), false
 	}
 	return domain.CanonicalError{}, true
+}
+
+// cooldownReasonForSignal maps a normalized probe runtime signal to the canonical
+// cooldown Health Reason. Only the time-waitable rate/quota classes create a
+// cooldown (§6 rule 1); ProbeSignalNone and any unrecognized class report false
+// so no cooldown is overlaid (§6 rule 4: auth/challenge/ban are not signals here).
+func cooldownReasonForSignal(signal ports.ProbeSignalClass) (domain.HealthReason, bool) {
+	switch signal {
+	case ports.ProbeSignalRateLimited:
+		return domain.HealthReasonProviderRateLimited, true
+	case ports.ProbeSignalQuotaExhausted:
+		return domain.HealthReasonProviderQuotaExhausted, true
+	default:
+		return "", false
+	}
+}
+
+func providerRetryNotBefore(
+	account domain.ProviderAccount,
+	scope domain.HealthScope,
+	reason domain.HealthReason,
+	retryAfterSeconds int,
+	now domain.Timestamp,
+) (domain.Timestamp, bool) {
+	if retryAfterSeconds <= 0 {
+		return defaultCooldownRetryNotBefore(account, scope, reason, now), false
+	}
+	maximum := providerRateHintMaxPlausible
+	if reason == domain.HealthReasonProviderQuotaExhausted {
+		maximum = providerQuotaHintMaxPlausible
+	}
+	if int64(retryAfterSeconds) > int64(maximum/time.Second) {
+		return defaultCooldownRetryNotBefore(account, scope, reason, now), true
+	}
+	return domain.NewTimestamp(now.Time().Add(time.Duration(retryAfterSeconds) * time.Second)), false
+}
+
+// defaultCooldownRetryNotBefore applies the frozen no-hint health policy. The
+// exponential duration is bounded by its reason class; deterministic positive
+// jitter (0-10%) is derived from the account/scope/next revision so workers do
+// not synchronize while identical evidence remains reproducible in tests.
+func defaultCooldownRetryNotBefore(
+	account domain.ProviderAccount,
+	scope domain.HealthScope,
+	reason domain.HealthReason,
+	now domain.Timestamp,
+) domain.Timestamp {
+	normalized, revision, backoffLevel := account.NextCooldownFence(scope)
+	base, maximum := transientCooldownBase, transientCooldownMax
+	if reason == domain.HealthReasonProviderQuotaExhausted {
+		base, maximum = quotaCooldownBase, quotaCooldownMax
+	}
+	duration := boundedExponentialCooldown(base, maximum, backoffLevel)
+	jitterRange := duration / 10
+	if jitterRange > 0 {
+		hash := fnv.New64a()
+		_, _ = hash.Write([]byte(account.ID))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(normalized.Kind))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(normalized.Operation))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(normalized.ModelSlug))
+		var encoded [8]byte
+		binary.LittleEndian.PutUint64(encoded[:], uint64(revision))
+		_, _ = hash.Write(encoded[:])
+		duration += time.Duration(hash.Sum64() % uint64(jitterRange+1))
+		if duration > maximum {
+			duration = maximum
+		}
+	}
+	return domain.NewTimestamp(now.Time().Add(duration))
+}
+
+func boundedExponentialCooldown(base, maximum time.Duration, level int) time.Duration {
+	if level < 1 {
+		level = 1
+	}
+	duration := base
+	for current := 1; current < level && duration < maximum; current++ {
+		if duration > maximum/2 {
+			return maximum
+		}
+		duration *= 2
+	}
+	if duration > maximum {
+		return maximum
+	}
+	return duration
 }

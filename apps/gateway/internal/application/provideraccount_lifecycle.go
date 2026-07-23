@@ -218,11 +218,18 @@ func (service *ProviderAccountService) EnableProviderAccount(ctx context.Context
 	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
 }
 
-// enableSoftGate enforces enable-only-from-disabled plus the single-flight OAuth
-// and replacement ownership windows (management contract §4.5, §4.6).
+// enableSoftGate enforces enable-only-from-disabled, the Auth Mode execution and
+// quarantine controls, plus the single-flight OAuth/replacement ownership windows
+// (management contract §4.5, §4.6; health controls §13.8, §15.2, §16.3).
 func (service *ProviderAccountService) enableSoftGate(account domain.ProviderAccount) (domain.CanonicalError, bool) {
 	if !account.Lifecycle.AcceptsEnable() {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+	}
+	if !account.Controls.AuthModeExecutionEnabled {
+		return domain.NewAuthModeUnavailable(), false
+	}
+	if account.Controls.Quarantine == domain.QuarantineQuarantined {
+		return domain.NewAccountNotUsable(domain.RemediationContactOperator), false
 	}
 	if account.ActiveOAuthAuthorizationID != "" {
 		return domain.NewAccountNotUsable(domain.RemediationCompleteOAuth), false

@@ -57,6 +57,12 @@ type Options struct {
 	// snapshot minting and model listing through real composition.
 	Capabilities ports.CapabilityStore
 	Capability   ports.CapabilityAdapter
+
+	// Provider Surface Circuit gate (#51). A nil port keeps the foundation
+	// closed-circuit store (every surface closed, nothing to block); a controlled
+	// fake proves an open cross-Tenant surface blocks matching new work through
+	// real composition without exposing the corroborating evidence.
+	Circuits ports.CircuitStore
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -100,6 +106,8 @@ func NewFixture(options Options) (*Fixture, error) {
 
 		Capabilities: options.Capabilities,
 		Capability:   options.Capability,
+
+		Circuits: options.Circuits,
 	})
 	if err != nil {
 		return nil, err

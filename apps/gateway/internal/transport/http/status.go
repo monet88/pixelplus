@@ -41,7 +41,7 @@ type statusResponse struct {
 func NewHandler(clock clock, ids idGenerator, status Status, gateway ProviderAccountGateway, assets AssetGateway, capabilities CapabilityGateway) http.Handler {
 	mux := http.NewServeMux()
 	registerStatusRoutes(mux, clock, ids, status)
-	registerProviderAccountRoutes(mux, gateway, ids)
+	registerProviderAccountRoutes(mux, gateway, clock, ids)
 	registerCapabilityRoutes(mux, capabilities, ids)
 	registerAssetRoutes(mux, assets, ids)
 	return mux

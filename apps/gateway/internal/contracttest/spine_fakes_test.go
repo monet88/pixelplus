@@ -173,11 +173,12 @@ func (store *stubReplayStore) Abandon(_ context.Context, identity domain.ReplayI
 // unknown, and deleted identifiers all return ErrAccountNotVisible so the
 // outcome is indistinguishable (#6 section 5.1).
 type stubAccountStore struct {
-	log       *spineLog
-	mu        sync.Mutex
-	byTenant  map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
-	createErr error
-	updateErr error
+	log        *spineLog
+	mu         sync.Mutex
+	byTenant   map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
+	createErr  error
+	updateErr  error
+	restoreErr error
 	// updateFailTimes forces the next N Update calls to return updateErr (or
 	// ErrDependencyUnavailable when updateErr is nil) so partial-success recovery
 	// after vault put can be contract-tested.
@@ -201,6 +202,10 @@ func (store *stubAccountStore) seed(tenant domain.TenantID, account domain.Provi
 		store.byTenant[tenant] = accounts
 	}
 	accounts[account.ID] = account
+}
+
+func (store *stubAccountStore) Restore(context.Context) error {
+	return store.restoreErr
 }
 
 func (store *stubAccountStore) Create(_ context.Context, creation ports.AccountCreation) (domain.ProviderAccount, error) {
@@ -295,8 +300,31 @@ func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpd
 	if update.RequireEmptyPendingVersion && existing.PendingCredentialVersion != 0 {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
+	if update.RequireEmptyRecoveryPermit && existing.RecoveryPermit.Owner != "" {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireRecoveryPermitOwner != "" && existing.RecoveryPermit.Owner != update.RequireRecoveryPermitOwner {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if required := update.RequireRecoveryCondition; required.Owner != "" && !stubAccountHasRecoveryCondition(existing, required) {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
+}
+
+func stubAccountHasRecoveryCondition(account domain.ProviderAccount, required domain.RecoveryPermit) bool {
+	if account.Credential.Version != required.CredentialVersion {
+		return false
+	}
+	for _, condition := range account.Health.Conditions {
+		if condition.Scope == required.Scope &&
+			condition.ConditionRevision == required.ConditionRevision &&
+			condition.CredentialVersion == required.CredentialVersion {
+			return true
+		}
+	}
+	return false
 }
 
 // captureAudit records the safe audit projections emitted by the spine.
@@ -458,6 +486,8 @@ type stubProbeAdapter struct {
 	probeErr  error
 	outcome   ports.ProbeOutcome
 	callCount atomic.Int32
+	entered   chan struct{}
+	release   <-chan struct{}
 }
 
 func newStubProbeAdapter(log *spineLog) *stubProbeAdapter {
@@ -467,6 +497,15 @@ func newStubProbeAdapter(log *spineLog) *stubProbeAdapter {
 func (adapter *stubProbeAdapter) Probe(_ context.Context, _ ports.ProbeCommand) (ports.ProbeOutcome, error) {
 	adapter.callCount.Add(1)
 	adapter.log.add("probe")
+	if adapter.entered != nil {
+		select {
+		case adapter.entered <- struct{}{}:
+		default:
+		}
+	}
+	if adapter.release != nil {
+		<-adapter.release
+	}
 	if adapter.probeErr != nil {
 		return ports.ProbeOutcome{}, adapter.probeErr
 	}
@@ -545,6 +584,54 @@ func (store *stubCapabilityStore) Put(_ context.Context, principal domain.Securi
 	}
 	accounts[snapshot.ProviderAccountID] = snapshot
 	return nil
+}
+
+// stubCircuitStore exposes only safe circuit state keyed by the shared Provider
+// surface coordinates. It deliberately carries no Tenant or account identity.
+type stubCircuitStore struct {
+	log       *spineLog
+	mu        sync.Mutex
+	states    map[ports.CircuitSurface]ports.CircuitState
+	queries   []ports.CircuitSurface
+	queryErr  error
+	callCount atomic.Int32
+}
+
+func newStubCircuitStore(log *spineLog) *stubCircuitStore {
+	return &stubCircuitStore{
+		log:    log,
+		states: make(map[ports.CircuitSurface]ports.CircuitState),
+	}
+}
+
+func (store *stubCircuitStore) set(surface ports.CircuitSurface, state ports.CircuitState) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.states[surface] = state
+}
+
+func (store *stubCircuitStore) SurfaceOpen(_ context.Context, surface ports.CircuitSurface) (ports.CircuitState, error) {
+	store.callCount.Add(1)
+	store.log.add("circuit.surface_open")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.queries = append(store.queries, surface)
+	if store.queryErr != nil {
+		return ports.CircuitState{}, store.queryErr
+	}
+	for evidence, state := range store.states {
+		if !state.Open || evidence.Provider != surface.Provider || evidence.AuthMode != surface.AuthMode {
+			continue
+		}
+		if surface.Surface != "" && evidence.Surface != surface.Surface {
+			continue
+		}
+		if surface.Operation != "" && evidence.Operation != "" && evidence.Operation != surface.Operation {
+			continue
+		}
+		return state, nil
+	}
+	return ports.CircuitState{}, nil
 }
 
 // stubCapabilityAdapter returns a configurable observation used to mint
@@ -626,6 +713,7 @@ var (
 	_ ports.ProbeAdapter       = (*stubProbeAdapter)(nil)
 	_ ports.CapabilityStore    = (*stubCapabilityStore)(nil)
 	_ ports.CapabilityAdapter  = (*stubCapabilityAdapter)(nil)
+	_ ports.CircuitStore       = (*stubCircuitStore)(nil)
 )
 
 // replayOutcome adapts a test string to the ports.ReplayOutcome value the stub

@@ -459,6 +459,18 @@ func TestDirectReauthenticationCutsOverPendingVersion(t *testing.T) {
 		account.Lifecycle = domain.LifecycleActive
 		account.Credential.Version = 1
 		account.Credential.LastAllocatedVersion = 1
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime),
+		)
+		decision := account.ScopedRecoveryPermit(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			"request_orphaned",
+		)
+		account = account.WithRecoveryPermitClaimed(decision.Permit)
 		h.accounts.seed("tenant_a", account)
 	})
 	response, payload := harness.do(t, requestSpec{
@@ -469,6 +481,13 @@ func TestDirectReauthenticationCutsOverPendingVersion(t *testing.T) {
 	})
 	if response.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202 (body=%s)", response.StatusCode, payload)
+	}
+	stored, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_reauth_direct")
+	if err != nil {
+		t.Fatalf("visible staged account: %v", err)
+	}
+	if stored.RecoveryPermit.Owner != "" {
+		t.Fatalf("recovery permit owner = %q, want cleared by reauthentication epoch", stored.RecoveryPermit.Owner)
 	}
 	staged := decodeAccount(t, payload)
 	if staged["lifecycle_state"] != string(domain.LifecyclePendingValidation) || staged["credential"].(map[string]any)["version"] != float64(1) {

@@ -149,10 +149,14 @@ type AccountCreation struct {
 }
 
 // AccountStore owns logical Provider Account persistence and same-Tenant,
-// non-enumerating visibility. Visible MUST return ErrAccountNotVisible for
-// foreign, unknown, and deleted identifiers so the outcome is indistinguishable
-// (#6 section 5.1).
+// non-enumerating visibility. Restore MUST make durable Provider Account state,
+// including scoped cooldowns and occupied recovery permits, readable before
+// composition reports execution readiness. An unreadable durable state returns
+// an error so startup stays fail-closed (health/cooldown spec §7.1-§7.2).
+// Visible MUST return ErrAccountNotVisible for foreign, unknown, and deleted
+// identifiers so the outcome is indistinguishable (#6 section 5.1).
 type AccountStore interface {
+	Restore(context.Context) error
 	Create(context.Context, AccountCreation) (domain.ProviderAccount, error)
 	Visible(context.Context, domain.SecurityPrincipal, domain.ProviderAccountID) (domain.ProviderAccount, error)
 	List(context.Context, domain.SecurityPrincipal) ([]domain.ProviderAccount, error)
@@ -192,6 +196,18 @@ type AccountUpdate struct {
 	// first-connect probe activation cannot clobber an in-flight replacement that
 	// staged after the writer loaded its snapshot.
 	RequireEmptyPendingVersion bool
+	// RequireEmptyRecoveryPermit rejects the write unless no half-open scoped
+	// recovery attempt is currently owned. It atomically claims the single permit
+	// before Vault validation or the Probe Adapter runs.
+	RequireEmptyRecoveryPermit bool
+	// RequireRecoveryPermitOwner, when non-empty, rejects the write unless the
+	// stored recovery permit belongs to this request. Scope/revision/version remain
+	// bound in Account and are checked by RequireRecoveryCondition below.
+	RequireRecoveryPermitOwner domain.Identifier
+	// RequireRecoveryCondition fences settlement against a renewed or replaced
+	// condition. The current stored account must still carry the exact scope,
+	// condition revision, and credential version represented by this permit.
+	RequireRecoveryCondition domain.RecoveryPermit
 }
 
 // AuditAction names a product/security audit event.
@@ -224,6 +240,10 @@ const (
 	// pending credential version is revoked before the account is removed; the
 	// event carries no secrets (connection lifecycle spec §4.12 rule 6).
 	AuditProviderAccountDeleted AuditAction = "provider_account.deleted"
+	// AuditProviderHintMalformed records that a normalized rate/quota signal
+	// carried an unusable relative reset hint. The event retains only safe
+	// classification and account ownership, never the raw Provider value.
+	AuditProviderHintMalformed AuditAction = "provider_hint.malformed"
 	// AuditProviderOAuthStarted records a successful server-owned OAuth start.
 	// It carries the account id and outcome only, never codes or tokens.
 	AuditProviderOAuthStarted AuditAction = "provider_oauth.started"

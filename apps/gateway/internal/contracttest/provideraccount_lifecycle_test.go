@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
@@ -277,6 +278,53 @@ func TestEnableReturnsPendingProbeThenActivates(t *testing.T) {
 	}
 }
 
+func TestEnableClearsOccupiedRecoveryPermit(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_enable_recovery_epoch", domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime),
+		)
+		decision := account.ScopedRecoveryPermit(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			"request_orphaned",
+		)
+		account = account.WithRecoveryPermitClaimed(decision.Permit)
+		account.Lifecycle = domain.LifecycleDisabled
+		h.accounts.seed("tenant_a", account)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_enable_recovery_epoch/enable",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("enable status = %d, want 202 (body=%s)", response.StatusCode, payload)
+	}
+	stored, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_enable_recovery_epoch")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if stored.RecoveryPermit.Owner != "" {
+		t.Fatalf("recovery permit owner = %q, want cleared on enable epoch", stored.RecoveryPermit.Owner)
+	}
+
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_enable_recovery_epoch/probe",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200 after enable (body=%s)", response.StatusCode, payload)
+	}
+}
+
 // AC (enable auth-class probe failure never activates): after enable, a probe
 // that fails authentication lands `reauth_required`, never a half-enabled active.
 func TestEnableProbeAuthFailureLandsReauthRequired(t *testing.T) {
@@ -332,6 +380,71 @@ func TestEnableRejectsNonDisabled(t *testing.T) {
 	}
 	if calls := harness.accounts.updateCalls.Load(); calls != 0 {
 		t.Fatalf("account.Update ran %d times enabling an active account, want 0", calls)
+	}
+}
+
+func TestEnableRejectsQuarantineAndAuthModeKill(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		mutate      func(*domain.ProviderAccount)
+		wantCode    string
+		remediation string
+	}{
+		{
+			name: "quarantine",
+			mutate: func(account *domain.ProviderAccount) {
+				account.Controls.Quarantine = domain.QuarantineQuarantined
+			},
+			wantCode:    "account_not_usable",
+			remediation: "contact_operator",
+		},
+		{
+			name: "auth mode kill",
+			mutate: func(account *domain.ProviderAccount) {
+				account.Controls.AuthModeExecutionEnabled = false
+			},
+			wantCode:    "auth_mode_unavailable",
+			remediation: "auth_mode_unavailable",
+		},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			accountID := "pa_enable_gate_" + strings.ReplaceAll(testCase.name, " ", "_")
+			harness := newSpineHarness(t, func(h *spineHarness) {
+				account := activeAccount(accountID, domain.AuthModeChatGPTCodexOAuth)
+				account.Lifecycle = domain.LifecycleDisabled
+				testCase.mutate(&account)
+				h.accounts.seed("tenant_a", account)
+			})
+
+			response, payload := harness.do(t, requestSpec{
+				method: http.MethodPost,
+				path:   "/v1/provider-accounts/" + accountID + "/enable",
+				bearer: tenantAKey,
+			})
+			if response.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+			}
+			body := decodeError(t, payload)
+			if body["code"] != testCase.wantCode || body["remediation"] != testCase.remediation {
+				t.Fatalf("error = %v, want %s/%s", body, testCase.wantCode, testCase.remediation)
+			}
+			stored, err := harness.accounts.Visible(t.Context(), managePrincipal(), domain.ProviderAccountID(accountID))
+			if err != nil {
+				t.Fatalf("visible: %v", err)
+			}
+			if stored.Lifecycle != domain.LifecycleDisabled {
+				t.Fatalf("lifecycle = %s, want disabled", stored.Lifecycle)
+			}
+			if calls := harness.accounts.updateCalls.Load(); calls != 0 {
+				t.Fatalf("account updates = %d, want 0", calls)
+			}
+		})
 	}
 }
 

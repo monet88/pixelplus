@@ -139,6 +139,13 @@ func NewMemoryAccountStore() *MemoryAccountStore {
 	return &MemoryAccountStore{byTenant: make(map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount)}
 }
 
+// Restore satisfies the startup recovery contract for the in-process foundation
+// store. A durable implementation must load and validate its persisted rows here;
+// this store already owns its complete state for its process lifetime.
+func (*MemoryAccountStore) Restore(context.Context) error {
+	return nil
+}
+
 // Create persists a new draft for the owning Tenant derived from the principal.
 func (store *MemoryAccountStore) Create(_ context.Context, creation ports.AccountCreation) (domain.ProviderAccount, error) {
 	store.mu.Lock()
@@ -186,8 +193,31 @@ func (store *MemoryAccountStore) Update(_ context.Context, update ports.AccountU
 	if update.RequireEmptyPendingVersion && existing.PendingCredentialVersion != 0 {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
+	if update.RequireEmptyRecoveryPermit && existing.RecoveryPermit.Owner != "" {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireRecoveryPermitOwner != "" && existing.RecoveryPermit.Owner != update.RequireRecoveryPermitOwner {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if required := update.RequireRecoveryCondition; required.Owner != "" && !accountHasRecoveryCondition(existing, required) {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
+}
+
+func accountHasRecoveryCondition(account domain.ProviderAccount, required domain.RecoveryPermit) bool {
+	if account.Credential.Version != required.CredentialVersion {
+		return false
+	}
+	for _, condition := range account.Health.Conditions {
+		if condition.Scope == required.Scope &&
+			condition.ConditionRevision == required.ConditionRevision &&
+			condition.CredentialVersion == required.CredentialVersion {
+			return true
+		}
+	}
+	return false
 }
 
 // Visible returns the owning-Tenant account or the single non-enumerating
@@ -223,9 +253,61 @@ func (store *MemoryAccountStore) List(_ context.Context, principal domain.Securi
 	return result, nil
 }
 
+// UnavailableAccountStore is installed after startup restoration fails. It
+// rejects every account read or mutation with the same dependency outcome so
+// direct product traffic cannot observe an empty/partial store and interpret it
+// as "no cooldown" (health/cooldown spec §7.1-§7.2).
+type UnavailableAccountStore struct{}
+
+func NewUnavailableAccountStore() *UnavailableAccountStore {
+	return &UnavailableAccountStore{}
+}
+
+func (*UnavailableAccountStore) Restore(context.Context) error {
+	return ports.ErrDependencyUnavailable
+}
+
+func (*UnavailableAccountStore) Create(context.Context, ports.AccountCreation) (domain.ProviderAccount, error) {
+	return domain.ProviderAccount{}, ports.ErrDependencyUnavailable
+}
+
+func (*UnavailableAccountStore) Update(context.Context, ports.AccountUpdate) (domain.ProviderAccount, error) {
+	return domain.ProviderAccount{}, ports.ErrDependencyUnavailable
+}
+
+func (*UnavailableAccountStore) Visible(context.Context, domain.SecurityPrincipal, domain.ProviderAccountID) (domain.ProviderAccount, error) {
+	return domain.ProviderAccount{}, ports.ErrDependencyUnavailable
+}
+
+func (*UnavailableAccountStore) List(context.Context, domain.SecurityPrincipal) ([]domain.ProviderAccount, error) {
+	return nil, ports.ErrDependencyUnavailable
+}
+
+// ClosedCircuitStore is the production foundation Provider Surface Circuit gate.
+// No correlation engine that collects the cross-Tenant bounded evidence
+// (§12.3-§12.4) is wired yet, so there is genuinely nothing to open a circuit
+// from: every surface reports closed (no open circuit). This is NOT a fail-open
+// on lost external state — it is the absence of any evidence to block on. When a
+// real circuit evaluator lands it replaces this default and MUST surface
+// ErrCircuitUnavailable so an unreadable-but-wired circuit fails closed.
+type ClosedCircuitStore struct{}
+
+// NewClosedCircuitStore builds the foundation circuit gate that blocks nothing.
+func NewClosedCircuitStore() *ClosedCircuitStore {
+	return &ClosedCircuitStore{}
+}
+
+// SurfaceOpen reports every surface closed because no correlation evidence
+// exists to open a circuit in this slice.
+func (*ClosedCircuitStore) SurfaceOpen(context.Context, ports.CircuitSurface) (ports.CircuitState, error) {
+	return ports.CircuitState{Open: false}, nil
+}
+
 var (
 	_ ports.PrincipalStore = (*FailClosedPrincipalStore)(nil)
 	_ ports.AdmissionStore = (*AlwaysAdmitStore)(nil)
 	_ ports.ReplayStore    = (*MemoryReplayStore)(nil)
 	_ ports.AccountStore   = (*MemoryAccountStore)(nil)
+	_ ports.AccountStore   = (*UnavailableAccountStore)(nil)
+	_ ports.CircuitStore   = (*ClosedCircuitStore)(nil)
 )

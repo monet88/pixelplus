@@ -77,10 +77,18 @@ func (service *ProviderAccountService) GetCapabilitySnapshot(ctx context.Context
 		return CapabilitySnapshotResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
-	// Management read recomputes freshness and ANDs fact-level offerable with
-	// account usability so inspect never advertises authorization for a
-	// non-usable account while listModels omits the same pairs.
+	// Management read recomputes freshness and then applies both account-wide
+	// usability and operation-scoped Health gates. It remains inspectable, but a
+	// matching cooldown must not advertise authorization that /v1/models omits.
 	snapshot = snapshot.WithDerivedFreshness(sc.start).WithAccountOfferGate(service.accountAllowsOffers(account))
+	if service.accountAllowsOffers(account) {
+		for operation, fact := range snapshot.Operations {
+			if accountHealthBlocksOperation(account, operation) {
+				fact.Offerable = false
+				snapshot.Operations[operation] = fact
+			}
+		}
+	}
 	service.observeSuccess(ctx, sc, ports.AuditCapabilitySnapshotRead, principal, account.ID, 200)
 	return CapabilitySnapshotResult{Snapshot: snapshot, RequestID: sc.requestID}, nil
 }
@@ -149,9 +157,29 @@ func (service *ProviderAccountService) ListModels(ctx context.Context, query Lis
 				if !derived.IsOfferablePair(op, model, sc.start) {
 					continue
 				}
+				if accountHealthBlocksPair(account, op, model.ModelSlug) {
+					continue
+				}
+				fact, hasFact := derived.Operations[op]
+				surface := model.SurfaceBinding
+				if hasFact && fact.ProbeSurface != "" {
+					surface = fact.ProbeSurface
+				}
+				circuit, err := service.circuits.SurfaceOpen(ctx, ports.CircuitSurface{
+					Provider:  account.Provider,
+					AuthMode:  account.AuthMode,
+					Surface:   surface,
+					Operation: op,
+				})
+				if err != nil || circuit.Open {
+					// Circuit state is a selection-only gate. An open or unreadable
+					// shared circuit omits this pair without rewriting account health,
+					// lifecycle, or administrative controls (§12.2, §12.6-§12.7).
+					continue
+				}
 				modelStatus := model.Operations[op]
 				operationStatus := modelStatus
-				if fact, ok := derived.Operations[op]; ok {
+				if hasFact {
 					// Dual-level enforcement: wire status must not claim stronger
 					// than the weaker of model-level and operation-level facts.
 					operationStatus = domain.WeakerOfferableStatus(modelStatus, fact.Status)
@@ -165,10 +193,8 @@ func (service *ProviderAccountService) ListModels(ctx context.Context, query Lis
 					Freshness:         domain.SnapshotFresh,
 					VerifiedAt:        derived.VerifiedAt,
 				}
-				if op == domain.CapabilityOpChatStreaming {
-					if fact, ok := derived.Operations[op]; ok {
-						offer.StreamingClass = fact.StreamingClass
-					}
+				if op == domain.CapabilityOpChatStreaming && hasFact {
+					offer.StreamingClass = fact.StreamingClass
 				}
 				offers = append(offers, offer)
 			}
@@ -211,15 +237,58 @@ func (service *ProviderAccountService) accountAllowsOffers(account domain.Provid
 }
 
 func accountHasNonRoutableAccountHealth(account domain.ProviderAccount) bool {
-	if isNonRoutableHealthState(account.Health.SummaryState) {
-		return true
-	}
 	for _, condition := range account.Health.Conditions {
 		if condition.Scope.Kind != domain.HealthScopeAccount {
 			continue
 		}
 		if isNonRoutableHealthState(condition.State) {
 			return true
+		}
+	}
+	return false
+}
+
+// accountHealthBlocksOperation applies Health to an operation-level management
+// fact. A model-only condition cannot make the whole operation unofferable
+// because other models may remain usable; account and matching operation scopes
+// do cover the fact.
+func accountHealthBlocksOperation(account domain.ProviderAccount, operation domain.CapabilityOperation) bool {
+	for _, condition := range account.Health.Conditions {
+		if !isNonRoutableHealthState(condition.State) {
+			continue
+		}
+		switch condition.Scope.Kind {
+		case domain.HealthScopeAccount:
+			return true
+		case domain.HealthScopeOperation:
+			if condition.Scope.Operation == string(operation) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// accountHealthBlocksPair applies only health evidence whose scope covers the
+// candidate pair. SummaryState is deliberately not consulted: it is the worst
+// condition across all scopes and cannot turn a model/operation condition into
+// an account-wide block (§3.8, I-HEALTH-SCOPED).
+func accountHealthBlocksPair(account domain.ProviderAccount, operation domain.CapabilityOperation, modelSlug string) bool {
+	for _, condition := range account.Health.Conditions {
+		if !isNonRoutableHealthState(condition.State) {
+			continue
+		}
+		switch condition.Scope.Kind {
+		case domain.HealthScopeAccount:
+			return true
+		case domain.HealthScopeOperation:
+			if condition.Scope.Operation == string(operation) {
+				return true
+			}
+		case domain.HealthScopeModel:
+			if condition.Scope.Operation == string(operation) && condition.Scope.ModelSlug == modelSlug {
+				return true
+			}
 		}
 	}
 	return false

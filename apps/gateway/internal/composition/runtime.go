@@ -67,6 +67,14 @@ type Dependencies struct {
 	Capabilities ports.CapabilityStore
 	Capability   ports.CapabilityAdapter
 
+	// Provider Surface Circuit gate (#51). A nil port keeps the foundation
+	// closed-circuit store composition substitutes by default: with no
+	// correlation evaluator wired there is no corroborated evidence, so every
+	// surface reports closed (nothing to block). A wired-but-failing store fails
+	// closed instead (health/cooldown spec §12). Contract tests inject a
+	// controlled fake to prove an open surface blocks matching new work.
+	Circuits ports.CircuitStore
+
 	// Asset exchange request-spine ports (#53). When a port is nil, New
 	// substitutes the production foundation implementation so the real
 	// production composition constructor is safe and fail-closed by default.
@@ -128,15 +136,28 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	}
 	runtime.healthy.Store(true)
 
+	accounts := dependencies.Accounts
+	if accounts == nil {
+		accounts = persistence.NewMemoryAccountStore()
+	}
+	dependencies.Accounts = accounts
+
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancelStartup()
 
-	if err := runtime.jobs.Restore(startupContext); err != nil {
-		logger.Error("gateway startup recovery failed; readiness stays closed", "error", err)
-		runtime.ready.Store(false)
-	} else {
-		runtime.ready.Store(true)
+	accountRestoreErr := accounts.Restore(startupContext)
+	if accountRestoreErr != nil {
+		logger.Error("provider account startup recovery failed; readiness stays closed", "error", accountRestoreErr)
+		// Do not expose a partially restored or empty account view to direct product
+		// traffic. The fail-closed substitute makes every account-backed path return
+		// dependency_unavailable until a new composition successfully restores state.
+		dependencies.Accounts = persistence.NewUnavailableAccountStore()
 	}
+	jobRestoreErr := runtime.jobs.Restore(startupContext)
+	if jobRestoreErr != nil {
+		logger.Error("gateway startup recovery failed; readiness stays closed", "error", jobRestoreErr)
+	}
+	runtime.ready.Store(accountRestoreErr == nil && jobRestoreErr == nil)
 
 	service, err := newProviderAccountService(dependencies)
 	if err != nil {
@@ -206,6 +227,10 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 	if capability == nil {
 		capability = vaultpkg.NewFailClosedCapabilityAdapter()
 	}
+	circuits := dependencies.Circuits
+	if circuits == nil {
+		circuits = persistence.NewClosedCircuitStore()
+	}
 
 	return application.NewProviderAccountService(application.ProviderAccountDependencies{
 		Principal:    principal,
@@ -217,6 +242,7 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 		OAuth:        oauth,
 		Capabilities: capabilities,
 		Capability:   capability,
+		Circuits:     circuits,
 		Audit:        audit,
 		Telemetry:    telemetry,
 		RequestLog:   requestLog,

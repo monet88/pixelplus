@@ -329,6 +329,153 @@ func TestListModelsOnlyFreshOfferablePairs(t *testing.T) {
 	}
 }
 
+// AC: an operation-scoped cooldown removes only the matching offer. The account
+// summary may still report cooling_down because it is the worst scoped state,
+// but that summary must not flatten image_generation evidence into unrelated
+// chat/chat_streaming buckets (§3.8, Example A, I-HEALTH-SCOPED).
+func TestListModelsHonorsMatchingScopedHealth(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		accountID := domain.ProviderAccountID("pa_scoped_health")
+		account := activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime.Add(time.Minute)),
+		)
+		h.accounts.seed("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/models",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	data, _ := body["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("data len = %d, want chat model preserved by unrelated image cooldown", len(data))
+	}
+	model, _ := data[0].(map[string]any)
+	x, _ := model["x_pixelplus"].(map[string]any)
+	offers, _ := x["offers"].([]any)
+	if len(offers) != 2 {
+		t.Fatalf("offers len = %d, want chat + chat_streaming preserved", len(offers))
+	}
+}
+
+// AC: a Provider Surface Circuit blocks only its matching operation and never
+// rewrites the owning account's lifecycle, health, or administrative controls.
+func TestListModelsHonorsScopedProviderSurfaceCircuit(t *testing.T) {
+	t.Parallel()
+
+	accountID := domain.ProviderAccountID("pa_circuit")
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
+		h.accounts.seed("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+		h.circuits.set(ports.CircuitSurface{
+			Provider:  domain.ProviderChatGPT,
+			AuthMode:  domain.AuthModeChatGPTCodexOAuth,
+			Surface:   "/backend-api/models",
+			Operation: domain.CapabilityOpChat,
+		}, ports.CircuitState{Open: true})
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/models",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	data, _ := body["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("data len = %d, want 1 model with the non-matching offer", len(data))
+	}
+	model, _ := data[0].(map[string]any)
+	x, _ := model["x_pixelplus"].(map[string]any)
+	offers, _ := x["offers"].([]any)
+	if len(offers) != 1 {
+		t.Fatalf("offers len = %d, want only chat_streaming", len(offers))
+	}
+	offer, _ := offers[0].(map[string]any)
+	if offer["operation"] != "chat_streaming" {
+		t.Fatalf("remaining operation = %v, want chat_streaming", offer["operation"])
+	}
+	if calls := harness.circuits.callCount.Load(); calls != 2 {
+		t.Fatalf("circuit checks = %d, want 2 offerable pairs", calls)
+	}
+
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/" + string(accountID),
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("account status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var account map[string]any
+	if err := json.Unmarshal(payload, &account); err != nil {
+		t.Fatalf("decode account: %v", err)
+	}
+	if account["lifecycle_state"] != "active" {
+		t.Fatalf("lifecycle_state = %v, want active", account["lifecycle_state"])
+	}
+	health, _ := account["health"].(map[string]any)
+	if health["summary_state"] != "healthy" {
+		t.Fatalf("health.summary_state = %v, want healthy", health["summary_state"])
+	}
+	controls, _ := account["administrative_controls"].(map[string]any)
+	if controls["drain_state"] != "off" || controls["quarantine_state"] != "off" || controls["auth_mode_execution_enabled"] != true {
+		t.Fatalf("administrative_controls changed after circuit gate: %v", controls)
+	}
+}
+
+// AC: a wired but unavailable circuit store fails closed without exposing its
+// corroborating evidence or allowing a possibly-open matching surface.
+func TestListModelsFailsClosedWhenCircuitStateUnavailable(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		accountID := domain.ProviderAccountID("pa_circuit_unavailable")
+		h.accounts.seed("tenant_a", activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth))
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+		h.circuits.queryErr = ports.ErrCircuitUnavailable
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/models",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want safe 200 projection (body=%s)", response.StatusCode, payload)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	data, _ := body["data"].([]any)
+	if len(data) != 0 {
+		t.Fatalf("data len = %d, want 0 when circuit state is unavailable", len(data))
+	}
+}
+
 // AC: version-mismatched snapshot remains inspectable but never offerable.
 func TestListModelsOmitsCredentialVersionMismatch(t *testing.T) {
 	t.Parallel()
@@ -416,6 +563,18 @@ func TestListModelsOmitsNonRoutableActiveAccounts(t *testing.T) {
 				account.Controls.Quarantine = domain.QuarantineQuarantined
 			},
 		},
+		{
+			name: "tenant_disabled",
+			mut: func(account *domain.ProviderAccount) {
+				*account = account.WithDisabled(domain.NewTimestamp(spineFixtureTime.Add(time.Second)))
+			},
+		},
+		{
+			name: "auth_mode_killed",
+			mut: func(account *domain.ProviderAccount) {
+				account.Controls.AuthModeExecutionEnabled = false
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -466,6 +625,47 @@ func TestListModelsOmitsNonRoutableActiveAccounts(t *testing.T) {
 				t.Fatalf("chat.offerable = %v, want false for non-usable account", chat["offerable"])
 			}
 		})
+	}
+}
+
+// AC #51: management inspection stays available but must not advertise an
+// operation as offerable when a matching operation-scoped cooldown blocks it.
+// An unrelated operation remains truthful and offerable.
+func TestGetCapabilitySnapshotHonorsMatchingScopedHealth(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount("pa_snapshot_scoped_health", domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime.Add(time.Minute)),
+		)
+		h.accounts.seed("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(account.ID, account.AuthMode, account.Credential.Version, spineFixtureTime))
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_snapshot_scoped_health/capability-snapshot",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 inspectable snapshot (body=%s)", response.StatusCode, payload)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(payload, &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	operations, _ := snapshot["operations"].(map[string]any)
+	chat, _ := operations["chat"].(map[string]any)
+	image, _ := operations["image_generation"].(map[string]any)
+	if chat["offerable"] != true {
+		t.Fatalf("chat.offerable = %v, want true for unrelated operation", chat["offerable"])
+	}
+	if image["offerable"] != false {
+		t.Fatalf("image_generation.offerable = %v, want false for matching cooldown", image["offerable"])
 	}
 }
 

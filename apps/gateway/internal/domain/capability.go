@@ -24,6 +24,21 @@ func PrimaryCapabilityOperations() []CapabilityOperation {
 	}
 }
 
+// Valid reports whether the operation belongs to the frozen primary operation
+// vocabulary. Client-provided probe scope may only narrow to these operations.
+func (operation CapabilityOperation) Valid() bool {
+	switch operation {
+	case CapabilityOpChat,
+		CapabilityOpChatStreaming,
+		CapabilityOpImageGeneration,
+		CapabilityOpImageEdit,
+		CapabilityOpInpaint:
+		return true
+	default:
+		return false
+	}
+}
+
 // CapabilityStatus is the per-operation/per-model verification token.
 type CapabilityStatus string
 

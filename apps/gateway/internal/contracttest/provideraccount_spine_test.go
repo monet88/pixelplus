@@ -37,6 +37,7 @@ type spineHarness struct {
 	oauth        *stubOAuthExchangeAdapter
 	capabilities *stubCapabilityStore
 	capability   *stubCapabilityAdapter
+	circuits     *stubCircuitStore
 }
 
 const (
@@ -87,6 +88,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		oauth:        newStubOAuthExchangeAdapter(log),
 		capabilities: newStubCapabilityStore(log),
 		capability:   newStubCapabilityAdapter(log),
+		circuits:     newStubCircuitStore(log),
 	}
 	if configure != nil {
 		configure(harness)
@@ -105,6 +107,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		OAuth:        harness.oauth,
 		Capabilities: harness.capabilities,
 		Capability:   harness.capability,
+		Circuits:     harness.circuits,
 	})
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)
