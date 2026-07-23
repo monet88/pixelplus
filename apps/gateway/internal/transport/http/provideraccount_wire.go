@@ -97,7 +97,7 @@ func timestampString(timestamp domain.Timestamp) string {
 }
 
 func toProviderAccountWire(account domain.ProviderAccount, responseTime time.Time) providerAccountWire {
-	retryTimingAllowed := accountAllowsRetryTiming(account)
+	retryTimingAllowed := application.RetryTimingAllowed(account)
 	conditions := make([]healthConditionWire, 0, len(account.Health.Conditions))
 	for _, condition := range account.Health.Conditions {
 		wire := healthConditionWire{
@@ -147,23 +147,6 @@ func toProviderAccountWire(account domain.ProviderAccount, responseTime time.Tim
 		CreatedAt: timestampString(account.CreatedAt),
 		UpdatedAt: timestampString(account.UpdatedAt),
 	}
-}
-
-func accountAllowsRetryTiming(account domain.ProviderAccount) bool {
-	switch account.Lifecycle {
-	case domain.LifecycleDisabled, domain.LifecycleRevoked, domain.LifecycleDeleted, domain.LifecycleReauthRequired:
-		return false
-	}
-	if account.Controls.Quarantine == domain.QuarantineQuarantined || !account.Controls.AuthModeExecutionEnabled {
-		return false
-	}
-	for _, condition := range account.Health.Conditions {
-		switch condition.State {
-		case domain.HealthExpired, domain.HealthChallenged, domain.HealthBlocked:
-			return false
-		}
-	}
-	return true
 }
 
 func writeAccountOperation(writer http.ResponseWriter, statusCode int, result application.ProviderAccountResult, responseTime time.Time) {

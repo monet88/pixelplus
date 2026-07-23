@@ -32,6 +32,27 @@ const (
 // never enters the replay scope map.
 const maxIdempotencyKeyLength = 255
 
+// RetryTimingAllowed reports whether the account's current lifecycle and
+// administrative controls permit a retry_after_seconds value to be exposed on
+// health conditions. This is application-owned policy, not transport
+// serialization (ADR 0009; pure-go-module-seams-and-dependency-budget.md §72).
+func RetryTimingAllowed(account domain.ProviderAccount) bool {
+	switch account.Lifecycle {
+	case domain.LifecycleDisabled, domain.LifecycleRevoked, domain.LifecycleDeleted, domain.LifecycleReauthRequired:
+		return false
+	}
+	if account.Controls.Quarantine == domain.QuarantineQuarantined || !account.Controls.AuthModeExecutionEnabled {
+		return false
+	}
+	for _, condition := range account.Health.Conditions {
+		switch condition.State {
+		case domain.HealthExpired, domain.HealthChallenged, domain.HealthBlocked:
+			return false
+		}
+	}
+	return true
+}
+
 // CreateProviderAccountCommand is the typed create request. PresentedKey is the
 // raw bearer material the transport extracted; the application authenticates it
 // and derives Tenant authority server-side. Client-supplied Tenant identity is

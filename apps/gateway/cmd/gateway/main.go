@@ -29,9 +29,10 @@ const (
 )
 
 type processConfig struct {
-	address         string
-	startupTimeout  time.Duration
-	shutdownTimeout time.Duration
+	address                  string
+	startupTimeout           time.Duration
+	shutdownTimeout          time.Duration
+	providerAccountStorePath string
 }
 
 func main() {
@@ -49,9 +50,13 @@ func run(ctx context.Context, getenv func(string) string) error {
 	if err != nil {
 		return err
 	}
+	if config.providerAccountStorePath == "" {
+		return errors.New("PROVIDER_ACCOUNT_STORE_PATH is required")
+	}
 
 	runtime, err := composition.New(composition.Config{
-		StartupTimeout: config.startupTimeout,
+		StartupTimeout:           config.startupTimeout,
+		ProviderAccountStorePath: config.providerAccountStorePath,
 	}, composition.ProductionDependencies())
 	if err != nil {
 		return fmt.Errorf("compose Gateway: %w", err)
@@ -160,6 +165,7 @@ func loadConfig(getenv func(string) string) (processConfig, error) {
 	if err != nil {
 		return processConfig{}, fmt.Errorf("PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT: %w", err)
 	}
+	config.providerAccountStorePath = getenv("PROVIDER_ACCOUNT_STORE_PATH")
 	return config, nil
 }
 

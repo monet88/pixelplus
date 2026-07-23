@@ -45,7 +45,8 @@ COPY --from=build /out/gateway /gateway
 # baked into any image layer.
 ENV PIXELPLUS_GATEWAY_ADDR=0.0.0.0:8080 \
     PIXELPLUS_GATEWAY_STARTUP_TIMEOUT=10s \
-    PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT=10s
+    PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT=10s \
+    PROVIDER_ACCOUNT_STORE_PATH=/tmp/provider-accounts.json
 
 USER nonroot:nonroot
 EXPOSE 8080

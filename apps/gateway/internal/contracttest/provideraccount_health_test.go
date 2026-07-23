@@ -1530,3 +1530,188 @@ func TestAccountScopeRecoveryCannotClearOperationCooldown(t *testing.T) {
 		t.Fatalf("summary_state = %v, want cooling_down (operation scope still cooling)", health["summary_state"])
 	}
 }
+
+// Review-fix: a recovery permit claim must fail if the account is disabled
+// concurrently. The probe claims the permit, the account is disabled while the
+// probe is in flight, then the stale success is fenced out by the lifecycle
+// precondition and the account stays disabled.
+func TestRecoveryPermitCannotResurrectDisabledAccount(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_recover_disable_race", domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime),
+		)
+		h.accounts.seed("tenant_a", account)
+		h.probe.entered = entered
+		h.probe.release = release
+		h.probe.outcome = ports.ProbeOutcome{Authenticated: true}
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var responseStatus int
+	var responseBody []byte
+	go func() {
+		defer wg.Done()
+		request, err := http.NewRequest(
+			http.MethodPost,
+			harness.fixture.URL()+"/v1/provider-accounts/pa_recover_disable_race/probe",
+			strings.NewReader(`{"scope":{"kind":"operation","operation":"image_generation"}}`),
+		)
+		if err != nil {
+			return
+		}
+		request.Header.Set("Authorization", "Bearer "+tenantAKey)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := harness.fixture.Client().Do(request)
+		if err != nil {
+			return
+		}
+		responseStatus = response.StatusCode
+		responseBody, _ = io.ReadAll(response.Body)
+		_ = response.Body.Close()
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not enter Probe Adapter")
+	}
+
+	principal := harness.principal.principals[tenantAKey]
+	current, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_disable_race")
+	if err != nil {
+		t.Fatalf("Visible() error = %v", err)
+	}
+	disabled := current.WithDisabled(domain.NewTimestamp(spineFixtureTime.Add(time.Second)))
+	if _, err := harness.accounts.Update(t.Context(), ports.AccountUpdate{Principal: principal, Account: disabled}); err != nil {
+		t.Fatalf("disable Update() error = %v", err)
+	}
+
+	close(release)
+	wg.Wait()
+	if responseStatus != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with disabled account preserved (body=%s)", responseStatus, responseBody)
+	}
+
+	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_disable_race")
+	if err != nil {
+		t.Fatalf("Visible() after race error = %v", err)
+	}
+	if stored.Lifecycle != domain.LifecycleDisabled {
+		t.Fatalf("lifecycle = %v, want disabled", stored.Lifecycle)
+	}
+}
+
+// Review-fix: independent scoped cooldown creation/renewal in separate probe
+// requests must not clobber each other. Renewing chat while creating
+// image_generation leaves both durable conditions intact.
+func TestIndependentScopedCooldownsDoNotOverwrite(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_independent_scopes", domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpChat)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime),
+		)
+		h.accounts.seed("tenant_a", account)
+		h.probe.outcome = ports.ProbeOutcome{
+			Authenticated: true,
+			Signal:        ports.ProbeSignalRateLimited,
+			SignalScope:   domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpChat)},
+		}
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_independent_scopes/probe",
+		bearer: tenantAKey,
+		body:   `{"scope":{"kind":"operation","operation":"chat"}}`,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("chat probe status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+
+	harness.probe.outcome = ports.ProbeOutcome{
+		Authenticated: true,
+		Signal:        ports.ProbeSignalQuotaExhausted,
+		SignalScope:   domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+	}
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_independent_scopes/probe",
+		bearer: tenantAKey,
+		body:   `{"scope":{"kind":"operation","operation":"image_generation"}}`,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("image probe status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+
+	principal := harness.principal.principals[tenantAKey]
+	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_independent_scopes")
+	if err != nil {
+		t.Fatalf("Visible() error = %v", err)
+	}
+	var chatCondition, imageCondition domain.HealthCondition
+	for _, condition := range stored.Health.Conditions {
+		if condition.Scope.Kind == domain.HealthScopeOperation && condition.Scope.Operation == string(domain.CapabilityOpChat) {
+			chatCondition = condition
+		}
+		if condition.Scope.Kind == domain.HealthScopeOperation && condition.Scope.Operation == string(domain.CapabilityOpImageGeneration) {
+			imageCondition = condition
+		}
+	}
+	if chatCondition.State != domain.HealthCoolingDown || chatCondition.ConditionRevision != 2 {
+		t.Fatalf("chat condition = %+v, want cooling_down revision 2", chatCondition)
+	}
+	if imageCondition.State != domain.HealthCoolingDown || imageCondition.ConditionRevision != 1 {
+		t.Fatalf("image condition = %+v, want cooling_down revision 1", imageCondition)
+	}
+}
+
+// Review-fix: an unrecognized ProbeSignalClass is a dependency/protocol
+// classification failure and must fail closed rather than continuing as a
+// successful probe.
+func TestUnknownProbeSignalFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", probeableAccount("pa_unknown_signal", domain.AuthModeChatGPTCodexOAuth))
+		h.probe.outcome = ports.ProbeOutcome{
+			Authenticated: true,
+			Signal:        "totally_unknown_signal",
+		}
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_unknown_signal/probe",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 fail-closed (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeError(t, payload)
+	if body["code"] != "dependency_unavailable" {
+		t.Fatalf("code = %v, want dependency_unavailable", body["code"])
+	}
+
+	principal := harness.principal.principals[tenantAKey]
+	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_unknown_signal")
+	if err != nil {
+		t.Fatalf("Visible() error = %v", err)
+	}
+	if stored.Lifecycle == domain.LifecycleActive {
+		t.Fatal("account activated on unknown probe signal")
+	}
+}

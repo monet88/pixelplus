@@ -29,6 +29,8 @@ func TestRunStartsProductionCompositionAndShutsDown(t *testing.T) {
 				return address
 			case "PIXELPLUS_GATEWAY_STARTUP_TIMEOUT", "PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT":
 				return "2s"
+			case "PROVIDER_ACCOUNT_STORE_PATH":
+				return t.TempDir() + "/accounts.json"
 			default:
 				return ""
 			}

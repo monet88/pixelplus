@@ -208,6 +208,29 @@ type AccountUpdate struct {
 	// condition. The current stored account must still carry the exact scope,
 	// condition revision, and credential version represented by this permit.
 	RequireRecoveryCondition domain.RecoveryPermit
+	// RequireLifecycle, when non-empty, rejects the write unless the currently
+	// stored lifecycle equals this value. This prevents stale probe/recovery
+	// snapshots from resurrecting a disabled account or overwriting a concurrent
+	// management transition (health/cooldown spec §7; management contract §4.6).
+	RequireLifecycle domain.LifecycleState
+	// RequireControls, when non-empty, rejects the write unless the currently
+	// stored administrative controls equal this value. This prevents stale health
+	// writes from reverting a quarantine, drain, or execution-disabled change.
+	RequireControls domain.AdministrativeControls
+	// RequireControlsMatch must be true for RequireControls to be enforced. A
+	// pointer-free struct cannot distinguish "not set" from "set to zero", so this
+	// boolean gates the check.
+	RequireControlsMatch bool
+	// Patch mode: when any Patch* field is true, Update mutates the existing row
+	// in place instead of replacing it with Account. This lets no-signal active
+	// re-probes record LastProbedAt without resurrecting concurrent health or
+	// recovery-permit changes.
+	PatchLastProbedAt bool
+	LastProbedAt      domain.Timestamp
+	// PatchClearRecoveryPermit clears the stored recovery permit without touching
+	// health or lifecycle. Combined with RequireRecoveryPermitOwner it settles a
+	// claimed permit safely when the health change is already persisted another way.
+	PatchClearRecoveryPermit bool
 }
 
 // AuditAction names a product/security audit event.

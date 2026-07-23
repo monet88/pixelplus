@@ -1,6 +1,15 @@
 package domain
 
 import "time"
+const (
+	// accountCooldownTransientBase/Max bound rate-limit/backoff progressive waits.
+	accountCooldownTransientBase = 30 * time.Second
+	accountCooldownTransientMax  = 15 * time.Minute
+	// accountCooldownQuotaBase/Max bound entitlement/quota-reset progressive waits.
+	accountCooldownQuotaBase = 15 * time.Minute
+	accountCooldownQuotaMax  = 24 * time.Hour
+)
+
 
 // Provider names a supported upstream Provider. Values mirror the frozen
 // Public API contract enum.
@@ -757,7 +766,7 @@ func (account ProviderAccount) WithScopedCooldown(now Timestamp, scope HealthSco
 			continue
 		}
 		if conditions[i].State == HealthCoolingDown {
-			conditions[i].BackoffLevel++
+			conditions[i].BackoffLevel = boundedBackoffLevel(reason, conditions[i].BackoffLevel+1)
 		} else {
 			conditions[i].BackoffLevel = 1
 		}
@@ -781,10 +790,10 @@ func (account ProviderAccount) WithScopedCooldown(now Timestamp, scope HealthSco
 			ObservedAt:        now,
 			Remediation:       RemediationWaitProviderCooldown,
 			ConditionRevision: 1,
-			BackoffLevel:      1,
-			RetryNotBefore:    retryNotBefore,
-			SourceClass:       HealthSourceUpstreamAttempt,
-		})
+		BackoffLevel:      1,
+		RetryNotBefore:    retryNotBefore,
+		SourceClass:       HealthSourceUpstreamAttempt,
+	})
 	}
 	account.Health.Conditions = conditions
 	account.Health.SummaryState = worstConditionState(conditions)
@@ -1027,4 +1036,46 @@ func (account ProviderAccount) WithDeleted(now Timestamp) ProviderAccount {
 	account.RecoveryPermit = RecoveryPermit{}
 	account.UpdatedAt = now
 	return account
+}
+
+// CooldownBaseAndMax returns the exponential policy bounds for a cooldown reason.
+func CooldownBaseAndMax(reason HealthReason) (time.Duration, time.Duration) {
+	switch reason {
+	case HealthReasonProviderQuotaExhausted:
+		return accountCooldownQuotaBase, accountCooldownQuotaMax
+	default:
+		return accountCooldownTransientBase, accountCooldownTransientMax
+	}
+}
+
+// boundedBackoffLevel caps the backoff escalation level at the point where the
+// reason-class duration is already clamped to its maximum. This keeps the
+// stored policy value bounded even under repeated failures.
+func boundedBackoffLevel(reason HealthReason, level int) int {
+	base, maximum := CooldownBaseAndMax(reason)
+	maxLevel := maxBackoffLevel(base, maximum)
+	if level < 1 {
+		level = 1
+	}
+	if level > maxLevel {
+		return maxLevel
+	}
+	return level
+}
+
+func maxBackoffLevel(base, maximum time.Duration) int {
+	if base <= 0 || maximum <= 0 || base >= maximum {
+		return 1
+	}
+	level := 1
+	duration := base
+	for duration < maximum {
+		level++
+		if duration > maximum/2 {
+			duration = maximum
+		} else {
+			duration *= 2
+		}
+	}
+	return level
 }

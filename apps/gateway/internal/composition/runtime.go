@@ -27,6 +27,10 @@ var ErrNotReady = errors.New("gateway runtime is not ready")
 // Config contains parsed, non-secret composition settings.
 type Config struct {
 	StartupTimeout time.Duration
+	// ProviderAccountStorePath is the durable file path for Provider Account
+	// state. Either this or an explicit Accounts port is required so production
+	// never silently loses cooldowns and recovery permits across restarts.
+	ProviderAccountStorePath string
 }
 
 // Dependencies contains the controlled foundation ports owned by this slice.
@@ -128,6 +132,18 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		logger = slog.Default()
 	}
 
+	accounts := dependencies.Accounts
+	if accounts == nil {
+		if config.ProviderAccountStorePath != "" {
+			accounts = persistence.NewFileAccountStore(config.ProviderAccountStorePath)
+		} else {
+			// Tests and fixtures rely on the in-process foundation store. Production
+			// entry points must supply a durable ProviderAccountStorePath.
+			accounts = persistence.NewMemoryAccountStore()
+		}
+	}
+	dependencies.Accounts = accounts
+
 	runtime := &Runtime{
 		worker: application.NewFoundationJobExecutor(),
 		jobs:   dependencies.Runtime,
@@ -135,12 +151,6 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		done:   make(chan struct{}),
 	}
 	runtime.healthy.Store(true)
-
-	accounts := dependencies.Accounts
-	if accounts == nil {
-		accounts = persistence.NewMemoryAccountStore()
-	}
-	dependencies.Accounts = accounts
 
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancelStartup()

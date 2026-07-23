@@ -11,6 +11,7 @@ import (
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/composition"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
+	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/persistence"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
@@ -61,9 +62,10 @@ func TestNewRejectsNegativeStartupTimeout(t *testing.T) {
 	_, err := composition.New(composition.Config{
 		StartupTimeout: -time.Second,
 	}, composition.Dependencies{
-		Runtime: inertJobRuntime{},
-		Clock:   inertClock{},
-		IDs:     inertIDs{},
+		Runtime:  inertJobRuntime{},
+		Clock:    inertClock{},
+		IDs:      inertIDs{},
+		Accounts: persistence.NewMemoryAccountStore(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "startup timeout must be positive") {
 		t.Fatalf("New() error = %v", err)
@@ -75,9 +77,10 @@ func TestRuntimeCloseRetriesOwnedResourceAfterTimeout(t *testing.T) {
 
 	jobs := &retryCloseJobRuntime{}
 	runtime, err := composition.New(composition.Config{}, composition.Dependencies{
-		Runtime: jobs,
-		Clock:   inertClock{},
-		IDs:     inertIDs{},
+		Runtime:  jobs,
+		Clock:    inertClock{},
+		IDs:      inertIDs{},
+		Accounts: persistence.NewMemoryAccountStore(),
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -111,9 +114,10 @@ func TestRunWorkersDoesNotPropagateHandlerErrors(t *testing.T) {
 		delivered: make(chan struct{}),
 	}
 	runtime, err := composition.New(composition.Config{}, composition.Dependencies{
-		Runtime: jobs,
-		Clock:   inertClock{},
-		IDs:     inertIDs{},
+		Runtime:  jobs,
+		Clock:    inertClock{},
+		IDs:      inertIDs{},
+		Accounts: persistence.NewMemoryAccountStore(),
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)

@@ -69,6 +69,7 @@ cmd_start() {
     --env PIXELPLUS_GATEWAY_ADDR="0.0.0.0:${CONTAINER_PORT}" \
     --env PIXELPLUS_GATEWAY_STARTUP_TIMEOUT="10s" \
     --env PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT="10s" \
+    --env PROVIDER_ACCOUNT_STORE_PATH="/tmp/provider-accounts.json" \
     --user "65532:65532" \
     --read-only \
     --cap-drop ALL \

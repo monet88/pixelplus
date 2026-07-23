@@ -37,6 +37,7 @@ services:
       PIXELPLUS_GATEWAY_ADDR: "0.0.0.0:8080"
       PIXELPLUS_GATEWAY_STARTUP_TIMEOUT: "10s"
       PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT: "10s"
+      PROVIDER_ACCOUNT_STORE_PATH: "/tmp/provider-accounts.json"
 
     # Run unprivileged and lock down privilege escalation.
     user: "65532:65532"

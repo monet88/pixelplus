@@ -18,11 +18,6 @@ import (
 const (
 	minCredentialMaterialLength = 8
 
-	transientCooldownBase = 30 * time.Second
-	transientCooldownMax  = 15 * time.Minute
-	quotaCooldownBase     = 15 * time.Minute
-	quotaCooldownMax      = 24 * time.Hour
-
 	providerRateHintMaxPlausible  = 24 * time.Hour
 	providerQuotaHintMaxPlausible = 31 * 24 * time.Hour
 )
@@ -419,8 +414,13 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		if decision.Eligible {
 			claimed := account.WithRecoveryPermitClaimed(decision.Permit)
 			account, err = service.accounts.Update(ctx, ports.AccountUpdate{
-				Principal:                  principal,
-				Account:                    claimed,
+				Principal: principal,
+				Account:   claimed,
+				// Fence lifecycle and administrative controls so a concurrent disable,
+				// quarantine, or drain cannot be resurrected by this stale snapshot.
+				RequireLifecycle:           account.Lifecycle,
+				RequireControlsMatch:       true,
+				RequireControls:            account.Controls,
 				RequireEmptyPendingVersion: true,
 				RequireEmptyRecoveryPermit: true,
 				RequireRecoveryCondition:   decision.Permit,
@@ -480,12 +480,32 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		// A dependency failure did not produce a Provider outcome, so allowing a new
 		// owner to reclaim the same revision would create unlimited half-open probes.
 		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{
-			Principal:                  principal,
-			Account:                    validated,
+			Principal: principal,
+			Account:   validated,
+			// Fence lifecycle and administrative controls so a concurrent disable or
+			// control change is not overwritten by this stale validation snapshot.
+			RequireLifecycle:           account.Lifecycle,
+			RequireControlsMatch:       true,
+			RequireControls:            account.Controls,
 			RequireRecoveryPermitOwner: recoveryPermit.Owner,
 			RequireRecoveryCondition:   recoveryPermit,
 		})
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	if !validProbeSignal(outcome.Signal) {
+		// An unrecognized signal class is a dependency/protocol classification
+		// failure. Fail closed rather than treating it as a successful probe.
+		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{
+			Principal: principal,
+			Account:   validated,
+			// Keep the same lifecycle/control fences as the dependency-failure path.
+			RequireLifecycle:           account.Lifecycle,
+			RequireControlsMatch:       true,
+			RequireControls:            account.Controls,
+			RequireRecoveryPermitOwner: recoveryPermit.Owner,
+			RequireRecoveryCondition:   recoveryPermit,
+		})
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
 	}
 	if !outcome.Authenticated {
 		if account.PendingCredentialVersion > 0 {
@@ -538,12 +558,20 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		// that rewrote origin to disabled after this probe loaded still lands disabled.
 		activated = base.WithReplacementProbeActivated(now)
 		update.RequirePendingVersion = account.PendingCredentialVersion
+		// Fence against a concurrent lifecycle or control change so a stale probe
+		// snapshot cannot resurrect a disabled/quarantined account.
+		update.RequireLifecycle = latest.Lifecycle
+		update.RequireControlsMatch = true
+		update.RequireControls = latest.Controls
 	case latest.Lifecycle == domain.LifecycleDisabled:
 		// Sticky disable mid first-connect / enable probe: record probe success
 		// evidence but do not re-activate. Mirrors disabled-origin replacement cutover.
 		activated = base.WithProbeActivated(now)
 		activated.Lifecycle = domain.LifecycleDisabled
 		update.RequireEmptyPendingVersion = true
+		update.RequireLifecycle = latest.Lifecycle
+		update.RequireControlsMatch = true
+		update.RequireControls = latest.Controls
 	case !latest.Lifecycle.AcceptsProbe():
 		// Concurrent lifecycle transition (e.g. revoke/delete path edge) rejected
 		// activation after the probe ran; fail closed without promoting use.
@@ -556,32 +584,48 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		// scope (§9.12, §11); the cooldown overlay below still renews/adds a scope
 		// when a fresh signal is present, so an out-of-scope cooldown survives
 		// (§4 rules 4-5, §7.9, I-HEALTH-NO-STALE-CLEAR).
-		if outcome.Signal == ports.ProbeSignalNone {
-			if recoveryPermit.Owner != "" {
-				activated = base.WithScopedRecovery(now, recoveryPermit)
-			} else {
-				activated = base
-				activated.Credential.LastProbedAt = now
-				activated.UpdatedAt = now
-			}
-		} else {
-			// A fresh rate/quota signal keeps the existing evidence untouched; the
-			// overlay below renews the matching scope. Only record the probe time.
+		switch {
+		case outcome.Signal == ports.ProbeSignalNone && recoveryPermit.Owner == "":
+			// No fresh signal and no claimed recovery: record a heartbeat without
+			// replacing the whole row, so concurrent scoped health changes survive.
+			update.PatchLastProbedAt = true
+			update.LastProbedAt = now
+			update.RequireLifecycle = latest.Lifecycle
+			update.RequireControlsMatch = true
+			update.RequireControls = latest.Controls
+			update.RequireEmptyPendingVersion = true
+		case outcome.Signal == ports.ProbeSignalNone && recoveryPermit.Owner != "":
+			// Settle the claimed scoped recovery permit; lifecycle/control fences
+			// prevent a concurrent disable from being resurrected.
+			activated = base.WithScopedRecovery(now, recoveryPermit)
+			update.RequireLifecycle = latest.Lifecycle
+			update.RequireControlsMatch = true
+			update.RequireControls = latest.Controls
+			update.RequireEmptyPendingVersion = true
+			update.RequireRecoveryPermitOwner = recoveryPermit.Owner
+			update.RequireRecoveryCondition = recoveryPermit
+		default:
+			// Fresh rate/quota signal: keep existing evidence, record probe time,
+			// then overlay the new cooldown below.
 			activated = base
 			activated.Credential.LastProbedAt = now
 			activated.UpdatedAt = now
-		}
-		// Fence against a concurrent replacement staging after this load. A claimed
-		// cooldown recovery additionally settles only its owner and exact condition.
-		update.RequireEmptyPendingVersion = true
-		if recoveryPermit.Owner != "" {
-			update.RequireRecoveryPermitOwner = recoveryPermit.Owner
-			update.RequireRecoveryCondition = recoveryPermit
+			update.RequireLifecycle = latest.Lifecycle
+			update.RequireControlsMatch = true
+			update.RequireControls = latest.Controls
+			update.RequireEmptyPendingVersion = true
+			if recoveryPermit.Owner != "" {
+				update.RequireRecoveryPermitOwner = recoveryPermit.Owner
+				update.RequireRecoveryCondition = recoveryPermit
+			}
 		}
 	default:
 		activated = base.WithProbeActivated(now)
 		// Fence against a concurrent replacement staging after this load.
 		update.RequireEmptyPendingVersion = true
+		update.RequireLifecycle = latest.Lifecycle
+		update.RequireControlsMatch = true
+		update.RequireControls = latest.Controls
 	}
 
 	// A validated Provider rate/quota signal surfaced during an otherwise
@@ -644,10 +688,31 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 // probeRejected persists the credential-rejected transition and returns the
 // non-activating result as a 200 success projection (the account exists and the
 // operation ran; the observable outcome is the resulting non-active account with
-// remediation reauthenticate). It records the probe audit without secrets.
+// remediation reauthenticate). It records the probe audit without secrets. It
+// re-reads the durable row before committing so a concurrent disable or control
+// change is observed and preserved rather than overwritten by the stale probe
+// snapshot.
 func (service *ProviderAccountService) probeRejected(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, account domain.ProviderAccount, recoveryPermit domain.RecoveryPermit) (ProviderAccountResult, error) {
-	rejected := account.WithCredentialRejected(domain.NewTimestamp(sc.start))
-	update := ports.AccountUpdate{Principal: principal, Account: rejected}
+	latest, err := service.accounts.Visible(ctx, principal, account.ID)
+	if err != nil {
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
+	}
+	rejected := latest.WithCredentialRejected(domain.NewTimestamp(sc.start))
+	// A concurrent management disable/revoke must win over a stale rejected probe;
+	// preserve the management lifecycle while still recording the rejection outcome
+	// in the health summary.
+	if latest.Lifecycle == domain.LifecycleDisabled || latest.Lifecycle == domain.LifecycleRevoked {
+		rejected.Lifecycle = latest.Lifecycle
+	}
+	update := ports.AccountUpdate{
+		Principal: principal,
+		Account:   rejected,
+		// Fence lifecycle and controls so a concurrent disable/control mutation
+		// wins over this stale credential-rejected snapshot.
+		RequireLifecycle:     latest.Lifecycle,
+		RequireControlsMatch: true,
+		RequireControls:      latest.Controls,
+	}
 	if recoveryPermit.Owner != "" {
 		update.RequireRecoveryPermitOwner = recoveryPermit.Owner
 		update.RequireRecoveryCondition = recoveryPermit
@@ -830,6 +895,18 @@ func cooldownReasonForSignal(signal ports.ProbeSignalClass) (domain.HealthReason
 	}
 }
 
+// validProbeSignal reports whether the adapter returned a recognized signal
+// class. Unknown values fail closed as a dependency/protocol classification
+// error instead of being treated as a successful probe with a signal.
+func validProbeSignal(signal ports.ProbeSignalClass) bool {
+	switch signal {
+	case ports.ProbeSignalNone, ports.ProbeSignalRateLimited, ports.ProbeSignalQuotaExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
 func providerRetryNotBefore(
 	account domain.ProviderAccount,
 	scope domain.HealthScope,
@@ -861,10 +938,7 @@ func defaultCooldownRetryNotBefore(
 	now domain.Timestamp,
 ) domain.Timestamp {
 	normalized, revision, backoffLevel := account.NextCooldownFence(scope)
-	base, maximum := transientCooldownBase, transientCooldownMax
-	if reason == domain.HealthReasonProviderQuotaExhausted {
-		base, maximum = quotaCooldownBase, quotaCooldownMax
-	}
+	base, maximum := domain.CooldownBaseAndMax(reason)
 	duration := boundedExponentialCooldown(base, maximum, backoffLevel)
 	jitterRange := duration / 10
 	if jitterRange > 0 {

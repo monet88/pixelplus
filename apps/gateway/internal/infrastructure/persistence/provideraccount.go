@@ -3,6 +3,9 @@ package persistence
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
@@ -125,6 +128,55 @@ func (store *MemoryReplayStore) Abandon(_ context.Context, identity domain.Repla
 	return nil
 }
 
+// applyAccountUpdate checks the caller-supplied preconditions and returns the
+// account row that should be persisted. It supports both full-row replacement
+// and narrow patch-mode updates so callers can touch LastProbedAt or clear a
+// recovery permit without resurrecting concurrent health changes.
+func applyAccountUpdate(existing domain.ProviderAccount, update ports.AccountUpdate) (domain.ProviderAccount, error) {
+	if update.RequireEmptyOAuthMarker && existing.ActiveOAuthAuthorizationID != "" {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireOAuthMarker != "" && existing.ActiveOAuthAuthorizationID != update.RequireOAuthMarker {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireDraftLifecycle && existing.Lifecycle != domain.LifecycleDraft {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequirePendingVersion > 0 && existing.PendingCredentialVersion != update.RequirePendingVersion {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireEmptyPendingVersion && existing.PendingCredentialVersion != 0 {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireEmptyRecoveryPermit && existing.RecoveryPermit.Owner != "" {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireRecoveryPermitOwner != "" && existing.RecoveryPermit.Owner != update.RequireRecoveryPermitOwner {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireLifecycle != "" && existing.Lifecycle != update.RequireLifecycle {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireControlsMatch && existing.Controls != update.RequireControls {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if required := update.RequireRecoveryCondition; required.Owner != "" && !accountHasRecoveryCondition(existing, required) {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+
+	if update.PatchLastProbedAt || update.PatchClearRecoveryPermit {
+		if update.PatchLastProbedAt {
+			existing.Credential.LastProbedAt = update.LastProbedAt
+			existing.UpdatedAt = update.LastProbedAt
+		}
+		if update.PatchClearRecoveryPermit {
+			existing.RecoveryPermit = domain.RecoveryPermit{}
+		}
+		return existing, nil
+	}
+	return update.Account, nil
+}
+
 // MemoryAccountStore is the production foundation Provider Account store. It
 // keeps same-Tenant, non-enumerating visibility: foreign, unknown, and deleted
 // identifiers all return ErrAccountNotVisible so the outcome is
@@ -178,32 +230,12 @@ func (store *MemoryAccountStore) Update(_ context.Context, update ports.AccountU
 	if !ok || existing.Lifecycle == domain.LifecycleDeleted {
 		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
 	}
-	if update.RequireEmptyOAuthMarker && existing.ActiveOAuthAuthorizationID != "" {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	result, err := applyAccountUpdate(existing, update)
+	if err != nil {
+		return domain.ProviderAccount{}, err
 	}
-	if update.RequireOAuthMarker != "" && existing.ActiveOAuthAuthorizationID != update.RequireOAuthMarker {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if update.RequireDraftLifecycle && existing.Lifecycle != domain.LifecycleDraft {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if update.RequirePendingVersion > 0 && existing.PendingCredentialVersion != update.RequirePendingVersion {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if update.RequireEmptyPendingVersion && existing.PendingCredentialVersion != 0 {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if update.RequireEmptyRecoveryPermit && existing.RecoveryPermit.Owner != "" {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if update.RequireRecoveryPermitOwner != "" && existing.RecoveryPermit.Owner != update.RequireRecoveryPermitOwner {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if required := update.RequireRecoveryCondition; required.Owner != "" && !accountHasRecoveryCondition(existing, required) {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	accounts[update.Account.ID] = update.Account
-	return update.Account, nil
+	accounts[update.Account.ID] = result
+	return result, nil
 }
 
 func accountHasRecoveryCondition(account domain.ProviderAccount, required domain.RecoveryPermit) bool {
@@ -251,6 +283,151 @@ func (store *MemoryAccountStore) List(_ context.Context, principal domain.Securi
 		result = append(result, account)
 	}
 	return result, nil
+}
+
+// FileAccountStore is a durable foundation Provider Account store that persists
+// same-Tenant account rows to a local JSON file. It satisfies the startup
+// recovery contract by loading persisted cooldowns and recovery permits in
+// Restore before composition reports readiness.
+type FileAccountStore struct {
+	mu       sync.Mutex
+	path     string
+	byTenant map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
+}
+
+// NewFileAccountStore builds a file-backed foundation account store.
+func NewFileAccountStore(path string) *FileAccountStore {
+	return &FileAccountStore{
+		path:     path,
+		byTenant: make(map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount),
+	}
+}
+
+// Restore loads persisted account rows from the configured file. A missing file
+// is treated as an empty store; a corrupted file fails closed.
+func (store *FileAccountStore) Restore(_ context.Context) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	data, err := os.ReadFile(store.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			store.byTenant = make(map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount)
+			return nil
+		}
+		return err
+	}
+	var loaded map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return err
+	}
+	store.byTenant = loaded
+	return nil
+}
+
+// Create persists a new draft for the owning Tenant derived from the principal.
+func (store *FileAccountStore) Create(ctx context.Context, creation ports.AccountCreation) (domain.ProviderAccount, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	return store.createLocked(ctx, creation)
+}
+
+func (store *FileAccountStore) createLocked(_ context.Context, creation ports.AccountCreation) (domain.ProviderAccount, error) {
+	tenant := creation.Principal.TenantID
+	accounts, ok := store.byTenant[tenant]
+	if !ok {
+		accounts = make(map[domain.ProviderAccountID]domain.ProviderAccount)
+		store.byTenant[tenant] = accounts
+	}
+	accounts[creation.Account.ID] = creation.Account
+	if err := store.saveLocked(); err != nil {
+		delete(accounts, creation.Account.ID)
+		if len(accounts) == 0 {
+			delete(store.byTenant, tenant)
+		}
+		return domain.ProviderAccount{}, err
+	}
+	return creation.Account, nil
+}
+
+// Update persists a mutated account for the owning Tenant. It rejects an
+// account that is not already visible under the principal's Tenant so a
+// mutation can never create a cross-Tenant row or resurrect a deleted account
+// (#6 section 5.1).
+func (store *FileAccountStore) Update(_ context.Context, update ports.AccountUpdate) (domain.ProviderAccount, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	accounts, ok := store.byTenant[update.Principal.TenantID]
+	if !ok {
+		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	existing, ok := accounts[update.Account.ID]
+	if !ok || existing.Lifecycle == domain.LifecycleDeleted {
+		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	result, err := applyAccountUpdate(existing, update)
+	if err != nil {
+		return domain.ProviderAccount{}, err
+	}
+	accounts[update.Account.ID] = result
+	if err := store.saveLocked(); err != nil {
+		accounts[update.Account.ID] = existing
+		return domain.ProviderAccount{}, err
+	}
+	return result, nil
+}
+
+// Visible returns the owning-Tenant account or the single non-enumerating
+// visibility failure for foreign, unknown, and deleted identifiers.
+func (store *FileAccountStore) Visible(_ context.Context, principal domain.SecurityPrincipal, id domain.ProviderAccountID) (domain.ProviderAccount, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	accounts, ok := store.byTenant[principal.TenantID]
+	if !ok {
+		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	account, ok := accounts[id]
+	if !ok || account.Lifecycle == domain.LifecycleDeleted {
+		return domain.ProviderAccount{}, ports.ErrAccountNotVisible
+	}
+	return account, nil
+}
+
+// List returns only the authenticated Tenant's non-deleted accounts.
+func (store *FileAccountStore) List(_ context.Context, principal domain.SecurityPrincipal) ([]domain.ProviderAccount, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	accounts := store.byTenant[principal.TenantID]
+	result := make([]domain.ProviderAccount, 0, len(accounts))
+	for _, account := range accounts {
+		if account.Lifecycle == domain.LifecycleDeleted {
+			continue
+		}
+		result = append(result, account)
+	}
+	return result, nil
+}
+
+func (store *FileAccountStore) saveLocked() error {
+	dir := filepath.Dir(store.path)
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return err
+		}
+	}
+	temp := store.path + ".tmp"
+	data, err := json.Marshal(store.byTenant)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(temp, data, 0o640); err != nil {
+		return err
+	}
+	return os.Rename(temp, store.path)
 }
 
 // UnavailableAccountStore is installed after startup restoration fails. It
@@ -309,5 +486,6 @@ var (
 	_ ports.ReplayStore    = (*MemoryReplayStore)(nil)
 	_ ports.AccountStore   = (*MemoryAccountStore)(nil)
 	_ ports.AccountStore   = (*UnavailableAccountStore)(nil)
+	_ ports.AccountStore   = (*FileAccountStore)(nil)
 	_ ports.CircuitStore   = (*ClosedCircuitStore)(nil)
 )

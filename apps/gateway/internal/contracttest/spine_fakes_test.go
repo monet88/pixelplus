@@ -309,6 +309,23 @@ func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpd
 	if required := update.RequireRecoveryCondition; required.Owner != "" && !stubAccountHasRecoveryCondition(existing, required) {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
+	if update.RequireLifecycle != "" && existing.Lifecycle != update.RequireLifecycle {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.RequireControlsMatch && existing.Controls != update.RequireControls {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.PatchLastProbedAt || update.PatchClearRecoveryPermit {
+		if update.PatchLastProbedAt {
+			existing.Credential.LastProbedAt = update.LastProbedAt
+			existing.UpdatedAt = update.LastProbedAt
+		}
+		if update.PatchClearRecoveryPermit {
+			existing.RecoveryPermit = domain.RecoveryPermit{}
+		}
+		accounts[update.Account.ID] = existing
+		return existing, nil
+	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
 }
