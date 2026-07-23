@@ -427,22 +427,57 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
-	// Validation + probe succeeded for the current version and every gate passed:
-	// this is the only transition into `active` in this slice.
+	// Validation + probe succeeded for the version this request proved. Re-read
+	// before activation so sticky disable (PendingOrigin / lifecycle) and any
+	// concurrent cutover are observed at commit time rather than on the
+	// pre-admission snapshot (management contract §4.6 disable-intent-wins).
+	latest, err := service.accounts.Visible(ctx, principal, account.ID)
+	if err != nil {
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
+	}
+	now := domain.NewTimestamp(sc.start)
+	base := latest
+	// Carry this request's validation evidence onto the durable row.
+	if !validated.Credential.LastValidatedAt.IsZero() {
+		base.Credential.LastValidatedAt = validated.Credential.LastValidatedAt
+	}
+
 	var activated domain.ProviderAccount
 	var priorVersion int
-	if account.PendingCredentialVersion > 0 {
-		priorVersion = account.Credential.Version
-		activated = validated.WithReplacementProbeActivated(domain.NewTimestamp(sc.start))
-	} else {
-		activated = validated.WithProbeActivated(domain.NewTimestamp(sc.start))
+	update := ports.AccountUpdate{Principal: principal}
+	switch {
+	case account.PendingCredentialVersion > 0:
+		// This request probed a pending replacement. A concurrent settlement that
+		// cleared or replaced the pending version must lose cleanly.
+		if latest.PendingCredentialVersion != account.PendingCredentialVersion {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+		}
+		priorVersion = latest.Credential.Version
+		// WithReplacementProbeActivated honors latest.PendingOrigin, so a disable
+		// that rewrote origin to disabled after this probe loaded still lands disabled.
+		activated = base.WithReplacementProbeActivated(now)
+		update.RequirePendingVersion = account.PendingCredentialVersion
+	case latest.Lifecycle == domain.LifecycleDisabled:
+		// Sticky disable mid first-connect / enable probe: record probe success
+		// evidence but do not re-activate. Mirrors disabled-origin replacement cutover.
+		activated = base.WithProbeActivated(now)
+		activated.Lifecycle = domain.LifecycleDisabled
+		update.RequireEmptyPendingVersion = true
+	case !latest.Lifecycle.AcceptsProbe():
+		// Concurrent lifecycle transition (e.g. revoke/delete path edge) rejected
+		// activation after the probe ran; fail closed without promoting use.
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationAccountRemediation))
+	default:
+		activated = base.WithProbeActivated(now)
+		// Fence against a concurrent replacement staging after this load.
+		update.RequireEmptyPendingVersion = true
 	}
-	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
-		Principal:             principal,
-		Account:               activated,
-		RequirePendingVersion: account.PendingCredentialVersion,
-	})
+	update.Account = activated
+	persisted, err := service.accounts.Update(ctx, update)
 	if err != nil {
+		if errors.Is(err, ports.ErrAccountUpdateConflict) {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	if priorVersion > 0 {

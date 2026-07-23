@@ -187,6 +187,11 @@ type AccountUpdate struct {
 	// RequirePendingVersion fences promotion/settlement to the version this
 	// request validated. A stale writer cannot promote another replacement.
 	RequirePendingVersion int
+	// RequireEmptyPendingVersion rejects the write unless the currently stored
+	// PendingCredentialVersion is zero. Used so a management enable/disable or a
+	// first-connect probe activation cannot clobber an in-flight replacement that
+	// staged after the writer loaded its snapshot.
+	RequireEmptyPendingVersion bool
 }
 
 // AuditAction names a product/security audit event.

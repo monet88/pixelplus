@@ -2,10 +2,12 @@ package contracttest_test
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
+	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
 // activeAccount builds a healthy, active account for the given Auth Mode: a
@@ -656,5 +658,308 @@ func TestDeleteRequiresManageScope(t *testing.T) {
 	}
 	if calls := harness.accounts.updateCalls.Load(); calls != 0 {
 		t.Fatalf("account.Update ran %d times on a forbidden delete, want 0", calls)
+	}
+}
+
+// AC (disable intent wins under a concurrent probe that loaded a pre-disable
+// snapshot): a probe writer that still carries PendingOrigin=active after disable
+// rewrote origin must not reactivate when it commits. The probe path re-reads
+// sticky origin at activation so cutover lands disabled.
+func TestDisableIntentWinsOverStaleProbeSnapshot(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_disable_stale_probe", domain.AuthModeChatGPTCodexOAuth)
+		account.Credential.LastAllocatedVersion = 2
+		account.PendingCredentialVersion = 2
+		account.PendingOrigin = domain.LifecycleActive
+		h.accounts.seed("tenant_a", account)
+	})
+
+	// Capture the pre-disable snapshot a concurrent probe would have loaded.
+	stale, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_disable_stale_probe")
+	if err != nil {
+		t.Fatalf("visible pre-disable: %v", err)
+	}
+	if stale.PendingOrigin != domain.LifecycleActive {
+		t.Fatalf("pre-disable PendingOrigin = %q, want active", stale.PendingOrigin)
+	}
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_disable_stale_probe/disable",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("disable status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+
+	// Stale full-record activation that ignores the re-read would write active.
+	// The real probe path re-reads and honors PendingOrigin=disabled.
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_disable_stale_probe/probe",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("probe status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	account := decodeAccount(t, payload)
+	if account["lifecycle_state"] != "disabled" {
+		t.Fatalf("lifecycle_state = %v, want disabled after stale-snapshot probe race", account["lifecycle_state"])
+	}
+
+	// A blind full replace from the pre-disable snapshot must lose the pending fence
+	// after cutover (pending cleared) rather than roll the row back to active/v1.
+	current, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_disable_stale_probe")
+	if err != nil {
+		t.Fatalf("visible post-probe: %v", err)
+	}
+	staleActive := stale.WithReplacementProbeActivated(domain.NewTimestamp(spineFixtureTime))
+	_, err = harness.accounts.Update(t.Context(), ports.AccountUpdate{
+		Principal:             managePrincipal(),
+		Account:               staleActive,
+		RequirePendingVersion: 2,
+	})
+	if !errors.Is(err, ports.ErrAccountUpdateConflict) {
+		t.Fatalf("stale activation error = %v, want ErrAccountUpdateConflict", err)
+	}
+	after, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_disable_stale_probe")
+	if err != nil {
+		t.Fatalf("visible after stale write: %v", err)
+	}
+	if after.Lifecycle != domain.LifecycleDisabled {
+		t.Fatalf("stale writer rewrote lifecycle = %s, want disabled", after.Lifecycle)
+	}
+	if after.Credential.Version != current.Credential.Version {
+		t.Fatalf("stale writer rewrote version = %d, want %d", after.Credential.Version, current.Credential.Version)
+	}
+}
+
+// AC (enable is rejected while a single-flight OAuth journey owns the window): a
+// disabled account with ActiveOAuthAuthorizationID set cannot be enabled; the
+// write is fenced so it cannot clear the marker either.
+func TestEnableRejectedWhileOAuthInFlight(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_enable_oauth", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleDisabled
+		account.ActiveOAuthAuthorizationID = "oa_inflight_enable"
+		h.accounts.seed("tenant_a", account)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_enable_oauth/enable",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeError(t, payload)
+	if body["code"] != "account_not_usable" {
+		t.Fatalf("code = %v, want account_not_usable", body["code"])
+	}
+	if body["remediation"] != "complete_oauth" {
+		t.Fatalf("remediation = %v, want complete_oauth", body["remediation"])
+	}
+	if calls := harness.accounts.updateCalls.Load(); calls != 0 {
+		t.Fatalf("account.Update ran %d times enabling over OAuth, want 0", calls)
+	}
+
+	// Durable OAuth marker is preserved (enable must not orphan the journey).
+	current, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_enable_oauth")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	if current.ActiveOAuthAuthorizationID != "oa_inflight_enable" {
+		t.Fatalf("OAuth marker = %q, want preserved", current.ActiveOAuthAuthorizationID)
+	}
+	if current.Lifecycle != domain.LifecycleDisabled {
+		t.Fatalf("lifecycle = %s, want disabled", current.Lifecycle)
+	}
+}
+
+// AC (enable requires accounts.manage and is non-enumerating for foreign ids).
+func TestEnableRequiresManageScopeAndNonEnumeration(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_enable_scope", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleDisabled
+		h.accounts.seed("tenant_a", account)
+		h.accounts.seed("tenant_b", activeAccount("pa_enable_foreign", domain.AuthModeChatGPTCodexOAuth))
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_enable_scope/enable",
+		bearer: readOnly,
+	})
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("scope status = %d, want 403 (body=%s)", response.StatusCode, payload)
+	}
+	if body := decodeError(t, payload); body["code"] != "forbidden" {
+		t.Fatalf("scope code = %v, want forbidden", body["code"])
+	}
+
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_enable_foreign/enable",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("foreign status = %d, want 404 (body=%s)", response.StatusCode, payload)
+	}
+	if body := decodeError(t, payload); body["code"] != "resource_not_found" {
+		t.Fatalf("foreign code = %v, want resource_not_found", body["code"])
+	}
+	if calls := harness.accounts.updateCalls.Load(); calls != 0 {
+		t.Fatalf("account.Update ran %d times on gated enable, want 0", calls)
+	}
+}
+
+// Enable's empty-OAuth fence rejects a concurrent marker claim: a late enable
+// full replace cannot clear ActiveOAuthAuthorizationID once OAuth claimed it.
+func TestEnableEmptyOAuthFenceRejectsConcurrentMarkerClaim(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_enable_fence", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleDisabled
+		h.accounts.seed("tenant_a", account)
+	})
+
+	// Simulate OAuth claiming the single-flight marker after enable's soft gate.
+	claimed, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_enable_fence")
+	if err != nil {
+		t.Fatalf("visible: %v", err)
+	}
+	claimed.ActiveOAuthAuthorizationID = "oa_claimed_before_enable_write"
+	if _, err := harness.accounts.Update(t.Context(), ports.AccountUpdate{
+		Principal:               managePrincipal(),
+		Account:                 claimed,
+		RequireEmptyOAuthMarker: true,
+	}); err != nil {
+		t.Fatalf("oauth claim: %v", err)
+	}
+
+	// A stale enable writer (empty marker snapshot) must conflict, not wipe the claim.
+	stale := claimed
+	stale.ActiveOAuthAuthorizationID = ""
+	stale = stale.WithEnableProbePending(domain.NewTimestamp(spineFixtureTime))
+	_, err = harness.accounts.Update(t.Context(), ports.AccountUpdate{
+		Principal:                  managePrincipal(),
+		Account:                    stale,
+		RequireEmptyOAuthMarker:    true,
+		RequireEmptyPendingVersion: true,
+	})
+	if !errors.Is(err, ports.ErrAccountUpdateConflict) {
+		t.Fatalf("stale enable error = %v, want ErrAccountUpdateConflict", err)
+	}
+	current, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_enable_fence")
+	if err != nil {
+		t.Fatalf("visible after conflict: %v", err)
+	}
+	if current.ActiveOAuthAuthorizationID != "oa_claimed_before_enable_write" {
+		t.Fatalf("marker after stale enable = %q, want preserved claim", current.ActiveOAuthAuthorizationID)
+	}
+	if current.Lifecycle != domain.LifecycleDisabled {
+		t.Fatalf("lifecycle after stale enable = %s, want disabled", current.Lifecycle)
+	}
+}
+
+// AC (delete fail-closed when vault revoke fails): a revoke dependency error
+// must not mark the account deleted; non-use is preserved for conservative retry.
+func TestDeleteRevokeFailureDoesNotMarkDeleted(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", activeAccount("pa_delete_revoke_fail", domain.AuthModeChatGPTCodexOAuth))
+		h.vault.revokeErr = ports.ErrDependencyUnavailable
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodDelete,
+		path:   "/v1/provider-accounts/pa_delete_revoke_fail",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", response.StatusCode, payload)
+	}
+	if body := decodeError(t, payload); body["code"] != "dependency_unavailable" {
+		t.Fatalf("code = %v, want dependency_unavailable", body["code"])
+	}
+	if calls := harness.accounts.updateCalls.Load(); calls != 0 {
+		t.Fatalf("account.Update ran %d times after revoke failure, want 0", calls)
+	}
+	// Account remains visible and non-deleted for retry.
+	if _, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_delete_revoke_fail"); err != nil {
+		t.Fatalf("account not visible after revoke failure: %v", err)
+	}
+}
+
+// Concurrent delete loser after revoke is product-idempotent: when Update sees
+// ErrAccountNotVisible (peer already deleted the row), the response is still 204
+// rather than internal_error, because credentials already lost use authority.
+func TestDeleteConcurrentLoserIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.accounts.seed("tenant_a", activeAccount("pa_delete_race", domain.AuthModeChatGPTCodexOAuth))
+		// Force the deleted transition write to observe "already gone" after revoke,
+		// which is the concurrent-loser shape (Visible passed, Update lost the race).
+		h.accounts.updateErr = ports.ErrAccountNotVisible
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodDelete,
+		path:   "/v1/provider-accounts/pa_delete_race",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 concurrent-loser idempotent (body=%s)", response.StatusCode, payload)
+	}
+	if len(payload) != 0 {
+		t.Fatalf("delete 204 returned a body: %s", payload)
+	}
+	// Revoke still ran before the lost Update (fail-closed non-use ordering).
+	if !harness.vault.wasRevoked("pa_delete_race", 1) {
+		t.Fatal("current credential version 1 was not revoked before the lost delete update")
+	}
+}
+
+// Enable health evidence is self-describing: pending_probe carries
+// unknown/initial_unprobed for the current credential version.
+func TestEnableHealthCarriesInitialUnprobedCondition(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_enable_health", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleDisabled
+		h.accounts.seed("tenant_a", account)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_enable_health/enable",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body=%s)", response.StatusCode, payload)
+	}
+	account := decodeAccount(t, payload)
+	health, _ := account["health"].(map[string]any)
+	if health["summary_state"] != "unknown" {
+		t.Fatalf("health.summary_state = %v, want unknown", health["summary_state"])
+	}
+	conditions, _ := health["conditions"].([]any)
+	if len(conditions) != 1 {
+		t.Fatalf("health.conditions len = %d, want 1 initial_unprobed", len(conditions))
+	}
+	first, _ := conditions[0].(map[string]any)
+	if first["reason"] != "initial_unprobed" {
+		t.Fatalf("health reason = %v, want initial_unprobed", first["reason"])
 	}
 }

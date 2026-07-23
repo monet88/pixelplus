@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
@@ -42,6 +43,10 @@ type DeleteProviderAccountCommand struct {
 // transition rewrites the pending origin to `disabled` so a concurrent
 // validation, exchange, probe, or replacement completion lands back in
 // `disabled` rather than re-activating the account (management contract §4.6).
+//
+// Persistence is fenced (OAuth marker + pending version) and re-reads the row
+// immediately before write so a concurrent cutover/OAuth claim is not clobbered
+// by a stale full-record snapshot.
 func (service *ProviderAccountService) DisableProviderAccount(ctx context.Context, command DisableProviderAccountCommand) (ProviderAccountResult, error) {
 	sc := spineContext{operation: operationDisableProviderAccount, requestID: service.resolveRequestID(command.RequestID), start: service.clock.Now()}
 
@@ -77,14 +82,63 @@ func (service *ProviderAccountService) DisableProviderAccount(ctx context.Contex
 	}
 	defer service.release(ctx, reservation)
 
-	disabled := account.WithDisabled(domain.NewTimestamp(sc.start))
-	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: disabled})
-	if err != nil {
-		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	persisted, canonical, ok := service.persistDisable(ctx, principal, command.AccountID, domain.NewTimestamp(sc.start))
+	if !ok {
+		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
 
 	service.observeSuccess(ctx, sc, ports.AuditProviderAccountDisabled, principal, persisted.ID, 200)
 	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
+}
+
+// persistDisable re-reads the account, re-checks the lifecycle gate, and writes
+// WithDisabled under OAuth/pending fences. One conflict retry absorbs a single
+// concurrent claim/cutover without clobbering the newer row.
+func (service *ProviderAccountService) persistDisable(ctx context.Context, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, now domain.Timestamp) (domain.ProviderAccount, domain.CanonicalError, bool) {
+	for attempt := 0; attempt < 2; attempt++ {
+		latest, err := service.accounts.Visible(ctx, principal, accountID)
+		if err != nil {
+			return domain.ProviderAccount{}, service.visibilityCanonical(err), false
+		}
+		if !latest.Lifecycle.AcceptsDisable() {
+			return domain.ProviderAccount{}, domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+		}
+
+		disabled := latest.WithDisabled(now)
+		update := ports.AccountUpdate{Principal: principal, Account: disabled}
+		if latest.PendingCredentialVersion > 0 {
+			// Fence to the pending version observed at write time so a concurrent
+			// promotion that clears pending loses cleanly instead of being rolled back.
+			update.RequirePendingVersion = latest.PendingCredentialVersion
+		} else {
+			update.RequireEmptyPendingVersion = true
+		}
+		if latest.ActiveOAuthAuthorizationID == "" {
+			// Do not wipe a single-flight OAuth claim that lands after this load.
+			update.RequireEmptyOAuthMarker = true
+		} else {
+			// Only settle against the journey we observed; a concurrent clear/claim loses.
+			update.RequireOAuthMarker = latest.ActiveOAuthAuthorizationID
+		}
+
+		persisted, err := service.accounts.Update(ctx, update)
+		if err == nil {
+			return persisted, domain.CanonicalError{}, true
+		}
+		if errors.Is(err, ports.ErrAccountUpdateConflict) && attempt == 0 {
+			continue
+		}
+		if errors.Is(err, ports.ErrAccountUpdateConflict) {
+			// A second conflict means the row is still racing; fail closed as a
+			// dependency so the client can retry without a permanent 500.
+			return domain.ProviderAccount{}, domain.NewDependencyUnavailable(), false
+		}
+		if errors.Is(err, ports.ErrAccountNotVisible) {
+			return domain.ProviderAccount{}, service.visibilityCanonical(err), false
+		}
+		return domain.ProviderAccount{}, service.dependencyCanonical(err), false
+	}
+	return domain.ProviderAccount{}, domain.NewInternalError(), false
 }
 
 // EnableProviderAccount runs the protected spine for a management enable. Every
@@ -116,18 +170,9 @@ func (service *ProviderAccountService) EnableProviderAccount(ctx context.Context
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
 	}
 
-	// Only a `disabled` account may enter the enable probe path.
-	if !account.Lifecycle.AcceptsEnable() {
-		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationAccountRemediation))
-	}
-	// A single-flight OAuth journey or an in-flight replacement version owns the
-	// window; enable must not race or overwrite it (management contract §4.5,
-	// §4.6). Reject before admission so a blocked enable debits nothing durable.
-	if account.ActiveOAuthAuthorizationID != "" {
-		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationCompleteOAuth))
-	}
-	if account.PendingCredentialVersion > 0 {
-		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationAccountRemediation))
+	// Soft gates before admission so a blocked enable debits nothing durable.
+	if canonical, ok := service.enableSoftGate(account); !ok {
+		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
 
 	reservation, canonical, ok := service.admit(ctx, principal, operationEnableProviderAccount)
@@ -136,14 +181,56 @@ func (service *ProviderAccountService) EnableProviderAccount(ctx context.Context
 	}
 	defer service.release(ctx, reservation)
 
-	pending := account.WithEnableProbePending(domain.NewTimestamp(sc.start))
-	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: pending})
+	// Re-read after admission so the write observes the latest OAuth/pending state
+	// rather than the pre-admission snapshot (OAuth poll pattern).
+	latest, err := service.accounts.Visible(ctx, principal, command.AccountID)
 	if err != nil {
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
+	}
+	if canonical, ok := service.enableSoftGate(latest); !ok {
+		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
+	}
+
+	pending := latest.WithEnableProbePending(domain.NewTimestamp(sc.start))
+	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
+		Principal:                  principal,
+		Account:                    pending,
+		RequireEmptyOAuthMarker:    true,
+		RequireEmptyPendingVersion: true,
+	})
+	if err != nil {
+		if errors.Is(err, ports.ErrAccountUpdateConflict) {
+			// Map the fence loss to the same soft-gate classes: re-read to choose
+			// complete_oauth vs account_remediation rather than internal_error.
+			current, visibleErr := service.accounts.Visible(ctx, principal, command.AccountID)
+			if visibleErr != nil {
+				return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(visibleErr))
+			}
+			if canonical, ok := service.enableSoftGate(current); !ok {
+				return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
+			}
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
 	service.observeSuccess(ctx, sc, ports.AuditProviderAccountEnabled, principal, persisted.ID, 202)
 	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
+}
+
+// enableSoftGate enforces enable-only-from-disabled plus the single-flight OAuth
+// and replacement ownership windows (management contract §4.5, §4.6).
+func (service *ProviderAccountService) enableSoftGate(account domain.ProviderAccount) (domain.CanonicalError, bool) {
+	if !account.Lifecycle.AcceptsEnable() {
+		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+	}
+	if account.ActiveOAuthAuthorizationID != "" {
+		return domain.NewAccountNotUsable(domain.RemediationCompleteOAuth), false
+	}
+	if account.PendingCredentialVersion > 0 {
+		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+	}
+	return domain.CanonicalError{}, true
 }
 
 // DeleteProviderAccount runs the protected spine for a management delete. It
@@ -192,6 +279,13 @@ func (service *ProviderAccountService) DeleteProviderAccount(ctx context.Context
 	deleted := account.WithDeleted(domain.NewTimestamp(sc.start))
 	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: deleted})
 	if err != nil {
+		// Concurrent delete already made the row non-visible: product-level
+		// delete is idempotent, credentials were revoked, and clients must not
+		// observe internal_error for "already gone."
+		if errors.Is(err, ports.ErrAccountNotVisible) {
+			service.observeSuccess(ctx, sc, ports.AuditProviderAccountDeleted, principal, deleted.ID, 204)
+			return ProviderAccountResult{Account: deleted, RequestID: sc.requestID}, nil
+		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 

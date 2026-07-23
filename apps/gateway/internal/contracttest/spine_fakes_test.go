@@ -292,6 +292,9 @@ func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpd
 	if update.RequirePendingVersion > 0 && existing.PendingCredentialVersion != update.RequirePendingVersion {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
+	if update.RequireEmptyPendingVersion && existing.PendingCredentialVersion != 0 {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
 	accounts[update.Account.ID] = update.Account
 	return update.Account, nil
 }
@@ -364,6 +367,9 @@ type stubCredentialVault struct {
 	mu          sync.Mutex
 	putErr      error
 	validateErr error
+	// revokeErr, when set, fails Revoke without affecting Validate. Used to prove
+	// delete fail-closed ordering when credential authority cannot be revoked.
+	revokeErr   error
 	validResult ports.CredentialValidationResult
 	putCalls    atomic.Int32
 	validCalls  atomic.Int32
@@ -414,6 +420,9 @@ func (vault *stubCredentialVault) Validate(_ context.Context, _ ports.Credential
 
 func (vault *stubCredentialVault) Revoke(_ context.Context, validation ports.CredentialValidation) error {
 	vault.log.add("vault.revoke")
+	if vault.revokeErr != nil {
+		return vault.revokeErr
+	}
 	if vault.validateErr != nil {
 		return vault.validateErr
 	}

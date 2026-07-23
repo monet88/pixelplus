@@ -606,13 +606,23 @@ func (account ProviderAccount) WithDisabled(now Timestamp) ProviderAccount {
 // disabled-to-active recovery first enters `pending_probe` and requires a
 // separate current-credential-version probe before use; the enable response
 // never predicts probe success (management contract §4.5, §4.10 rule 4,
-// I-ACCOUNT-ENABLE-PROBED). Health resets to unknown for the re-probe so a
-// stale healthy summary from before the disable cannot authorize new work until
-// the current version is re-proven; the credential version is preserved so the
-// probe targets the version the account already stored.
+// I-ACCOUNT-ENABLE-PROBED). Health resets to unknown/initial_unprobed for the
+// re-probe so a stale healthy summary from before the disable cannot authorize
+// new work until the current version is re-proven; the credential version is
+// preserved so the probe targets the version the account already stored.
 func (account ProviderAccount) WithEnableProbePending(now Timestamp) ProviderAccount {
 	account.Lifecycle = LifecyclePendingProbe
-	account.Health = HealthSummary{SummaryState: HealthUnknown}
+	account.Health = HealthSummary{
+		SummaryState: HealthUnknown,
+		Conditions: []HealthCondition{{
+			Scope:             HealthScope{Kind: HealthScopeAccount},
+			State:             HealthUnknown,
+			Reason:            HealthReasonInitialUnprobed,
+			CredentialVersion: account.Credential.Version,
+			ObservedAt:        now,
+			Remediation:       RemediationNone,
+		}},
+	}
 	account.UpdatedAt = now
 	return account
 }
