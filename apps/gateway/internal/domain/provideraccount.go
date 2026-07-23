@@ -370,6 +370,34 @@ func (state LifecycleState) AcceptsCredentialSubmission() bool {
 	}
 }
 
+// AcceptsDisable reports whether a management disable is allowed from this
+// lifecycle state. A pure `draft` shell has no usable credentialed connection to
+// pause, so disable is rejected with a stable class rather than a silent no-op;
+// a `deleted` id is not visible. A `revoked` account is excluded because the
+// transition matrix marks its disable column `—` and recovery is reauth with new
+// material, never enable: allowing `revoked -> disabled -> enable` would let a
+// revoked credential re-enter the probe/activation ceremony, violating
+// I-REVOKE-NONUSE. Disable on an already-`disabled` account is idempotent, and
+// every other credentialed state (`pending_*`, `active`, `reauth_required`) may
+// be disabled (connection lifecycle spec §4.10 rule 5, §4.11, §4.13 matrix,
+// management contract §4.5).
+func (state LifecycleState) AcceptsDisable() bool {
+	switch state {
+	case LifecyclePendingValidation, LifecyclePendingProbe, LifecycleActive, LifecycleReauthRequired, LifecycleDisabled:
+		return true
+	default:
+		return false
+	}
+}
+
+// AcceptsEnable reports whether a management enable is allowed from this
+// lifecycle state. Enable is the disabled-to-probe recovery path, so it is
+// accepted only from `disabled`; every other state has no disable intent to
+// clear (management contract §4.5, I-ACCOUNT-ENABLE-PROBED).
+func (state LifecycleState) AcceptsEnable() bool {
+	return state == LifecycleDisabled
+}
+
 // AcceptsProbe reports whether a controlled probe is allowed from this state. A
 // probe proves credential usability, so it is allowed once a credential has
 // been submitted and validation is pending (`pending_validation`), a prior
@@ -550,6 +578,65 @@ func (account ProviderAccount) WithPendingCredentialRejected(now Timestamp) Prov
 			Remediation:       RemediationReauthenticate,
 		}},
 	}
+	account.UpdatedAt = now
+	return account
+}
+
+// WithDisabled returns the account after a management disable. It moves to
+// `disabled` and preserves credential material and the last truthful health
+// evidence: disable blocks new use but never invents an upstream health failure
+// or falsely claims a credential failure (connection lifecycle spec §4.10 rules
+// 1 and 6, management contract §4.5). When a replacement version is in flight,
+// the pending origin is rewritten to `disabled` so a concurrent validation,
+// exchange, probe, or replacement completion lands back in `disabled` rather
+// than re-activating the account: disable intent wins over the replacement
+// journey (management contract §4.6, AC "disable intent wins"). Disable is
+// idempotent for an already-`disabled` account.
+func (account ProviderAccount) WithDisabled(now Timestamp) ProviderAccount {
+	account.Lifecycle = LifecycleDisabled
+	if account.PendingCredentialVersion > 0 {
+		account.PendingOrigin = LifecycleDisabled
+		account.PendingOriginHealth = account.Health
+	}
+	account.UpdatedAt = now
+	return account
+}
+
+// WithEnableProbePending returns the account after a management enable. Every
+// disabled-to-active recovery first enters `pending_probe` and requires a
+// separate current-credential-version probe before use; the enable response
+// never predicts probe success (management contract §4.5, §4.10 rule 4,
+// I-ACCOUNT-ENABLE-PROBED). Health resets to unknown/initial_unprobed for the
+// re-probe so a stale healthy summary from before the disable cannot authorize
+// new work until the current version is re-proven; the credential version is
+// preserved so the probe targets the version the account already stored.
+func (account ProviderAccount) WithEnableProbePending(now Timestamp) ProviderAccount {
+	account.Lifecycle = LifecyclePendingProbe
+	account.Health = HealthSummary{
+		SummaryState: HealthUnknown,
+		Conditions: []HealthCondition{{
+			Scope:             HealthScope{Kind: HealthScopeAccount},
+			State:             HealthUnknown,
+			Reason:            HealthReasonInitialUnprobed,
+			CredentialVersion: account.Credential.Version,
+			ObservedAt:        now,
+			Remediation:       RemediationNone,
+		}},
+	}
+	account.UpdatedAt = now
+	return account
+}
+
+// WithDeleted returns the account after a management delete. It moves to the
+// terminal `deleted` state so the id behaves as not-found for ordinary Public
+// API reads (connection lifecycle spec §4.12 rule 4, I-DELETE-TERMINAL). The
+// application revokes every current and pending credential version before this
+// transition persists so all credentials lose use authority before the account
+// disappears; a retention hold may keep encrypted evidence but cannot restore
+// retrieval, decrypt, or usability (management contract §3.3, vault spec §6.5,
+// §8.5).
+func (account ProviderAccount) WithDeleted(now Timestamp) ProviderAccount {
+	account.Lifecycle = LifecycleDeleted
 	account.UpdatedAt = now
 	return account
 }

@@ -27,6 +27,9 @@ type ProviderAccountGateway interface {
 	SubmitProviderCredential(context.Context, application.SubmitProviderCredentialCommand) (application.ProviderAccountResult, error)
 	ReauthenticateProviderAccount(context.Context, application.SubmitProviderCredentialCommand) (application.ProviderAccountResult, error)
 	ProbeProviderAccount(context.Context, application.ProbeProviderAccountCommand) (application.ProviderAccountResult, error)
+	DisableProviderAccount(context.Context, application.DisableProviderAccountCommand) (application.ProviderAccountResult, error)
+	EnableProviderAccount(context.Context, application.EnableProviderAccountCommand) (application.ProviderAccountResult, error)
+	DeleteProviderAccount(context.Context, application.DeleteProviderAccountCommand) (application.ProviderAccountResult, error)
 	StartOAuthAuthorization(context.Context, application.StartOAuthAuthorizationCommand) (application.OAuthAuthorizationResult, error)
 	GetOAuthAuthorization(context.Context, application.GetOAuthAuthorizationQuery) (application.OAuthAuthorizationResult, error)
 	GetCapabilitySnapshot(context.Context, application.GetCapabilitySnapshotQuery) (application.CapabilitySnapshotResult, error)
@@ -45,6 +48,9 @@ func registerProviderAccountRoutes(mux *http.ServeMux, gateway ProviderAccountGa
 	mux.HandleFunc("POST /v1/provider-accounts", handler.create)
 	mux.HandleFunc("GET /v1/provider-accounts", handler.list)
 	mux.HandleFunc("GET /v1/provider-accounts/{provider_account_id}", handler.get)
+	mux.HandleFunc("DELETE /v1/provider-accounts/{provider_account_id}", handler.delete)
+	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/disable", handler.disable)
+	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/enable", handler.enable)
 	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/credentials", handler.submitCredential)
 	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/reauthentication", handler.reauthenticate)
 	mux.HandleFunc("POST /v1/provider-accounts/{provider_account_id}/probe", handler.probe)
@@ -249,6 +255,64 @@ func (handler providerAccountHandler) get(writer http.ResponseWriter, request *h
 		return
 	}
 	writeAccount(writer, http.StatusOK, result.Account)
+}
+
+// disable blocks new use of a Provider Account without deleting the record. It
+// carries no body and no Idempotency-Key; a 200 returns the safe disabled
+// projection.
+func (handler providerAccountHandler) disable(writer http.ResponseWriter, request *http.Request) {
+	presented, _ := bearerMaterial(request)
+	accountID := request.PathValue("provider_account_id")
+
+	command := application.DisableProviderAccountCommand{
+		RequestID:            handler.newRequestID(),
+		PresentedKeyMaterial: presented,
+		AccountID:            domain.ProviderAccountID(accountID),
+	}
+	result, err := handler.gateway.DisableProviderAccount(request.Context(), command)
+	if err != nil {
+		writeGatewayError(writer, err)
+		return
+	}
+	writeAccountOperation(writer, http.StatusOK, result)
+}
+
+// enable enters the current-credential-version probe path for a disabled
+// account. The 202 response returns the pending_probe projection and never
+// predicts probe success.
+func (handler providerAccountHandler) enable(writer http.ResponseWriter, request *http.Request) {
+	presented, _ := bearerMaterial(request)
+	accountID := request.PathValue("provider_account_id")
+
+	command := application.EnableProviderAccountCommand{
+		RequestID:            handler.newRequestID(),
+		PresentedKeyMaterial: presented,
+		AccountID:            domain.ProviderAccountID(accountID),
+	}
+	result, err := handler.gateway.EnableProviderAccount(request.Context(), command)
+	if err != nil {
+		writeGatewayError(writer, err)
+		return
+	}
+	writeAccountOperation(writer, http.StatusAccepted, result)
+}
+
+// delete stops new use/decrypt, revokes every stored credential version, and
+// removes the account from ordinary list/get. It returns 204 with no body.
+func (handler providerAccountHandler) delete(writer http.ResponseWriter, request *http.Request) {
+	presented, _ := bearerMaterial(request)
+	accountID := request.PathValue("provider_account_id")
+
+	command := application.DeleteProviderAccountCommand{
+		RequestID:            handler.newRequestID(),
+		PresentedKeyMaterial: presented,
+		AccountID:            domain.ProviderAccountID(accountID),
+	}
+	if _, err := handler.gateway.DeleteProviderAccount(request.Context(), command); err != nil {
+		writeGatewayError(writer, err)
+		return
+	}
+	writeNoContent(writer)
 }
 
 func (handler providerAccountHandler) list(writer http.ResponseWriter, request *http.Request) {

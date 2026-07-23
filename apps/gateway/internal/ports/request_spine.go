@@ -187,6 +187,11 @@ type AccountUpdate struct {
 	// RequirePendingVersion fences promotion/settlement to the version this
 	// request validated. A stale writer cannot promote another replacement.
 	RequirePendingVersion int
+	// RequireEmptyPendingVersion rejects the write unless the currently stored
+	// PendingCredentialVersion is zero. Used so a management enable/disable or a
+	// first-connect probe activation cannot clobber an in-flight replacement that
+	// staged after the writer loaded its snapshot.
+	RequireEmptyPendingVersion bool
 }
 
 // AuditAction names a product/security audit event.
@@ -207,6 +212,18 @@ const (
 	// AuditProviderAccountActivated records the transition into `active` after a
 	// required probe succeeds (connection lifecycle spec §4.7).
 	AuditProviderAccountActivated AuditAction = "provider_account.activated"
+	// AuditProviderAccountDisabled records a management disable. It carries the
+	// account id and outcome only; disable preserves credential material and the
+	// last truthful health evidence (connection lifecycle spec §4.10 rule 6).
+	AuditProviderAccountDisabled AuditAction = "provider_account.disabled"
+	// AuditProviderAccountEnabled records a management enable that opens the
+	// current-version probe path. It never predicts probe success (management
+	// contract §4.5, I-ACCOUNT-ENABLE-PROBED).
+	AuditProviderAccountEnabled AuditAction = "provider_account.enabled"
+	// AuditProviderAccountDeleted records a management delete. Every current and
+	// pending credential version is revoked before the account is removed; the
+	// event carries no secrets (connection lifecycle spec §4.12 rule 6).
+	AuditProviderAccountDeleted AuditAction = "provider_account.deleted"
 	// AuditProviderOAuthStarted records a successful server-owned OAuth start.
 	// It carries the account id and outcome only, never codes or tokens.
 	AuditProviderOAuthStarted AuditAction = "provider_oauth.started"

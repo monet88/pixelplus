@@ -22,6 +22,9 @@ const (
 	operationProbeProviderAccount          domain.OperationToken = "probe_provider_account"
 	operationStartOAuthAuthorization       domain.OperationToken = "start_oauth_authorization"
 	operationGetOAuthAuthorization         domain.OperationToken = "get_oauth_authorization"
+	operationDisableProviderAccount        domain.OperationToken = "disable_provider_account"
+	operationEnableProviderAccount         domain.OperationToken = "enable_provider_account"
+	operationDeleteProviderAccount         domain.OperationToken = "delete_provider_account"
 )
 
 // maxIdempotencyKeyLength mirrors the frozen OpenAPI RequiredIdempotencyKey
