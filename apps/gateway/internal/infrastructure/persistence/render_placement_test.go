@@ -52,3 +52,35 @@ func TestAssetCommitIdempotentForStableOutputID(t *testing.T) {
 		t.Fatalf("Visible: %v", err)
 	}
 }
+
+// Placement-keyed Reserve is idempotent: crash after Reserve before Commit
+// re-Reserve must not double-count reserved accounting.
+func TestPlacementKeyedReserveDoesNotDoubleCount(t *testing.T) {
+	t.Parallel()
+
+	// Cap: 100 bytes so a double-count (2×60) would exceed.
+	meta := persistence.NewMemoryAssetMetadataStoreWithCaps(
+		clock{t: time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC)},
+		100,
+		10,
+	)
+	key := domain.PlacementKey{
+		TenantID: "tenant_a", JobID: "job_1", OutputEntryID: "out_0",
+	}.String()
+	hold := ports.AssetReservation{TenantID: "tenant_a", Bytes: 60, PlacementKey: key}
+	if err := meta.Reserve(context.Background(), hold); err != nil {
+		t.Fatalf("Reserve1: %v", err)
+	}
+	// Simulated crash recovery: same placement key Reserve again.
+	if err := meta.Reserve(context.Background(), hold); err != nil {
+		t.Fatalf("Reserve2 (same key) must be idempotent, got %v", err)
+	}
+	// A different placement still competes for remaining headroom (100-60=40).
+	other := ports.AssetReservation{
+		TenantID: "tenant_a", Bytes: 50,
+		PlacementKey: domain.PlacementKey{TenantID: "tenant_a", JobID: "job_2", OutputEntryID: "out_0"}.String(),
+	}
+	if err := meta.Reserve(context.Background(), other); err == nil {
+		t.Fatal("Reserve other 50 bytes should hit cap after one 60-byte hold")
+	}
+}

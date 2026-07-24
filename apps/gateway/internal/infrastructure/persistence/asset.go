@@ -32,6 +32,8 @@ type tenantStorage struct {
 	committedCount int
 	reservedCount  int
 	assets         map[domain.AssetID]domain.Asset
+	// openHolds keys placement-identity holds so Reserve is idempotent per key.
+	openHolds map[string]int64
 }
 
 // MemoryAssetMetadataStore is the production foundation Asset metadata store. It
@@ -71,8 +73,14 @@ func NewMemoryAssetMetadataStoreWithCaps(clock ports.Clock, capBytes int64, capC
 func (store *MemoryAssetMetadataStore) tenant(id domain.TenantID) *tenantStorage {
 	state, ok := store.byTenant[id]
 	if !ok {
-		state = &tenantStorage{assets: make(map[domain.AssetID]domain.Asset)}
+		state = &tenantStorage{
+			assets:    make(map[domain.AssetID]domain.Asset),
+			openHolds: make(map[string]int64),
+		}
 		store.byTenant[id] = state
+	}
+	if state.openHolds == nil {
+		state.openHolds = make(map[string]int64)
 	}
 	return state
 }
@@ -80,11 +88,18 @@ func (store *MemoryAssetMetadataStore) tenant(id domain.TenantID) *tenantStorage
 // Reserve acquires an atomic committed + reserved hold or fails closed with
 // ErrStorageCapExceeded. It never admits an overrun and it counts the pending
 // object so the object-count cap is enforced before any durable Asset exists.
+// When PlacementKey is set, a second Reserve for the same key is a no-op (no
+// double-count) so crash-after-Reserve recovery cannot lose accounting.
 func (store *MemoryAssetMetadataStore) Reserve(_ context.Context, reservation ports.AssetReservation) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
 	state := store.tenant(reservation.TenantID)
+	if reservation.PlacementKey != "" {
+		if _, held := state.openHolds[reservation.PlacementKey]; held {
+			return nil
+		}
+	}
 	if state.committedBytes+state.reservedBytes+reservation.Bytes > store.capBytes {
 		return ports.ErrStorageCapExceeded
 	}
@@ -93,6 +108,9 @@ func (store *MemoryAssetMetadataStore) Reserve(_ context.Context, reservation po
 	}
 	state.reservedBytes += reservation.Bytes
 	state.reservedCount++
+	if reservation.PlacementKey != "" {
+		state.openHolds[reservation.PlacementKey] = reservation.Bytes
+	}
 	return nil
 }
 
@@ -108,10 +126,10 @@ func (store *MemoryAssetMetadataStore) Commit(_ context.Context, creation ports.
 	if existing, ok := state.assets[creation.Asset.ID]; ok {
 		// Idempotent re-commit after a prior success (placement recovery).
 		// Consume the hold if still reserved so retry does not strand reserved bytes.
-		store.consumeHold(state, creation.Reservation.Bytes)
+		store.consumeHold(state, creation.Reservation)
 		return existing, nil
 	}
-	store.consumeHold(state, creation.Reservation.Bytes)
+	store.consumeHold(state, creation.Reservation)
 	state.committedBytes += creation.Reservation.Bytes
 	state.committedCount++
 	state.assets[creation.Asset.ID] = creation.Asset
@@ -129,17 +147,25 @@ func (store *MemoryAssetMetadataStore) Release(_ context.Context, reservation po
 	if !ok {
 		return nil
 	}
-	store.consumeHold(state, reservation.Bytes)
+	store.consumeHold(state, reservation)
 	return nil
 }
 
 // consumeHold subtracts one held reservation from the reserved accounting,
-// clamping at zero so a redundant release is inert.
-func (store *MemoryAssetMetadataStore) consumeHold(state *tenantStorage, bytes int64) {
+// clamping at zero so a redundant release is inert. Placement-keyed holds are
+// cleared so a later Reserve for the same key may proceed only if needed.
+func (store *MemoryAssetMetadataStore) consumeHold(state *tenantStorage, reservation ports.AssetReservation) {
+	if reservation.PlacementKey != "" {
+		if _, ok := state.openHolds[reservation.PlacementKey]; !ok {
+			// Already consumed for this placement key.
+			return
+		}
+		delete(state.openHolds, reservation.PlacementKey)
+	}
 	if state.reservedCount == 0 {
 		return
 	}
-	state.reservedBytes -= bytes
+	state.reservedBytes -= reservation.Bytes
 	if state.reservedBytes < 0 {
 		state.reservedBytes = 0
 	}

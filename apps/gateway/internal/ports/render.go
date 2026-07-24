@@ -153,6 +153,9 @@ type RenderJobStore interface {
 	// was never accepted by the queue (QueuePublished=false). Used by autonomous
 	// startup/background recovery without a second client request (#14 §3.3).
 	ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error)
+	// MarkAdmissionSettled records that create-time occupancy Reconcile completed
+	// exactly once for this job. Idempotent when already settled.
+	MarkAdmissionSettled(context.Context, domain.JobRef) (domain.RenderJob, error)
 }
 
 // RenderReplayDecision carries a terminal job for create replay.

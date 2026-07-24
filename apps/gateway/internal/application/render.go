@@ -80,6 +80,8 @@ type RetryRenderJobOutputCommand struct {
 	RequestID            domain.Identifier
 	JobID                domain.Identifier
 	OutputEntryID        domain.OutputEntryID
+	// OversizeBody is set by transport when the request body exceeds the size gate.
+	OversizeBody bool
 }
 
 // RenderJobResult carries one safe job projection plus the server-owned request id.
@@ -639,6 +641,10 @@ func (service *RenderService) RetryRenderJobOutput(ctx context.Context, command 
 	if !principal.Scopes.Has(domain.ScopeJobsManage) {
 		return OutputDeliveryResult{}, service.fail(ctx, sc, domain.NewForbidden())
 	}
+	// A2 size before further validation.
+	if command.OversizeBody {
+		return OutputDeliveryResult{}, service.fail(ctx, sc, domain.NewRequestTooLarge())
+	}
 	if command.JobID == "" || command.OutputEntryID == "" {
 		return OutputDeliveryResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
@@ -647,7 +653,12 @@ func (service *RenderService) RetryRenderJobOutput(ctx context.Context, command 
 	if err != nil {
 		return OutputDeliveryResult{}, service.fail(ctx, sc, service.jobVisibilityCanonical(err))
 	}
-	if job.Lifecycle != domain.JobCompleted || job.Manifest.ID == "" {
+	// Issue #54: completed requires durable placement; also accept failed jobs
+	// that still have a manifest for placement-only recovery after storage-cap.
+	if job.Manifest.ID == "" {
+		return OutputDeliveryResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
+	}
+	if job.Lifecycle != domain.JobCompleted && job.Lifecycle != domain.JobFailed {
 		return OutputDeliveryResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
 
@@ -672,7 +683,7 @@ func (service *RenderService) RetryRenderJobOutput(ctx context.Context, command 
 
 	// Already available: idempotent return, zero render/placement side effect.
 	if entry.DeliveryState == domain.OutputAvailable && entry.AssetID != "" {
-		service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, job, 200)
+		service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, job, 202)
 		return OutputDeliveryResult{Job: job, Entry: entry, RequestID: sc.requestID}, nil
 	}
 
@@ -682,7 +693,7 @@ func (service *RenderService) RetryRenderJobOutput(ctx context.Context, command 
 	if placeErr.Code != "" {
 		return OutputDeliveryResult{}, service.fail(ctx, sc, placeErr)
 	}
-	service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, result.Job, 200)
+	service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, result.Job, 202)
 	return OutputDeliveryResult{Job: result.Job, Entry: result.Entry, RequestID: sc.requestID}, nil
 }
 
@@ -971,7 +982,10 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 
 	// Application owns Asset Reserve/Commit/Put via stable placement ids;
-	// job store only records the result. Storage-cap is placement/delivery only.
+	// job store only records the result.
+	// Issue #54 acceptance: completed only after durable output Asset placement.
+	// Storage-cap → failed (not completed+pending). Deviates from older #14 prose
+	// allowing completed with pending delivery for this ticket's acceptance.
 	jobAfter, err := service.jobs.Load(ctx, ref)
 	if err != nil {
 		return err
@@ -981,7 +995,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
 				if _, err := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
 					JobRef: ref, FencingToken: fence, EntryID: entry.ID,
-					DeliveryStateForced: domain.OutputPending,
+					DeliveryStateForced: domain.OutputFailed,
 					FailureClass:        string(domain.ErrCodeStorageCapExceeded),
 					Now:                 service.nowTS(),
 				}); err != nil {
@@ -990,7 +1004,11 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 					}
 					return err
 				}
-				continue
+				return service.persistTerminal(ctx, job, ports.FencedTransition{
+					JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+					FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeStorageCapExceeded,
+					CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
+				})
 			}
 			if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 				JobRef: ref, FencingToken: fence, To: domain.JobFailed,
@@ -1210,9 +1228,17 @@ func (service *RenderService) preflightExecute(
 	return account, "", true
 }
 
-// releaseJobAdmission settles the create-time occupancy for one job at terminal.
-// Reconstructs the reservation from durable job identity (#8 Active Render Jobs).
+// releaseJobAdmission settles the create-time occupancy for one job at terminal
+// exactly once. Durable AdmissionSettled marker prevents double Reconcile on
+// cancel redelivery or post-terminal recovery (#8 §7.4).
 func (service *RenderService) releaseJobAdmission(ctx context.Context, job domain.RenderJob) {
+	if job.AdmissionSettled {
+		return
+	}
+	// Re-load so concurrent terminal paths race safely on the marker.
+	if current, err := service.jobs.Load(ctx, job.JobRef()); err == nil && current.AdmissionSettled {
+		return
+	}
 	op, ok := createAdmissionOperation(job.Operation)
 	if !ok {
 		return
@@ -1224,6 +1250,12 @@ func (service *RenderService) releaseJobAdmission(ctx context.Context, job domai
 		},
 		Operation: op,
 	})
+	if _, err := service.jobs.MarkAdmissionSettled(ctx, job.JobRef()); err != nil {
+		// Marker write failure leaves recovery able to re-attempt settlement.
+		// Occupancy was already reconciled once in this process; marker is for
+		// durable exactly-once across restarts/redelivery.
+		return
+	}
 }
 
 func createAdmissionOperation(op domain.RenderOperation) (domain.OperationToken, bool) {
@@ -1313,7 +1345,16 @@ func (service *RenderService) placeOutputBytes(
 	byteSize := int64(len(data))
 	sum := sha256.Sum256(data)
 	checksum := hex.EncodeToString(sum[:])
-	hold := ports.AssetReservation{TenantID: job.TenantID, Bytes: byteSize}
+	// Placement-keyed hold: crash after Reserve before Commit reuses the same
+	// key without double-counting reserved bytes (#14 §8.3).
+	placementKey := domain.PlacementKey{
+		TenantID: job.TenantID, JobID: job.JobID, OutputEntryID: entry.ID,
+	}.String()
+	hold := ports.AssetReservation{
+		TenantID:     job.TenantID,
+		Bytes:        byteSize,
+		PlacementKey: placementKey,
+	}
 	if err := service.assets.Reserve(ctx, hold); err != nil {
 		// Recovery: prior attempt may have committed the Asset after reserve.
 		if existing, visErr := service.assets.Visible(ctx, principal, stableID); visErr == nil {

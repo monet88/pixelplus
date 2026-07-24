@@ -557,6 +557,24 @@ func (store *MemoryRenderJobStore) ListUnpublishedQueue(context.Context) ([]doma
 	return out, nil
 }
 
+// MarkAdmissionSettled records create-time occupancy settlement exactly once.
+func (store *MemoryRenderJobStore) MarkAdmissionSettled(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	job, err := store.loadLocked(ref)
+	if err != nil {
+		return domain.RenderJob{}, err
+	}
+	if job.AdmissionSettled {
+		return cloneJob(job), nil
+	}
+	job.AdmissionSettled = true
+	job.StateRevision++
+	store.saveLocked(job)
+	return cloneJob(job), nil
+}
+
 func (store *MemoryRenderJobStore) loadLocked(ref domain.JobRef) (domain.RenderJob, error) {
 	jobs, ok := store.byTenant[domain.TenantID(ref.TenantID)]
 	if !ok {
@@ -657,6 +675,9 @@ func (*UnavailableRenderJobStore) MarkQueuePublished(context.Context, domain.Job
 }
 func (*UnavailableRenderJobStore) ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error) {
 	return nil, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) MarkAdmissionSettled(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
 }
 
 // MemoryRenderReplayStore is the process-local create-idempotency store for

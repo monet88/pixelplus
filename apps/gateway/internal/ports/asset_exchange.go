@@ -32,6 +32,10 @@ var (
 type AssetReservation struct {
 	TenantID domain.TenantID
 	Bytes    int64
+	// PlacementKey, when non-empty, is the stable (tenant, job, output_entry)
+	// identity for this hold. Reserve is idempotent per key so a crash after
+	// Reserve before Commit cannot double-count reserved bytes (#14 §8.3).
+	PlacementKey string
 }
 
 // AssetCreation is the typed command to persist a validated, immutable Asset

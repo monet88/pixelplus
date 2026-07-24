@@ -177,21 +177,20 @@ func (handler renderHandler) cancel(writer http.ResponseWriter, request *http.Re
 func (handler renderHandler) retryOutput(writer http.ResponseWriter, request *http.Request) {
 	presented, _ := bearerMaterial(request)
 	// Optional body may carry re_render; it is always forced false by the app.
-	body, oversize := readLimitedBody(request)
-	if oversize {
-		// Still go through application for A0/A1 order with flags via empty parse.
-		_ = body
-	}
+	// Oversize is enforced through the application A0→A1→A2 order (413).
+	_, oversize := readLimitedBody(request)
 
 	result, err := handler.gateway.RetryRenderJobOutput(request.Context(), application.RetryRenderJobOutputCommand{
 		RequestID:            handler.newRequestID(),
 		PresentedKeyMaterial: presented,
 		JobID:                domain.Identifier(request.PathValue("job_id")),
 		OutputEntryID:        domain.OutputEntryID(request.PathValue("output_entry_id")),
+		OversizeBody:         oversize,
 	})
 	if err != nil {
 		writeGatewayError(writer, err)
 		return
 	}
-	writeRenderJob(writer, http.StatusOK, result.Job)
+	// Stable OpenAPI: 202 OutputRetryResponse (not 200 full RenderJob).
+	writeOutputRetry(writer, http.StatusAccepted, result)
 }

@@ -3,6 +3,7 @@ package httptransport
 import (
 	"net/http"
 
+	"github.com/monet88/pixelplus/apps/gateway/internal/application"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 )
 
@@ -114,4 +115,28 @@ func toRenderJobWire(job domain.RenderJob) renderJobWire {
 
 func writeRenderJob(writer http.ResponseWriter, statusCode int, job domain.RenderJob) {
 	writeJSON(writer, statusCode, toRenderJobWire(job))
+}
+
+// outputRetryWire is the stable OutputRetryResponse projection (async accepted
+// placement recovery). It is not a full RenderJob body.
+type outputRetryWire struct {
+	JobID         string `json:"job_id"`
+	OutputEntryID string `json:"output_entry_id"`
+	DeliveryState string `json:"delivery_state"`
+	AssetID       string `json:"asset_id,omitempty"`
+	// re_render is always false on this surface (#14 §8.4).
+	ReRender bool `json:"re_render"`
+}
+
+func writeOutputRetry(writer http.ResponseWriter, statusCode int, result application.OutputDeliveryResult) {
+	wire := outputRetryWire{
+		JobID:         string(result.Job.JobID),
+		OutputEntryID: string(result.Entry.ID),
+		DeliveryState: string(result.Entry.DeliveryState),
+		ReRender:      false,
+	}
+	if result.Entry.DeliveryState == domain.OutputAvailable && result.Entry.AssetID != "" {
+		wire.AssetID = string(result.Entry.AssetID)
+	}
+	writeJSON(writer, statusCode, wire)
 }
