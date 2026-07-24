@@ -39,17 +39,18 @@ SDK shapes, and goroutine-layout assertions are not acceptance evidence.
 Run from `apps/gateway` unless the command uses `go -C`:
 
 ```text
-gofmt -w <changed-go-files>
+gofmt -l <changed-go-files>
 go build ./...
 go vet ./...
-go test ./...
-go test -race ./...
+go test ./... -count=1
+go test -race ./... -count=1
+$env:GOTOOLCHAIN='go1.25.12'; govulncheck ./...
 ```
 
 Harness verification command:
 
 ```text
-go -C apps/gateway test ./...
+go -C apps/gateway test ./... -count=1
 ```
 
 Before commit:
@@ -60,16 +61,33 @@ GitNexus detect_changes(scope=compare, base_ref=main)
 
 ## Acceptance Evidence
 
-Two local commits on `feature/issue-54-routed-render-jobs`:
+Validated product head: `5a12b9c` on
+`feature/issue-54-routed-render-jobs`.
 
-1. Standards P1-A/B/C — credential authorizer, audit-before-allow, recovery-before-ready.
-2. Spec lifecycle — nonblocking/idempotent queue, `RunWorkers` E2E delivery,
-   CaptureManifest cancel CAS, failed placement-only fence 0, replay freshness,
-   staging purge/expiry, worker lease heartbeat.
+| Proof | Result | Concrete evidence |
+| --- | --- | --- |
+| Format | pass | `gofmt -l` returned no changed Go files. |
+| Build | pass | `go build ./...` from `apps/gateway`. |
+| Vet | pass | `go vet ./...` from `apps/gateway`. |
+| Unit/integration | pass | `go test ./... -count=1`; all Gateway packages passed. |
+| Race | pass | `go test -race ./... -count=1`; all Gateway packages passed. |
+| Public E2E | pass | Contract suite creates through `Runtime.Handler()`, executes through `Runtime.RunWorkers` / `JobExecutor`, then retrieves `completed` with durable output Asset placement. |
+| Cancel recovery | pass | Pre-payload recovery stays `not_started`; post-payload recovery becomes `unknown`; both make zero Provider calls. |
+| Vulnerability | pass | With `GOTOOLCHAIN=go1.25.12`, `govulncheck ./...` returned `No vulnerabilities found`. Host `go1.25.5` alone remains below the standard-library fixes required by the scanner. |
+| Diff hygiene | pass | `git diff --check main...5a12b9c`. |
+| Final Standards review | pass | Exact-commit review of `5a12b9c` reported no actionable finding. |
 
-Proof commands (from `apps/gateway`):
+The implementation was delivered as issue-scoped local commits from
+`1da40de` through `5a12b9c`. The final review-fix commit normalizes uncertain
+post-payload cancel recovery without changing authoritative commit evidence.
 
-```text
-go test ./... -count=1
-go test -race ./... -count=1
-```
+## Residual Risks
+
+- Production deliberately remains not-ready without injected durable Render
+  persistence/queue, Vault credential authorizer, and Provider Adapter.
+- No Provider status-lookup Adapter exists; post-payload crash/cancel recovery
+  records `unknown` and forbids rerender instead of inventing abort certainty.
+- No live Provider acceptance was run; controlled adapters prove Gateway
+  orchestration and security boundaries, not a production Provider protocol.
+- GitNexus has no PDG/taint layer for this checkout, so graph taint safety was
+  not claimed; secret-boundary behavior is covered by explicit tests/reviews.

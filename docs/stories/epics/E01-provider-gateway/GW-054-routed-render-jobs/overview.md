@@ -1,13 +1,13 @@
 # Overview
 
-## Current Behavior
+## Prior Behavior
 
-The Gateway exposes Provider Account, capability, health, routing, and Asset
-surfaces through the real Pure-Go composition. Image-generation Render Job
-routes are not implemented, and the exported `JobExecutor` still fails closed
-with `ErrJobExecutionUnavailable`.
+The Gateway exposed Provider Account, capability, health, routing, and Asset
+surfaces through the real Pure-Go composition. Image Render Job routes were not
+implemented, and the exported `JobExecutor` failed closed with
+`ErrJobExecutionUnavailable`.
 
-## Target Behavior
+## Implemented Behavior
 
 An authenticated Tenant can create one idempotent durable image-generation,
 edit, or inpaint Render Job through the stable Public API. The request passes
@@ -21,6 +21,11 @@ attempt, durably captures an immutable result manifest, places the output Asset,
 and only then publishes `completed`. Queue redelivery, stale workers, uncertain
 commit state, cancellation, recovery, and output-delivery retry cannot create a
 replacement render.
+
+The completed slice is available on `feature/issue-54-routed-render-jobs` at
+product commit `5a12b9c`. Production remains fail closed until durable Render
+stores, a queue, a Vault credential authorizer, and a Provider Adapter are
+injected; deterministic in-memory implementations are fixture-only.
 
 ## Affected Users
 

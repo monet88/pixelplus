@@ -41,6 +41,9 @@ Worker:
 Cancellation and recovery preserve commit truth: a queued cancel never reaches
 the Provider; a running cancel first becomes `cancel_requested`; stale workers
 cannot mutate; uncertain attempts fail closed; output retry never calls render.
+If recovery sees `PayloadSent=true` but only empty/`not_started` commit evidence,
+terminal cancel records `unknown`; it preserves authoritative `not_committed`,
+`committed`, or already-`unknown` evidence.
 
 ## Interface Contract
 
@@ -63,6 +66,11 @@ implementations only. It does not select a physical database schema. Atomicity,
 fencing, idempotency, immutable manifest, and placement guarantees are expressed
 through the application-owned port methods so a future durable implementation
 cannot weaken them.
+
+Durable audit and cleanup obligations are represented on the job with markers
+for claim, output placement, terminal audit, prompt purge, admission settlement,
+and staging purge. Redelivery retries an owed obligation without reopening
+Provider execution.
 
 ## UI / Platform Impact
 
@@ -89,3 +97,6 @@ surfaces are the Go HTTP server and worker process.
    manifest and output Asset placement to be durable before completion.
 4. Let the Adapter retry full renders. Rejected because the Render Job execution
    layer is the sole retry owner.
+5. Preserve `not_started` while cancel-recovering a post-payload attempt.
+   Rejected because payload transmission means Provider commit may be unknown;
+   recording `not_started` could authorize an unsafe replacement render.

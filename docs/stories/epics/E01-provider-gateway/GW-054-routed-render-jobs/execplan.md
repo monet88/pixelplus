@@ -58,14 +58,27 @@ GitNexus pre-edit impact:
 
 ## Work Phases
 
-1. Add one failing public contract test for idempotent queued creation.
-2. Add the minimum domain and port contracts to make that slice pass.
-3. Add worker claim, lease, attempt, capture, placement, and completion slices.
-4. Add cancellation, fencing/recovery, and output-only retry slices.
-5. Add ownership, capability/health/Vault, replay, and redaction negative cases.
-6. Run focused tests after each slice and the full build/vet/test/race matrix.
-7. Run Standards + Spec review, fix findings, inspect GitNexus changes, and
-   commit locally to the feature branch.
+1. Completed: public idempotent queued creation through real composition.
+2. Completed: domain and port contracts for jobs, replay, staging, audit,
+   confidential prompt/Asset/credential injection, and safe queue references.
+3. Completed: worker claim, lease heartbeat, attempt truth, capture, placement,
+   terminal audit, cleanup, and completion through `Runtime.RunWorkers`.
+4. Completed: cancellation, fencing/recovery, output-only retry, staging expiry,
+   and no-rerender redelivery behavior.
+5. Completed: ownership, capability/health/Vault, replay, audit-before-allow,
+   readiness recovery, and redaction negative cases.
+6. Completed: focused TDD cycles and full build/vet/test/race validation.
+7. Completed: iterative Standards + Spec reviews and review-fix commits through
+   `5a12b9c`; final Standards review reported no open findings.
+
+## Delivery Checkpoint
+
+- Base: `main@2c6edb3`.
+- Product head: `5a12b9c`.
+- Scope: local feature branch only; no push or pull request.
+- GitNexus final product delta: 1,362 changed symbols, 52 affected processes,
+  `CRITICAL` aggregate risk because the vertical slice crosses public HTTP,
+  composition, worker, persistence, Vault, and Asset flows.
 
 ## Stop Conditions
 
