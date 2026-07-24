@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/application"
+	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/observability"
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/persistence"
 	vaultpkg "github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/vault"
@@ -31,6 +32,11 @@ type Config struct {
 	// state. Either this or an explicit Accounts port is required so production
 	// never silently loses cooldowns and recovery permits across restarts.
 	ProviderAccountStorePath string
+	// AllowInMemoryRenderJobs permits the process-local MemoryRenderJobStore
+	// when RenderJobs is nil. Production must leave this false so a missing
+	// durable job store fails closed (UnavailableRenderJobStore). Contract
+	// fixtures set true for controlled in-process proofs only.
+	AllowInMemoryRenderJobs bool
 }
 
 // Dependencies contains the controlled foundation ports owned by this slice.
@@ -97,6 +103,29 @@ type Dependencies struct {
 	AssetMetadata ports.AssetMetadataStore
 	AssetContent  ports.AssetContentStore
 	AssetAudit    ports.AssetAuditRecorder
+
+	// Render Job ports (#54). When a port is nil, New substitutes foundation
+	// implementations. Contract tests inject controlled fakes. RenderAdapter is
+	// the low-level controlled surface wrapped by AuthorizedRender so application
+	// never receives a port that accepts confidential material.
+	RenderJobs       ports.RenderJobStore
+	RenderReplay     ports.RenderReplayStore
+	RenderAdapter    ports.RenderAdapter
+	RenderPrompts    ports.RenderPromptStore
+	RenderStaging    ports.RenderStagingStore
+	AuthorizedRender ports.AuthorizedRender
+	RenderAudit      ports.RenderAuditRecorder
+	// RenderCredentialAuthorizer mints callback-scoped credential material for
+	// Adapter entry (ADR 0009). Production missing inject stays not-ready;
+	// AllowInMemory fixtures install a permissive fixture authorizer.
+	RenderCredentialAuthorizer ports.RenderCredentialAuthorizer
+	// RenderDigester produces keyed create fingerprints. Production without an
+	// injected digester (or fixture AllowInMemory key) fails readiness closed.
+	RenderDigester ports.RenderDigester
+	// RenderDigestKey is optional raw key material for composing an HMAC digester
+	// when RenderDigester is nil. Never logged. Empty in production without inject
+	// keeps readiness closed (no restart-unstable auto key).
+	RenderDigestKey []byte
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -213,20 +242,130 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if jobRestoreErr != nil {
 		logger.Error("gateway startup recovery failed; readiness stays closed", "error", jobRestoreErr)
 	}
-	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil && jobRestoreErr == nil)
+	// Resolve digester before readiness: only a usable digester (probe mint
+	// succeeds) counts as ready. Injected FailClosed or short keys keep Ready
+	// closed even when the digester pointer is non-nil (#54 pre-review follow-up).
+	digester, digesterUsable := resolveRenderDigester(config, dependencies)
+	dependencies.RenderDigester = digester
+
+	// Materialize controlled in-memory render ports before Restore so recovery
+	// runs on the instances that will serve product work (Standards P1-C).
+	if config.AllowInMemoryRenderJobs {
+		ensureInMemoryRenderPorts(&dependencies)
+	}
+
+	// Recovery-before-ready (P1-C): restore job/replay/prompt/staging when present.
+	// Missing production injects keep readiness closed via durability gate below;
+	// explicit Unavailable injects fail Restore and also keep readiness closed.
+	renderRestoreErr := restoreRenderPorts(startupContext, dependencies)
+	if renderRestoreErr != nil {
+		logger.Error("render durability startup recovery failed; readiness stays closed", "error", renderRestoreErr)
+	}
+
+	// ADR 0009 / P1-A/C: production without durable render ports + credential
+	// authorizer + usable digester must not advertise execution readiness.
+	// Fixtures use AllowInMemoryRenderJobs (auto memory + fixture authorizer).
+	renderDurabilityReady := digesterUsable && renderRestoreErr == nil && (config.AllowInMemoryRenderJobs ||
+		(dependencies.RenderJobs != nil &&
+			dependencies.RenderReplay != nil &&
+			dependencies.RenderPrompts != nil &&
+			dependencies.RenderStaging != nil &&
+			dependencies.RenderCredentialAuthorizer != nil))
+	if !renderDurabilityReady {
+		logger.Error("render job durability, authorizer, or usable digester not configured; readiness stays closed")
+	}
 
 	service, err := newProviderAccountService(dependencies)
 	if err != nil {
 		return nil, err
 	}
 
+	// Share one Asset metadata/content pair across AssetService and RenderService
+	// so upload→edit/inpaint sees the same same-Tenant Assets (ADR 0009 single
+	// composition root). Creating independent Memory stores per service would
+	// make Visible/Fetch miss committed uploads.
+	if dependencies.AssetMetadata == nil {
+		dependencies.AssetMetadata = persistence.NewMemoryAssetMetadataStore(dependencies.Clock)
+	}
+	if dependencies.AssetContent == nil {
+		dependencies.AssetContent = persistence.NewMemoryAssetContentStore()
+	}
+
 	assetService, err := newAssetService(dependencies)
 	if err != nil {
 		return nil, err
 	}
-	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service)
+	renderService, err := newRenderService(config, dependencies)
+	if err != nil {
+		return nil, err
+	}
+	// Wire the real JobExecutor when the render spine is available.
+	runtime.worker = renderService
+	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service, renderService)
+
+	// Pre-ready queue publication recovery (P1-C / Spec P1-3): re-arm every
+	// nonterminal SafeJobReference into the process-local runtime (including
+	// jobs already marked QueuePublished). Failure keeps Ready closed.
+	queueRecoverErr := runtime.recoverQueuePublications(startupContext)
+	if queueRecoverErr != nil {
+		logger.Error("queue publication recovery failed; readiness stays closed", "error", queueRecoverErr)
+	}
+
+	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil &&
+		jobRestoreErr == nil && renderRestoreErr == nil && queueRecoverErr == nil && renderDurabilityReady)
 
 	return runtime, nil
+}
+
+// ensureInMemoryRenderPorts installs process-local controlled render foundations
+// for fixture AllowInMemory mode before Restore/Ready evaluation.
+func ensureInMemoryRenderPorts(dependencies *Dependencies) {
+	if dependencies == nil {
+		return
+	}
+	if dependencies.RenderJobs == nil {
+		dependencies.RenderJobs = persistence.NewMemoryRenderJobStore()
+	}
+	if dependencies.RenderReplay == nil {
+		dependencies.RenderReplay = persistence.NewMemoryRenderReplayStore()
+	}
+	if dependencies.RenderPrompts == nil {
+		dependencies.RenderPrompts = vaultpkg.NewMemoryRenderPromptStore()
+	}
+	if dependencies.RenderStaging == nil {
+		dependencies.RenderStaging = persistence.NewMemoryRenderStagingStore()
+	}
+	if dependencies.RenderCredentialAuthorizer == nil {
+		dependencies.RenderCredentialAuthorizer = vaultpkg.NewPermissiveFixtureRenderCredentialAuthorizer()
+	}
+}
+
+// restoreRenderPorts runs Restorer.Restore on present required render durability
+// ports. Any non-nil candidate that does not implement ports.Restorer is a
+// fail-closed dependency error — never silently skip (Spec P1-4).
+func restoreRenderPorts(ctx context.Context, dependencies Dependencies) error {
+	var first error
+	for _, candidate := range []any{
+		dependencies.RenderJobs,
+		dependencies.RenderReplay,
+		dependencies.RenderPrompts,
+		dependencies.RenderStaging,
+	} {
+		if candidate == nil {
+			continue
+		}
+		restorer, ok := candidate.(ports.Restorer)
+		if !ok {
+			if first == nil {
+				first = ports.ErrDependencyUnavailable
+			}
+			continue
+		}
+		if err := restorer.Restore(ctx); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // newProviderAccountService wires the Provider Account request-spine service.
@@ -372,6 +511,181 @@ func newAssetService(dependencies Dependencies) (*application.AssetService, erro
 	})
 }
 
+// newRenderService wires the Render Job spine and JobExecutor. Nil ports fall
+// back to fail-closed foundations so production composition is safe by default.
+func newRenderService(config Config, dependencies Dependencies) (*application.RenderService, error) {
+	principal := dependencies.Principal
+	if principal == nil {
+		principal = persistence.NewFailClosedPrincipalStore()
+	}
+	admission := dependencies.Admission
+	if admission == nil {
+		admission = persistence.NewAlwaysAdmitStore()
+	}
+	replay := dependencies.RenderReplay
+	if replay == nil {
+		replay = persistence.NewMemoryRenderReplayStore()
+	}
+	jobs := dependencies.RenderJobs
+	if jobs == nil {
+		// Production default: fail closed. Process-local memory is not restart-
+		// durable and must not silently stand in for a foundation ledger.
+		if config.AllowInMemoryRenderJobs {
+			jobs = persistence.NewMemoryRenderJobStore()
+		} else {
+			jobs = persistence.NewUnavailableRenderJobStore()
+		}
+	}
+	staging := dependencies.RenderStaging
+	if staging == nil {
+		if config.AllowInMemoryRenderJobs {
+			staging = persistence.NewMemoryRenderStagingStore()
+		} else {
+			staging = persistence.NewUnavailableRenderStagingStore()
+		}
+	}
+	accounts := dependencies.Accounts
+	if accounts == nil {
+		accounts = persistence.NewMemoryAccountStore()
+	}
+	health := dependencies.Health
+	if health == nil {
+		health = persistence.NewMemoryHealthStore()
+	}
+	capabilities := dependencies.Capabilities
+	if capabilities == nil {
+		capabilities = vaultpkg.NewFailClosedCapabilityStore()
+	}
+	circuits := dependencies.Circuits
+	if circuits == nil {
+		circuits = persistence.NewClosedCircuitStore()
+	}
+	routing := dependencies.Routing
+	if routing == nil {
+		routing = persistence.NewMemoryRoutingPolicyStore()
+	}
+	metadata := dependencies.AssetMetadata
+	if metadata == nil {
+		metadata = persistence.NewMemoryAssetMetadataStore(dependencies.Clock)
+	}
+	content := dependencies.AssetContent
+	if content == nil {
+		content = persistence.NewMemoryAssetContentStore()
+	}
+	vault := dependencies.Vault
+	if vault == nil {
+		vault = vaultpkg.NewFailClosedCredentialVault()
+	}
+	// Confidential prompt store: production fail-closed unless controlled memory
+	// is explicitly allowed (fixtures) or injected. Never auto-create Memory when
+	// AllowInMemoryRenderJobs is false.
+	prompts := dependencies.RenderPrompts
+	if prompts == nil {
+		if config.AllowInMemoryRenderJobs {
+			prompts = vaultpkg.NewMemoryRenderPromptStore()
+		} else {
+			prompts = vaultpkg.NewFailClosedRenderPromptStore()
+		}
+	}
+	audit := dependencies.RenderAudit
+	if audit == nil {
+		audit = observability.NewSlogRenderAuditRecorder(dependencies.Logger)
+	}
+	authorized := dependencies.AuthorizedRender
+	if authorized == nil {
+		adapter := dependencies.RenderAdapter
+		if adapter == nil {
+			adapter = vaultpkg.NewFailClosedRenderAdapter()
+		}
+		// P1-A: credential capability is vault-owned; production without inject
+		// uses fail-closed authorizer (Adapter never entered). Fixtures use the
+		// permissive fixture authorizer installed by ensureInMemoryRenderPorts.
+		authorizer := dependencies.RenderCredentialAuthorizer
+		if authorizer == nil {
+			if config.AllowInMemoryRenderJobs {
+				authorizer = vaultpkg.NewPermissiveFixtureRenderCredentialAuthorizer()
+			} else {
+				authorizer = vaultpkg.NewFailClosedRenderCredentialAuthorizer()
+			}
+		}
+		if prompts != nil && adapter != nil && staging != nil {
+			// content is required so edit/inpaint can inject same-Tenant Asset
+			// bytes inside the authorized boundary without application seeing them.
+			authorized = vaultpkg.NewAuthorizedRenderService(prompts, authorizer, adapter, staging, content, audit)
+		} else {
+			authorized = vaultpkg.NewFailClosedAuthorizedRender()
+		}
+	}
+	// Digester was resolved in New for readiness; rebuild if missing (defensive).
+	digester := dependencies.RenderDigester
+	if digester == nil {
+		digester, _ = resolveRenderDigester(config, dependencies)
+	}
+	telemetry := dependencies.Telemetry
+	if telemetry == nil {
+		telemetry = observability.NewSlogTelemetryRecorder(dependencies.Logger)
+	}
+	requestLog := dependencies.RequestLog
+	if requestLog == nil {
+		requestLog = observability.NewSlogRequestLogRecorder(dependencies.Logger)
+	}
+
+	return application.NewRenderService(application.RenderDependencies{
+		Principal:    principal,
+		Admission:    admission,
+		Replay:       replay,
+		Jobs:         jobs,
+		Accounts:     accounts,
+		Health:       health,
+		Capabilities: capabilities,
+		Circuits:     circuits,
+		Routing:      routing,
+		Assets:       metadata,
+		Content:      content,
+		Staging:      staging,
+		Vault:        vault,
+		Prompts:      prompts,
+		Authorized:   authorized,
+		Digester:     digester,
+		Queue:        dependencies.Runtime,
+		Audit:        audit,
+		Telemetry:    telemetry,
+		RequestLog:   requestLog,
+		Clock:        dependencies.Clock,
+		IDs:          dependencies.IDs,
+	})
+}
+
+// resolveRenderDigester builds the digester used for product create fingerprints
+// and reports whether it can actually mint digests. Short keys and FailClosed
+// implementations are not usable for readiness.
+func resolveRenderDigester(config Config, dependencies Dependencies) (ports.RenderDigester, bool) {
+	if dependencies.RenderDigester != nil {
+		return dependencies.RenderDigester, renderDigesterUsable(dependencies.RenderDigester)
+	}
+	key := dependencies.RenderDigestKey
+	if len(key) == 0 && config.AllowInMemoryRenderJobs {
+		// Fixture-only deterministic key; never used as production default.
+		key = []byte(vaultpkg.FixtureRenderDigestKey)
+	}
+	if len(key) >= vaultpkg.MinRenderDigestKeyBytes {
+		if d, err := vaultpkg.NewHMACRenderDigester(key); err == nil {
+			return d, true
+		}
+	}
+	// Empty/weak/missing key: process may start, product digests fail closed.
+	return vaultpkg.FailClosedRenderDigester{}, false
+}
+
+// renderDigesterUsable probes whether the digester can mint a durable fingerprint.
+func renderDigesterUsable(d ports.RenderDigester) bool {
+	if d == nil {
+		return false
+	}
+	_, err := d.CreateFingerprint(domain.RenderOpImageGeneration, "ready-probe", "ready-probe", nil, "")
+	return err == nil
+}
+
 // Handler returns the real composed HTTP surface.
 func (runtime *Runtime) Handler() http.Handler {
 	return runtime.handler
@@ -392,10 +706,39 @@ func (runtime *Runtime) Ready() bool {
 	return runtime.ready.Load() && runtime.healthy.Load()
 }
 
+// RecoverQueuePublications re-arms SafeJobReference delivery for all durable
+// nonterminal jobs without a client retry. Public entry requires Ready.
+func (runtime *Runtime) RecoverQueuePublications(ctx context.Context) error {
+	if runtime == nil || !runtime.Ready() {
+		return ErrNotReady
+	}
+	return runtime.recoverQueuePublications(ctx)
+}
+
+// recoverQueuePublications is the internal recovery path used before Ready and
+// from RunWorkers. It must not check Ready (avoids circular startup guard, P1-C).
+func (runtime *Runtime) recoverQueuePublications(ctx context.Context) error {
+	if runtime == nil {
+		return ErrNotReady
+	}
+	if recoverer, ok := runtime.worker.(interface {
+		RecoverQueuePublications(context.Context) error
+	}); ok {
+		return recoverer.RecoverQueuePublications(ctx)
+	}
+	return nil
+}
+
 // RunWorkers connects safe queue references to the exported JobExecutor.
 func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 	if !runtime.Ready() {
 		return ErrNotReady
+	}
+
+	// Autonomous publication recovery before consuming the queue (#14 §3.3).
+	// Required recovery failures fail closed — never warn-and-continue (P1-C).
+	if err := runtime.recoverQueuePublications(ctx); err != nil {
+		return err
 	}
 
 	workerContext, cancelWorkers := context.WithCancel(ctx)
@@ -411,6 +754,11 @@ func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 		}
 	}()
 
+	// Handler contract (ADR 0009 / #14):
+	// - invalid SafeJobReference → discard (nil) so poison messages do not stall
+	// - ExecuteJob nil (benign non-claim / terminal / concurrent lose) → accept
+	// - durable ExecuteJob errors → propagate so JobRuntime can redeliver and
+	//   RunWorkers surfaces the failure instead of silently dropping the ref
 	err := runtime.jobs.Run(workerContext, func(ctx context.Context, reference ports.SafeJobReference) error {
 		job, err := reference.JobRef()
 		if err != nil {
@@ -418,10 +766,11 @@ func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 			return nil
 		}
 		if err := runtime.worker.ExecuteJob(ctx, job); err != nil {
-			runtime.logger.Warn("discarding failed job",
+			runtime.logger.Warn("job execution failed; propagating for redelivery",
 				"tenant_id", string(job.TenantID),
 				"job_id", string(job.JobID),
 				"error", err)
+			return err
 		}
 		return nil
 	})

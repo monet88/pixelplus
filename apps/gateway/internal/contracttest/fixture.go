@@ -74,6 +74,26 @@ type Options struct {
 	// a controlled fake proves atomic Replace mutation counts through real
 	// composition without Vault/Adapter access.
 	Routing ports.RoutingPolicyStore
+
+	// Render Job ports (#54). A nil port keeps the foundation memory/fail-closed
+	// implementations; controlled fakes prove create/claim/render/placement
+	// through real composition and the exported JobExecutor.
+	RenderJobs     ports.RenderJobStore
+	RenderReplay   ports.RenderReplayStore
+	RenderAdapter  ports.RenderAdapter
+	RenderStaging  ports.RenderStagingStore
+	RenderAudit    ports.RenderAuditRecorder
+	RenderDigester ports.RenderDigester
+	// RenderDigestKey injects key material when RenderDigester is nil.
+	RenderDigestKey []byte
+	// AllowInMemoryRenderJobs overrides the fixture default (true). Set false
+	// for production-like readiness/digester proofs.
+	AllowInMemoryRenderJobs *bool
+
+	// EnqueueFailTimes fails the first N Enqueue calls with EnqueueError (or
+	// dependency unavailable) so contract tests prove create+publication recovery.
+	EnqueueFailTimes int
+	EnqueueError     error
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -92,12 +112,24 @@ type Fixture struct {
 func NewFixture(options Options) (*Fixture, error) {
 	events := &eventLog{}
 	jobs := newControlledJobRuntime(events, options.RecoveryError, options.JobRuntimeCloseGate)
+	if options.EnqueueFailTimes > 0 {
+		jobs.enqueueFailRemaining.Store(int32(options.EnqueueFailTimes))
+		jobs.enqueueError = options.EnqueueError
+	}
 
 	clock := ports.Clock(&controlledClock{next: fixtureStartTime})
 	if options.Clock != nil {
 		clock = options.Clock
 	}
-	runtime, err := composition.New(composition.Config{}, composition.Dependencies{
+	allowInMemory := true
+	if options.AllowInMemoryRenderJobs != nil {
+		allowInMemory = *options.AllowInMemoryRenderJobs
+	}
+	runtime, err := composition.New(composition.Config{
+		// Controlled fixtures only: process-local job store is not production
+		// durable state. Production composition leaves this false and fails closed.
+		AllowInMemoryRenderJobs: allowInMemory,
+	}, composition.Dependencies{
 		Runtime: jobs,
 		Clock:   clock,
 		IDs:     &controlledIDs{},
@@ -125,6 +157,14 @@ func NewFixture(options Options) (*Fixture, error) {
 
 		Circuits: options.Circuits,
 		Routing:  options.Routing,
+
+		RenderJobs:      options.RenderJobs,
+		RenderReplay:    options.RenderReplay,
+		RenderAdapter:   options.RenderAdapter,
+		RenderStaging:   options.RenderStaging,
+		RenderAudit:     options.RenderAudit,
+		RenderDigester:  options.RenderDigester,
+		RenderDigestKey: options.RenderDigestKey,
 	})
 	if err != nil {
 		return nil, err
@@ -162,6 +202,13 @@ func (fixture *Fixture) WorkersStarted() <-chan struct{} {
 // Events returns a concurrency-safe copy of lifecycle observations.
 func (fixture *Fixture) Events() []string {
 	return fixture.events.values()
+}
+
+// EnqueuedReferences returns SafeJobReference values accepted by the fixture
+// job runtime. Used by Render Job contract tests to prove one secret-free
+// enqueue per admitted create without inspecting private application state.
+func (fixture *Fixture) EnqueuedReferences() []ports.SafeJobReference {
+	return fixture.jobs.EnqueuedReferences()
 }
 
 // Close shuts down HTTP first, then delegates reverse resource closure to Runtime.
@@ -232,6 +279,21 @@ type controlledJobRuntime struct {
 
 	startOnce sync.Once
 	doneOnce  sync.Once
+
+	// enqueueMu protects observation log + delivery backlog + publication set.
+	// enqueueRefs is append-only history for "exactly one publication" proofs
+	// (first logical accept only). pending is the delivery backlog for Run.
+	enqueueMu   sync.Mutex
+	enqueueRefs []ports.SafeJobReference
+	pending     []ports.SafeJobReference
+	published   map[string]struct{}
+	// wakeup signals Run that pending grew (buffered 1; nonblocking Enqueue).
+	wakeup chan struct{}
+	// enqueueFailRemaining, when >0, fails the next Enqueue calls with
+	// enqueueError (or ErrDependencyUnavailable) then decrements — used to
+	// prove durable create + publication recovery (#14 §3.3).
+	enqueueFailRemaining atomic.Int32
+	enqueueError         error
 }
 
 func newControlledJobRuntime(events *eventLog, recoveryError error, closeGate <-chan struct{}) *controlledJobRuntime {
@@ -241,6 +303,8 @@ func newControlledJobRuntime(events *eventLog, recoveryError error, closeGate <-
 		closeGate:     closeGate,
 		started:       make(chan struct{}),
 		done:          make(chan struct{}),
+		wakeup:        make(chan struct{}, 1),
+		published:     make(map[string]struct{}),
 	}
 }
 
@@ -249,26 +313,128 @@ func (runtime *controlledJobRuntime) Restore(context.Context) error {
 	return runtime.recoveryError
 }
 
+func controlledPublicationKey(reference ports.SafeJobReference) string {
+	return string(reference.TenantID) + "/" + string(reference.JobID)
+}
+
 func (runtime *controlledJobRuntime) Enqueue(_ context.Context, reference ports.SafeJobReference) (ports.EnqueueReceipt, error) {
 	if _, err := reference.JobRef(); err != nil {
 		return ports.EnqueueReceipt{}, err
 	}
+	if remaining := runtime.enqueueFailRemaining.Load(); remaining > 0 {
+		if runtime.enqueueFailRemaining.CompareAndSwap(remaining, remaining-1) {
+			runtime.events.add("job_runtime.enqueue_fail")
+			err := runtime.enqueueError
+			if err == nil {
+				err = ports.ErrDependencyUnavailable
+			}
+			return ports.EnqueueReceipt{}, err
+		}
+	}
+	// Nonblocking + idempotent by SafeJobReference identity (matches jobs.Runtime).
+	runtime.enqueueMu.Lock()
+	if runtime.published == nil {
+		runtime.published = make(map[string]struct{})
+	}
+	key := controlledPublicationKey(reference)
+	if _, seen := runtime.published[key]; seen {
+		if !runtime.hasPendingLocked(key) {
+			runtime.pending = append(runtime.pending, reference)
+			runtime.enqueueMu.Unlock()
+			runtime.signalWakeup()
+			return ports.EnqueueReceipt{Reference: reference}, nil
+		}
+		runtime.enqueueMu.Unlock()
+		return ports.EnqueueReceipt{Reference: reference}, nil
+	}
+	runtime.published[key] = struct{}{}
+	runtime.enqueueRefs = append(runtime.enqueueRefs, reference)
+	runtime.pending = append(runtime.pending, reference)
+	runtime.enqueueMu.Unlock()
+	runtime.events.add("job_runtime.enqueue")
+	runtime.signalWakeup()
 	return ports.EnqueueReceipt{Reference: reference}, nil
 }
 
-func (runtime *controlledJobRuntime) Run(ctx context.Context, _ ports.JobHandler) error {
+func (runtime *controlledJobRuntime) hasPendingLocked(key string) bool {
+	for _, ref := range runtime.pending {
+		if controlledPublicationKey(ref) == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (runtime *controlledJobRuntime) signalWakeup() {
+	select {
+	case runtime.wakeup <- struct{}{}:
+	default:
+	}
+}
+
+func (runtime *controlledJobRuntime) takePending() (ports.SafeJobReference, bool) {
+	runtime.enqueueMu.Lock()
+	defer runtime.enqueueMu.Unlock()
+	if len(runtime.pending) == 0 {
+		return ports.SafeJobReference{}, false
+	}
+	ref := runtime.pending[0]
+	runtime.pending = runtime.pending[1:]
+	return ref, true
+}
+
+func (runtime *controlledJobRuntime) requeueFront(reference ports.SafeJobReference) {
+	runtime.enqueueMu.Lock()
+	runtime.pending = append([]ports.SafeJobReference{reference}, runtime.pending...)
+	runtime.enqueueMu.Unlock()
+}
+
+// EnqueuedReferences returns a copy of SafeJobReference values accepted by Enqueue.
+// Only first logical accepts are recorded (idempotent re-Enqueue does not grow this).
+func (runtime *controlledJobRuntime) EnqueuedReferences() []ports.SafeJobReference {
+	runtime.enqueueMu.Lock()
+	defer runtime.enqueueMu.Unlock()
+	return append([]ports.SafeJobReference(nil), runtime.enqueueRefs...)
+}
+
+// Run delivers accepted SafeJobReference values to handler so
+// composition.Runtime.RunWorkers can invoke the exported JobExecutor.
+// Enqueue before or during Run is supported without deadlock. Handler errors
+// requeue the same reference (at-least-once) and surface to the Run caller.
+func (runtime *controlledJobRuntime) Run(ctx context.Context, handler ports.JobHandler) error {
 	runtime.running.Store(true)
 	runtime.events.add("job_runtime.run")
 	runtime.startOnce.Do(func() {
 		close(runtime.started)
 	})
+	defer func() {
+		runtime.doneOnce.Do(func() {
+			close(runtime.done)
+		})
+	}()
 
-	<-ctx.Done()
-	runtime.events.add("job_runtime.canceled")
-	runtime.doneOnce.Do(func() {
-		close(runtime.done)
-	})
-	return ctx.Err()
+	if handler == nil {
+		<-ctx.Done()
+		runtime.events.add("job_runtime.canceled")
+		return ctx.Err()
+	}
+
+	for {
+		reference, ok := runtime.takePending()
+		if !ok {
+			select {
+			case <-ctx.Done():
+				runtime.events.add("job_runtime.canceled")
+				return ctx.Err()
+			case <-runtime.wakeup:
+				continue
+			}
+		}
+		if err := handler(ctx, reference); err != nil {
+			runtime.requeueFront(reference)
+			return err
+		}
+	}
 }
 
 func (runtime *controlledJobRuntime) Close(ctx context.Context) error {

@@ -29,6 +29,13 @@ const (
 	// ScopeRoutingManage authorizes atomic replacement of the Tenant singleton
 	// Routing Policy (routing/fallback/affinity/leases §8.4; OpenAPI replaceRoutingPolicy).
 	ScopeRoutingManage Scope = "routing.manage"
+	// Image and job scopes (#8 section 5.2, ADR 0009 operation matrix).
+	// Generation create requires images.generate; edit/inpaint require images.edit;
+	// status read requires jobs.read; cancel and output retry require jobs.manage.
+	ScopeImagesGenerate Scope = "images.generate"
+	ScopeImagesEdit     Scope = "images.edit"
+	ScopeJobsRead       Scope = "jobs.read"
+	ScopeJobsManage     Scope = "jobs.manage"
 )
 
 // ScopeSet is the set of operation ids granted to a Security Principal.

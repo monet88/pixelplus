@@ -56,12 +56,20 @@ func (store *stubPrincipalStore) Authenticate(_ context.Context, key ports.Prese
 // stubAdmissionStore admits by default and can be configured to reject at a
 // named normative stage. It counts admit/reconcile so a test can prove that a
 // rejected or non-enumerating request never debited admission.
+// SettlementKey Reconcile is logically idempotent: only the first settle per
+// key increments logicalSettleCount (occupancy release effect).
 type stubAdmissionStore struct {
 	log            *spineLog
 	rejectStage    ports.AdmissionStage
 	admitErr       error
 	admitCalls     atomic.Int32
 	reconcileCalls atomic.Int32
+	// logicalSettleCount counts first-time keyed settles only.
+	logicalSettleCount atomic.Int32
+	mu                 sync.Mutex
+	settledKeys        map[string]struct{}
+	// failMarker is unused on admit store; tests may inject settleErr.
+	settleErr error
 }
 
 func (store *stubAdmissionStore) Admit(_ context.Context, request ports.AdmissionRequest) (ports.AdmissionDecision, ports.AdmissionReservation, error) {
@@ -74,12 +82,28 @@ func (store *stubAdmissionStore) Admit(_ context.Context, request ports.Admissio
 		return ports.AdmissionDecision{Admitted: false, Stage: store.rejectStage}, ports.AdmissionReservation{}, nil
 	}
 	return ports.AdmissionDecision{Admitted: true},
-		ports.AdmissionReservation(request),
+		ports.AdmissionReservation{Principal: request.Principal, Operation: request.Operation},
 		nil
 }
 
-func (store *stubAdmissionStore) Reconcile(context.Context, ports.AdmissionReservation) error {
+func (store *stubAdmissionStore) Reconcile(_ context.Context, reservation ports.AdmissionReservation) error {
 	store.reconcileCalls.Add(1)
+	if store.settleErr != nil {
+		return store.settleErr
+	}
+	if reservation.SettlementKey == "" {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.settledKeys == nil {
+		store.settledKeys = make(map[string]struct{})
+	}
+	if _, ok := store.settledKeys[reservation.SettlementKey]; ok {
+		return nil
+	}
+	store.settledKeys[reservation.SettlementKey] = struct{}{}
+	store.logicalSettleCount.Add(1)
 	return nil
 }
 
