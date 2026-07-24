@@ -238,10 +238,20 @@ type RenderPromptStore interface {
 	Delete(context.Context, RenderPromptAccess) error
 }
 
+// RenderCapturePlan names the staging identities for one authorized render so
+// Provider output bytes are written only into RenderStagingStore inside the
+// protected boundary (ADR 0009).
+type RenderCapturePlan struct {
+	TenantID   domain.TenantID
+	JobID      domain.Identifier
+	AttemptID  domain.AttemptID
+	ManifestID domain.ResultManifestID
+}
+
 // AuthorizedRenderRequest is the application-facing request for one upstream
-// render. It carries only safe identities and the job reference so the
-// authorized port can resolve Vault credential + confidential prompt material
-// internally. Application never supplies prompt or credential plaintext.
+// render. It carries only safe identities so the authorized port can resolve
+// Vault credential, confidential prompt, and staging capture internally.
+// Application never supplies or receives prompt/credential/output plaintext.
 type AuthorizedRenderRequest struct {
 	Principal  domain.SecurityPrincipal
 	JobRef     domain.JobRef
@@ -249,12 +259,13 @@ type AuthorizedRenderRequest struct {
 	AuthMode   domain.AuthMode
 	Version    int
 	Invocation domain.RenderInvocation
+	Capture    RenderCapturePlan
 }
 
 // AuthorizedRender is the protected execution boundary for one render attempt.
-// Implementations resolve credential (Vault) and prompt (confidential store)
-// inside the port and inject them into the Adapter without returning plaintext
-// to application code (ADR 0009 CredentialVault.Render / confidential ports).
+// Implementations resolve credential (Vault), prompt (confidential store), and
+// stage Provider outputs into RenderStagingStore via a capture sink. Application
+// receives only safe RenderOutcome metadata (ADR 0009).
 type AuthorizedRender interface {
 	Render(context.Context, AuthorizedRenderRequest) (domain.RenderOutcome, error)
 }
@@ -270,20 +281,23 @@ type RenderCommand struct {
 }
 
 // PromptInjection grants the Adapter a single-call, Use-scoped view of prompt
-// plaintext constructed only inside AuthorizedRender. Application never obtains
-// a populated injection; credential plaintext remains Vault-owned and is not
-// exposed here when CredentialVault only supports Validate.
+// plaintext constructed only inside AuthorizedRender.
 type PromptInjection interface {
-	// Use invokes fn with prompt plaintext for this call frame only. The
-	// plaintext must not be retained by the Adapter beyond the call.
 	Use(func(plaintext string) error) error
 }
 
+// RenderCaptureSink receives Provider output bytes only inside the authorized
+// infrastructure boundary. Accept stages bytes and records safe entry metadata;
+// application never sees the byte slices.
+type RenderCaptureSink interface {
+	Accept(position int, contentType string, data []byte) error
+}
+
 // RenderAdapter runs one controlled generation/edit/inpaint attempt after the
-// authorized boundary has resolved secrets. Prompt is injected only via
-// PromptInjection for this call. Application must not call this port directly.
+// authorized boundary has resolved secrets. Prompt is injected via
+// PromptInjection; output bytes go only to RenderCaptureSink.
 type RenderAdapter interface {
-	Render(context.Context, RenderCommand, PromptInjection) (domain.RenderOutcome, error)
+	Render(context.Context, RenderCommand, PromptInjection, RenderCaptureSink) (domain.RenderOutcome, error)
 }
 
 // RenderAuditAction names a Render Job product/security audit event.

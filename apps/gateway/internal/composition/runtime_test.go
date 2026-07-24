@@ -113,7 +113,10 @@ func TestRunWorkersDoesNotPropagateHandlerErrors(t *testing.T) {
 		},
 		delivered: make(chan struct{}),
 	}
-	runtime, err := composition.New(composition.Config{}, composition.Dependencies{
+	runtime, err := composition.New(composition.Config{
+		// Worker delivery proof needs Ready(); controlled in-memory render durability.
+		AllowInMemoryRenderJobs: true,
+	}, composition.Dependencies{
 		Runtime:  jobs,
 		Clock:    inertClock{},
 		IDs:      inertIDs{},
@@ -121,6 +124,9 @@ func TestRunWorkersDoesNotPropagateHandlerErrors(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
+	}
+	if !runtime.Ready() {
+		t.Fatal("Ready() = false, want true for RunWorkers proof")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

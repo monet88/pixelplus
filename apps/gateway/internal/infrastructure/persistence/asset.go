@@ -97,12 +97,20 @@ func (store *MemoryAssetMetadataStore) Reserve(_ context.Context, reservation po
 }
 
 // Commit converts a prior hold to committed usage exactly once and persists the
-// immutable Asset for the owning Tenant.
+// immutable Asset for the owning Tenant. Re-commit of the same Asset ID is
+// idempotent: returns the existing row without double-counting reservation
+// (stable placement-derived ids for output Assets, #14 §8.3 / #13).
 func (store *MemoryAssetMetadataStore) Commit(_ context.Context, creation ports.AssetCreation) (domain.Asset, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
 	state := store.tenant(creation.Principal.TenantID)
+	if existing, ok := state.assets[creation.Asset.ID]; ok {
+		// Idempotent re-commit after a prior success (placement recovery).
+		// Consume the hold if still reserved so retry does not strand reserved bytes.
+		store.consumeHold(state, creation.Reservation.Bytes)
+		return existing, nil
+	}
 	store.consumeHold(state, creation.Reservation.Bytes)
 	state.committedBytes += creation.Reservation.Bytes
 	state.committedCount++

@@ -437,6 +437,19 @@ func StagingChecksum(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// StableOutputAssetID derives a deterministic Asset id from the placement key
+// so placement retries claim at most one Asset/reservation (#14 §8.3, #13).
+func StableOutputAssetID(tenant TenantID, jobID Identifier, entryID OutputEntryID) AssetID {
+	const separator = "\x1f"
+	h := sha256.New()
+	_, _ = h.Write([]byte(tenant))
+	_, _ = h.Write([]byte(separator))
+	_, _ = h.Write([]byte(jobID))
+	_, _ = h.Write([]byte(separator))
+	_, _ = h.Write([]byte(entryID))
+	return AssetID("asset_" + hex.EncodeToString(h.Sum(nil))[:32])
+}
+
 // DefaultOutputContentType is the MVP generated image media type.
 const DefaultOutputContentType = ContentTypePNG
 
@@ -454,8 +467,8 @@ const (
 )
 
 // RenderInvocation is the safe, non-secret render request the Adapter receives.
-// Prompt and Asset bytes are not carried here when the controlled Adapter uses
-// pre-seeded outcomes; production Adapters resolve content via Vault/Asset ports.
+// Prompt and Asset bytes are not carried here; bytes are captured only through
+// the protected staging sink (ADR 0009 RenderStagingStore).
 type RenderInvocation struct {
 	TenantID          TenantID
 	JobID             Identifier
@@ -467,12 +480,12 @@ type RenderInvocation struct {
 }
 
 // RenderOutcome is the safe classification returned to application code.
-// Bytes are staging material for capture, never a temporary Provider URL.
+// It never carries output bytes — only commit certainty and the immutable
+// result manifest metadata already staged under RenderStagingStore.
 type RenderOutcome struct {
-	Class       RenderOutcomeClass
-	Commit      CommitStatus
-	ContentType string
-	Outputs     [][]byte
+	Class    RenderOutcomeClass
+	Commit   CommitStatus
+	Manifest ResultManifest
 }
 
 // NowTimestamp is a convenience for tests and pure helpers.

@@ -683,7 +683,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 
 	// Job→account continuity binding for this execution (not exclusive account mutex).
 	if err := service.jobs.BindAccountLease(ctx, ref, fence, job.ProviderAccountID); err != nil {
-		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobFailed,
@@ -692,7 +692,9 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			CommitStatus: domain.CommitNotStarted,
 			ClearLease:   true,
 			Now:          service.nowTS(),
-		})
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -709,14 +711,16 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 	if current.Lifecycle == domain.JobCancelRequested {
-		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobCanceled,
 			CommitStatus: domain.CommitNotStarted,
 			ClearLease:   true,
 			Now:          service.nowTS(),
-		})
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -769,10 +773,10 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	// Payload send boundary: AuthorizedRender resolves Vault credential +
-	// confidential prompt inside its boundary. Application never supplies or
-	// receives prompt/credential plaintext on this path (ADR 0009).
+	// Payload send boundary: AuthorizedRender stages Provider bytes into
+	// RenderStagingStore and returns only safe manifest metadata (ADR 0009).
 	attempt.PayloadSent = true
+	manifestID := domain.NewResultManifestID(attempt.ID)
 	outcome, renderErr := service.authorized.Render(ctx, ports.AuthorizedRenderRequest{
 		Principal: principal,
 		JobRef:    ref,
@@ -787,82 +791,67 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			ProviderAccountID: job.ProviderAccountID,
 			CredentialVersion: job.CredentialVersion,
 		},
+		Capture: ports.RenderCapturePlan{
+			TenantID:   job.TenantID,
+			JobID:      job.JobID,
+			AttemptID:  attempt.ID,
+			ManifestID: manifestID,
+		},
 	})
 
 	if renderErr != nil {
 		// After payload transmission, absence of authoritative non-commit is unknown.
 		commit := domain.CommitUnknown
-		if errors.Is(renderErr, ports.ErrRenderAdapterUnavailable) {
-			// Fail-closed adapter before any Provider is not_committed only if
-			// we treat unavailable adapter as no payload accepted — still
-			// conservative: if PayloadSent, unknown.
-			commit = domain.CommitUnknown
-		}
 		attempt.CommitStatus = commit
 		now = service.nowTS()
-		_, _ = service.jobs.ObserveAttempt(ctx, ports.AttemptObservation{
-			JobRef:       ref,
-			FencingToken: fence,
-			Attempt:      attempt,
-			Phase:        domain.PhaseUpstream,
-			CommitStatus: commit,
-			Now:          now,
-		})
-		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-			JobRef:       ref,
-			FencingToken: fence,
-			To:           domain.JobFailed,
-			FailureStage: domain.StageDependency,
-			FailureClass: domain.ErrCodeDependencyUnavailable,
-			CommitStatus: commit,
-			ClearLease:   true,
-			Now:          now,
-		})
+		if err := service.persistAttempt(ctx, ports.AttemptObservation{
+			JobRef: ref, FencingToken: fence, Attempt: attempt,
+			Phase: domain.PhaseUpstream, CommitStatus: commit, Now: now,
+		}); err != nil {
+			return err
+		}
+		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+			FailureStage: domain.StageDependency, FailureClass: domain.ErrCodeDependencyUnavailable,
+			CommitStatus: commit, ClearLease: true, Now: now,
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
 
 	switch outcome.Class {
 	case domain.RenderOutcomeNotCommitted:
-		// Authoritative pre-commit rejection: fail without replacement in this slice.
 		attempt.CommitStatus = domain.CommitNotCommitted
-		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-			JobRef:       ref,
-			FencingToken: fence,
-			To:           domain.JobFailed,
-			FailureStage: domain.StageInternal,
-			FailureClass: domain.ErrCodeInternal,
-			CommitStatus: domain.CommitNotCommitted,
-			ClearLease:   true,
-			Now:          service.nowTS(),
-		})
+		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+			FailureStage: domain.StageInternal, FailureClass: domain.ErrCodeInternal,
+			CommitStatus: domain.CommitNotCommitted, ClearLease: true, Now: service.nowTS(),
+		}); err != nil {
+			return err
+		}
 		return nil
 	case domain.RenderOutcomeUnknown:
 		attempt.CommitStatus = domain.CommitUnknown
-		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-			JobRef:       ref,
-			FencingToken: fence,
-			To:           domain.JobFailed,
-			FailureStage: domain.StageRecovery,
-			FailureClass: domain.ErrCodeInternal,
-			CommitStatus: domain.CommitUnknown,
-			ClearLease:   true,
-			Now:          service.nowTS(),
-		})
+		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+			FailureStage: domain.StageRecovery, FailureClass: domain.ErrCodeInternal,
+			CommitStatus: domain.CommitUnknown, ClearLease: true, Now: service.nowTS(),
+		}); err != nil {
+			return err
+		}
 		return nil
 	case domain.RenderOutcomeSuccess, domain.RenderOutcomeCommitted:
-		// fall through to capture
+		// fall through — bytes already staged; only metadata remains
 	default:
 		attempt.CommitStatus = domain.CommitUnknown
-		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-			JobRef:       ref,
-			FencingToken: fence,
-			To:           domain.JobFailed,
-			FailureStage: domain.StageInternal,
-			FailureClass: domain.ErrCodeInternal,
-			CommitStatus: domain.CommitUnknown,
-			ClearLease:   true,
-			Now:          service.nowTS(),
-		})
+		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+			FailureStage: domain.StageInternal, FailureClass: domain.ErrCodeInternal,
+			CommitStatus: domain.CommitUnknown, ClearLease: true, Now: service.nowTS(),
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -872,87 +861,27 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 	if current.Lifecycle == domain.JobCancelRequested {
-		// Spec: if result already in hand we still capture then decide; for
-		// simplicity with CAS, cancel_requested before capture suppresses completed.
-		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-			JobRef:       ref,
-			FencingToken: fence,
-			To:           domain.JobCanceled,
-			CommitStatus: domain.CommitCommitted,
-			ClearLease:   true,
-			Now:          service.nowTS(),
-		})
-		return nil
-	}
-
-	outputs := outcome.Outputs
-	if len(outputs) == 0 {
-		// Committed success without capturable bytes is fail-closed capture
-		// failure — never synthesize fixture PNG in production domain/app.
-		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-			JobRef:       ref,
-			FencingToken: fence,
-			To:           domain.JobFailed,
-			FailureStage: domain.StageInternal,
-			FailureClass: domain.ErrCodeInternal,
-			CommitStatus: domain.CommitCommitted,
-			ClearLease:   true,
-			Now:          service.nowTS(),
-		})
-		return nil
-	}
-	contentType := outcome.ContentType
-	if contentType == "" {
-		contentType = domain.DefaultOutputContentType
-	}
-
-	entries := make([]domain.OutputEntry, 0, len(outputs))
-	for i, data := range outputs {
-		checksum := domain.StagingChecksum(data)
-		entries = append(entries, domain.OutputEntry{
-			ID:            domain.NewOutputEntryID(job.JobID, i),
-			Position:      i,
-			DeliveryState: domain.OutputPending,
-			ContentType:   contentType,
-			ByteSize:      int64(len(data)),
-			Checksum:      checksum,
-		})
-	}
-	manifest := domain.ResultManifest{
-		ID:              domain.NewResultManifestID(attempt.ID),
-		AttemptID:       attempt.ID,
-		Entries:         entries,
-		StagingChecksum: entries[0].Checksum,
-		CapturedAt:      domain.NewTimestamp(service.clock.Now()),
-	}
-
-	// Stage result bytes through the injected RenderStagingStore (Tenant +
-	// manifest + entry + checksum). Never use package-global maps.
-	for i, entry := range entries {
-		if err := service.staging.Put(ctx, ports.StagingPut{
-			Identity: ports.StagingIdentity{
-				TenantID:   job.TenantID,
-				JobID:      job.JobID,
-				ManifestID: manifest.ID,
-				EntryID:    entry.ID,
-				Checksum:   entry.Checksum,
-			},
-			ContentType: contentType,
-			Data:        outputs[i],
+		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+			JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
+			CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
 		}); err != nil {
-			_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-				JobRef:       ref,
-				FencingToken: fence,
-				To:           domain.JobFailed,
-				FailureStage: domain.StageDependency,
-				FailureClass: domain.ErrCodeDependencyUnavailable,
-				CommitStatus: domain.CommitCommitted,
-				ClearLease:   true,
-				Now:          service.nowTS(),
-			})
-			return nil
+			return err
 		}
+		return nil
 	}
+
+	manifest := outcome.Manifest
+	if manifest.ID == "" || len(manifest.Entries) == 0 {
+		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+			FailureStage: domain.StageInternal, FailureClass: domain.ErrCodeInternal,
+			CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
+		}); err != nil {
+			return err
+		}
+		return nil
+	}
+	manifest.CapturedAt = service.nowTS()
 
 	if _, err := service.jobs.CaptureManifest(ctx, ports.ManifestCapture{
 		JobRef:       ref,
@@ -967,58 +896,70 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	// Application owns Asset Reserve/Commit/Put; job store only records the result.
-	// Storage-cap is a placement/delivery outcome, not a Provider render class.
+	// Application owns Asset Reserve/Commit/Put via stable placement ids;
+	// job store only records the result. Storage-cap is placement/delivery only.
 	jobAfter, err := service.jobs.Load(ctx, ref)
 	if err != nil {
 		return err
 	}
 	for _, entry := range jobAfter.OutputEntries {
 		if placeErr := service.placeEntryFromStaging(ctx, principal, jobAfter, entry, fence); placeErr != nil {
-			// Storage cap: remain completed with pending delivery later.
 			if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
-				_, _ = service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
-					JobRef:              ref,
-					FencingToken:        fence,
-					EntryID:             entry.ID,
+				if _, err := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
+					JobRef: ref, FencingToken: fence, EntryID: entry.ID,
 					DeliveryStateForced: domain.OutputPending,
 					FailureClass:        string(domain.ErrCodeStorageCapExceeded),
 					Now:                 service.nowTS(),
-				})
+				}); err != nil {
+					if errors.Is(err, domain.ErrStaleFence) {
+						return nil
+					}
+					return err
+				}
 				continue
 			}
-			_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-				JobRef:       ref,
-				FencingToken: fence,
-				To:           domain.JobFailed,
-				FailureStage: domain.StageAsset,
-				FailureClass: domain.ErrCodeInternal,
-				CommitStatus: domain.CommitCommitted,
-				ClearLease:   true,
-				Now:          service.nowTS(),
-			})
+			if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+				JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+				FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeInternal,
+				CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
+			}); err != nil {
+				return err
+			}
 			return nil
 		}
 	}
 
 	completeAt := service.nowTS()
-	_, err = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
-		JobRef:       ref,
-		FencingToken: fence,
-		To:           domain.JobCompleted,
+	if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		JobRef: ref, FencingToken: fence, To: domain.JobCompleted,
 		CommitStatus: domain.CommitCommitted,
 		Progress: domain.JobProgress{
-			Source:    domain.ProgressEstimated,
-			Value:     100,
-			UpdatedAt: completeAt,
+			Source: domain.ProgressEstimated, Value: 100, UpdatedAt: completeAt,
 		},
-		ClearLease: true,
-		Now:        completeAt,
-	})
-	if err != nil && !errors.Is(err, domain.ErrStaleFence) {
+		ClearLease: true, Now: completeAt,
+	}); err != nil {
 		return err
 	}
 	return nil
+}
+
+// persistAttempt records attempt observation; only ErrStaleFence is discarded.
+func (service *RenderService) persistAttempt(ctx context.Context, observation ports.AttemptObservation) error {
+	_, err := service.jobs.ObserveAttempt(ctx, observation)
+	if err != nil && errors.Is(err, domain.ErrStaleFence) {
+		return nil
+	}
+	return err
+}
+
+// persistTerminal applies a terminal transition; only ErrStaleFence is discarded.
+// Other durable mutation errors return so redelivery can recover without a second render.
+func (service *RenderService) persistTerminal(ctx context.Context, tenant domain.TenantID, transition ports.FencedTransition) error {
+	_, err := service.fencedTerminal(ctx, tenant, transition)
+	if err != nil && errors.Is(err, domain.ErrStaleFence) {
+		return nil
+	}
+	return err
 }
 
 func (service *RenderService) nowTS() domain.Timestamp {
@@ -1069,21 +1010,34 @@ func (service *RenderService) placeOutputBytes(
 	data []byte,
 	fence domain.FencingToken,
 ) error {
+	// Stable placement-derived Asset ID: retries claim at most one Asset.
+	stableID := domain.StableOutputAssetID(job.TenantID, job.JobID, entry.ID)
+	if existing, err := service.assets.Visible(ctx, principal, stableID); err == nil {
+		_, err = service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
+			JobRef: job.JobRef(), FencingToken: fence, EntryID: entry.ID,
+			Asset: existing, Now: service.nowTS(),
+		})
+		return err
+	}
+
 	byteSize := int64(len(data))
 	sum := sha256.Sum256(data)
 	checksum := hex.EncodeToString(sum[:])
 	hold := ports.AssetReservation{TenantID: job.TenantID, Bytes: byteSize}
 	if err := service.assets.Reserve(ctx, hold); err != nil {
-		return err
-	}
-	assetID, err := service.ids.New(domain.IdentifierKindAsset)
-	if err != nil {
-		_ = service.assets.Release(ctx, hold)
+		// Recovery: prior attempt may have committed the Asset after reserve.
+		if existing, visErr := service.assets.Visible(ctx, principal, stableID); visErr == nil {
+			_, err = service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
+				JobRef: job.JobRef(), FencingToken: fence, EntryID: entry.ID,
+				Asset: existing, Now: service.nowTS(),
+			})
+			return err
+		}
 		return err
 	}
 	now := domain.NewTimestamp(service.clock.Now())
 	asset := domain.Asset{
-		ID:             domain.AssetID(assetID),
+		ID:             stableID,
 		TenantID:       job.TenantID,
 		Kind:           domain.AssetKindOutput,
 		ContentType:    entry.ContentType,
@@ -1099,9 +1053,26 @@ func (service *RenderService) placeOutputBytes(
 	}
 	if err := service.content.Put(ctx, asset.ID, data); err != nil {
 		_ = service.assets.Release(ctx, hold)
+		// Content put failed: if metadata already exists from a prior attempt, recover.
+		if existing, visErr := service.assets.Visible(ctx, principal, stableID); visErr == nil {
+			_, err = service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
+				JobRef: job.JobRef(), FencingToken: fence, EntryID: entry.ID,
+				Asset: existing, Now: service.nowTS(),
+			})
+			return err
+		}
 		return err
 	}
-	if _, err := service.assets.Commit(ctx, ports.AssetCreation{Principal: principal, Asset: asset, Reservation: hold}); err != nil {
+	committed, err := service.assets.Commit(ctx, ports.AssetCreation{Principal: principal, Asset: asset, Reservation: hold})
+	if err != nil {
+		// Do not Release if Asset may already be committed under stable id.
+		if existing, visErr := service.assets.Visible(ctx, principal, stableID); visErr == nil {
+			_, placeErr := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
+				JobRef: job.JobRef(), FencingToken: fence, EntryID: entry.ID,
+				Asset: existing, Now: service.nowTS(),
+			})
+			return placeErr
+		}
 		_ = service.assets.Release(ctx, hold)
 		return err
 	}
@@ -1109,9 +1080,11 @@ func (service *RenderService) placeOutputBytes(
 		JobRef:       job.JobRef(),
 		FencingToken: fence,
 		EntryID:      entry.ID,
-		Asset:        asset,
+		Asset:        committed,
 		Now:          service.nowTS(),
 	})
+	// If PlaceOutput fails after Commit, return error for redelivery; next attempt
+	// Visible(stableID) and records placement only — no second reservation.
 	return err
 }
 

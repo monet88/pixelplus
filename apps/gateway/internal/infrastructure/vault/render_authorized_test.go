@@ -11,21 +11,41 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
+// stubStaging is a test-local staging store (vault may not import persistence).
+type stubStaging struct {
+	puts int
+}
+
+func (s *stubStaging) Put(_ context.Context, put ports.StagingPut) error {
+	s.puts++
+	if len(put.Data) == 0 {
+		return ports.ErrDependencyUnavailable
+	}
+	return nil
+}
+func (s *stubStaging) Use(context.Context, ports.StagingAccess, func([]byte) error) error {
+	return ports.ErrStagingNotFound
+}
+
 type capturePromptAdapter struct {
 	seen atomic.Value
 }
 
-func (a *capturePromptAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection) (domain.RenderOutcome, error) {
+func (a *capturePromptAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	if prompt != nil {
 		_ = prompt.Use(func(p string) error {
 			a.seen.Store(p)
 			return nil
 		})
 	}
+	if sink != nil {
+		if err := sink.Accept(0, domain.ContentTypePNG, []byte{0x89, 0x50, 0x4e, 0x47}); err != nil {
+			return domain.RenderOutcome{}, err
+		}
+	}
 	return domain.RenderOutcome{
-		Class:   domain.RenderOutcomeSuccess,
-		Commit:  domain.CommitCommitted,
-		Outputs: [][]byte{{0x89, 0x50, 0x4e, 0x47}},
+		Class:  domain.RenderOutcomeSuccess,
+		Commit: domain.CommitCommitted,
 	}, nil
 }
 
@@ -41,8 +61,9 @@ func TestAuthorizedRenderInjectsPromptViaUseNotCommand(t *testing.T) {
 	t.Parallel()
 
 	prompts := vaultpkg.NewMemoryRenderPromptStore()
+	staging := &stubStaging{}
 	adapter := &capturePromptAdapter{}
-	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter)
+	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, staging)
 
 	if err := prompts.Put(context.Background(), ports.RenderPromptIntake{
 		TenantID: "tenant_a",
@@ -52,16 +73,22 @@ func TestAuthorizedRenderInjectsPromptViaUseNotCommand(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// Command/request must not carry Prompt fields (compile-time via ports types).
-	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
+	outcome, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
 		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
 		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_1"},
 		AccountID: "pa_1",
 		Version:   1,
 		Invocation: domain.RenderInvocation{
-			TenantID: "tenant_a",
-			JobID:    "job_1",
-			Model:    "m",
+			TenantID:  "tenant_a",
+			JobID:     "job_1",
+			AttemptID: "att_1",
+			Model:     "m",
+		},
+		Capture: ports.RenderCapturePlan{
+			TenantID:   "tenant_a",
+			JobID:      "job_1",
+			AttemptID:  "att_1",
+			ManifestID: "man_1",
 		},
 	})
 	if err != nil {
@@ -71,6 +98,10 @@ func TestAuthorizedRenderInjectsPromptViaUseNotCommand(t *testing.T) {
 	if got != "secret-prompt-text" {
 		t.Fatalf("adapter saw %q, want secret-prompt-text", got)
 	}
+	if len(outcome.Manifest.Entries) != 1 {
+		t.Fatalf("manifest entries = %d, want 1 (bytes staged, metadata only returned)", len(outcome.Manifest.Entries))
+	}
+	// Outcome must not expose raw output bytes (field removed from domain type).
 }
 
 func TestMemoryPromptStoreDeletePurges(t *testing.T) {

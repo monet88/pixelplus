@@ -230,7 +230,19 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if jobRestoreErr != nil {
 		logger.Error("gateway startup recovery failed; readiness stays closed", "error", jobRestoreErr)
 	}
-	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil && jobRestoreErr == nil)
+	// ADR 0009: replay/job recovery (and render confidential/staging durability)
+	// must be restored before Ready. Production without explicit durable render
+	// ports or controlled in-memory mode keeps readiness closed so /readyz does
+	// not advertise execution readiness against unavailable stores.
+	renderDurabilityReady := config.AllowInMemoryRenderJobs ||
+		(dependencies.RenderJobs != nil &&
+			dependencies.RenderReplay != nil &&
+			dependencies.RenderPrompts != nil &&
+			dependencies.RenderStaging != nil)
+	if !renderDurabilityReady {
+		logger.Error("render job durability not configured; readiness stays closed")
+	}
+	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil && jobRestoreErr == nil && renderDurabilityReady)
 
 	service, err := newProviderAccountService(dependencies)
 	if err != nil {
@@ -477,9 +489,8 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 		if adapter == nil {
 			adapter = vaultpkg.NewFailClosedRenderAdapter()
 		}
-		// When prompts is fail-closed, authorized render still wires but Put/Use fail closed.
-		if prompts != nil && adapter != nil {
-			authorized = vaultpkg.NewAuthorizedRenderService(prompts, vault, adapter)
+		if prompts != nil && adapter != nil && staging != nil {
+			authorized = vaultpkg.NewAuthorizedRenderService(prompts, vault, adapter, staging)
 		} else {
 			authorized = vaultpkg.NewFailClosedAuthorizedRender()
 		}

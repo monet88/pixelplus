@@ -144,7 +144,7 @@ type countingRenderAdapter struct {
 	entered chan struct{}
 }
 
-func (adapter *countingRenderAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection) (domain.RenderOutcome, error) {
+func (adapter *countingRenderAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	adapter.harness.renderCalls.Add(1)
 	if prompt != nil {
 		_ = prompt.Use(func(plaintext string) error {
@@ -165,14 +165,17 @@ func (adapter *countingRenderAdapter) Render(_ context.Context, _ ports.RenderCo
 	if adapter.err != nil {
 		return domain.RenderOutcome{}, adapter.err
 	}
-	if adapter.outcome.Class != "" {
+	if adapter.outcome.Class != "" && adapter.outcome.Class != domain.RenderOutcomeSuccess && adapter.outcome.Class != domain.RenderOutcomeCommitted {
 		return adapter.outcome, nil
 	}
+	if sink != nil {
+		if err := sink.Accept(0, domain.ContentTypePNG, fixtureMinimalPNG()); err != nil {
+			return domain.RenderOutcome{}, err
+		}
+	}
 	return domain.RenderOutcome{
-		Class:       domain.RenderOutcomeSuccess,
-		Commit:      domain.CommitCommitted,
-		ContentType: domain.ContentTypePNG,
-		Outputs:     [][]byte{fixtureMinimalPNG()},
+		Class:  domain.RenderOutcomeSuccess,
+		Commit: domain.CommitCommitted,
 	}, nil
 }
 

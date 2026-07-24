@@ -11,7 +11,6 @@ import (
 // MemoryRenderPromptStore is a process-local controlled confidential prompt
 // store for fixtures. It is NOT the production default (use
 // FailClosedRenderPromptStore unless AllowInMemoryRenderJobs / explicit inject).
-// Use injects material into a callback; Delete purges terminal/rollback paths.
 type MemoryRenderPromptStore struct {
 	mu    sync.Mutex
 	byKey map[string]string
@@ -37,8 +36,7 @@ func (store *MemoryRenderPromptStore) Put(_ context.Context, intake ports.Render
 	return nil
 }
 
-// Use injects a copy of prompt plaintext into fn. Material is not returned to
-// the caller as a value and is not deleted by Use (Delete is explicit purge).
+// Use injects prompt plaintext into fn without returning it as a value.
 func (store *MemoryRenderPromptStore) Use(_ context.Context, access ports.RenderPromptAccess, fn func(plaintext string) error) error {
 	if fn == nil || access.TenantID == "" || access.JobID == "" {
 		return ports.ErrRenderAdapterUnavailable
@@ -63,20 +61,17 @@ func (store *MemoryRenderPromptStore) Delete(_ context.Context, access ports.Ren
 	return nil
 }
 
-// Len reports how many prompts are retained (test observation only).
+// Len reports retained prompt count (test observation only).
 func (store *MemoryRenderPromptStore) Len() int {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	return len(store.byKey)
 }
 
-// promptInjection is a call-scoped PromptInjection built only inside this
-// package. Application cannot obtain a populated injection from stored prompts.
 type promptInjection struct {
 	material string
 }
 
-// Use grants the Adapter one-shot access to prompt plaintext for this call.
 func (p promptInjection) Use(fn func(plaintext string) error) error {
 	if fn == nil || p.material == "" {
 		return ports.ErrRenderAdapterUnavailable
@@ -84,39 +79,100 @@ func (p promptInjection) Use(fn func(plaintext string) error) error {
 	return fn(p.material)
 }
 
-// AuthorizedRenderService is the protected render boundary. It validates the
-// credential via Vault (presence only — CredentialVault does not release
-// plaintext), Uses confidential prompt via bounded callback, and injects prompt
-// into the Adapter through PromptInjection for this call only.
+// stagingCaptureSink stages Provider output bytes into RenderStagingStore and
+// accumulates safe OutputEntry metadata. Application never sees the bytes.
+type stagingCaptureSink struct {
+	ctx     context.Context
+	staging ports.RenderStagingStore
+	plan    ports.RenderCapturePlan
+	entries []domain.OutputEntry
+}
+
+func (s *stagingCaptureSink) Accept(position int, contentType string, data []byte) error {
+	if s.staging == nil || s.plan.TenantID == "" || s.plan.JobID == "" || s.plan.ManifestID == "" {
+		return ports.ErrDependencyUnavailable
+	}
+	if len(data) == 0 {
+		return ports.ErrDependencyUnavailable
+	}
+	if contentType == "" {
+		contentType = domain.DefaultOutputContentType
+	}
+	checksum := domain.StagingChecksum(data)
+	entryID := domain.NewOutputEntryID(s.plan.JobID, position)
+	if err := s.staging.Put(s.ctx, ports.StagingPut{
+		Identity: ports.StagingIdentity{
+			TenantID:   s.plan.TenantID,
+			JobID:      s.plan.JobID,
+			ManifestID: s.plan.ManifestID,
+			EntryID:    entryID,
+			Checksum:   checksum,
+		},
+		ContentType: contentType,
+		Data:        data,
+	}); err != nil {
+		return err
+	}
+	s.entries = append(s.entries, domain.OutputEntry{
+		ID:            entryID,
+		Position:      position,
+		DeliveryState: domain.OutputPending,
+		ContentType:   contentType,
+		ByteSize:      int64(len(data)),
+		Checksum:      checksum,
+	})
+	return nil
+}
+
+func (s *stagingCaptureSink) manifest() domain.ResultManifest {
+	checksum := ""
+	if len(s.entries) > 0 {
+		checksum = s.entries[0].Checksum
+	}
+	return domain.ResultManifest{
+		ID:              s.plan.ManifestID,
+		AttemptID:       s.plan.AttemptID,
+		Entries:         append([]domain.OutputEntry(nil), s.entries...),
+		StagingChecksum: checksum,
+	}
+}
+
+// AuthorizedRenderService is the protected render boundary.
 //
-// Limitation (honest): production CredentialVault currently supports only
-// Validate/Put/Revoke — no SecretMaterial injection into the Adapter. Credential
-// plaintext remains Vault-owned and is not passed to RenderAdapter. When a real
-// Vault.Render(SecretMaterial) lands, it must inject credentials inside the
-// Vault boundary without returning them to application.
+// Limitation (honest): CredentialVault currently supports only Validate/Put/Revoke —
+// credential plaintext is not injected into the Adapter. When Vault.Render(SecretMaterial)
+// lands it must inject credentials inside the Vault without returning them to application.
 type AuthorizedRenderService struct {
 	prompts ports.RenderPromptStore
 	vault   ports.CredentialVault
 	adapter ports.RenderAdapter
+	staging ports.RenderStagingStore
 }
 
 // NewAuthorizedRenderService wires the authorized render boundary.
-// prompts and adapter must be non-nil; this constructor does not invent a
-// Memory prompt store (composition owns fail-closed vs controlled selection).
-func NewAuthorizedRenderService(prompts ports.RenderPromptStore, vault ports.CredentialVault, adapter ports.RenderAdapter) *AuthorizedRenderService {
+func NewAuthorizedRenderService(
+	prompts ports.RenderPromptStore,
+	vault ports.CredentialVault,
+	adapter ports.RenderAdapter,
+	staging ports.RenderStagingStore,
+) *AuthorizedRenderService {
 	if vault == nil {
 		vault = NewFailClosedCredentialVault()
 	}
-	return &AuthorizedRenderService{prompts: prompts, vault: vault, adapter: adapter}
+	return &AuthorizedRenderService{
+		prompts: prompts,
+		vault:   vault,
+		adapter: adapter,
+		staging: staging,
+	}
 }
 
-// Render resolves Vault Validate + confidential prompt Use inside this boundary,
-// then calls the Adapter with a call-scoped PromptInjection.
+// Render resolves Vault Validate + prompt Use, invokes the Adapter with a
+// capture sink that stages bytes, and returns only safe manifest metadata.
 func (service *AuthorizedRenderService) Render(ctx context.Context, request ports.AuthorizedRenderRequest) (domain.RenderOutcome, error) {
-	if service.prompts == nil || service.adapter == nil {
+	if service.prompts == nil || service.adapter == nil || service.staging == nil {
 		return domain.RenderOutcome{}, ports.ErrRenderAdapterUnavailable
 	}
-	// Credential presence gate — no plaintext returned (Vault-owned only).
 	if _, err := service.vault.Validate(ctx, ports.CredentialValidation{
 		Principal: request.Principal,
 		AccountID: request.AccountID,
@@ -126,15 +182,28 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 		return domain.RenderOutcome{}, err
 	}
 
+	plan := request.Capture
+	if plan.TenantID == "" {
+		plan.TenantID = domain.TenantID(request.JobRef.TenantID)
+	}
+	if plan.JobID == "" {
+		plan.JobID = request.JobRef.JobID
+	}
+	if plan.AttemptID == "" {
+		plan.AttemptID = request.Invocation.AttemptID
+	}
+	if plan.ManifestID == "" && plan.AttemptID != "" {
+		plan.ManifestID = domain.NewResultManifestID(plan.AttemptID)
+	}
+
+	sink := &stagingCaptureSink{ctx: ctx, staging: service.staging, plan: plan}
 	var outcome domain.RenderOutcome
 	var renderErr error
 	access := ports.RenderPromptAccess{
 		TenantID: domain.TenantID(request.JobRef.TenantID),
 		JobID:    request.JobRef.JobID,
 	}
-	// Bounded Use: material never assigned to application-visible fields.
 	err := service.prompts.Use(ctx, access, func(plaintext string) error {
-		// Construct injection inside this package only for this call frame.
 		injection := promptInjection{material: plaintext}
 		outcome, renderErr = service.adapter.Render(ctx, ports.RenderCommand{
 			Principal:  request.Principal,
@@ -142,16 +211,23 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 			AuthMode:   request.AuthMode,
 			Version:    request.Version,
 			Invocation: request.Invocation,
-		}, injection)
+		}, injection, sink)
 		return renderErr
 	})
 	if err != nil {
 		return domain.RenderOutcome{}, err
 	}
-	return outcome, renderErr
+	// Attach safe staged metadata for successful/committed paths.
+	if outcome.Class == domain.RenderOutcomeSuccess || outcome.Class == domain.RenderOutcomeCommitted {
+		outcome.Manifest = sink.manifest()
+		if outcome.Commit == "" {
+			outcome.Commit = domain.CommitCommitted
+		}
+	}
+	return outcome, nil
 }
 
-// FailClosedAuthorizedRender fails every render closed (no Adapter/Vault).
+// FailClosedAuthorizedRender fails every render closed.
 type FailClosedAuthorizedRender struct{}
 
 // NewFailClosedAuthorizedRender builds the fail-closed authorized render port.
@@ -164,8 +240,7 @@ func (*FailClosedAuthorizedRender) Render(context.Context, ports.AuthorizedRende
 	return domain.RenderOutcome{}, ports.ErrRenderAdapterUnavailable
 }
 
-// FailClosedRenderPromptStore rejects every confidential operation so production
-// without an explicit controlled store cannot silently retain prompts.
+// FailClosedRenderPromptStore rejects confidential operations.
 type FailClosedRenderPromptStore struct{}
 
 // NewFailClosedRenderPromptStore builds the fail-closed prompt store.
@@ -173,27 +248,14 @@ func NewFailClosedRenderPromptStore() *FailClosedRenderPromptStore {
 	return &FailClosedRenderPromptStore{}
 }
 
-// Put fails closed.
 func (*FailClosedRenderPromptStore) Put(context.Context, ports.RenderPromptIntake) error {
 	return ports.ErrDependencyUnavailable
 }
-
-// Use fails closed.
 func (*FailClosedRenderPromptStore) Use(context.Context, ports.RenderPromptAccess, func(string) error) error {
 	return ports.ErrRenderAdapterUnavailable
 }
-
-// Delete is a no-op success (nothing to purge).
 func (*FailClosedRenderPromptStore) Delete(context.Context, ports.RenderPromptAccess) error {
 	return nil
-}
-
-// emptyPromptInjection is used by fail-closed adapters that must satisfy the
-// interface without receiving material.
-type emptyPromptInjection struct{}
-
-func (emptyPromptInjection) Use(func(string) error) error {
-	return ports.ErrRenderAdapterUnavailable
 }
 
 var (
@@ -202,5 +264,5 @@ var (
 	_ ports.AuthorizedRender  = (*AuthorizedRenderService)(nil)
 	_ ports.AuthorizedRender  = (*FailClosedAuthorizedRender)(nil)
 	_ ports.PromptInjection   = promptInjection{}
-	_ ports.PromptInjection   = emptyPromptInjection{}
+	_ ports.RenderCaptureSink = (*stagingCaptureSink)(nil)
 )
