@@ -18,6 +18,8 @@ var ErrAlreadyRunning = errors.New("job runtime is already running")
 
 // Runtime is the standard-library foundation job runtime. It is intentionally
 // process-local; durable delivery remains owned by the later job-runtime slice.
+// Handler errors re-queue the same SafeJobReference for at-least-once redelivery
+// (never a new job identity) and then surface the error to the Run caller.
 type Runtime struct {
 	queue chan enqueueRequest
 	done  chan struct{}
@@ -29,6 +31,9 @@ type Runtime struct {
 	running bool
 	cancel  context.CancelFunc
 	runDone chan struct{}
+	// pending holds SafeJobReferences awaiting redelivery after a handler
+	// failure. Survives Run restarts on the same Runtime instance.
+	pending []ports.SafeJobReference
 }
 
 type enqueueRequest struct {
@@ -112,26 +117,59 @@ func (runtime *Runtime) Run(ctx context.Context, handler ports.JobHandler) error
 	}()
 
 	for {
-		select {
-		case <-runContext.Done():
-			return runContext.Err()
-		case <-runtime.done:
-			return context.Canceled
-		case request := <-runtime.queue:
+		reference, accepted, fromPending, err := runtime.nextWork(runContext)
+		if err != nil {
+			return err
+		}
+		if accepted != nil {
 			runtime.mu.Lock()
 			closing := runtime.closed || runtime.closing.Load()
 			runtime.mu.Unlock()
 			if closing {
-				request.accepted <- ErrClosed
+				accepted <- ErrClosed
 				return context.Canceled
 			}
-
-			request.accepted <- nil
-			if err := handler(runContext, request.reference); err != nil {
-				return err
+			accepted <- nil
+		}
+		if err := handler(runContext, reference); err != nil {
+			// At-least-once: keep the same safe reference for the next Run or
+			// loop cycle. Application decides whether a redelivery may render.
+			if !fromPending {
+				runtime.enqueuePending(reference)
+			} else {
+				// Failed redelivery stays pending for a subsequent Run.
+				runtime.enqueuePending(reference)
 			}
+			return err
 		}
 	}
+}
+
+// nextWork prefers redelivery backlog, then the inbound queue.
+func (runtime *Runtime) nextWork(ctx context.Context) (ports.SafeJobReference, chan error, bool, error) {
+	runtime.mu.Lock()
+	if len(runtime.pending) > 0 {
+		ref := runtime.pending[0]
+		runtime.pending = runtime.pending[1:]
+		runtime.mu.Unlock()
+		return ref, nil, true, nil
+	}
+	runtime.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ports.SafeJobReference{}, nil, false, ctx.Err()
+	case <-runtime.done:
+		return ports.SafeJobReference{}, nil, false, context.Canceled
+	case request := <-runtime.queue:
+		return request.reference, request.accepted, false, nil
+	}
+}
+
+func (runtime *Runtime) enqueuePending(reference ports.SafeJobReference) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.pending = append(runtime.pending, reference)
 }
 
 // Close stops delivery and waits for active consumers without leaking a goroutine.

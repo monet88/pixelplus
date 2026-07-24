@@ -135,9 +135,15 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 		}
 		// Expired or released fence: reclaim only when no payload was sent and
-		// commit status remains not_started. PayloadSent / non-not_started forbids
-		// a second generation (lease expiry ≠ re-render).
-		if job.CommitStatus != domain.CommitNotStarted || job.Attempt.PayloadSent {
+		// commit class still allows safe pre-commit resume (#14 §6.2–6.4).
+		// PayloadSent or committed/unknown forbids a second generation.
+		if job.Attempt.PayloadSent {
+			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
+		}
+		switch job.CommitStatus {
+		case domain.CommitNotStarted, domain.CommitNotCommitted, "":
+			// reclaim ok
+		default:
 			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 		}
 	default:

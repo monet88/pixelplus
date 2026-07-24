@@ -210,6 +210,13 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 	}
 	err = service.prompts.Use(ctx, access, func(plaintext string) error {
 		injection := promptInjection{material: plaintext}
+		// Send-boundary fact: durable PayloadSent only when Adapter entry is
+		// imminent — after Validate + confidential resolve, not earlier.
+		if request.SendBoundary != nil {
+			if markErr := request.SendBoundary.MarkPayloadSent(ctx); markErr != nil {
+				return markErr
+			}
+		}
 		outcome, renderErr = service.adapter.Render(ctx, ports.RenderCommand{
 			Principal:  request.Principal,
 			AccountID:  request.AccountID,

@@ -251,18 +251,29 @@ type RenderCapturePlan struct {
 	ManifestID domain.ResultManifestID
 }
 
+// PayloadSendBoundary records the durable fact that Provider payload
+// transmission is beginning. It is invoked only at the protected send surface
+// (immediately before Adapter.Render), never before preflight/authorization
+// so a crash prior to Adapter entry cannot falsely block lease recovery
+// (#14 §6.2–6.4).
+type PayloadSendBoundary interface {
+	MarkPayloadSent(context.Context) error
+}
+
 // AuthorizedRenderRequest is the application-facing request for one upstream
 // render. It carries only safe identities so the authorized port can resolve
 // Vault credential, confidential prompt, and staging capture internally.
 // Application never supplies or receives prompt/credential/output plaintext.
+// SendBoundary, when non-nil, is marked only immediately before Adapter entry.
 type AuthorizedRenderRequest struct {
-	Principal  domain.SecurityPrincipal
-	JobRef     domain.JobRef
-	AccountID  domain.ProviderAccountID
-	AuthMode   domain.AuthMode
-	Version    int
-	Invocation domain.RenderInvocation
-	Capture    RenderCapturePlan
+	Principal    domain.SecurityPrincipal
+	JobRef       domain.JobRef
+	AccountID    domain.ProviderAccountID
+	AuthMode     domain.AuthMode
+	Version      int
+	Invocation   domain.RenderInvocation
+	Capture      RenderCapturePlan
+	SendBoundary PayloadSendBoundary
 }
 
 // AuthorizedRender is the protected execution boundary for one render attempt.

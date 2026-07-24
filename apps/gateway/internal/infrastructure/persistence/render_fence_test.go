@@ -98,8 +98,8 @@ func TestStaleFenceRejectsTransitionAndPlacement(t *testing.T) {
 	}
 }
 
-// Lease expiry allows reclaim only when not_started and PayloadSent=false;
-// after durable PayloadSent, expiry never re-claims (no second generation).
+// Lease expiry allows reclaim when not_started and PayloadSent=false (crash
+// before Adapter entry). After durable PayloadSent, reclaim never re-renders.
 func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
 	t.Parallel()
 
@@ -137,7 +137,27 @@ func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
 		t.Fatalf("ClaimWorker1: %v", err)
 	}
 
-	// Pre-payload expiry: safe reclaim (not_started, PayloadSent false).
+	// Pre-payload: attempt ledger may exist as not_started without PayloadSent.
+	preAttempt := domain.UpstreamAttempt{
+		ID:           domain.NewAttemptID(job.JobID, 1),
+		CommitStatus: domain.CommitNotStarted,
+		PayloadSent:  false,
+		Sequence:     1,
+		CreatedAt:    claimAt,
+		UpdatedAt:    claimAt,
+	}
+	if _, err := store.ObserveAttempt(context.Background(), ports.AttemptObservation{
+		JobRef:       job.JobRef(),
+		FencingToken: claim1.FencingToken,
+		Attempt:      preAttempt,
+		Phase:        domain.PhaseUpstream,
+		CommitStatus: domain.CommitNotStarted,
+		Now:          claimAt,
+	}); err != nil {
+		t.Fatalf("ObserveAttempt pre-send: %v", err)
+	}
+
+	// Crash before Adapter entry + lease expiry: reclaim remains allowed.
 	afterExpiry := domain.NewTimestamp(base.Add(31 * time.Second))
 	claim2, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
 		WorkerID:  "worker_2",
@@ -151,10 +171,10 @@ func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
 		t.Fatalf("expected new fencing token after reclaim, got %d", claim2.FencingToken)
 	}
 
-	// Durable PayloadSent before Adapter boundary.
+	// Durable PayloadSent at Adapter entry surface only.
 	attempt := domain.UpstreamAttempt{
 		ID:           domain.NewAttemptID(job.JobID, 1),
-		CommitStatus: domain.CommitNotCommitted,
+		CommitStatus: domain.CommitNotStarted,
 		PayloadSent:  true,
 		Sequence:     1,
 		CreatedAt:    afterExpiry,
@@ -165,7 +185,7 @@ func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
 		FencingToken: claim2.FencingToken,
 		Attempt:      attempt,
 		Phase:        domain.PhaseUpstream,
-		CommitStatus: domain.CommitNotCommitted,
+		CommitStatus: domain.CommitNotStarted,
 		Now:          afterExpiry,
 	}); err != nil {
 		t.Fatalf("ObserveAttempt PayloadSent: %v", err)

@@ -57,6 +57,86 @@ func (alwaysValidVault) Validate(context.Context, ports.CredentialValidation) (p
 }
 func (alwaysValidVault) Revoke(context.Context, ports.CredentialValidation) error { return nil }
 
+// countingSendBoundary records when MarkPayloadSent is invoked.
+type countingSendBoundary struct {
+	calls atomic.Int32
+	err   error
+}
+
+func (b *countingSendBoundary) MarkPayloadSent(context.Context) error {
+	b.calls.Add(1)
+	return b.err
+}
+
+// failBeforeAdapterAuthorized fails after Validate/prompt resolve would run but
+// before SendBoundary when configured via missing prompt (prompt Use fails first).
+// failAfterMark calls SendBoundary then fails the Adapter.
+type markThenFailAdapter struct {
+	fail error
+}
+
+func (a *markThenFailAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+	return domain.RenderOutcome{}, a.fail
+}
+
+func TestPayloadSendBoundaryOnlyAtAdapterEntry(t *testing.T) {
+	t.Parallel()
+
+	prompts := vaultpkg.NewMemoryRenderPromptStore()
+	staging := &stubStaging{}
+	boundary := &countingSendBoundary{}
+	// No prompt stored → Use fails before MarkPayloadSent.
+	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, &capturePromptAdapter{}, staging)
+	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
+		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_pre"},
+		AccountID: "pa_1",
+		Version:   1,
+		Invocation: domain.RenderInvocation{
+			TenantID: "tenant_a", JobID: "job_pre", AttemptID: "att_1", Model: "m",
+		},
+		Capture: ports.RenderCapturePlan{
+			TenantID: "tenant_a", JobID: "job_pre", AttemptID: "att_1", ManifestID: "man_1",
+		},
+		SendBoundary: boundary,
+	})
+	if err == nil {
+		t.Fatal("expected failure before Adapter entry (missing prompt)")
+	}
+	if boundary.calls.Load() != 0 {
+		t.Fatalf("MarkPayloadSent calls = %d, want 0 before Adapter entry", boundary.calls.Load())
+	}
+
+	// With prompt present, boundary fires once immediately before Adapter.
+	if err := prompts.Put(context.Background(), ports.RenderPromptIntake{
+		TenantID: "tenant_a", JobID: "job_pre", Material: "p",
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	adapter := &markThenFailAdapter{fail: errors.New("adapter boom")}
+	auth = vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, staging)
+	boundary2 := &countingSendBoundary{}
+	_, err = auth.Render(context.Background(), ports.AuthorizedRenderRequest{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
+		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_pre"},
+		AccountID: "pa_1",
+		Version:   1,
+		Invocation: domain.RenderInvocation{
+			TenantID: "tenant_a", JobID: "job_pre", AttemptID: "att_1", Model: "m",
+		},
+		Capture: ports.RenderCapturePlan{
+			TenantID: "tenant_a", JobID: "job_pre", AttemptID: "att_1", ManifestID: "man_1",
+		},
+		SendBoundary: boundary2,
+	})
+	if err == nil {
+		t.Fatal("expected adapter error")
+	}
+	if boundary2.calls.Load() != 1 {
+		t.Fatalf("MarkPayloadSent calls = %d, want 1 at Adapter entry", boundary2.calls.Load())
+	}
+}
+
 func TestAuthorizedRenderInjectsPromptViaUseNotCommand(t *testing.T) {
 	t.Parallel()
 

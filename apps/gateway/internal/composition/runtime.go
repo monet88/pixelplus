@@ -572,6 +572,11 @@ func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 		}
 	}()
 
+	// Handler contract (ADR 0009 / #14):
+	// - invalid SafeJobReference → discard (nil) so poison messages do not stall
+	// - ExecuteJob nil (benign non-claim / terminal / concurrent lose) → accept
+	// - durable ExecuteJob errors → propagate so JobRuntime can redeliver and
+	//   RunWorkers surfaces the failure instead of silently dropping the ref
 	err := runtime.jobs.Run(workerContext, func(ctx context.Context, reference ports.SafeJobReference) error {
 		job, err := reference.JobRef()
 		if err != nil {
@@ -579,10 +584,11 @@ func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 			return nil
 		}
 		if err := runtime.worker.ExecuteJob(ctx, job); err != nil {
-			runtime.logger.Warn("discarding failed job",
+			runtime.logger.Warn("job execution failed; propagating for redelivery",
 				"tenant_id", string(job.TenantID),
 				"job_id", string(job.JobID),
 				"error", err)
+			return err
 		}
 		return nil
 	})

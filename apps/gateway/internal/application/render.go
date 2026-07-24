@@ -764,7 +764,8 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return nil
 	}
 
-	// Attempt ledger before payload (still not_started until send boundary).
+	// Attempt ledger before payload: CommitNotStarted + PayloadSent=false so a
+	// crash before Adapter entry remains lease-recoverable (#14 §6.2–6.4).
 	now = service.nowTS()
 	attempt := domain.UpstreamAttempt{
 		ID:                domain.NewAttemptID(job.JobID, 1),
@@ -795,49 +796,15 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	// Durable pre-send observation: commit class moves to not_committed while
-	// PayloadSent remains false until the send fact is itself persisted.
-	now = service.nowTS()
-	attempt.CommitStatus = domain.CommitNotCommitted
-	attempt.PayloadSent = false
-	attempt.UpdatedAt = now
-	if _, err := service.jobs.ObserveAttempt(ctx, ports.AttemptObservation{
-		JobRef:       ref,
-		FencingToken: fence,
-		Attempt:      attempt,
-		Phase:        domain.PhaseUpstream,
-		CommitStatus: domain.CommitNotCommitted,
-		Now:          now,
-	}); err != nil {
-		if errors.Is(err, domain.ErrStaleFence) {
-			return nil
-		}
-		return err
-	}
-
-	// Durable payload-send truth BEFORE Adapter call: once this ObserveAttempt
-	// commits, lease recovery MUST NOT start a second generation (#14 §6.2–6.4).
-	now = service.nowTS()
-	attempt.PayloadSent = true
-	attempt.UpdatedAt = now
-	if _, err := service.jobs.ObserveAttempt(ctx, ports.AttemptObservation{
-		JobRef:       ref,
-		FencingToken: fence,
-		Attempt:      attempt,
-		Phase:        domain.PhaseUpstream,
-		CommitStatus: domain.CommitNotCommitted,
-		Now:          now,
-	}); err != nil {
-		if errors.Is(err, domain.ErrStaleFence) {
-			return nil
-		}
-		return err
-	}
-
-	// Payload send boundary: AuthorizedRender stages Provider bytes into
-	// RenderStagingStore and returns only safe manifest metadata (ADR 0009).
-	// AuthMode is enforced on the protected surface (Validate + Adapter).
+	// Payload send boundary lives inside AuthorizedRender immediately before
+	// Adapter entry (SendBoundary). Application does not mark PayloadSent here.
 	manifestID := domain.NewResultManifestID(attempt.ID)
+	sendBoundary := &fencedPayloadSendBoundary{
+		service: service,
+		ref:     ref,
+		fence:   fence,
+		attempt: &attempt,
+	}
 	outcome, renderErr := service.authorized.Render(ctx, ports.AuthorizedRenderRequest{
 		Principal: principal,
 		JobRef:    ref,
@@ -859,18 +826,24 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			AttemptID:  attempt.ID,
 			ManifestID: manifestID,
 		},
+		SendBoundary: sendBoundary,
 	})
 
 	if renderErr != nil {
-		// After durable PayloadSent, absence of authoritative non-commit is unknown.
-		// Map credential usability rejects to account_not_usable when possible.
-		commit := domain.CommitUnknown
+		// Classification depends on whether the send boundary was crossed.
+		// Pre-send failures stay not_started (recoverable); post-send uncertain
+		// outcomes are unknown (no re-render).
+		commit := domain.CommitNotStarted
 		failureClass := domain.ErrCodeDependencyUnavailable
 		failureStage := domain.StageDependency
-		if errors.Is(renderErr, ports.ErrCredentialAbsent) {
-			// PayloadSent was durably true; preserve unknown (no re-render) and
-			// surface usability class for operators/clients.
+		if attempt.PayloadSent {
 			commit = domain.CommitUnknown
+		}
+		if errors.Is(renderErr, ports.ErrCredentialAbsent) {
+			// Vault reject is pre-Adapter (AuthorizedRender validates first).
+			if !attempt.PayloadSent {
+				commit = domain.CommitNotStarted
+			}
 			failureClass = domain.ErrCodeAccountNotUsable
 			failureStage = domain.StageRouting
 		}
@@ -1012,6 +985,40 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		},
 		ClearLease: true, Now: completeAt,
 	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// fencedPayloadSendBoundary records PayloadSent=true under the worker fence at
+// the protected Adapter entry surface (not before AuthorizedRender begins).
+type fencedPayloadSendBoundary struct {
+	service *RenderService
+	ref     domain.JobRef
+	fence   domain.FencingToken
+	attempt *domain.UpstreamAttempt
+}
+
+// MarkPayloadSent durably observes payload transmission beginning.
+func (b *fencedPayloadSendBoundary) MarkPayloadSent(ctx context.Context) error {
+	if b == nil || b.service == nil || b.attempt == nil {
+		return ports.ErrDependencyUnavailable
+	}
+	now := b.service.nowTS()
+	b.attempt.PayloadSent = true
+	b.attempt.UpdatedAt = now
+	// Commit remains not_started until Adapter returns an authoritative class;
+	// PayloadSent alone blocks lease reclaim re-render (#14 §6.2).
+	_, err := b.service.jobs.ObserveAttempt(ctx, ports.AttemptObservation{
+		JobRef:       b.ref,
+		FencingToken: b.fence,
+		Attempt:      *b.attempt,
+		Phase:        domain.PhaseUpstream,
+		CommitStatus: b.attempt.CommitStatus,
+		Now:          now,
+	})
+	if err != nil {
+		b.attempt.PayloadSent = false
 		return err
 	}
 	return nil
