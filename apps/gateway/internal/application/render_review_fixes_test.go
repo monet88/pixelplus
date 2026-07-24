@@ -2,6 +2,8 @@ package application_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -102,7 +104,7 @@ func (s *auditJobStore) ReleaseAccountLease(context.Context, domain.JobRef, doma
 func (s *auditJobStore) MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error) {
 	return s.job, nil
 }
-func (s *auditJobStore) ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error) {
+func (s *auditJobStore) ListQueueRecoveryCandidates(context.Context) ([]domain.RenderJob, error) {
 	return nil, nil
 }
 func (s *auditJobStore) MarkAdmissionSettled(context.Context, domain.JobRef) (domain.RenderJob, error) {
@@ -315,6 +317,12 @@ func (s *cancelRecoverStore) Transition(_ context.Context, tr ports.FencedTransi
 	if tr.CommitStatus.Valid() {
 		s.job.CommitStatus = tr.CommitStatus
 	}
+	if tr.FailureStage != "" {
+		s.job.FailureStage = tr.FailureStage
+	}
+	if tr.FailureClass != "" {
+		s.job.FailureClass = tr.FailureClass
+	}
 	return s.job, nil
 }
 
@@ -396,9 +404,9 @@ func TestCancelRequestedExpiredLeaseRecoversWithoutRender(t *testing.T) {
 	}
 }
 
-// Post-payload cancel recovery must not finalize canceled+not_started: PayloadSent
-// means the Provider may have received work, so terminal commit truth is unknown
-// unless stronger evidence already exists (#14 §6.2 / §6.4).
+// Spec P1-5: post-payload cancel recovery without abort/drain evidence must not
+// claim canceled. PayloadSent + empty/not_started commit → failed + recovery +
+// unknown; zero Provider. Pre-payload stays canceled+not_started (separate test).
 func TestCancelRequestedExpiredLeaseAfterPayloadSentFinalizesUnknown(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 24, 22, 0, 0, 0, time.UTC)
@@ -446,11 +454,70 @@ func TestCancelRequestedExpiredLeaseAfterPayloadSentFinalizesUnknown(t *testing.
 	if counter.calls.Load() != 0 {
 		t.Fatalf("Provider render calls = %d, want 0", counter.calls.Load())
 	}
-	if jobs.job.Lifecycle != domain.JobCanceled {
-		t.Fatalf("lifecycle = %v, want canceled", jobs.job.Lifecycle)
+	if jobs.job.Lifecycle != domain.JobFailed {
+		t.Fatalf("lifecycle = %v, want failed (no abort evidence after payload)", jobs.job.Lifecycle)
+	}
+	if jobs.job.FailureStage != domain.StageRecovery {
+		t.Fatalf("failure_stage = %q, want recovery", jobs.job.FailureStage)
 	}
 	if jobs.job.CommitStatus != domain.CommitUnknown {
 		t.Fatalf("commit status = %q, want unknown after payload-sent cancel recovery", jobs.job.CommitStatus)
+	}
+}
+
+// Spec P1-5: authoritative not_committed after payload may still terminalize as
+// canceled (Provider never committed; cancel is honest without status-lookup Adapter).
+func TestCancelRequestedExpiredLeaseWithNotCommittedMayCancel(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 24, 22, 30, 0, 0, time.UTC)
+	jobs := &cancelRecoverStore{}
+	job := domain.NewQueuedRenderJob(
+		"job_cr_nc", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		"d", nil, "", "pa_1", 1, "fp", "idem", domain.NewTimestamp(base),
+	)
+	job.Lifecycle = domain.JobCancelRequested
+	job.LeaseHeld = true
+	job.LeaseExpiresAt = domain.NewTimestamp(base.Add(time.Minute))
+	job.WorkerID = "w_dead"
+	job.WorkerFencingToken = 1
+	job.CommitStatus = domain.CommitNotCommitted
+	job.Attempt = domain.UpstreamAttempt{
+		ID:           domain.NewAttemptID(job.JobID, 1),
+		CommitStatus: domain.CommitNotCommitted,
+		PayloadSent:  true,
+		Sequence:     1,
+		CreatedAt:    domain.NewTimestamp(base),
+		UpdatedAt:    domain.NewTimestamp(base.Add(30 * time.Second)),
+	}
+	job.PromptPurged = true
+	job.AdmissionSettled = true
+	jobs.job = job
+	jobs.fence = 1
+
+	counter := &countingNoopAuthorized{}
+	svc, err := application.NewRenderService(application.RenderDependencies{
+		Principal: noopPrincipal{}, Admission: &keyedAdmissionStore{settled: map[string]struct{}{}},
+		Replay: noopRenderReplay{}, Jobs: jobs, Accounts: noopAccounts{}, Capabilities: noopCapabilities{},
+		Routing: noopRouting{}, Assets: noopAssets{}, Content: noopContent{}, Staging: noopStaging{},
+		Vault: noopVault{}, Prompts: &cleanupPromptStore{}, Authorized: counter, Digester: noopDigester{},
+		Queue: noopQueue{}, Audit: &failOnceAudit{}, Telemetry: noopTelemetry{}, RequestLog: noopRequestLog{},
+		Clock: fixedClock{now: base.Add(5 * time.Minute)}, IDs: fixedIDs{},
+	})
+	if err != nil {
+		t.Fatalf("NewRenderService: %v", err)
+	}
+
+	if err := svc.ExecuteJob(context.Background(), job.JobRef()); err != nil {
+		t.Fatalf("recovery ExecuteJob: %v", err)
+	}
+	if counter.calls.Load() != 0 {
+		t.Fatalf("Provider render calls = %d, want 0", counter.calls.Load())
+	}
+	if jobs.job.Lifecycle != domain.JobCanceled {
+		t.Fatalf("lifecycle = %v, want canceled when not_committed is authoritative", jobs.job.Lifecycle)
+	}
+	if jobs.job.CommitStatus != domain.CommitNotCommitted {
+		t.Fatalf("commit status = %q, want not_committed preserved", jobs.job.CommitStatus)
 	}
 }
 
@@ -566,7 +633,7 @@ func (s *loadFailStore) ReleaseAccountLease(context.Context, domain.JobRef, doma
 func (s *loadFailStore) MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error) {
 	return domain.RenderJob{}, ports.ErrDependencyUnavailable
 }
-func (s *loadFailStore) ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error) {
+func (s *loadFailStore) ListQueueRecoveryCandidates(context.Context) ([]domain.RenderJob, error) {
 	return nil, ports.ErrDependencyUnavailable
 }
 func (s *loadFailStore) MarkAdmissionSettled(context.Context, domain.JobRef) (domain.RenderJob, error) {
@@ -827,11 +894,57 @@ func (s *scriptedWorkerStore) CaptureManifest(_ context.Context, c ports.Manifes
 	s.job.OutputEntries = append([]domain.OutputEntry(nil), c.Manifest.Entries...)
 	return s.job, nil
 }
-func (s *scriptedWorkerStore) PlaceOutput(context.Context, ports.PlacementRequest) (ports.PlacementResult, error) {
+func (s *scriptedWorkerStore) PlaceOutput(_ context.Context, req ports.PlacementRequest) (ports.PlacementResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.placeCalls++
-	return ports.PlacementResult{Job: s.job}, nil
+	if req.FencingToken != 0 && req.FencingToken != s.job.WorkerFencingToken {
+		return ports.PlacementResult{}, domain.ErrStaleFence
+	}
+	for i := range s.job.OutputEntries {
+		if s.job.OutputEntries[i].ID != req.EntryID {
+			continue
+		}
+		if req.DeliveryStateForced != "" {
+			s.job.OutputEntries[i].DeliveryState = req.DeliveryStateForced
+		} else if req.Asset.ID != "" {
+			s.job.OutputEntries[i].AssetID = req.Asset.ID
+			s.job.OutputEntries[i].DeliveryState = domain.OutputAvailable
+			if req.Asset.ContentType != "" {
+				s.job.OutputEntries[i].ContentType = req.Asset.ContentType
+			}
+			if req.Asset.ByteSize > 0 {
+				s.job.OutputEntries[i].ByteSize = req.Asset.ByteSize
+			}
+			if req.Asset.Checksum != "" {
+				s.job.OutputEntries[i].Checksum = req.Asset.Checksum
+			}
+		}
+		break
+	}
+	// Keep manifest entries aligned for reloads that read Manifest.
+	for i := range s.job.Manifest.Entries {
+		if s.job.Manifest.Entries[i].ID != req.EntryID {
+			continue
+		}
+		for _, e := range s.job.OutputEntries {
+			if e.ID == req.EntryID {
+				s.job.Manifest.Entries[i] = e
+				break
+			}
+		}
+		break
+	}
+	return ports.PlacementResult{Job: s.job, Entry: entryByID(s.job.OutputEntries, req.EntryID)}, nil
+}
+
+func entryByID(entries []domain.OutputEntry, id domain.OutputEntryID) domain.OutputEntry {
+	for _, e := range entries {
+		if e.ID == id {
+			return e
+		}
+	}
+	return domain.OutputEntry{}
 }
 func (s *scriptedWorkerStore) Cancel(context.Context, ports.CancelMutation) (domain.RenderJob, error) {
 	return s.job, nil
@@ -848,7 +961,7 @@ func (s *scriptedWorkerStore) ReleaseAccountLease(context.Context, domain.JobRef
 func (s *scriptedWorkerStore) MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error) {
 	return s.job, nil
 }
-func (s *scriptedWorkerStore) ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error) {
+func (s *scriptedWorkerStore) ListQueueRecoveryCandidates(context.Context) ([]domain.RenderJob, error) {
 	return nil, nil
 }
 func (s *scriptedWorkerStore) MarkAdmissionSettled(context.Context, domain.JobRef) (domain.RenderJob, error) {
@@ -1048,5 +1161,331 @@ func TestHeartbeatRenewalFailureCancelsAdapterNoCapture(t *testing.T) {
 	}
 	if auth.calls.Load() != 1 {
 		t.Fatalf("Authorized.Render calls = %d, want 1", auth.calls.Load())
+	}
+}
+
+// --- Spec P1-2: post-placement cleanup debt must not fail business lifecycle ---
+
+// gateAudit blocks a single action until Unblock; other actions always succeed.
+type gateAudit struct {
+	mu          sync.Mutex
+	blockAction ports.RenderAuditAction
+	blocked     bool
+	actions     []ports.RenderAuditAction
+}
+
+func (a *gateAudit) Record(_ context.Context, event ports.RenderAuditEvent) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.blocked && event.Action == a.blockAction {
+		return ports.ErrDependencyUnavailable
+	}
+	a.actions = append(a.actions, event.Action)
+	return nil
+}
+
+func (a *gateAudit) Unblock() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.blocked = false
+}
+
+// placingStaging serves staged output bytes for Use and tracks Delete debt.
+type placingStaging struct {
+	mu      sync.Mutex
+	bytes   map[string][]byte
+	deletes int
+	failDel int // fail first N Deletes
+}
+
+func (s *placingStaging) key(id ports.StagingIdentity) string {
+	return string(id.TenantID) + "/" + string(id.JobID) + "/" + string(id.ManifestID) + "/" + string(id.EntryID) + "/" + id.Checksum
+}
+
+func (s *placingStaging) Put(_ context.Context, put ports.StagingPut) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bytes == nil {
+		s.bytes = make(map[string][]byte)
+	}
+	s.bytes[s.key(put.Identity)] = append([]byte(nil), put.Data...)
+	return nil
+}
+
+func (s *placingStaging) Use(_ context.Context, access ports.StagingAccess, fn func([]byte) error) error {
+	s.mu.Lock()
+	data, ok := s.bytes[s.key(access.Identity)]
+	s.mu.Unlock()
+	if !ok {
+		return ports.ErrStagingNotFound
+	}
+	return fn(append([]byte(nil), data...))
+}
+
+func (s *placingStaging) Delete(_ context.Context, id ports.StagingIdentity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deletes++
+	if s.failDel > 0 {
+		s.failDel--
+		return ports.ErrDependencyUnavailable
+	}
+	delete(s.bytes, s.key(id))
+	return nil
+}
+
+// memPlacingAssets is a minimal Reserve/Commit/Visible map for placement path.
+type memPlacingAssets struct {
+	mu   sync.Mutex
+	byID map[domain.AssetID]domain.Asset
+}
+
+func (a *memPlacingAssets) Reserve(context.Context, ports.AssetReservation) error { return nil }
+func (a *memPlacingAssets) Release(context.Context, ports.AssetReservation) error { return nil }
+func (a *memPlacingAssets) Commit(_ context.Context, c ports.AssetCreation) (domain.Asset, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.byID == nil {
+		a.byID = make(map[domain.AssetID]domain.Asset)
+	}
+	a.byID[c.Asset.ID] = c.Asset
+	return c.Asset, nil
+}
+func (a *memPlacingAssets) Visible(_ context.Context, _ domain.SecurityPrincipal, id domain.AssetID) (domain.Asset, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	asset, ok := a.byID[id]
+	if !ok {
+		return domain.Asset{}, ports.ErrAssetNotVisible
+	}
+	return asset, nil
+}
+
+type memPlacingContent struct{}
+
+func (memPlacingContent) Put(context.Context, domain.AssetID, []byte) error { return nil }
+func (memPlacingContent) Fetch(context.Context, domain.SecurityPrincipal, domain.AssetID) (ports.AssetContent, error) {
+	return ports.AssetContent{}, ports.ErrAssetNotVisible
+}
+
+// successPlacingAuthorized stages PNG bytes and returns a success manifest.
+// entryCount controls multi-output placement.
+type successPlacingAuthorized struct {
+	calls      atomic.Int32
+	staging    *placingStaging
+	entryCount int
+	png        []byte
+}
+
+func (a *successPlacingAuthorized) Render(ctx context.Context, req ports.AuthorizedRenderRequest) (domain.RenderOutcome, error) {
+	a.calls.Add(1)
+	if req.SendBoundary != nil {
+		if err := req.SendBoundary.MarkPayloadSent(ctx); err != nil {
+			return domain.RenderOutcome{}, err
+		}
+	}
+	n := a.entryCount
+	if n < 1 {
+		n = 1
+	}
+	png := a.png
+	if len(png) == 0 {
+		png = []byte{0x89, 0x50, 0x4e, 0x47}
+	}
+	sum := sha256.Sum256(png)
+	checksum := hex.EncodeToString(sum[:])
+	manifestID := req.Capture.ManifestID
+	if manifestID == "" {
+		manifestID = domain.NewResultManifestID(req.Invocation.AttemptID)
+	}
+	entries := make([]domain.OutputEntry, 0, n)
+	for i := 0; i < n; i++ {
+		entryID := domain.OutputEntryID("e" + itoaSmall(i))
+		identity := ports.StagingIdentity{
+			TenantID:   req.Capture.TenantID,
+			JobID:      req.Capture.JobID,
+			ManifestID: manifestID,
+			EntryID:    entryID,
+			Checksum:   checksum,
+		}
+		if err := a.staging.Put(ctx, ports.StagingPut{
+			Identity:    identity,
+			Data:        png,
+			ContentType: domain.ContentTypePNG,
+			ExpiresAt:   domain.NewTimestamp(req.Capture.Now.Time().Add(time.Hour)),
+		}); err != nil {
+			return domain.RenderOutcome{}, err
+		}
+		entries = append(entries, domain.OutputEntry{
+			ID:            entryID,
+			ContentType:   domain.ContentTypePNG,
+			ByteSize:      int64(len(png)),
+			Checksum:      checksum,
+			DeliveryState: domain.OutputPending,
+		})
+	}
+	return domain.RenderOutcome{
+		Class:  domain.RenderOutcomeSuccess,
+		Commit: domain.CommitCommitted,
+		Manifest: domain.ResultManifest{
+			ID:      manifestID,
+			Entries: entries,
+		},
+	}, nil
+}
+
+func itoaSmall(n int) string {
+	if n < 10 {
+		return string(rune('0' + n))
+	}
+	return string(rune('0'+n/10)) + string(rune('0'+n%10))
+}
+
+// Spec P1-2: output-placed audit fails after durable PlaceOutput on the RUNNING
+// worker path. Job must complete (not fail); Asset remains available; error is
+// cleanup debt only; redelivery cleans without a second Provider render.
+func TestPostPlacementAuditFailureCompletesWithCleanupDebt(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 25, 3, 0, 0, 0, time.UTC)
+	jobs := &scriptedWorkerStore{
+		job: domain.NewQueuedRenderJob(
+			"job_p1_2", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+			"d", nil, "", "pa_1", 1, "fp", "idem", domain.NewTimestamp(now),
+		),
+	}
+	staging := &placingStaging{}
+	assets := &memPlacingAssets{}
+	auth := &successPlacingAuthorized{staging: staging, entryCount: 1, png: []byte{0x89, 0x50, 0x4e, 0x47, 0x0d}}
+	audit := &gateAudit{blockAction: ports.AuditRenderOutputPlaced, blocked: true}
+	prompts := &cleanupPromptStore{material: map[string]string{"tenant_a/job_p1_2": "prompt"}}
+
+	svc, err := application.NewRenderService(application.RenderDependencies{
+		Principal: noopPrincipal{}, Admission: &keyedAdmissionStore{settled: map[string]struct{}{}},
+		Replay: noopRenderReplay{}, Jobs: jobs,
+		Accounts:     fixedAccountStore{account: usableReviewAccount()},
+		Capabilities: offerCapStore{now: now},
+		Routing:      noopRouting{},
+		Assets:       assets,
+		Content:      memPlacingContent{},
+		Staging:      staging,
+		Vault:        alwaysValidVault{},
+		Prompts:      prompts,
+		Authorized:   auth,
+		Digester:     noopDigester{},
+		Queue:        noopQueue{},
+		Audit:        audit,
+		Telemetry:    noopTelemetry{},
+		RequestLog:   noopRequestLog{},
+		Clock:        fixedClock{now: now},
+		IDs:          fixedIDs{},
+	})
+	if err != nil {
+		t.Fatalf("NewRenderService: %v", err)
+	}
+
+	err1 := svc.ExecuteJob(context.Background(), jobs.job.JobRef())
+	if err1 == nil {
+		t.Fatal("want retryable cleanup debt after output-placed audit failure")
+	}
+	if jobs.job.Lifecycle != domain.JobCompleted {
+		t.Fatalf("lifecycle = %v, want completed (must not flip to failed for cleanup debt)", jobs.job.Lifecycle)
+	}
+	if len(jobs.job.OutputEntries) < 1 || jobs.job.OutputEntries[0].DeliveryState != domain.OutputAvailable {
+		t.Fatalf("output entry not available after placement: %+v", jobs.job.OutputEntries)
+	}
+	if jobs.job.OutputEntries[0].AssetID == "" {
+		t.Fatal("asset_id missing after durable placement")
+	}
+	assetID := jobs.job.OutputEntries[0].AssetID
+	if _, err := assets.Visible(context.Background(), domain.SecurityPrincipal{TenantID: "tenant_a"}, assetID); err != nil {
+		t.Fatalf("Asset must remain visible: %v", err)
+	}
+	if auth.calls.Load() != 1 {
+		t.Fatalf("Provider calls after first ExecuteJob = %d, want 1", auth.calls.Load())
+	}
+
+	// Redelivery: unblock audit; cleanup only; zero additional render.
+	audit.Unblock()
+	if err := svc.ExecuteJob(context.Background(), jobs.job.JobRef()); err != nil {
+		t.Fatalf("cleanup redelivery: %v", err)
+	}
+	if auth.calls.Load() != 1 {
+		t.Fatalf("Provider calls after redelivery = %d, want 1", auth.calls.Load())
+	}
+	if jobs.job.Lifecycle != domain.JobCompleted {
+		t.Fatalf("lifecycle after redelivery = %v, want completed", jobs.job.Lifecycle)
+	}
+	if jobs.job.OutputEntries[0].AssetID != assetID {
+		t.Fatalf("asset id changed on redelivery: %q → %q", assetID, jobs.job.OutputEntries[0].AssetID)
+	}
+	if !jobs.job.OutputPlacedAudited {
+		t.Fatal("OutputPlacedAudited must be true after cleanup redelivery")
+	}
+}
+
+// Spec P1-2 multi-output: cleanup debt on first entry must not stop remaining
+// placements; all entries end available; Provider still once.
+func TestMultiOutputContinuesPlacementAfterCleanupDebt(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 25, 3, 15, 0, 0, time.UTC)
+	jobs := &scriptedWorkerStore{
+		job: domain.NewQueuedRenderJob(
+			"job_p1_2m", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+			"d", nil, "", "pa_1", 1, "fp", "idem", domain.NewTimestamp(now),
+		),
+	}
+	// First Delete fails once (entry e0 cleanup debt); e1 still places.
+	staging := &placingStaging{failDel: 1}
+	assets := &memPlacingAssets{}
+	auth := &successPlacingAuthorized{staging: staging, entryCount: 2, png: []byte{0x89, 0x50, 0x4e, 0x47, 0x0d}}
+	prompts := &cleanupPromptStore{material: map[string]string{"tenant_a/job_p1_2m": "prompt"}}
+
+	svc, err := application.NewRenderService(application.RenderDependencies{
+		Principal: noopPrincipal{}, Admission: &keyedAdmissionStore{settled: map[string]struct{}{}},
+		Replay: noopRenderReplay{}, Jobs: jobs,
+		Accounts:     fixedAccountStore{account: usableReviewAccount()},
+		Capabilities: offerCapStore{now: now},
+		Routing:      noopRouting{},
+		Assets:       assets,
+		Content:      memPlacingContent{},
+		Staging:      staging,
+		Vault:        alwaysValidVault{},
+		Prompts:      prompts,
+		Authorized:   auth,
+		Digester:     noopDigester{},
+		Queue:        noopQueue{},
+		Audit:        &failOnceAudit{}, // no failures
+		Telemetry:    noopTelemetry{},
+		RequestLog:   noopRequestLog{},
+		Clock:        fixedClock{now: now},
+		IDs:          fixedIDs{},
+	})
+	if err != nil {
+		t.Fatalf("NewRenderService: %v", err)
+	}
+
+	// First run may surface residual purge debt from finishTerminalCleanup after
+	// the first Delete fail, or clear it if finish retries successfully.
+	_ = svc.ExecuteJob(context.Background(), jobs.job.JobRef())
+	if jobs.job.Lifecycle != domain.JobCompleted {
+		t.Fatalf("lifecycle = %v, want completed (not failed on cleanup debt)", jobs.job.Lifecycle)
+	}
+	if len(jobs.job.OutputEntries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(jobs.job.OutputEntries))
+	}
+	for i, e := range jobs.job.OutputEntries {
+		if e.DeliveryState != domain.OutputAvailable || e.AssetID == "" {
+			t.Fatalf("entry[%d] not available: %+v", i, e)
+		}
+	}
+	if auth.calls.Load() != 1 {
+		t.Fatalf("Provider calls = %d, want 1", auth.calls.Load())
+	}
+	// Redelivery must not re-render.
+	if err := svc.ExecuteJob(context.Background(), jobs.job.JobRef()); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	if auth.calls.Load() != 1 {
+		t.Fatalf("Provider after redelivery = %d, want 1", auth.calls.Load())
 	}
 }

@@ -692,7 +692,7 @@ func (s *flakyClaimJobStore) MarkQueuePublished(_ context.Context, ref domain.Jo
 	s.jobs[s.key(ref)] = job
 	return job, nil
 }
-func (s *flakyClaimJobStore) ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error) {
+func (s *flakyClaimJobStore) ListQueueRecoveryCandidates(context.Context) ([]domain.RenderJob, error) {
 	return nil, nil
 }
 func (s *flakyClaimJobStore) MarkAdmissionSettled(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
@@ -1800,7 +1800,10 @@ func TestConcurrentWorkerClaimRendersOnce(t *testing.T) {
 		}()
 	}
 	for i := 0; i < 2; i++ {
-		if err := <-errCh; err != nil {
+		err := <-errCh
+		// Winner completes (nil). Concurrent loser surfaces ErrJobNotClaimable so
+		// queue redelivery retains the ref (Spec P1-1); terminal redelivery cleans up (nil).
+		if err != nil && !errors.Is(err, domain.ErrJobNotClaimable) {
 			t.Fatalf("ExecuteJob: %v", err)
 		}
 	}
@@ -1935,7 +1938,7 @@ func TestEnqueueFailureAfterCreateRecoversSameJobOnRetry(t *testing.T) {
 }
 
 // P1-2: durable create + enqueue failure recovers via autonomous recovery
-// without a second client request (startup/background RecoverUnpublishedQueues).
+// without a second client request (startup/background RecoverQueuePublications).
 // P1-3 RecoveryOnly claim is proven at the store seam (render_fence_test) and
 // ExecuteJob path (zero re-render on completed redelivery below).
 func TestUnpublishedQueueRecoversWithoutClientRetry(t *testing.T) {
@@ -1962,8 +1965,8 @@ func TestUnpublishedQueueRecoversWithoutClientRetry(t *testing.T) {
 	}
 
 	// Autonomous recovery (no client matching retry).
-	if err := h.fixture.Runtime().RecoverUnpublishedQueues(t.Context()); err != nil {
-		t.Fatalf("RecoverUnpublishedQueues: %v", err)
+	if err := h.fixture.Runtime().RecoverQueuePublications(t.Context()); err != nil {
+		t.Fatalf("RecoverQueuePublications: %v", err)
 	}
 	if n := len(h.fixture.EnqueuedReferences()); n != 1 {
 		t.Fatalf("enqueues after recovery = %d, want 1", n)

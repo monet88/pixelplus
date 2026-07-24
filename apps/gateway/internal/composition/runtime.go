@@ -303,16 +303,16 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	runtime.worker = renderService
 	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service, renderService)
 
-	// Pre-ready QueuePublished recovery (P1-C): internal path has no Ready guard
-	// so startup can re-publish without circular dependency. Failure keeps Ready
-	// closed and blocks workers — never warn-and-continue.
-	unpublishedErr := runtime.recoverUnpublishedQueues(startupContext)
-	if unpublishedErr != nil {
-		logger.Error("unpublished queue recovery failed; readiness stays closed", "error", unpublishedErr)
+	// Pre-ready queue publication recovery (P1-C / Spec P1-3): re-arm every
+	// nonterminal SafeJobReference into the process-local runtime (including
+	// jobs already marked QueuePublished). Failure keeps Ready closed.
+	queueRecoverErr := runtime.recoverQueuePublications(startupContext)
+	if queueRecoverErr != nil {
+		logger.Error("queue publication recovery failed; readiness stays closed", "error", queueRecoverErr)
 	}
 
 	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil &&
-		jobRestoreErr == nil && renderRestoreErr == nil && unpublishedErr == nil && renderDurabilityReady)
+		jobRestoreErr == nil && renderRestoreErr == nil && queueRecoverErr == nil && renderDurabilityReady)
 
 	return runtime, nil
 }
@@ -340,7 +340,9 @@ func ensureInMemoryRenderPorts(dependencies *Dependencies) {
 	}
 }
 
-// restoreRenderPorts runs Restorer.Restore on present render durability ports.
+// restoreRenderPorts runs Restorer.Restore on present required render durability
+// ports. Any non-nil candidate that does not implement ports.Restorer is a
+// fail-closed dependency error — never silently skip (Spec P1-4).
 func restoreRenderPorts(ctx context.Context, dependencies Dependencies) error {
 	var first error
 	for _, candidate := range []any{
@@ -354,6 +356,9 @@ func restoreRenderPorts(ctx context.Context, dependencies Dependencies) error {
 		}
 		restorer, ok := candidate.(ports.Restorer)
 		if !ok {
+			if first == nil {
+				first = ports.ErrDependencyUnavailable
+			}
 			continue
 		}
 		if err := restorer.Restore(ctx); err != nil && first == nil {
@@ -701,25 +706,25 @@ func (runtime *Runtime) Ready() bool {
 	return runtime.ready.Load() && runtime.healthy.Load()
 }
 
-// RecoverUnpublishedQueues re-enqueues durable jobs with QueuePublished=false
-// without a client retry. Public entry requires Ready (post-startup operators).
-func (runtime *Runtime) RecoverUnpublishedQueues(ctx context.Context) error {
+// RecoverQueuePublications re-arms SafeJobReference delivery for all durable
+// nonterminal jobs without a client retry. Public entry requires Ready.
+func (runtime *Runtime) RecoverQueuePublications(ctx context.Context) error {
 	if runtime == nil || !runtime.Ready() {
 		return ErrNotReady
 	}
-	return runtime.recoverUnpublishedQueues(ctx)
+	return runtime.recoverQueuePublications(ctx)
 }
 
-// recoverUnpublishedQueues is the internal recovery path used before Ready and
+// recoverQueuePublications is the internal recovery path used before Ready and
 // from RunWorkers. It must not check Ready (avoids circular startup guard, P1-C).
-func (runtime *Runtime) recoverUnpublishedQueues(ctx context.Context) error {
+func (runtime *Runtime) recoverQueuePublications(ctx context.Context) error {
 	if runtime == nil {
 		return ErrNotReady
 	}
 	if recoverer, ok := runtime.worker.(interface {
-		RecoverUnpublishedQueues(context.Context) error
+		RecoverQueuePublications(context.Context) error
 	}); ok {
-		return recoverer.RecoverUnpublishedQueues(ctx)
+		return recoverer.RecoverQueuePublications(ctx)
 	}
 	return nil
 }
@@ -732,7 +737,7 @@ func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 
 	// Autonomous publication recovery before consuming the queue (#14 §3.3).
 	// Required recovery failures fail closed — never warn-and-continue (P1-C).
-	if err := runtime.recoverUnpublishedQueues(ctx); err != nil {
+	if err := runtime.recoverQueuePublications(ctx); err != nil {
 		return err
 	}
 

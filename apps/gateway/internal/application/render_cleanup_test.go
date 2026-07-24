@@ -411,7 +411,7 @@ func (s *cleanupJobStore) ReleaseAccountLease(context.Context, domain.JobRef, do
 func (s *cleanupJobStore) MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error) {
 	return s.job, nil
 }
-func (s *cleanupJobStore) ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error) {
+func (s *cleanupJobStore) ListQueueRecoveryCandidates(context.Context) ([]domain.RenderJob, error) {
 	return nil, nil
 }
 func (s *cleanupJobStore) MarkAdmissionSettled(context.Context, domain.JobRef) (domain.RenderJob, error) {

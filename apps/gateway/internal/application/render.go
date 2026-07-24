@@ -24,6 +24,38 @@ const (
 	operationExecuteRenderJob      domain.OperationToken = "execute_render_job"
 )
 
+// placementCleanupDebtError marks post-placement audit/purge/marker failure after
+// durable Asset + PlaceOutput. Business lifecycle must complete (not fail); the
+// error is retryable cleanup debt for queue redelivery without Provider re-render.
+type placementCleanupDebtError struct {
+	cause error
+}
+
+func (e placementCleanupDebtError) Error() string {
+	if e.cause == nil {
+		return "placement cleanup debt"
+	}
+	return "placement cleanup debt: " + e.cause.Error()
+}
+
+func (e placementCleanupDebtError) Unwrap() error { return e.cause }
+
+func asPlacementCleanupDebt(err error) error {
+	if err == nil {
+		return nil
+	}
+	var already placementCleanupDebtError
+	if errors.As(err, &already) {
+		return err
+	}
+	return placementCleanupDebtError{cause: err}
+}
+
+func isPlacementCleanupDebt(err error) bool {
+	var debt placementCleanupDebtError
+	return errors.As(err, &debt)
+}
+
 // CreateImageGenerationCommand is the typed generation create request.
 type CreateImageGenerationCommand struct {
 	PresentedKeyMaterial string
@@ -543,29 +575,31 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	return RenderJobResult{Job: published, RequestID: sc.requestID}, nil
 }
 
-// ensureQueuePublished enqueues the SafeJobReference once and marks the job
-// published. Idempotent when already published.
+// ensureQueuePublished re-arms the process-local queue with the stable
+// SafeJobReference and marks historical publication when needed. Enqueue is
+// always attempted (idempotent by stable ref) so process restart recovery can
+// re-populate a fresh runtime even when QueuePublished is already true.
 func (service *RenderService) ensureQueuePublished(ctx context.Context, job domain.RenderJob) (domain.RenderJob, error) {
-	if job.QueuePublished {
-		return job, nil
-	}
 	if _, err := service.queue.Enqueue(ctx, ports.SafeJobReference{
 		TenantID: domain.Identifier(job.TenantID),
 		JobID:    job.JobID,
 	}); err != nil {
 		return job, err
 	}
+	if job.QueuePublished {
+		return job, nil
+	}
 	return service.jobs.MarkQueuePublished(ctx, job.JobRef())
 }
 
-// RecoverUnpublishedQueues autonomously enqueues durable jobs that were created
-// but never published (QueuePublished=false). Does not require a second client
-// request (#14 §3.3 startup/background recovery).
-func (service *RenderService) RecoverUnpublishedQueues(ctx context.Context) error {
+// RecoverQueuePublications re-arms SafeJobReference delivery for every durable
+// nonterminal job (including those already marked QueuePublished). Does not
+// require a client retry (#14 §3.3 startup/background recovery across restart).
+func (service *RenderService) RecoverQueuePublications(ctx context.Context) error {
 	if service == nil || service.jobs == nil || service.queue == nil {
 		return ports.ErrDependencyUnavailable
 	}
-	pending, err := service.jobs.ListUnpublishedQueue(ctx)
+	pending, err := service.jobs.ListQueueRecoveryCandidates(ctx)
 	if err != nil {
 		return err
 	}
@@ -907,12 +941,19 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	if err != nil {
 		// Terminal jobs may still owe cleanup (prompt purge / admission settle / audits).
 		// Redelivery retries cleanup only — never Provider render.
-		if errors.Is(err, domain.ErrJobNotClaimable) || errors.Is(err, ports.ErrRenderJobNotVisible) {
+		if errors.Is(err, domain.ErrJobNotClaimable) {
 			if existing, loadErr := service.jobs.Load(ctx, ref); loadErr == nil && existing.Lifecycle.Terminal() {
 				return service.finishTerminalCleanup(ctx, existing)
 			}
-			// Non-terminal not claimable (e.g. active cancel_requested lease): do not ACK
-			// forever — return nil only when another live worker still holds the fence.
+			// Non-terminal not-claimable (active cancel_requested lease, concurrent
+			// fence hold, etc.): surface the original retryable error so jobs.Runtime
+			// retains the SafeJobReference. Never ACK — after lease expiry the same
+			// ref redelivers and recovery-terminalizes without Provider render.
+			// Avoid spinning: Runtime returns on handler error (no hot loop here).
+			return err
+		}
+		if errors.Is(err, ports.ErrRenderJobNotVisible) {
+			// True not-visible is safe to discard (poison / foreign ref).
 			return nil
 		}
 		// Durable store dependency failures must redeliver (do not ACK/discard).
@@ -1224,12 +1265,18 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	// Issue #54 acceptance: completed only after durable output Asset placement.
 	// Storage-cap → failed (not completed+pending). Deviates from older #14 prose
 	// allowing completed with pending delivery for this ticket's acceptance.
+	// Post-placement cleanup debt (audit/purge/marker) must not fail the job —
+	// continue remaining entries, complete lifecycle, surface residual debt.
 	jobAfter, err := service.jobs.Load(ctx, ref)
 	if err != nil {
 		return err
 	}
 	for _, entry := range jobAfter.OutputEntries {
 		if placeErr := service.placeEntryFromStaging(ctx, principal, jobAfter, entry, fence); placeErr != nil {
+			if isPlacementCleanupDebt(placeErr) {
+				// Placement durable; keep placing remaining outputs.
+				continue
+			}
 			if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
 				if _, err := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
 					JobRef: ref, FencingToken: fence, EntryID: entry.ID,
@@ -1260,17 +1307,15 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 
 	completeAt := service.nowTS()
-	if err := service.persistTerminal(ctx, job, ports.FencedTransition{
+	// persistTerminal runs finishTerminalCleanup which retries purge/audit debt.
+	return service.persistTerminal(ctx, job, ports.FencedTransition{
 		JobRef: ref, FencingToken: fence, To: domain.JobCompleted,
 		CommitStatus: domain.CommitCommitted,
 		Progress: domain.JobProgress{
 			Source: domain.ProgressEstimated, Value: 100, UpdatedAt: completeAt,
 		},
 		ClearLease: true, Now: completeAt,
-	}); err != nil {
-		return err
-	}
-	return nil
+	})
 }
 
 // recoverAttemptWithoutRender finalizes or fails a post-payload attempt using
@@ -1287,15 +1332,32 @@ func (service *RenderService) recoverAttemptWithoutRender(
 		return err
 	}
 	if current.Lifecycle == domain.JobCancelRequested {
-		// PayloadSent without stronger commit evidence means the Provider may have
-		// received work; terminal cancel must not claim not_started (#14 §6.2/§6.4).
-		// Preserve authoritative not_committed / committed / already-unknown.
+		// Spec P1-5 / #14 §6.2 / §6.4: cancel recovery honesty without status-lookup
+		// Adapter or abort/drain evidence.
+		// - Pre-payload: canceled + not_started (Provider never received work).
+		// - Authoritative not_committed: may cancel (Provider never committed).
+		// - Post-payload empty/not_started or committed/unknown without abort proof:
+		//   failed + recovery + unknown/committed (never claim canceled).
 		commit := current.CommitStatus
-		if current.Attempt.PayloadSent && (commit == "" || commit == domain.CommitNotStarted) {
+		if !current.Attempt.PayloadSent {
+			return service.persistTerminal(ctx, job, ports.FencedTransition{
+				JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
+				CommitStatus: commit, ClearLease: true, Now: service.nowTS(),
+			})
+		}
+		if commit == domain.CommitNotCommitted {
+			return service.persistTerminal(ctx, job, ports.FencedTransition{
+				JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
+				CommitStatus: domain.CommitNotCommitted, ClearLease: true, Now: service.nowTS(),
+			})
+		}
+		if commit == "" || commit == domain.CommitNotStarted {
 			commit = domain.CommitUnknown
 		}
+		// committed / unknown / promoted unknown: fail closed, never canceled.
 		return service.persistTerminal(ctx, job, ports.FencedTransition{
-			JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
+			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+			FailureStage: domain.StageRecovery, FailureClass: domain.ErrCodeInternal,
 			CommitStatus: commit, ClearLease: true, Now: service.nowTS(),
 		})
 	}
@@ -1312,10 +1374,11 @@ func (service *RenderService) recoverAttemptWithoutRender(
 	// Manifest already captured: complete placement and mark completed.
 	if current.Manifest.ID != "" && len(current.OutputEntries) > 0 {
 		for _, entry := range current.OutputEntries {
-			if entry.DeliveryState == domain.OutputAvailable && entry.AssetID != "" {
-				continue
-			}
+			// Resume path: available+asset still needs afterPlacementSettled debt.
 			if placeErr := service.placeEntryFromStaging(ctx, principal, current, entry, fence); placeErr != nil {
+				if isPlacementCleanupDebt(placeErr) {
+					continue
+				}
 				if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
 					// Issue #54 acceptance: placement not durable → do not complete.
 					return service.persistTerminal(ctx, job, ports.FencedTransition{
@@ -1588,6 +1651,9 @@ func (service *RenderService) stagingIdentity(job domain.RenderJob, entry domain
 
 // placeEntryFromStaging Uses staged bytes then commits a permanent Asset and
 // records placement on the job store. No package-global state.
+// After durable PlaceOutput, audit/purge/marker failures return placement
+// cleanup debt (not a placement failure) so callers complete the business
+// lifecycle and redelivery retries cleanup only.
 func (service *RenderService) placeEntryFromStaging(
 	ctx context.Context,
 	principal domain.SecurityPrincipal,
@@ -1598,7 +1664,7 @@ func (service *RenderService) placeEntryFromStaging(
 	identity := service.stagingIdentity(job, entry)
 	// Resume path: placement already durable, only purge/audit debt remains.
 	if entry.DeliveryState == domain.OutputAvailable && entry.AssetID != "" {
-		return service.afterPlacementSettled(ctx, job, identity)
+		return asPlacementCleanupDebt(service.afterPlacementSettled(ctx, job, identity))
 	}
 	var placeErr error
 	err := service.staging.Use(ctx, ports.StagingAccess{
@@ -1632,18 +1698,23 @@ func (service *RenderService) placeEntryFromStaging(
 		return err
 	}
 	if placeErr != nil {
+		// Real placement failure (Reserve/Commit/PlaceOutput) — not cleanup debt.
 		return placeErr
 	}
-	return service.afterPlacementSettled(ctx, job, identity)
+	// Asset + PlaceOutput durable; purge debt is marked inside afterPlacementSettled
+	// before audit/Delete so terminal cleanup can discover and retry it.
+	return asPlacementCleanupDebt(service.afterPlacementSettled(ctx, job, identity))
 }
 
 // afterPlacementSettled records purge debt, audits output-placed once, then Deletes
 // staging. Failures are durable obligations for redelivery (no re-render).
+// Callers wrap with asPlacementCleanupDebt so business lifecycle is not failed.
 func (service *RenderService) afterPlacementSettled(
 	ctx context.Context,
 	job domain.RenderJob,
 	identity ports.StagingIdentity,
 ) error {
+	// Discoverable purge debt before audit/Delete so crash mid-cleanup is recoverable.
 	if _, err := service.jobs.MarkStagingPurgePending(ctx, job.JobRef(), true); err != nil {
 		return err
 	}
@@ -1847,6 +1918,19 @@ func (service *RenderService) placeFromManifest(
 		return result, domain.CanonicalError{}
 	}
 	if err := service.placeEntryFromStaging(ctx, principal, job, entry, fence); err != nil {
+		if isPlacementCleanupDebt(err) {
+			// Durable placement succeeded; surface entry state (cleanup is retriable).
+			updated, loadErr := service.jobs.Load(ctx, job.JobRef())
+			if loadErr != nil {
+				return ports.PlacementResult{}, service.dependencyCanonical(loadErr)
+			}
+			for _, e := range updated.OutputEntries {
+				if e.ID == entry.ID {
+					return ports.PlacementResult{Job: updated, Entry: e}, domain.CanonicalError{}
+				}
+			}
+			return ports.PlacementResult{Job: updated}, domain.CanonicalError{}
+		}
 		if errors.Is(err, ports.ErrStagingNotFound) || errors.Is(err, ports.ErrDependencyUnavailable) {
 			result, placeErr := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
 				JobRef:              job.JobRef(),

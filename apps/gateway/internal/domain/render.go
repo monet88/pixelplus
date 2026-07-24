@@ -275,10 +275,10 @@ type RenderJob struct {
 	FailureStage      FailureStage
 	FailureClass      ErrorCode
 	CommitStatus      CommitStatus
-	// QueuePublished is true after the SafeJobReference was accepted by the
-	// queue. Durable create may succeed before publication; matching retry must
-	// recover the same job and re-attempt enqueue without creating a replacement
-	// (#14 §3.3).
+	// QueuePublished is true after the SafeJobReference was accepted by a queue
+	// at least once. It is a historical acceptance marker, not proof that a
+	// process-local pending item survived restart. Startup recovery re-arms every
+	// nonterminal job's stable ref even when this flag is true (#14 §3.3).
 	QueuePublished bool
 	// AdmissionSettled is true after create-time occupancy Reconcile was
 	// durably recorded. Reconcile itself is keyed-idempotent; the marker stops

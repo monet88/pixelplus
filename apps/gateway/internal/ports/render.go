@@ -148,11 +148,14 @@ type RenderJobStore interface {
 	ReleaseAccountLease(context.Context, domain.JobRef, domain.FencingToken) error
 	// MarkQueuePublished records that the SafeJobReference was accepted by the
 	// queue for this job (durable create may precede publication; #14 §3.3).
+	// QueuePublished is a historical acceptance marker — not proof that a
+	// process-local pending item survived restart.
 	MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error)
-	// ListUnpublishedQueue returns durable non-terminal jobs whose SafeJobReference
-	// was never accepted by the queue (QueuePublished=false). Used by autonomous
-	// startup/background recovery without a second client request (#14 §3.3).
-	ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error)
+	// ListQueueRecoveryCandidates returns all durable non-terminal jobs that may
+	// need SafeJobReference re-arm into a process-local queue after restart or
+	// crash (including jobs already marked QueuePublished=true). Startup recovery
+	// must re-Enqueue each stable ref without a client retry (#14 §3.3).
+	ListQueueRecoveryCandidates(context.Context) ([]domain.RenderJob, error)
 	// MarkAdmissionSettled records that create-time occupancy Reconcile completed
 	// for this job. Idempotent when already settled.
 	MarkAdmissionSettled(context.Context, domain.JobRef) (domain.RenderJob, error)
@@ -401,9 +404,10 @@ type RenderAdapter interface {
 	Render(context.Context, RenderCommand, PromptInjection, InputAssetInjection, CredentialInjection, RenderCaptureSink) (domain.RenderOutcome, error)
 }
 
-// Restorer is an optional recovery contract for durable render persistence.
-// Memory fixtures may no-op; Unavailable stores return dependency failure.
-// composition.New runs Restore before Ready=true (#54 Standards P1-C).
+// Restorer is the required recovery contract for any present render durability
+// port (jobs/replay/prompts/staging). Memory fixtures may no-op; Unavailable
+// stores return dependency failure. composition.New fails closed (not Ready)
+// when a non-nil durability candidate lacks Restorer (#54 Spec P1-4 / P1-C).
 type Restorer interface {
 	Restore(context.Context) error
 }
