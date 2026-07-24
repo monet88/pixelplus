@@ -276,13 +276,17 @@ type RenderJob struct {
 	// recover the same job and re-attempt enqueue without creating a replacement
 	// (#14 §3.3).
 	QueuePublished bool
-	// AdmissionSettled is true after create-time occupancy Reconcile ran exactly
-	// once at accounting terminal. Prevents double-release on cancel redelivery
-	// or crash recovery after terminal write (#8 §7.4).
+	// AdmissionSettled is true after create-time occupancy Reconcile was
+	// durably recorded. Reconcile itself is keyed-idempotent; the marker stops
+	// unnecessary work and proves settlement for operators (#8 §7.4).
 	AdmissionSettled bool
-	CreatedAt        Timestamp
-	UpdatedAt        Timestamp
-	TerminalAt       Timestamp
+	// PromptPurged is true after confidential prompt material was deleted for
+	// this job. Terminal visibility may precede purge; redelivery retries purge
+	// without Provider render when this remains false (ADR 0009).
+	PromptPurged bool
+	CreatedAt    Timestamp
+	UpdatedAt    Timestamp
+	TerminalAt   Timestamp
 }
 
 // JobRef returns the durable ownership identity shared with workers.

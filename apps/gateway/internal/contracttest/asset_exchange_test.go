@@ -392,7 +392,7 @@ type assetStubAdmissionStore struct{}
 
 func (assetStubAdmissionStore) Admit(_ context.Context, request ports.AdmissionRequest) (ports.AdmissionDecision, ports.AdmissionReservation, error) {
 	return ports.AdmissionDecision{Admitted: true},
-		ports.AdmissionReservation(request),
+		ports.AdmissionReservation{Principal: request.Principal, Operation: request.Operation},
 		nil
 }
 

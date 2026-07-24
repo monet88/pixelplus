@@ -462,7 +462,12 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 
 	persisted, err := service.jobs.Create(ctx, ports.RenderJobCreation{Principal: principal, Job: job})
 	if err != nil {
-		service.purgePrompt(ctx, principal.TenantID, jobID)
+		// Rollback: prompt purge must not be ignored; best-effort then surface create err.
+		if delErr := service.prompts.Delete(ctx, ports.RenderPromptAccess{TenantID: principal.TenantID, JobID: jobID}); delErr != nil {
+			service.release(ctx, reservation)
+			service.abandon(ctx, identity)
+			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(delErr))
+		}
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
 		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
@@ -529,21 +534,46 @@ func (service *RenderService) RecoverUnpublishedQueues(ctx context.Context) erro
 	return first
 }
 
-func (service *RenderService) purgePrompt(ctx context.Context, tenant domain.TenantID, jobID domain.Identifier) {
-	_ = service.prompts.Delete(ctx, ports.RenderPromptAccess{TenantID: tenant, JobID: jobID})
+// fencedTerminal applies a fenced lifecycle transition only. Terminal cleanup
+// (prompt purge + admission settle) is finishTerminalCleanup so a crash after
+// terminal write can redelivery-retry cleanup without Provider work.
+func (service *RenderService) fencedTerminal(ctx context.Context, tenant domain.TenantID, transition ports.FencedTransition) (domain.RenderJob, error) {
+	_ = tenant
+	return service.jobs.Transition(ctx, transition)
 }
 
-// fencedTerminal applies a fenced transition and purges confidential prompt when
-// the resulting lifecycle is terminal (completed/failed/canceled).
-func (service *RenderService) fencedTerminal(ctx context.Context, tenant domain.TenantID, transition ports.FencedTransition) (domain.RenderJob, error) {
-	job, err := service.jobs.Transition(ctx, transition)
+// finishTerminalCleanup purges confidential prompt and settles create occupancy.
+// Job lifecycle may already be terminal; cleanup debt remains durable and
+// retriable. Returns the first cleanup error so queue redelivery/operator
+// visibility remains (no silent ignore).
+func (service *RenderService) finishTerminalCleanup(ctx context.Context, job domain.RenderJob) error {
+	if !job.Lifecycle.Terminal() {
+		return nil
+	}
+	// Reload for current cleanup markers.
+	current, err := service.jobs.Load(ctx, job.JobRef())
 	if err != nil {
-		return domain.RenderJob{}, err
+		return err
 	}
-	if job.Lifecycle.Terminal() {
-		service.purgePrompt(ctx, tenant, job.JobID)
+	if !current.PromptPurged {
+		if err := service.prompts.Delete(ctx, ports.RenderPromptAccess{
+			TenantID: current.TenantID,
+			JobID:    current.JobID,
+		}); err != nil {
+			return err
+		}
+		purged, err := service.jobs.MarkPromptPurged(ctx, current.JobRef())
+		if err != nil {
+			return err
+		}
+		current = purged
 	}
-	return job, nil
+	return service.releaseJobAdmission(ctx, current)
+}
+
+// admissionSettlementKey is the stable idempotency key for create-time occupancy.
+func admissionSettlementKey(job domain.RenderJob) string {
+	return string(job.TenantID) + "/" + string(job.JobID) + "/create_occupancy"
 }
 
 // GetRenderJob reads one same-Tenant job status.
@@ -616,11 +646,17 @@ func (service *RenderService) CancelRenderJob(ctx context.Context, command Cance
 		return RenderJobResult{}, service.fail(ctx, sc, service.jobVisibilityCanonical(err))
 	}
 
-	// Purge confidential prompt on terminal cancel (queued→canceled).
-	if job.Lifecycle == domain.JobCanceled {
-		service.purgePrompt(ctx, principal.TenantID, job.JobID)
-		// Create-time occupancy is released only at accounting terminal.
-		service.releaseJobAdmission(ctx, job)
+	// Terminal cancel: purge + admission settle are durable and retriable.
+	// Outcome is already terminal for client visibility even if cleanup errors.
+	if job.Lifecycle.Terminal() {
+		if err := service.finishTerminalCleanup(ctx, job); err != nil {
+			// Surface dependency so operator/redelivery can finish cleanup debt.
+			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		}
+		// Reload after cleanup markers for honest projection.
+		if refreshed, loadErr := service.jobs.Visible(ctx, principal, job.JobID); loadErr == nil {
+			job = refreshed
+		}
 	}
 
 	action := ports.AuditRenderJobCanceled
@@ -715,9 +751,15 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		ExpiresAt: domain.NewTimestamp(now.Time().Add(2 * time.Minute)),
 	})
 	if err != nil {
-		// Concurrent claimant / terminal / cancel / post-payload lease expiry —
-		// discard without Provider work (lease expiry ≠ re-render).
-		if errors.Is(err, domain.ErrJobNotClaimable) || errors.Is(err, ports.ErrRenderJobNotVisible) || errors.Is(err, ports.ErrDependencyUnavailable) {
+		// Terminal jobs may still owe cleanup (prompt purge / admission settle).
+		// Redelivery retries cleanup only — never Provider render.
+		if errors.Is(err, domain.ErrJobNotClaimable) || errors.Is(err, ports.ErrRenderJobNotVisible) {
+			if existing, loadErr := service.jobs.Load(ctx, ref); loadErr == nil && existing.Lifecycle.Terminal() {
+				return service.finishTerminalCleanup(ctx, existing)
+			}
+			return nil
+		}
+		if errors.Is(err, ports.ErrDependencyUnavailable) {
 			return nil
 		}
 		return err
@@ -728,7 +770,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	// Queued cancel may have won; re-load and exit without Provider.
 	if job.Lifecycle == domain.JobCancelRequested || job.Lifecycle.Terminal() {
 		if job.Lifecycle.Terminal() {
-			service.releaseJobAdmission(ctx, job)
+			return service.finishTerminalCleanup(ctx, job)
 		}
 		return nil
 	}
@@ -1055,8 +1097,7 @@ func (service *RenderService) recoverAttemptWithoutRender(
 		})
 	}
 	if current.Lifecycle.Terminal() {
-		service.releaseJobAdmission(ctx, current)
-		return nil
+		return service.finishTerminalCleanup(ctx, current)
 	}
 
 	principal := domain.SecurityPrincipal{
@@ -1156,7 +1197,8 @@ func (service *RenderService) persistAttempt(ctx context.Context, observation po
 
 // persistTerminal applies a terminal transition; only ErrStaleFence is discarded.
 // Other durable mutation errors return so redelivery can recover without a second render.
-// On successful terminal, create-time admission occupancy is released once (#8 §7.4).
+// After terminal write, cleanup debt (prompt purge + admission settle) must succeed
+// or return so redelivery retries cleanup without Provider render.
 func (service *RenderService) persistTerminal(ctx context.Context, job domain.RenderJob, transition ports.FencedTransition) error {
 	terminal, err := service.fencedTerminal(ctx, job.TenantID, transition)
 	if err != nil {
@@ -1166,7 +1208,7 @@ func (service *RenderService) persistTerminal(ctx context.Context, job domain.Re
 		return err
 	}
 	if terminal.Lifecycle.Terminal() {
-		service.releaseJobAdmission(ctx, terminal)
+		return service.finishTerminalCleanup(ctx, terminal)
 	}
 	return nil
 }
@@ -1228,34 +1270,36 @@ func (service *RenderService) preflightExecute(
 	return account, "", true
 }
 
-// releaseJobAdmission settles the create-time occupancy for one job at terminal
-// exactly once. Durable AdmissionSettled marker prevents double Reconcile on
-// cancel redelivery or post-terminal recovery (#8 §7.4).
-func (service *RenderService) releaseJobAdmission(ctx context.Context, job domain.RenderJob) {
+// releaseJobAdmission settles create-time occupancy with a keyed Reconcile then
+// persists AdmissionSettled. Reconcile is logically idempotent per SettlementKey
+// so a crash after successful Reconcile before the marker cannot double-release
+// occupancy on redelivery (#8 §7.4). Marker failure returns an error for retry.
+func (service *RenderService) releaseJobAdmission(ctx context.Context, job domain.RenderJob) error {
 	if job.AdmissionSettled {
-		return
+		return nil
 	}
-	// Re-load so concurrent terminal paths race safely on the marker.
 	if current, err := service.jobs.Load(ctx, job.JobRef()); err == nil && current.AdmissionSettled {
-		return
+		return nil
 	}
 	op, ok := createAdmissionOperation(job.Operation)
 	if !ok {
-		return
+		return nil
 	}
-	service.release(ctx, ports.AdmissionReservation{
+	reservation := ports.AdmissionReservation{
 		Principal: domain.SecurityPrincipal{
 			TenantID:       job.TenantID,
 			ClientAPIKeyID: job.ClientAPIKeyID,
 		},
-		Operation: op,
-	})
-	if _, err := service.jobs.MarkAdmissionSettled(ctx, job.JobRef()); err != nil {
-		// Marker write failure leaves recovery able to re-attempt settlement.
-		// Occupancy was already reconciled once in this process; marker is for
-		// durable exactly-once across restarts/redelivery.
-		return
+		Operation:     op,
+		SettlementKey: admissionSettlementKey(job),
 	}
+	if err := service.admission.Reconcile(ctx, reservation); err != nil {
+		return err
+	}
+	if _, err := service.jobs.MarkAdmissionSettled(ctx, job.JobRef()); err != nil {
+		return err
+	}
+	return nil
 }
 
 func createAdmissionOperation(op domain.RenderOperation) (domain.OperationToken, bool) {

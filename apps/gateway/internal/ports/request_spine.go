@@ -73,14 +73,19 @@ type AdmissionDecision struct {
 
 // AdmissionReservation identifies an accepted admission so its occupancy and
 // quota effects can be reconciled after the operation settles.
+// SettlementKey, when non-empty, makes Reconcile logically idempotent for that
+// durable unit of work (e.g. one Render Job create occupancy). Empty keys keep
+// legacy non-keyed settle semantics for request-scoped operations.
 type AdmissionReservation struct {
-	Principal domain.SecurityPrincipal
-	Operation domain.OperationToken
+	Principal     domain.SecurityPrincipal
+	Operation     domain.OperationToken
+	SettlementKey string
 }
 
 // AdmissionStore evaluates the A3-A5 admission gates in normative order and
 // reserves capacity on accept. Unavailable limit state MUST fail closed rather
-// than admit (#8 section 7.6).
+// than admit (#8 section 7.6). Reconcile with a non-empty SettlementKey MUST be
+// logically idempotent: a second settle for the same key is a no-op.
 type AdmissionStore interface {
 	Admit(context.Context, AdmissionRequest) (AdmissionDecision, AdmissionReservation, error)
 	Reconcile(context.Context, AdmissionReservation) error

@@ -1376,12 +1376,15 @@ func TestAdmissionReservationHeldUntilJobTerminal(t *testing.T) {
 	if recon := h.admission.reconcileCalls.Load(); recon != 1 {
 		t.Fatalf("reconcile after terminal complete = %d, want 1", recon)
 	}
-	// Queue redelivery after terminal must not double-release.
+	if logical := h.admission.logicalSettleCount.Load(); logical != 1 {
+		t.Fatalf("logical keyed settles = %d, want 1", logical)
+	}
+	// Queue redelivery after terminal must not double-release occupancy.
 	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), ref); err != nil {
 		t.Fatalf("redelivery: %v", err)
 	}
-	if recon := h.admission.reconcileCalls.Load(); recon != 1 {
-		t.Fatalf("reconcile after redelivery = %d, want 1 (AdmissionSettled)", recon)
+	if logical := h.admission.logicalSettleCount.Load(); logical != 1 {
+		t.Fatalf("logical settles after redelivery = %d, want 1 (keyed idempotent)", logical)
 	}
 }
 
