@@ -78,11 +78,17 @@ type Options struct {
 	// Render Job ports (#54). A nil port keeps the foundation memory/fail-closed
 	// implementations; controlled fakes prove create/claim/render/placement
 	// through real composition and the exported JobExecutor.
-	RenderJobs    ports.RenderJobStore
-	RenderReplay  ports.RenderReplayStore
-	RenderAdapter ports.RenderAdapter
-	RenderStaging ports.RenderStagingStore
-	RenderAudit   ports.RenderAuditRecorder
+	RenderJobs     ports.RenderJobStore
+	RenderReplay   ports.RenderReplayStore
+	RenderAdapter  ports.RenderAdapter
+	RenderStaging  ports.RenderStagingStore
+	RenderAudit    ports.RenderAuditRecorder
+	RenderDigester ports.RenderDigester
+	// RenderDigestKey injects key material when RenderDigester is nil.
+	RenderDigestKey []byte
+	// AllowInMemoryRenderJobs overrides the fixture default (true). Set false
+	// for production-like readiness/digester proofs.
+	AllowInMemoryRenderJobs *bool
 
 	// EnqueueFailTimes fails the first N Enqueue calls with EnqueueError (or
 	// dependency unavailable) so contract tests prove create+publication recovery.
@@ -115,10 +121,14 @@ func NewFixture(options Options) (*Fixture, error) {
 	if options.Clock != nil {
 		clock = options.Clock
 	}
+	allowInMemory := true
+	if options.AllowInMemoryRenderJobs != nil {
+		allowInMemory = *options.AllowInMemoryRenderJobs
+	}
 	runtime, err := composition.New(composition.Config{
 		// Controlled fixtures only: process-local job store is not production
 		// durable state. Production composition leaves this false and fails closed.
-		AllowInMemoryRenderJobs: true,
+		AllowInMemoryRenderJobs: allowInMemory,
 	}, composition.Dependencies{
 		Runtime: jobs,
 		Clock:   clock,
@@ -148,11 +158,13 @@ func NewFixture(options Options) (*Fixture, error) {
 		Circuits: options.Circuits,
 		Routing:  options.Routing,
 
-		RenderJobs:    options.RenderJobs,
-		RenderReplay:  options.RenderReplay,
-		RenderAdapter: options.RenderAdapter,
-		RenderStaging: options.RenderStaging,
-		RenderAudit:   options.RenderAudit,
+		RenderJobs:      options.RenderJobs,
+		RenderReplay:    options.RenderReplay,
+		RenderAdapter:   options.RenderAdapter,
+		RenderStaging:   options.RenderStaging,
+		RenderAudit:     options.RenderAudit,
+		RenderDigester:  options.RenderDigester,
+		RenderDigestKey: options.RenderDigestKey,
 	})
 	if err != nil {
 		return nil, err

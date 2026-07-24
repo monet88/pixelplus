@@ -59,8 +59,9 @@ func TestAdmissionSettleLogicalOnceWhenMarkerFailsThenRetries(t *testing.T) {
 	}
 }
 
-// P1-8: prompt purge failure surfaces; redelivery retries purge without render.
-func TestPromptPurgeFailureRetriesWithoutRender(t *testing.T) {
+// P1-8/P1-13: prompt purge failure still settles admission; redelivery purges
+// prompt with zero Provider (claim not claimable path).
+func TestPromptPurgeFailureStillSettlesAdmissionThenRetriesPurge(t *testing.T) {
 	t.Parallel()
 
 	jobs := &cleanupJobStore{}
@@ -77,13 +78,20 @@ func TestPromptPurgeFailureRetriesWithoutRender(t *testing.T) {
 	jobs.job = job
 
 	if err := svc.ExecuteJob(context.Background(), job.JobRef()); err == nil {
-		t.Fatal("expected purge error")
+		t.Fatal("expected purge error (joined cleanup debt)")
 	}
 	if prompts.deleteCalls != 1 {
 		t.Fatalf("delete calls = %d, want 1", prompts.deleteCalls)
 	}
-	if admission.logicalSettles != 0 {
-		t.Fatal("admission must not settle before prompt purge succeeds")
+	// Admission must settle even when prompt purge failed (occupancy not leaked).
+	if admission.logicalSettles != 1 {
+		t.Fatalf("logical settles after prompt failure = %d, want 1", admission.logicalSettles)
+	}
+	if !jobs.job.AdmissionSettled {
+		t.Fatal("AdmissionSettled must be true after independent settle")
+	}
+	if jobs.job.PromptPurged {
+		t.Fatal("PromptPurged must remain false after purge failure")
 	}
 
 	prompts.failDelete = nil
@@ -93,12 +101,34 @@ func TestPromptPurgeFailureRetriesWithoutRender(t *testing.T) {
 	if prompts.deleteCalls != 2 {
 		t.Fatalf("delete calls after retry = %d, want 2", prompts.deleteCalls)
 	}
-	// Third redelivery: Delete is idempotent; no extra admission settle.
+	if !jobs.job.PromptPurged {
+		t.Fatal("PromptPurged must be true after successful retry")
+	}
+	// Third redelivery: no extra admission settle.
 	if err := svc.ExecuteJob(context.Background(), job.JobRef()); err != nil {
 		t.Fatalf("third cleanup: %v", err)
 	}
 	if admission.logicalSettles != 1 {
 		t.Fatalf("logical settles = %d, want 1", admission.logicalSettles)
+	}
+}
+
+// P1-11: ClaimWorker dependency errors must propagate for redelivery.
+func TestClaimWorkerDependencyErrorPropagates(t *testing.T) {
+	t.Parallel()
+	jobs := &cleanupJobStore{claimErr: ports.ErrDependencyUnavailable}
+	admission := &keyedAdmissionStore{}
+	prompts := &cleanupPromptStore{}
+	now := time.Date(2026, 7, 24, 18, 0, 0, 0, time.UTC)
+	svc := mustRenderService(t, admission, jobs, prompts, now)
+	job := domain.NewQueuedRenderJob(
+		"job_dep", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		"digest", nil, "", "pa_1", 1, "fp", "idem", domain.NewTimestamp(now),
+	)
+	jobs.job = job
+	err := svc.ExecuteJob(context.Background(), job.JobRef())
+	if !errors.Is(err, ports.ErrDependencyUnavailable) {
+		t.Fatalf("ExecuteJob err = %v, want ErrDependencyUnavailable", err)
 	}
 }
 
@@ -236,9 +266,9 @@ func (noopAuthorized) Render(context.Context, ports.AuthorizedRenderRequest) (do
 
 type noopDigester struct{}
 
-func (noopDigester) DigestPrompt(string) string { return "d" }
-func (noopDigester) CreateFingerprint(domain.RenderOperation, string, string, []domain.AssetID, domain.AssetID) domain.Fingerprint {
-	return "fp"
+func (noopDigester) DigestPrompt(string) (string, error) { return "d", nil }
+func (noopDigester) CreateFingerprint(domain.RenderOperation, string, string, []domain.AssetID, domain.AssetID) (domain.Fingerprint, error) {
+	return "fp", nil
 }
 
 type noopQueue struct{}
@@ -334,6 +364,7 @@ type cleanupJobStore struct {
 	job               domain.RenderJob
 	failMarkAdmission error
 	failMarkPurge     error
+	claimErr          error
 }
 
 func (s *cleanupJobStore) Create(context.Context, ports.RenderJobCreation) (domain.RenderJob, error) {
@@ -346,6 +377,9 @@ func (s *cleanupJobStore) Load(context.Context, domain.JobRef) (domain.RenderJob
 	return s.job, nil
 }
 func (s *cleanupJobStore) ClaimWorker(context.Context, domain.JobRef, ports.WorkerLease) (ports.WorkerClaim, error) {
+	if s.claimErr != nil {
+		return ports.WorkerClaim{}, s.claimErr
+	}
 	// Terminal jobs are not claimable → ExecuteJob takes cleanup path.
 	return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 }

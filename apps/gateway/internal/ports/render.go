@@ -348,15 +348,23 @@ type RenderAdapter interface {
 	Render(context.Context, RenderCommand, PromptInjection, InputAssetInjection, RenderCaptureSink) (domain.RenderOutcome, error)
 }
 
+// ErrRenderDigesterUnavailable is returned when the digester cannot mint a
+// durable fingerprint (missing/weak key, fail-closed composition). Create must
+// fail closed with dependency_unavailable before replay/admission side effects.
+var ErrRenderDigesterUnavailable = errors.New("render digester unavailable")
+
 // RenderDigester produces opaque, keyed digests for create-time fingerprint and
 // optional prompt binding. The key never leaves the digester implementation
 // (composition/confidential infrastructure). Application receives only hex digests.
+// Methods return errors so product paths cannot proceed with empty digests when
+// the digester is fail-closed (not only /readyz).
 // Unkeyed SHA-256 of the prompt MUST NOT equal these digests (dictionary oracle ban).
 type RenderDigester interface {
 	// DigestPrompt returns a keyed HMAC digest of prompt material.
-	DigestPrompt(prompt string) string
-	// CreateFingerprint binds operation, model, prompt, and asset ids under the key.
-	CreateFingerprint(operation domain.RenderOperation, model, prompt string, inputs []domain.AssetID, mask domain.AssetID) domain.Fingerprint
+	DigestPrompt(prompt string) (string, error)
+	// CreateFingerprint binds operation, model, prompt, and asset ids under the key
+	// using a typed structured payload (not delimiter concatenation).
+	CreateFingerprint(operation domain.RenderOperation, model, prompt string, inputs []domain.AssetID, mask domain.AssetID) (domain.Fingerprint, error)
 }
 
 // RenderAuditAction names a Render Job product/security audit event.

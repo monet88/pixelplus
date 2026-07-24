@@ -348,7 +348,12 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		}
 	}
 
-	fingerprint := service.digester.CreateFingerprint(command.operation, command.model, command.prompt, command.inputs, command.mask)
+	// Keyed digester must succeed before any replay/admission/job side effect.
+	// Fail-closed digester returns dependency_unavailable (not empty fingerprint).
+	fingerprint, err := service.digester.CreateFingerprint(command.operation, command.model, command.prompt, command.inputs, command.mask)
+	if err != nil {
+		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
 	identity := domain.ReplayIdentity{
 		Scope: domain.ReplayScope{
 			TenantID:       principal.TenantID,
@@ -394,15 +399,15 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	// A3-A5 admission before routing/side effects.
 	reservation, canonical, ok := service.admit(ctx, principal, command.opToken)
 	if !ok {
-		service.abandon(ctx, identity)
+		if abErr := service.abandon(ctx, identity); abErr != nil {
+			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(abErr))
+		}
 		return RenderJobResult{}, service.fail(ctx, sc, canonical)
 	}
 
 	account, canonical, ok := service.selectAccount(ctx, principal, command.operation, command.model, sc.start)
 	if !ok {
-		service.release(ctx, reservation)
-		service.abandon(ctx, identity)
-		return RenderJobResult{}, service.fail(ctx, sc, canonical)
+		return RenderJobResult{}, service.failAfterRollback(ctx, sc, canonical, reservation, identity)
 	}
 
 	// Vault presence gate: credential version must be authorized before enqueue.
@@ -414,29 +419,26 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		Version:   account.Credential.Version,
 	})
 	if err != nil {
-		service.release(ctx, reservation)
-		service.abandon(ctx, identity)
 		if errors.Is(err, ports.ErrCredentialAbsent) {
-			return RenderJobResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationSubmitCredential))
+			return RenderJobResult{}, service.failAfterRollback(ctx, sc, domain.NewAccountNotUsable(domain.RemediationSubmitCredential), reservation, identity)
 		}
-		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		return RenderJobResult{}, service.failAfterRollback(ctx, sc, service.dependencyCanonical(err), reservation, identity)
 	}
 	if !validation.Valid {
-		service.release(ctx, reservation)
-		service.abandon(ctx, identity)
-		return RenderJobResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationSubmitCredential))
+		return RenderJobResult{}, service.failAfterRollback(ctx, sc, domain.NewAccountNotUsable(domain.RemediationSubmitCredential), reservation, identity)
 	}
 
 	jobID, err := service.ids.New(domain.IdentifierKindJob)
 	if err != nil {
-		service.release(ctx, reservation)
-		service.abandon(ctx, identity)
-		return RenderJobResult{}, service.fail(ctx, sc, domain.NewInternalError())
+		return RenderJobResult{}, service.failAfterRollback(ctx, sc, domain.NewInternalError(), reservation, identity)
 	}
 	now := domain.NewTimestamp(sc.start)
 	// Job metadata stores only a non-secret digest; plaintext goes to the
 	// confidential port and is never retained on the durable job row (ADR 0009).
-	promptDigest := service.digester.DigestPrompt(command.prompt)
+	promptDigest, err := service.digester.DigestPrompt(command.prompt)
+	if err != nil {
+		return RenderJobResult{}, service.failAfterRollback(ctx, sc, service.dependencyCanonical(err), reservation, identity)
+	}
 	job := domain.NewQueuedRenderJob(
 		jobID,
 		principal.TenantID,
@@ -461,21 +463,22 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		JobID:    jobID,
 		Material: command.prompt,
 	}); err != nil {
-		service.release(ctx, reservation)
-		service.abandon(ctx, identity)
-		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		return RenderJobResult{}, service.failAfterRollback(ctx, sc, service.dependencyCanonical(err), reservation, identity)
 	}
 
 	persisted, err := service.jobs.Create(ctx, ports.RenderJobCreation{Principal: principal, Job: job})
 	if err != nil {
-		// Rollback: prompt purge must not be ignored; best-effort then surface create err.
+		// Rollback: prompt purge must not be ignored; join with create failure.
+		var rbErrs []error
 		if delErr := service.prompts.Delete(ctx, ports.RenderPromptAccess{TenantID: principal.TenantID, JobID: jobID}); delErr != nil {
-			service.release(ctx, reservation)
-			service.abandon(ctx, identity)
-			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(delErr))
+			rbErrs = append(rbErrs, delErr)
 		}
-		service.release(ctx, reservation)
-		service.abandon(ctx, identity)
+		if rbErr := service.rollbackCreateAdmission(ctx, reservation, identity); rbErr != nil {
+			rbErrs = append(rbErrs, rbErr)
+		}
+		if len(rbErrs) > 0 {
+			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(errors.Join(append([]error{err}, rbErrs...)...)))
+		}
 		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
@@ -548,10 +551,10 @@ func (service *RenderService) fencedTerminal(ctx context.Context, tenant domain.
 	return service.jobs.Transition(ctx, transition)
 }
 
-// finishTerminalCleanup purges confidential prompt and settles create occupancy.
-// Job lifecycle may already be terminal; cleanup debt remains durable and
-// retriable. Returns the first cleanup error so queue redelivery/operator
-// visibility remains (no silent ignore).
+// finishTerminalCleanup purges confidential prompt and settles create occupancy
+// independently. Job lifecycle may already be terminal; cleanup debt remains
+// durable and retriable. Prompt failure must not block admission settlement
+// (occupancy leak). Returns errors.Join of remaining debts.
 func (service *RenderService) finishTerminalCleanup(ctx context.Context, job domain.RenderJob) error {
 	if !job.Lifecycle.Terminal() {
 		return nil
@@ -561,20 +564,27 @@ func (service *RenderService) finishTerminalCleanup(ctx context.Context, job dom
 	if err != nil {
 		return err
 	}
+	var errs []error
 	if !current.PromptPurged {
 		if err := service.prompts.Delete(ctx, ports.RenderPromptAccess{
 			TenantID: current.TenantID,
 			JobID:    current.JobID,
 		}); err != nil {
-			return err
+			errs = append(errs, err)
+		} else {
+			purged, markErr := service.jobs.MarkPromptPurged(ctx, current.JobRef())
+			if markErr != nil {
+				errs = append(errs, markErr)
+			} else {
+				current = purged
+			}
 		}
-		purged, err := service.jobs.MarkPromptPurged(ctx, current.JobRef())
-		if err != nil {
-			return err
-		}
-		current = purged
 	}
-	return service.releaseJobAdmission(ctx, current)
+	// Always attempt admission settle even when prompt purge failed.
+	if settleErr := service.releaseJobAdmission(ctx, current); settleErr != nil {
+		errs = append(errs, settleErr)
+	}
+	return errors.Join(errs...)
 }
 
 // admissionSettlementKey is the stable idempotency key for create-time occupancy.
@@ -608,7 +618,9 @@ func (service *RenderService) GetRenderJob(ctx context.Context, query GetRenderJ
 	if !ok {
 		return RenderJobResult{}, service.fail(ctx, sc, canonical)
 	}
-	service.release(ctx, reservation)
+	if err := service.release(ctx, reservation); err != nil {
+		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
 
 	service.observeSuccess(ctx, sc, ports.AuditRenderJobRead, principal, job, 200)
 	return RenderJobResult{Job: job, RequestID: sc.requestID}, nil
@@ -640,7 +652,7 @@ func (service *RenderService) CancelRenderJob(ctx context.Context, command Cance
 	if !ok {
 		return RenderJobResult{}, service.fail(ctx, sc, canonical)
 	}
-	defer service.release(ctx, reservation)
+	defer func() { _ = service.release(ctx, reservation) }()
 
 	job, err := service.jobs.Cancel(ctx, ports.CancelMutation{
 		Principal:   principal,
@@ -721,7 +733,7 @@ func (service *RenderService) RetryRenderJobOutput(ctx context.Context, command 
 	if !ok {
 		return OutputDeliveryResult{}, service.fail(ctx, sc, canonical)
 	}
-	defer service.release(ctx, reservation)
+	defer func() { _ = service.release(ctx, reservation) }()
 
 	// Already available: idempotent return, zero render/placement side effect.
 	if entry.DeliveryState == domain.OutputAvailable && entry.AssetID != "" {
@@ -765,9 +777,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			}
 			return nil
 		}
-		if errors.Is(err, ports.ErrDependencyUnavailable) {
-			return nil
-		}
+		// Durable store dependency failures must redeliver (do not ACK/discard).
 		return err
 	}
 	job := claim.Job
@@ -1725,12 +1735,21 @@ func (service *RenderService) admit(ctx context.Context, principal domain.Securi
 	}
 }
 
-func (service *RenderService) release(ctx context.Context, reservation ports.AdmissionReservation) {
-	_ = service.admission.Reconcile(ctx, reservation)
+func (service *RenderService) release(ctx context.Context, reservation ports.AdmissionReservation) error {
+	return service.admission.Reconcile(ctx, reservation)
 }
 
-func (service *RenderService) abandon(ctx context.Context, identity domain.ReplayIdentity) {
-	_ = service.replay.Abandon(ctx, identity)
+func (service *RenderService) abandon(ctx context.Context, identity domain.ReplayIdentity) error {
+	return service.replay.Abandon(ctx, identity)
+}
+
+// rollbackCreateAdmission settles create-path admission + abandons replay claim.
+// Surfaces dependency failures instead of silent ignore (joined by callers).
+func (service *RenderService) rollbackCreateAdmission(ctx context.Context, reservation ports.AdmissionReservation, identity domain.ReplayIdentity) error {
+	return errors.Join(
+		service.release(ctx, reservation),
+		service.abandon(ctx, identity),
+	)
 }
 
 func (service *RenderService) jobVisibilityCanonical(err error) domain.CanonicalError {
@@ -1748,10 +1767,28 @@ func (service *RenderService) assetVisibilityCanonical(err error) domain.Canonic
 }
 
 func (service *RenderService) dependencyCanonical(err error) domain.CanonicalError {
-	if errors.Is(err, ports.ErrDependencyUnavailable) || errors.Is(err, ports.ErrRenderAdapterUnavailable) {
+	if errors.Is(err, ports.ErrDependencyUnavailable) ||
+		errors.Is(err, ports.ErrRenderAdapterUnavailable) ||
+		errors.Is(err, ports.ErrRenderDigesterUnavailable) {
 		return domain.NewDependencyUnavailable()
 	}
 	return domain.NewInternalError()
+}
+
+// failAfterRollback joins primary create-path failure with admission/replay
+// rollback errors so cleanup debt is never silently ignored.
+func (service *RenderService) failAfterRollback(
+	ctx context.Context,
+	sc spineContext,
+	primary domain.CanonicalError,
+	reservation ports.AdmissionReservation,
+	identity domain.ReplayIdentity,
+) domain.CanonicalError {
+	if rbErr := service.rollbackCreateAdmission(ctx, reservation, identity); rbErr != nil {
+		// Rollback dependency failure takes precedence for fail-closed visibility.
+		return service.fail(ctx, sc, service.dependencyCanonical(rbErr))
+	}
+	return service.fail(ctx, sc, primary)
 }
 
 func (service *RenderService) fail(ctx context.Context, sc spineContext, canonical domain.CanonicalError) domain.CanonicalError {
