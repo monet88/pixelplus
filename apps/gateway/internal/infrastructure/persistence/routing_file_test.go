@@ -261,3 +261,56 @@ func splitLines(data []byte) [][]byte {
 	}
 	return lines
 }
+
+// Rejected Replace must leave in-memory state and ledger bytes unchanged.
+func TestFileRoutingPolicyStoreReplaceRejectsWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "routing.ledger")
+	store := NewFileRoutingPolicyStore(path)
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	good := domain.RoutingPolicy{
+		CandidateAccounts: []domain.ProviderAccountID{"pa_good"},
+		SelectionOrder:    []domain.ProviderAccountID{"pa_good"},
+		FallbackEnabled:   false,
+		FallbackChain:     []domain.ProviderAccountID{},
+		FallbackAuthModes: []domain.AuthMode{},
+		Affinity:          domain.AffinityPolicy{Enabled: false},
+		LeasePolicy:       domain.LeasePolicy{Enabled: false, EligibleUnits: []domain.LeaseUnit{}},
+		UpdatedAt:         domain.NewTimestamp(time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)),
+		UpdatedBy:         "key_a",
+	}
+	if _, err := store.Replace(context.Background(), ports.RoutingPolicyChange{Principal: principal, Policy: good}); err != nil {
+		t.Fatalf("seed Replace: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	// Experimental mode in fallback_auth_modes is fail-closed.
+	bad := good
+	bad.FallbackEnabled = true
+	bad.FallbackChain = []domain.ProviderAccountID{"pa_good"}
+	bad.FallbackAuthModes = []domain.AuthMode{domain.AuthModeChatGPTWebAccess}
+	if _, err := store.Replace(context.Background(), ports.RoutingPolicyChange{Principal: principal, Policy: bad}); err == nil {
+		t.Fatal("Replace bad policy: want error")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read ledger after reject: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("ledger mutated on rejected Replace")
+	}
+	got, err := store.Read(context.Background(), principal)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.UpdatedBy != "key_a" || len(got.FallbackAuthModes) != 0 {
+		t.Fatalf("in-memory policy changed on reject: %+v", got)
+	}
+}

@@ -10,7 +10,7 @@ stores. No private handler/use-case tests as primary evidence.
 
 | Layer | Cases |
 | --- | --- |
-| Integration (contract) | Tenant isolation GET/PUT; scopes; auth before size/shape; strict required/non-null fields; unique arrays; ordered subsets; fallback off rejects chain/modes; fallback on requires non-empty chain (§8.1); malformed `pa_` id → 400; foreign/unknown/deleted identical 404 (strip request_id); quota 429 before Visible/capability; unusable/risk/capability rejects; atomic Replace; missing policy fail-closed with epoch `updated_at` + `updated_by=system_default`; /models unwidened |
+| Integration (contract) | Prior proofs + cross-mode selection∪fallback modes; allowlist 403 vs foreign 404; active+unknown health reject; experimental fail-closed; circuit SurfaceOpen → 503; /models unwidened |
 | Composition/HTTP | Corrupt/lock-occupied/semantically invalid routing companion → readiness false; GET/PUT 503 `dependency_unavailable`; no durable mutation |
 | Persistence | File restore rejects null/invalid rows; append-only Replace ×2 + restart latest-row wins; second Tenant intact |
 | Models regression | Existing Models contract tests still pass |
@@ -51,4 +51,4 @@ node scripts/test-public-api-contract-validator.mjs
 - `node scripts/validate-public-api-contract.mjs` PASS
 - `node scripts/test-public-api-contract-validator.mjs` PASS
 - GitNexus: new FileRoutingPolicyStore symbols UNKNOWN (index lag); composition.New HIGH (full suite required)
-- Follow-up commit after 049b786 (review fixes: shape, order, non-enum, append-only file store)
+- Follow-up commits after 049b786/678d2bc: allowlist tri-state; cross-mode selection∪chain; active+unknown health; experimental fail-closed; circuit→503; shared domain validation; Replace pre-append validate

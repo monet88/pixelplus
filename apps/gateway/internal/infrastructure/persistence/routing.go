@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -233,93 +232,14 @@ func (store *FileRoutingPolicyStore) reloadLocked() error {
 }
 
 // validateDurableRoutingPolicy fails closed on semantically invalid persisted
-// rows so readiness never opens over untrusted durability (same posture as
-// validateAccountRow / health ledger validation).
+// rows so readiness never opens over untrusted durability. It delegates shape
+// and mode posture to domain.ValidateRoutingPolicyDurable — the same invariants
+// application Replace applies via ValidateRoutingPolicyShape (+ audit fields).
 func validateDurableRoutingPolicy(policy domain.RoutingPolicy) error {
-	if policy.UpdatedBy == "" {
-		return errors.New("missing updated_by")
-	}
-	if policy.UpdatedAt.IsZero() {
-		return errors.New("missing updated_at")
-	}
-
-	candidates, err := uniqueValidAccountIDs(policy.CandidateAccounts)
-	if err != nil {
+	if err := domain.ValidateRoutingPolicyDurable(policy); err != nil {
 		return err
-	}
-	selection, err := uniqueValidAccountIDs(policy.SelectionOrder)
-	if err != nil {
-		return err
-	}
-	chain, err := uniqueValidAccountIDs(policy.FallbackChain)
-	if err != nil {
-		return err
-	}
-	if !subsetOf(selection, candidates) {
-		return errors.New("selection_order not subset of candidate_accounts")
-	}
-	if !subsetOf(chain, candidates) {
-		return errors.New("fallback_chain not subset of candidate_accounts")
-	}
-	if !policy.FallbackEnabled {
-		if len(chain) > 0 || len(policy.FallbackAuthModes) > 0 {
-			return errors.New("fallback disabled with chain or modes")
-		}
-	} else if len(chain) == 0 {
-		// routing spec §8.1: fallback_chain when fallback_enabled.
-		return errors.New("fallback enabled without chain")
-	}
-
-	seenModes := make(map[domain.AuthMode]struct{}, len(policy.FallbackAuthModes))
-	for _, mode := range policy.FallbackAuthModes {
-		if !mode.Valid() {
-			return errors.New("invalid fallback auth mode")
-		}
-		if _, ok := seenModes[mode]; ok {
-			return errors.New("duplicate fallback auth mode")
-		}
-		seenModes[mode] = struct{}{}
-	}
-	seenUnits := make(map[domain.LeaseUnit]struct{}, len(policy.LeasePolicy.EligibleUnits))
-	for _, unit := range policy.LeasePolicy.EligibleUnits {
-		if !unit.Valid() {
-			return errors.New("invalid lease unit")
-		}
-		if _, ok := seenUnits[unit]; ok {
-			return errors.New("duplicate lease unit")
-		}
-		seenUnits[unit] = struct{}{}
 	}
 	return nil
-}
-
-func uniqueValidAccountIDs(ids []domain.ProviderAccountID) ([]domain.ProviderAccountID, error) {
-	seen := make(map[domain.ProviderAccountID]struct{}, len(ids))
-	out := make([]domain.ProviderAccountID, 0, len(ids))
-	for _, id := range ids {
-		if !id.Valid() {
-			return nil, errors.New("invalid provider_account_id")
-		}
-		if _, ok := seen[id]; ok {
-			return nil, errors.New("duplicate provider_account_id")
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	return out, nil
-}
-
-func subsetOf(subset, universe []domain.ProviderAccountID) bool {
-	index := make(map[domain.ProviderAccountID]struct{}, len(universe))
-	for _, id := range universe {
-		index[id] = struct{}{}
-	}
-	for _, id := range subset {
-		if _, ok := index[id]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // appendPolicyLocked appends one JSONL record for the Tenant singleton.
@@ -368,9 +288,9 @@ func (store *FileRoutingPolicyStore) Read(_ context.Context, principal domain.Se
 	return cloneRoutingPolicy(policy), nil
 }
 
-// Replace appends one ledger line for the Tenant singleton under exclusive
-// lock after a fresh reload. In-memory map update is rolled back if the append
-// fails so process state never diverges from durable failure.
+// Replace validates the policy before any in-memory or ledger mutation, then
+// appends one JSONL line under exclusive lock after a fresh reload. A rejected
+// policy leaves map and ledger bytes unchanged.
 func (store *FileRoutingPolicyStore) Replace(_ context.Context, change ports.RoutingPolicyChange) (domain.RoutingPolicy, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -382,9 +302,13 @@ func (store *FileRoutingPolicyStore) Replace(_ context.Context, change ports.Rou
 	if err := store.reloadLocked(); err != nil {
 		return domain.RoutingPolicy{}, err
 	}
+	policy := cloneRoutingPolicy(change.Policy)
+	// Validate BEFORE map mutation or append so a bad write is a pure no-op.
+	if err := validateDurableRoutingPolicy(policy); err != nil {
+		return domain.RoutingPolicy{}, fmt.Errorf("%w: %v", ports.ErrDependencyUnavailable, err)
+	}
 	tenant := change.Principal.TenantID
 	prior, hadPrior := store.byTenant[tenant]
-	policy := cloneRoutingPolicy(change.Policy)
 	store.byTenant[tenant] = policy
 	if err := store.appendPolicyLocked(tenant, policy); err != nil {
 		if hadPrior {

@@ -922,3 +922,216 @@ func mapsEqual(a, b map[string]any) bool {
 	}
 	return true
 }
+
+// AC: selection_order ∪ fallback_chain multi-mode requires fallback_auth_modes
+// to enumerate every distinct mode (invalid_request when incomplete).
+func TestRoutingPolicyCrossModeRequiresDeclaredModes(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		seedEligibleAccount(h, "tenant_a", "pa_mode_a", domain.AuthModeChatGPTCodexOAuth)
+		seedEligibleAccount(h, "tenant_a", "pa_mode_b", domain.AuthModeGrokXAIOAuth)
+	})
+	before := harness.routing.mutationsCount()
+
+	// Two modes in selection_order + chain, but only one listed in fallback_auth_modes.
+	body := `{
+		"candidate_accounts": ["pa_mode_a", "pa_mode_b"],
+		"selection_order": ["pa_mode_a", "pa_mode_b"],
+		"fallback_enabled": true,
+		"fallback_chain": ["pa_mode_b"],
+		"fallback_auth_modes": ["chatgpt_codex_oauth"],
+		"affinity": {"enabled": false},
+		"lease_policy": {"enabled": false, "eligible_units": []}
+	}`
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   body,
+	})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", response.StatusCode, payload)
+	}
+	if decodeError(t, payload)["code"] != "invalid_request" {
+		t.Fatalf("code = %v, want invalid_request", decodeError(t, payload)["code"])
+	}
+	if harness.routing.mutationsCount() != before {
+		t.Fatalf("store mutated on incomplete cross-mode declaration")
+	}
+
+	// Complete declaration succeeds.
+	bodyOK := `{
+		"candidate_accounts": ["pa_mode_a", "pa_mode_b"],
+		"selection_order": ["pa_mode_a", "pa_mode_b"],
+		"fallback_enabled": true,
+		"fallback_chain": ["pa_mode_b"],
+		"fallback_auth_modes": ["chatgpt_codex_oauth", "grok_xai_oauth"],
+		"affinity": {"enabled": false},
+		"lease_policy": {"enabled": false, "eligible_units": []}
+	}`
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   bodyOK,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("complete cross-mode status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+}
+
+// AC: allowlist tri-state — empty deny-all is 403 for visible same-Tenant;
+// foreign stays 404. Ownership precedes allowlist.
+func TestRoutingPolicyAllowlistTriState(t *testing.T) {
+	t.Parallel()
+
+	const allowKey = "sk-pxp_locatorAL_secretAL"
+	emptyList := []domain.ProviderAccountID{}
+	onlyOne := []domain.ProviderAccountID{"pa_allow_ok"}
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		seedEligibleAccount(h, "tenant_a", "pa_allow_ok", domain.AuthModeChatGPTCodexOAuth)
+		seedEligibleAccount(h, "tenant_a", "pa_allow_blocked", domain.AuthModeChatGPTCodexOAuth)
+		seedEligibleAccount(h, "tenant_b", "pa_allow_foreign", domain.AuthModeChatGPTCodexOAuth)
+		h.principal.principals[allowKey] = domain.SecurityPrincipal{
+			TenantID:                 "tenant_a",
+			ClientAPIKeyID:           "key_al",
+			Scopes:                   domain.NewScopeSet(domain.ScopeRoutingRead, domain.ScopeRoutingManage),
+			ProviderAccountAllowlist: &onlyOne,
+		}
+	})
+
+	// Visible same-Tenant but not on allowlist → 403.
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: allowKey,
+		body:   validPolicyBody("pa_allow_blocked"),
+	})
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("allowlist block status = %d, want 403 (body=%s)", response.StatusCode, payload)
+	}
+	if decodeError(t, payload)["code"] != "forbidden" {
+		t.Fatalf("code = %v, want forbidden", decodeError(t, payload)["code"])
+	}
+
+	// Foreign still 404 (non-enumeration beats allowlist).
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: allowKey,
+		body:   validPolicyBody("pa_allow_foreign"),
+	})
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("foreign under allowlist status = %d, want 404 (body=%s)", response.StatusCode, payload)
+	}
+
+	// Allowed id succeeds.
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: allowKey,
+		body:   validPolicyBody("pa_allow_ok"),
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("allowlist member status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+
+	// Explicit empty allowlist deny-all → 403 for any same-Tenant id.
+	denyKey := "sk-pxp_locatorDN_secretDN"
+	harness.principal.principals[denyKey] = domain.SecurityPrincipal{
+		TenantID:                 "tenant_a",
+		ClientAPIKeyID:           "key_dn",
+		Scopes:                   domain.NewScopeSet(domain.ScopeRoutingManage, domain.ScopeRoutingRead),
+		ProviderAccountAllowlist: &emptyList,
+	}
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: denyKey,
+		body:   validPolicyBody("pa_allow_ok"),
+	})
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("deny-all status = %d, want 403 (body=%s)", response.StatusCode, payload)
+	}
+}
+
+// AC: lifecycle=active with effective health unknown is not eligible.
+func TestRoutingPolicyRejectsActiveUnknownHealth(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount("pa_unknown_h", domain.AuthModeChatGPTCodexOAuth)
+		account.Health = domain.HealthSummary{
+			SummaryState: domain.HealthUnknown,
+			Conditions: []domain.HealthCondition{{
+				Scope:             domain.HealthScope{Kind: domain.HealthScopeAccount},
+				State:             domain.HealthUnknown,
+				Reason:            domain.HealthReasonInitialUnprobed,
+				CredentialVersion: account.Credential.Version,
+				Remediation:       domain.RemediationNone,
+				SourceClass:       domain.HealthSourceRequiredProbe,
+			}},
+		}
+		h.seedAccount("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_unknown_h", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+	})
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   validPolicyBody("pa_unknown_h"),
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	if decodeError(t, payload)["code"] != "account_not_usable" {
+		t.Fatalf("code = %v, want account_not_usable", decodeError(t, payload)["code"])
+	}
+}
+
+// AC: experimental Auth Modes fail closed in production (no lab profile).
+func TestRoutingPolicyRejectsExperimentalAuthMode(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		// ChatGPT Web Access is experimental under the risk envelope.
+		seedEligibleAccount(h, "tenant_a", "pa_exp_web", domain.AuthModeChatGPTWebAccess)
+	})
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   validPolicyBody("pa_exp_web"),
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	if decodeError(t, payload)["code"] != "auth_mode_unavailable" {
+		t.Fatalf("code = %v, want auth_mode_unavailable", decodeError(t, payload)["code"])
+	}
+}
+
+// AC: CircuitStore.SurfaceOpen dependency error is dependency_unavailable (503),
+// not capability_unsupported.
+func TestRoutingPolicyCircuitDependencyUnavailable(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		seedEligibleAccount(h, "tenant_a", "pa_circ_dep", domain.AuthModeChatGPTCodexOAuth)
+		h.circuits.queryErr = ports.ErrDependencyUnavailable
+	})
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   validPolicyBody("pa_circ_dep"),
+	})
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", response.StatusCode, payload)
+	}
+	if decodeError(t, payload)["code"] != "dependency_unavailable" {
+		t.Fatalf("code = %v, want dependency_unavailable", decodeError(t, payload)["code"])
+	}
+}

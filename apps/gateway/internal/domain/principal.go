@@ -56,9 +56,31 @@ type SecurityPrincipal struct {
 	TenantID       TenantID
 	ClientAPIKeyID ClientAPIKeyID
 	Scopes         ScopeSet
+	// ProviderAccountAllowlist is the Client API Key account allowlist (#8 §5.1/§5.4).
+	// Tri-state:
+	//   - nil: unrestricted (all same-Tenant accounts permitted)
+	//   - non-nil empty: deny-all
+	//   - non-nil non-empty: membership required
+	// Ownership/non-enumeration still wins: foreign/unknown/deleted never become
+	// allowlist denials (they stay resource_not_found).
+	ProviderAccountAllowlist *[]ProviderAccountID
 }
 
 // Valid reports whether both ownership and key identities are present.
 func (principal SecurityPrincipal) Valid() bool {
 	return principal.TenantID != "" && principal.ClientAPIKeyID != ""
+}
+
+// AllowsProviderAccount reports whether the allowlist permits a same-Tenant
+// account id. Call only after ownership visibility is established.
+func (principal SecurityPrincipal) AllowsProviderAccount(id ProviderAccountID) bool {
+	if principal.ProviderAccountAllowlist == nil {
+		return true
+	}
+	for _, allowed := range *principal.ProviderAccountAllowlist {
+		if allowed == id {
+			return true
+		}
+	}
+	return false
 }
