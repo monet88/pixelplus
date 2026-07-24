@@ -140,6 +140,7 @@ type ProviderAccountService struct {
 	capabilities ports.CapabilityStore
 	capability   ports.CapabilityAdapter
 	circuits     ports.CircuitStore
+	routing      ports.RoutingPolicyStore
 	audit        ports.AuditRecorder
 	telemetry    ports.TelemetryRecorder
 	requestLog   ports.RequestLogRecorder
@@ -160,6 +161,7 @@ type ProviderAccountDependencies struct {
 	Capabilities ports.CapabilityStore
 	Capability   ports.CapabilityAdapter
 	Circuits     ports.CircuitStore
+	Routing      ports.RoutingPolicyStore
 	Audit        ports.AuditRecorder
 	Telemetry    ports.TelemetryRecorder
 	RequestLog   ports.RequestLogRecorder
@@ -192,6 +194,8 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		return nil, errors.New("application: capability adapter is required")
 	case dependencies.Circuits == nil:
 		return nil, errors.New("application: circuit store is required")
+	case dependencies.Routing == nil:
+		return nil, errors.New("application: routing policy store is required")
 	case dependencies.Audit == nil:
 		return nil, errors.New("application: audit recorder is required")
 	case dependencies.Telemetry == nil:
@@ -215,6 +219,7 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		capabilities: dependencies.Capabilities,
 		capability:   dependencies.Capability,
 		circuits:     dependencies.Circuits,
+		routing:      dependencies.Routing,
 		audit:        dependencies.Audit,
 		telemetry:    dependencies.Telemetry,
 		requestLog:   dependencies.RequestLog,

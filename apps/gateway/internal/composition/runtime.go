@@ -46,10 +46,10 @@ type Dependencies struct {
 	// production composition constructor is safe and fail-closed by default.
 	// Contract tests inject controlled fakes through these same fields to
 	// exercise the protected spine through real composition.
-	Principal  ports.PrincipalStore
-	Admission  ports.AdmissionStore
-	Replay     ports.ReplayStore
-	Accounts   ports.AccountStore
+	Principal ports.PrincipalStore
+	Admission ports.AdmissionStore
+	Replay    ports.ReplayStore
+	Accounts  ports.AccountStore
 	// Health owns scoped conditions and recovery permits independently of
 	// AccountStore lifecycle metadata (ADR 0009 HealthStore catalogue).
 	Health     ports.HealthStore
@@ -81,6 +81,12 @@ type Dependencies struct {
 	// closed instead (health/cooldown spec §12). Contract tests inject a
 	// controlled fake to prove an open surface blocks matching new work.
 	Circuits ports.CircuitStore
+
+	// Routing Policy store (#52). A nil port keeps the in-process foundation
+	// Memory store (or a file companion when ProviderAccountStorePath is set)
+	// so production composition is safe without inventing cross-Tenant policy.
+	// Contract tests inject a controlled fake with mutation counters.
+	Routing ports.RoutingPolicyStore
 
 	// Asset exchange request-spine ports (#53). When a port is nil, New
 	// substitutes the production foundation implementation so the real
@@ -159,6 +165,16 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	}
 	dependencies.Health = health
 
+	routing := dependencies.Routing
+	if routing == nil {
+		if config.ProviderAccountStorePath != "" {
+			routing = persistence.NewFileRoutingPolicyStore(config.ProviderAccountStorePath + ".routing-policy.ledger")
+		} else {
+			routing = persistence.NewMemoryRoutingPolicyStore()
+		}
+	}
+	dependencies.Routing = routing
+
 	runtime := &Runtime{
 		worker: application.NewFoundationJobExecutor(),
 		jobs:   dependencies.Runtime,
@@ -183,11 +199,19 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		logger.Error("provider health startup recovery failed; readiness stays closed", "error", healthRestoreErr)
 		dependencies.Health = persistence.NewUnavailableHealthStore()
 	}
+	routingRestoreErr := error(nil)
+	if restorer, ok := routing.(interface{ Restore(context.Context) error }); ok {
+		routingRestoreErr = restorer.Restore(startupContext)
+		if routingRestoreErr != nil {
+			logger.Error("routing policy startup recovery failed; readiness stays closed", "error", routingRestoreErr)
+			dependencies.Routing = persistence.NewMemoryRoutingPolicyStore()
+		}
+	}
 	jobRestoreErr := runtime.jobs.Restore(startupContext)
 	if jobRestoreErr != nil {
 		logger.Error("gateway startup recovery failed; readiness stays closed", "error", jobRestoreErr)
 	}
-	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && jobRestoreErr == nil)
+	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil && jobRestoreErr == nil)
 
 	service, err := newProviderAccountService(dependencies)
 	if err != nil {
@@ -198,7 +222,7 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service)
+	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service)
 
 	return runtime, nil
 }
@@ -265,6 +289,10 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 	if circuits == nil {
 		circuits = persistence.NewClosedCircuitStore()
 	}
+	routing := dependencies.Routing
+	if routing == nil {
+		routing = persistence.NewMemoryRoutingPolicyStore()
+	}
 
 	return application.NewProviderAccountService(application.ProviderAccountDependencies{
 		Principal:    principal,
@@ -278,6 +306,7 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 		Capabilities: capabilities,
 		Capability:   capability,
 		Circuits:     circuits,
+		Routing:      routing,
 		Audit:        audit,
 		Telemetry:    telemetry,
 		RequestLog:   requestLog,

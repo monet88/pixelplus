@@ -23,6 +23,12 @@ const (
 	// ScopeCapabilitiesRead authorizes Capability Snapshot inspection and the
 	// offerable model list (capability semantics section 11; OpenAPI x-required-scopes).
 	ScopeCapabilitiesRead Scope = "capabilities.read"
+	// ScopeRoutingRead authorizes reading the Tenant singleton Routing Policy
+	// (routing/fallback/affinity/leases §8.4; OpenAPI getRoutingPolicy).
+	ScopeRoutingRead Scope = "routing.read"
+	// ScopeRoutingManage authorizes atomic replacement of the Tenant singleton
+	// Routing Policy (routing/fallback/affinity/leases §8.4; OpenAPI replaceRoutingPolicy).
+	ScopeRoutingManage Scope = "routing.manage"
 )
 
 // ScopeSet is the set of operation ids granted to a Security Principal.

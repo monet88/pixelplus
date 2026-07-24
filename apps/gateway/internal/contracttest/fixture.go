@@ -25,13 +25,13 @@ type Options struct {
 	// Provider Account request-spine ports (#45). A nil port keeps the
 	// production foundation implementation composition substitutes by default;
 	// a controlled fake proves the protected spine through real composition.
-	Principal  ports.PrincipalStore
-	Admission  ports.AdmissionStore
-	Replay     ports.ReplayStore
-	Accounts   ports.AccountStore
+	Principal ports.PrincipalStore
+	Admission ports.AdmissionStore
+	Replay    ports.ReplayStore
+	Accounts  ports.AccountStore
 	// Health is injected independently so public-proof fixtures can control
 	// health durability without coupling to AccountStore lifecycle rows.
-	Health     ports.HealthStore
+	Health ports.HealthStore
 	// Clock overrides the fixture's controlled clock when non-nil (e.g. for
 	// advancing past cooldown timers without reseeding durable health).
 	Clock      ports.Clock
@@ -69,6 +69,11 @@ type Options struct {
 	// fake proves an open cross-Tenant surface blocks matching new work through
 	// real composition without exposing the corroborating evidence.
 	Circuits ports.CircuitStore
+
+	// Routing Policy store (#52). A nil port keeps the foundation memory store;
+	// a controlled fake proves atomic Replace mutation counts through real
+	// composition without Vault/Adapter access.
+	Routing ports.RoutingPolicyStore
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -119,6 +124,7 @@ func NewFixture(options Options) (*Fixture, error) {
 		Capability:   options.Capability,
 
 		Circuits: options.Circuits,
+		Routing:  options.Routing,
 	})
 	if err != nil {
 		return nil, err
