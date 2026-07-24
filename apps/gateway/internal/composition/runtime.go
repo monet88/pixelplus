@@ -566,10 +566,30 @@ func (runtime *Runtime) Ready() bool {
 	return runtime.ready.Load() && runtime.healthy.Load()
 }
 
+// RecoverUnpublishedQueues re-enqueues durable jobs with QueuePublished=false
+// without a client retry. Safe to call after startup when Ready.
+func (runtime *Runtime) RecoverUnpublishedQueues(ctx context.Context) error {
+	if runtime == nil || !runtime.Ready() {
+		return ErrNotReady
+	}
+	if recoverer, ok := runtime.worker.(interface {
+		RecoverUnpublishedQueues(context.Context) error
+	}); ok {
+		return recoverer.RecoverUnpublishedQueues(ctx)
+	}
+	return nil
+}
+
 // RunWorkers connects safe queue references to the exported JobExecutor.
 func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 	if !runtime.Ready() {
 		return ErrNotReady
+	}
+
+	// Autonomous publication recovery before consuming the queue (#14 §3.3).
+	if err := runtime.RecoverUnpublishedQueues(ctx); err != nil {
+		runtime.logger.Warn("unpublished queue recovery incomplete", "error", err)
+		// Continue workers; remaining unpublished jobs stay recoverable.
 	}
 
 	workerContext, cancelWorkers := context.WithCancel(ctx)

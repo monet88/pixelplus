@@ -1227,6 +1227,53 @@ func TestEnqueueFailureAfterCreateRecoversSameJobOnRetry(t *testing.T) {
 	}
 }
 
+// P1-2: durable create + enqueue failure recovers via autonomous recovery
+// without a second client request (startup/background RecoverUnpublishedQueues).
+func TestUnpublishedQueueRecoversWithoutClientRetry(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_auto_pub")
+		h.enqueueFailTimes = 1
+		h.enqueueError = ports.ErrDependencyUnavailable
+	})
+
+	first, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-auto-pub",
+		body:    `{"model":"gpt-image-1","prompt":"recover me"}`,
+	})
+	if first.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d, want 503 (body=%s)", first.StatusCode, payload)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 0 {
+		t.Fatalf("enqueues after fail = %d, want 0", n)
+	}
+
+	// Autonomous recovery (no client matching retry).
+	if err := h.fixture.Runtime().RecoverUnpublishedQueues(t.Context()); err != nil {
+		t.Fatalf("RecoverUnpublishedQueues: %v", err)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 1 {
+		t.Fatalf("enqueues after recovery = %d, want 1", n)
+	}
+
+	// Worker can claim the recovered publication.
+	ref := h.fixture.EnqueuedReferences()[0]
+	jobRef, err := ref.JobRef()
+	if err != nil {
+		t.Fatalf("JobRef: %v", err)
+	}
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), jobRef); err != nil {
+		t.Fatalf("ExecuteJob after recovery: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls = %d, want 1", calls)
+	}
+}
+
 // Spec: create admission occupancy is held until job terminal — not released on
 // HTTP create response. Worker complete (or cancel) settles Reconcile once.
 func TestAdmissionReservationHeldUntilJobTerminal(t *testing.T) {

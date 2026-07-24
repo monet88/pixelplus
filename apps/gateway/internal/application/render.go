@@ -507,6 +507,26 @@ func (service *RenderService) ensureQueuePublished(ctx context.Context, job doma
 	return service.jobs.MarkQueuePublished(ctx, job.JobRef())
 }
 
+// RecoverUnpublishedQueues autonomously enqueues durable jobs that were created
+// but never published (QueuePublished=false). Does not require a second client
+// request (#14 §3.3 startup/background recovery).
+func (service *RenderService) RecoverUnpublishedQueues(ctx context.Context) error {
+	if service == nil || service.jobs == nil || service.queue == nil {
+		return ports.ErrDependencyUnavailable
+	}
+	pending, err := service.jobs.ListUnpublishedQueue(ctx)
+	if err != nil {
+		return err
+	}
+	var first error
+	for _, job := range pending {
+		if _, err := service.ensureQueuePublished(ctx, job); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
 func (service *RenderService) purgePrompt(ctx context.Context, tenant domain.TenantID, jobID domain.Identifier) {
 	_ = service.prompts.Delete(ctx, ports.RenderPromptAccess{TenantID: tenant, JobID: jobID})
 }

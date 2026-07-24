@@ -145,6 +145,10 @@ type RenderJobStore interface {
 	// MarkQueuePublished records that the SafeJobReference was accepted by the
 	// queue for this job (durable create may precede publication; #14 §3.3).
 	MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error)
+	// ListUnpublishedQueue returns durable non-terminal jobs whose SafeJobReference
+	// was never accepted by the queue (QueuePublished=false). Used by autonomous
+	// startup/background recovery without a second client request (#14 §3.3).
+	ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error)
 }
 
 // RenderReplayDecision carries a terminal job for create replay.

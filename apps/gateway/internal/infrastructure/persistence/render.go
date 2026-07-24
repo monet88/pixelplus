@@ -528,6 +528,24 @@ func (store *MemoryRenderJobStore) MarkQueuePublished(_ context.Context, ref dom
 	return cloneJob(job), nil
 }
 
+// ListUnpublishedQueue returns non-terminal jobs still needing SafeJobReference
+// publication (QueuePublished=false).
+func (store *MemoryRenderJobStore) ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	var out []domain.RenderJob
+	for _, jobs := range store.byTenant {
+		for _, job := range jobs {
+			if job.QueuePublished || job.Lifecycle.Terminal() {
+				continue
+			}
+			out = append(out, cloneJob(job))
+		}
+	}
+	return out, nil
+}
+
 func (store *MemoryRenderJobStore) loadLocked(ref domain.JobRef) (domain.RenderJob, error) {
 	jobs, ok := store.byTenant[domain.TenantID(ref.TenantID)]
 	if !ok {
@@ -625,6 +643,9 @@ func (*UnavailableRenderJobStore) ReleaseAccountLease(context.Context, domain.Jo
 }
 func (*UnavailableRenderJobStore) MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error) {
 	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) ListUnpublishedQueue(context.Context) ([]domain.RenderJob, error) {
+	return nil, ports.ErrDependencyUnavailable
 }
 
 // MemoryRenderReplayStore is the process-local create-idempotency store for
