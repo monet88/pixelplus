@@ -97,6 +97,15 @@ type Dependencies struct {
 	AssetMetadata ports.AssetMetadataStore
 	AssetContent  ports.AssetContentStore
 	AssetAudit    ports.AssetAuditRecorder
+
+	// Render Job ports (#54). When a port is nil, New substitutes foundation
+	// implementations. The real JobExecutor is wired only when Jobs store and
+	// Render adapter paths are available; otherwise the fail-closed foundation
+	// executor remains. Contract tests inject controlled fakes.
+	RenderJobs    ports.RenderJobStore
+	RenderReplay  ports.RenderReplayStore
+	RenderAdapter ports.RenderAdapter
+	RenderAudit   ports.RenderAuditRecorder
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -224,7 +233,13 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service)
+	renderService, err := newRenderService(dependencies)
+	if err != nil {
+		return nil, err
+	}
+	// Wire the real JobExecutor when the render spine is available.
+	runtime.worker = renderService
+	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service, renderService)
 
 	return runtime, nil
 }
@@ -369,6 +384,98 @@ func newAssetService(dependencies Dependencies) (*application.AssetService, erro
 		RequestLog: requestLog,
 		Clock:      dependencies.Clock,
 		IDs:        dependencies.IDs,
+	})
+}
+
+// newRenderService wires the Render Job spine and JobExecutor. Nil ports fall
+// back to foundation implementations so production composition is fail-closed
+// by default (no Provider render surface until injected).
+func newRenderService(dependencies Dependencies) (*application.RenderService, error) {
+	principal := dependencies.Principal
+	if principal == nil {
+		principal = persistence.NewFailClosedPrincipalStore()
+	}
+	admission := dependencies.Admission
+	if admission == nil {
+		admission = persistence.NewAlwaysAdmitStore()
+	}
+	replay := dependencies.RenderReplay
+	if replay == nil {
+		replay = persistence.NewMemoryRenderReplayStore()
+	}
+	jobs := dependencies.RenderJobs
+	if jobs == nil {
+		jobs = persistence.NewMemoryRenderJobStore()
+	}
+	accounts := dependencies.Accounts
+	if accounts == nil {
+		accounts = persistence.NewMemoryAccountStore()
+	}
+	health := dependencies.Health
+	if health == nil {
+		health = persistence.NewMemoryHealthStore()
+	}
+	capabilities := dependencies.Capabilities
+	if capabilities == nil {
+		capabilities = vaultpkg.NewFailClosedCapabilityStore()
+	}
+	circuits := dependencies.Circuits
+	if circuits == nil {
+		circuits = persistence.NewClosedCircuitStore()
+	}
+	routing := dependencies.Routing
+	if routing == nil {
+		routing = persistence.NewMemoryRoutingPolicyStore()
+	}
+	metadata := dependencies.AssetMetadata
+	if metadata == nil {
+		metadata = persistence.NewMemoryAssetMetadataStore(dependencies.Clock)
+	}
+	content := dependencies.AssetContent
+	if content == nil {
+		content = persistence.NewMemoryAssetContentStore()
+	}
+	vault := dependencies.Vault
+	if vault == nil {
+		vault = vaultpkg.NewFailClosedCredentialVault()
+	}
+	render := dependencies.RenderAdapter
+	if render == nil {
+		render = vaultpkg.NewFailClosedRenderAdapter()
+	}
+	audit := dependencies.RenderAudit
+	if audit == nil {
+		audit = observability.NewSlogRenderAuditRecorder(dependencies.Logger)
+	}
+	telemetry := dependencies.Telemetry
+	if telemetry == nil {
+		telemetry = observability.NewSlogTelemetryRecorder(dependencies.Logger)
+	}
+	requestLog := dependencies.RequestLog
+	if requestLog == nil {
+		requestLog = observability.NewSlogRequestLogRecorder(dependencies.Logger)
+	}
+
+	return application.NewRenderService(application.RenderDependencies{
+		Principal:    principal,
+		Admission:    admission,
+		Replay:       replay,
+		Jobs:         jobs,
+		Accounts:     accounts,
+		Health:       health,
+		Capabilities: capabilities,
+		Circuits:     circuits,
+		Routing:      routing,
+		Assets:       metadata,
+		Content:      content,
+		Vault:        vault,
+		Render:       render,
+		Queue:        dependencies.Runtime,
+		Audit:        audit,
+		Telemetry:    telemetry,
+		RequestLog:   requestLog,
+		Clock:        dependencies.Clock,
+		IDs:          dependencies.IDs,
 	})
 }
 

@@ -74,6 +74,14 @@ type Options struct {
 	// a controlled fake proves atomic Replace mutation counts through real
 	// composition without Vault/Adapter access.
 	Routing ports.RoutingPolicyStore
+
+	// Render Job ports (#54). A nil port keeps the foundation memory/fail-closed
+	// implementations; controlled fakes prove create/claim/render/placement
+	// through real composition and the exported JobExecutor.
+	RenderJobs    ports.RenderJobStore
+	RenderReplay  ports.RenderReplayStore
+	RenderAdapter ports.RenderAdapter
+	RenderAudit   ports.RenderAuditRecorder
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -125,6 +133,11 @@ func NewFixture(options Options) (*Fixture, error) {
 
 		Circuits: options.Circuits,
 		Routing:  options.Routing,
+
+		RenderJobs:    options.RenderJobs,
+		RenderReplay:  options.RenderReplay,
+		RenderAdapter: options.RenderAdapter,
+		RenderAudit:   options.RenderAudit,
 	})
 	if err != nil {
 		return nil, err
@@ -162,6 +175,13 @@ func (fixture *Fixture) WorkersStarted() <-chan struct{} {
 // Events returns a concurrency-safe copy of lifecycle observations.
 func (fixture *Fixture) Events() []string {
 	return fixture.events.values()
+}
+
+// EnqueuedReferences returns SafeJobReference values accepted by the fixture
+// job runtime. Used by Render Job contract tests to prove one secret-free
+// enqueue per admitted create without inspecting private application state.
+func (fixture *Fixture) EnqueuedReferences() []ports.SafeJobReference {
+	return fixture.jobs.EnqueuedReferences()
 }
 
 // Close shuts down HTTP first, then delegates reverse resource closure to Runtime.
@@ -232,6 +252,12 @@ type controlledJobRuntime struct {
 
 	startOnce sync.Once
 	doneOnce  sync.Once
+
+	// enqueueMu protects enqueueRefs for SafeJobReference observation in
+	// Render Job contract tests (#54): admitted create must enqueue exactly
+	// one secret-free reference.
+	enqueueMu   sync.Mutex
+	enqueueRefs []ports.SafeJobReference
 }
 
 func newControlledJobRuntime(events *eventLog, recoveryError error, closeGate <-chan struct{}) *controlledJobRuntime {
@@ -253,7 +279,18 @@ func (runtime *controlledJobRuntime) Enqueue(_ context.Context, reference ports.
 	if _, err := reference.JobRef(); err != nil {
 		return ports.EnqueueReceipt{}, err
 	}
+	runtime.enqueueMu.Lock()
+	runtime.enqueueRefs = append(runtime.enqueueRefs, reference)
+	runtime.enqueueMu.Unlock()
+	runtime.events.add("job_runtime.enqueue")
 	return ports.EnqueueReceipt{Reference: reference}, nil
+}
+
+// EnqueuedReferences returns a copy of SafeJobReference values accepted by Enqueue.
+func (runtime *controlledJobRuntime) EnqueuedReferences() []ports.SafeJobReference {
+	runtime.enqueueMu.Lock()
+	defer runtime.enqueueMu.Unlock()
+	return append([]ports.SafeJobReference(nil), runtime.enqueueRefs...)
 }
 
 func (runtime *controlledJobRuntime) Run(ctx context.Context, _ ports.JobHandler) error {
