@@ -370,9 +370,14 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	case ports.ReplayClaimed:
 		// sole owner continues below
 	case ports.ReplayTerminal:
-		// Matching replay: same job. If queue publication never succeeded,
-		// recover by re-enqueueing without creating a replacement (#14 §3.3).
+		// Matching replay: load *current* job from the store by TerminalJob.JobRef
+		// so worker-completed state is not a stale queued snapshot (P1-6).
 		job := decision.TerminalJob
+		if current, loadErr := service.jobs.Load(ctx, job.JobRef()); loadErr == nil {
+			job = current
+		}
+		// If queue publication never succeeded, recover by re-enqueueing without
+		// creating a replacement (#14 §3.3).
 		if !job.QueuePublished {
 			published, err := service.ensureQueuePublished(ctx, job)
 			if err != nil {
@@ -928,6 +933,9 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		fence:   fence,
 		attempt: &attempt,
 	}
+	// Heartbeat during long Adapter calls so lease expiry does not steal the fence.
+	stopHB := service.startLeaseHeartbeat(ctx, ref, fence, workerID)
+	defer stopHB()
 	outcome, renderErr := service.authorized.Render(ctx, ports.AuthorizedRenderRequest{
 		Principal: principal,
 		JobRef:    ref,
@@ -1434,16 +1442,20 @@ func (service *RenderService) placeEntryFromStaging(
 	entry domain.OutputEntry,
 	fence domain.FencingToken,
 ) error {
+	identity := service.stagingIdentity(job, entry)
 	var placeErr error
 	err := service.staging.Use(ctx, ports.StagingAccess{
 		Principal: principal,
-		Identity:  service.stagingIdentity(job, entry),
+		Identity:  identity,
+		Now:       service.nowTS(),
 	}, func(data []byte) error {
 		placeErr = service.placeOutputBytes(ctx, principal, job, entry, data, fence)
 		return placeErr
 	})
 	if err != nil {
-		if errors.Is(err, ports.ErrStagingNotFound) || errors.Is(err, ports.ErrDependencyUnavailable) {
+		if errors.Is(err, ports.ErrStagingNotFound) ||
+			errors.Is(err, ports.ErrStagingExpired) ||
+			errors.Is(err, ports.ErrDependencyUnavailable) {
 			return err
 		}
 		return err
@@ -1451,9 +1463,49 @@ func (service *RenderService) placeEntryFromStaging(
 	if placeErr != nil {
 		return placeErr
 	}
+	// Purge staging after successful placement (P1-7).
+	_ = service.staging.Delete(ctx, identity)
 	// Output placed audit after durable placement (P1-B).
 	return service.recordJobAudit(ctx, ports.AuditRenderOutputPlaced, job, "success")
 }
+
+// startLeaseHeartbeat renews the worker fence while Adapter is in-flight.
+// Interval is leaseTTL/3 (foundation default TTL 2m → ~40s). Stop via returned cancel.
+func (service *RenderService) startLeaseHeartbeat(
+	ctx context.Context,
+	ref domain.JobRef,
+	fence domain.FencingToken,
+	workerID domain.Identifier,
+) func() {
+	done := make(chan struct{})
+	interval := defaultWorkerLeaseTTL / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := service.nowTS()
+				_, _ = service.jobs.RenewWorkerLease(ctx, ref, fence, ports.WorkerLease{
+					WorkerID:  workerID,
+					Now:       now,
+					ExpiresAt: domain.NewTimestamp(now.Time().Add(defaultWorkerLeaseTTL)),
+				})
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+// defaultWorkerLeaseTTL mirrors the foundation store bound for heartbeat renewals.
+const defaultWorkerLeaseTTL = 2 * time.Minute
 
 func (service *RenderService) placeOutputBytes(
 	ctx context.Context,

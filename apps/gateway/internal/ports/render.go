@@ -159,6 +159,9 @@ type RenderJobStore interface {
 	// MarkPromptPurged records that confidential prompt material was deleted.
 	// Idempotent when already purged.
 	MarkPromptPurged(context.Context, domain.JobRef) (domain.RenderJob, error)
+	// RenewWorkerLease extends LeaseExpiresAt and HeartbeatAt under the current
+	// fence for a long-running healthy worker. Stale fence / wrong worker fails.
+	RenewWorkerLease(context.Context, domain.JobRef, domain.FencingToken, WorkerLease) (domain.RenderJob, error)
 }
 
 // RenderReplayDecision carries a terminal job for create replay.
@@ -197,23 +200,33 @@ func (id StagingIdentity) Valid() bool {
 
 // StagingPut stores temporary result bytes under a stable identity. Permanent
 // Asset objects do not live here — only capture staging for placement/retry.
+// ExpiresAt, when non-zero, bounds retention for storage-cap placement retry;
+// Use after expiry fails closed and clears the blob.
 type StagingPut struct {
 	Identity    StagingIdentity
 	ContentType string
 	Data        []byte
+	// ExpiresAt bounds staging retention for placement-only recovery after
+	// storage-cap failure. Zero means fixture/default unbounded until Delete.
+	ExpiresAt domain.Timestamp
 }
 
 // StagingAccess authorizes purpose-bound use of staged bytes for placement.
 // Application never receives plaintext as a return value; Use injects into a
-// callback only.
+// callback only. Now, when non-zero, is the observation instant for ExpiresAt.
 type StagingAccess struct {
 	Principal domain.SecurityPrincipal
 	Identity  StagingIdentity
+	Now       domain.Timestamp
 }
 
 // ErrStagingNotFound reports missing or non-visible staged material for the
 // requested identity (same-Tenant non-enumeration at the application boundary).
 var ErrStagingNotFound = errors.New("render staging material not found")
+
+// ErrStagingExpired reports staged material past ExpiresAt; implementations
+// clear the blob and return this so placement retry fails closed.
+var ErrStagingExpired = errors.New("render staging material expired")
 
 // RenderStagingStore owns temporary Provider result bytes for capture and
 // placement retry. It is distinct from AssetContentStore (permanent Assets) and
@@ -222,10 +235,12 @@ var ErrStagingNotFound = errors.New("render staging material not found")
 //
 // Put is idempotent by StagingIdentity (same checksum). Use injects a copy of
 // bytes into the callback and returns ErrStagingNotFound when the identity is
-// unknown or Tenant does not match.
+// unknown or Tenant does not match. Delete purges after successful placement.
+// Storage-cap paths may set ExpiresAt; Use after expiry fails and clears.
 type RenderStagingStore interface {
 	Put(context.Context, StagingPut) error
 	Use(context.Context, StagingAccess, func([]byte) error) error
+	Delete(context.Context, StagingIdentity) error
 }
 
 // RenderPromptIntake is the transient create-time handoff of prompt material

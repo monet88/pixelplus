@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/persistence"
@@ -79,5 +80,46 @@ func TestUnavailableRenderStagingFailsClosed(t *testing.T) {
 	})
 	if !errors.Is(err, ports.ErrDependencyUnavailable) {
 		t.Fatalf("Put error = %v, want ErrDependencyUnavailable", err)
+	}
+}
+
+func TestMemoryRenderStagingDeleteAndExpiry(t *testing.T) {
+	t.Parallel()
+
+	store := persistence.NewMemoryRenderStagingStore()
+	id := ports.StagingIdentity{
+		TenantID: "tenant_a", JobID: "job_1", ManifestID: "m", EntryID: "e", Checksum: "c",
+	}
+	now := domain.NewTimestamp(time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC))
+	if err := store.Put(context.Background(), ports.StagingPut{
+		Identity: id, Data: []byte{9}, ExpiresAt: domain.NewTimestamp(now.Time().Add(time.Hour)),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := store.Delete(context.Background(), id); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	err := store.Use(context.Background(), ports.StagingAccess{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a"},
+		Identity:  id,
+		Now:       now,
+	}, func([]byte) error { return nil })
+	if !errors.Is(err, ports.ErrStagingNotFound) {
+		t.Fatalf("Use after Delete = %v, want not found", err)
+	}
+
+	// Expiry clears and returns ErrStagingExpired.
+	if err := store.Put(context.Background(), ports.StagingPut{
+		Identity: id, Data: []byte{1}, ExpiresAt: now,
+	}); err != nil {
+		t.Fatalf("Put2: %v", err)
+	}
+	err = store.Use(context.Background(), ports.StagingAccess{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a"},
+		Identity:  id,
+		Now:       domain.NewTimestamp(now.Time().Add(time.Second)),
+	}, func([]byte) error { return nil })
+	if !errors.Is(err, ports.ErrStagingExpired) {
+		t.Fatalf("Use expired = %v, want ErrStagingExpired", err)
 	}
 }

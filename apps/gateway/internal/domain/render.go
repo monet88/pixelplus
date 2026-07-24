@@ -265,7 +265,11 @@ type RenderJob struct {
 	// LeaseExpiresAt is the worker fence expiry. After expiry, a new worker may
 	// reclaim only when CommitStatus is not_started and PayloadSent is false
 	// (#14 §6.4). Expiry never authorizes a second generation after payload.
-	LeaseExpiresAt    Timestamp
+	LeaseExpiresAt Timestamp
+	// HeartbeatAt is the last durable worker lease renewal under the current fence.
+	// Long Adapter calls renew via RenewWorkerLease so expiry recovery does not
+	// steal an active healthy worker (#14 §6.4).
+	HeartbeatAt       Timestamp
 	CancelRequestedAt Timestamp
 	CancelRequestedBy ClientAPIKeyID
 	FailureStage      FailureStage

@@ -703,6 +703,20 @@ func (s *flakyClaimJobStore) MarkAdmissionSettled(_ context.Context, ref domain.
 	s.jobs[s.key(ref)] = job
 	return job, nil
 }
+func (s *flakyClaimJobStore) RenewWorkerLease(_ context.Context, ref domain.JobRef, token domain.FencingToken, lease ports.WorkerLease) (domain.RenderJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.jobs[s.key(ref)]
+	if job.WorkerFencingToken != token {
+		return domain.RenderJob{}, domain.ErrStaleFence
+	}
+	job.HeartbeatAt = lease.Now
+	if !lease.ExpiresAt.IsZero() {
+		job.LeaseExpiresAt = lease.ExpiresAt
+	}
+	s.jobs[s.key(ref)] = job
+	return job, nil
+}
 func (s *flakyClaimJobStore) MarkPromptPurged(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -957,6 +971,184 @@ func TestForeignRenderJobIsNonEnumerating404(t *testing.T) {
 	// Ownership fails before admission on get.
 	if h.admission.admitCalls.Load() != admits {
 		t.Fatalf("admission after foreign get = %d, want %d", h.admission.admitCalls.Load(), admits)
+	}
+}
+
+// Spec: HTTP create → nonblocking queue → Runtime.RunWorkers → GET completed
+// with manifest/Asset. Proves controlledJobRuntime delivers to JobExecutor,
+// no deadlock on enqueue-before-consumer, and no replacement publication.
+func TestRunWorkersDeliversCreateToCompletedHTTP(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_runworkers_e2e")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-runworkers-e2e",
+		body:    `{"model":"gpt-image-1","prompt":"runworkers e2e"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d, want 202 (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	if err := json.Unmarshal(payload, &job); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	jobID, _ := job["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("job_id missing: %s", payload)
+	}
+	enqueuesAfterCreate := len(h.fixture.EnqueuedReferences())
+	if enqueuesAfterCreate != 1 {
+		t.Fatalf("enqueues after create = %d, want 1", enqueuesAfterCreate)
+	}
+
+	workerCtx, cancelWorkers := context.WithCancel(t.Context())
+	defer cancelWorkers()
+	workerResult := make(chan error, 1)
+	go func() {
+		workerResult <- h.fixture.Runtime().RunWorkers(workerCtx)
+	}()
+
+	select {
+	case <-h.fixture.WorkersStarted():
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunWorkers did not start (possible deadlock)")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var completed map[string]any
+	var getPayload []byte
+	for {
+		get, body := h.do(t, requestSpec{
+			method: http.MethodGet,
+			path:   "/v1/render-jobs/" + jobID,
+			bearer: tenantAKey,
+		})
+		if get.StatusCode == http.StatusOK {
+			var bodyJob map[string]any
+			if err := json.Unmarshal(body, &bodyJob); err == nil && bodyJob["lifecycle_state"] == "completed" {
+				completed = bodyJob
+				getPayload = body
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job did not complete via RunWorkers (last body=%s)", body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls = %d, want 1", calls)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != enqueuesAfterCreate {
+		t.Fatalf("enqueues after complete = %d, want %d (no replacement publication)", n, enqueuesAfterCreate)
+	}
+	entries, _ := completed["output_entries"].([]any)
+	if len(entries) < 1 {
+		t.Fatalf("output_entries empty: %s", getPayload)
+	}
+	entry, _ := entries[0].(map[string]any)
+	if entry["delivery_state"] != "available" {
+		t.Fatalf("delivery_state = %v, want available", entry["delivery_state"])
+	}
+	if assetID, _ := entry["asset_id"].(string); assetID == "" {
+		t.Fatalf("asset_id missing: %v", entry)
+	}
+
+	cancelWorkers()
+	select {
+	case err := <-workerResult:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunWorkers error = %v, want nil or context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunWorkers did not exit after cancel (deadlock)")
+	}
+}
+
+// Spec: Enqueue before RunWorkers (unpublished recovery path) must not deadlock
+// and must deliver the same single publication to completion.
+func TestRunWorkersRecoversUnpublishedWithoutDeadlock(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_unpub_recover")
+		// Fail first Enqueue so create leaves QueuePublished=false.
+		h.enqueueFailTimes = 1
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-unpub-recover",
+		body:    `{"model":"gpt-image-1","prompt":"recover me"}`,
+	})
+	// Create may be 503 after durable job + enqueue fail, or 202 if composition
+	// path differs — either way job must exist for recovery via matching retry
+	// or RunWorkers preflight. Prefer matching create retry then RunWorkers.
+	if create.StatusCode != http.StatusAccepted && create.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	// Matching retry recovers same job and publishes once.
+	create2, payload2 := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-unpub-recover",
+		body:    `{"model":"gpt-image-1","prompt":"recover me"}`,
+	})
+	if create2.StatusCode != http.StatusAccepted {
+		t.Fatalf("recovery create status = %d (body=%s)", create2.StatusCode, payload2)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload2, &job)
+	jobID, _ := job["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("job_id missing: %s", payload2)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 1 {
+		t.Fatalf("logical enqueues = %d, want 1 after recovery", n)
+	}
+
+	workerCtx, cancelWorkers := context.WithCancel(t.Context())
+	defer cancelWorkers()
+	done := make(chan error, 1)
+	go func() { done <- h.fixture.Runtime().RunWorkers(workerCtx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		get, body := h.do(t, requestSpec{
+			method: http.MethodGet, path: "/v1/render-jobs/" + jobID, bearer: tenantAKey,
+		})
+		if get.StatusCode == http.StatusOK {
+			var bodyJob map[string]any
+			if err := json.Unmarshal(body, &bodyJob); err == nil && bodyJob["lifecycle_state"] == "completed" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("unpublished recovery did not complete (body=%s)", body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 1 {
+		t.Fatalf("replacement publication: enqueues = %d, want 1", n)
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls = %d, want 1", calls)
+	}
+	cancelWorkers()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunWorkers hang after cancel")
 	}
 }
 

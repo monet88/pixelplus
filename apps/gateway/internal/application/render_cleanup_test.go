@@ -245,7 +245,8 @@ func (noopContent) Fetch(context.Context, domain.SecurityPrincipal, domain.Asset
 
 type noopStaging struct{}
 
-func (noopStaging) Put(context.Context, ports.StagingPut) error { return nil }
+func (noopStaging) Put(context.Context, ports.StagingPut) error         { return nil }
+func (noopStaging) Delete(context.Context, ports.StagingIdentity) error { return nil }
 func (noopStaging) Use(context.Context, ports.StagingAccess, func([]byte) error) error {
 	return ports.ErrStagingNotFound
 }
@@ -425,5 +426,8 @@ func (s *cleanupJobStore) MarkPromptPurged(context.Context, domain.JobRef) (doma
 		return s.job, s.failMarkPurge
 	}
 	s.job.PromptPurged = true
+	return s.job, nil
+}
+func (s *cleanupJobStore) RenewWorkerLease(context.Context, domain.JobRef, domain.FencingToken, ports.WorkerLease) (domain.RenderJob, error) {
 	return s.job, nil
 }

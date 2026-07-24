@@ -202,6 +202,51 @@ func leaseExpired(job domain.RenderJob, now domain.Timestamp) bool {
 	return !now.Time().Before(job.LeaseExpiresAt.Time())
 }
 
+// RenewWorkerLease extends the active fence lifetime and records HeartbeatAt.
+// Requires the current fencing token and an active non-expired lease held by
+// the same worker. Used during long Adapter calls so expiry recovery does not
+// steal a healthy in-flight worker.
+func (store *MemoryRenderJobStore) RenewWorkerLease(
+	_ context.Context,
+	ref domain.JobRef,
+	token domain.FencingToken,
+	lease ports.WorkerLease,
+) (domain.RenderJob, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	job, err := store.loadLocked(ref)
+	if err != nil {
+		return domain.RenderJob{}, err
+	}
+	if err := store.requireFence(job, token); err != nil {
+		return domain.RenderJob{}, err
+	}
+	now := lease.Now
+	if now.IsZero() {
+		return domain.RenderJob{}, ports.ErrDependencyUnavailable
+	}
+	if job.Lifecycle != domain.JobRunning || !job.LeaseHeld {
+		return domain.RenderJob{}, ports.ErrRenderJobConflict
+	}
+	if lease.WorkerID != "" && job.WorkerID != lease.WorkerID {
+		return domain.RenderJob{}, domain.ErrStaleFence
+	}
+	if leaseExpired(job, now) {
+		return domain.RenderJob{}, domain.ErrStaleFence
+	}
+	expiresAt := lease.ExpiresAt
+	if expiresAt.IsZero() {
+		expiresAt = domain.NewTimestamp(now.Time().Add(defaultWorkerLeaseTTL))
+	}
+	job.LeaseExpiresAt = expiresAt
+	job.HeartbeatAt = now
+	job.UpdatedAt = now
+	job.StateRevision++
+	store.saveLocked(job)
+	return cloneJob(job), nil
+}
+
 // ObserveAttempt updates the attempt ledger under the current fence.
 func (store *MemoryRenderJobStore) ObserveAttempt(_ context.Context, observation ports.AttemptObservation) (domain.RenderJob, error) {
 	store.mu.Lock()
@@ -300,6 +345,8 @@ func (store *MemoryRenderJobStore) Transition(_ context.Context, transition port
 }
 
 // CaptureManifest freezes the immutable result under the fence.
+// Atomic CAS: requires lifecycle running (not cancel_requested/terminal). Cancel
+// wins over capture under the same fence — no placement from a canceled capture.
 func (store *MemoryRenderJobStore) CaptureManifest(_ context.Context, capture ports.ManifestCapture) (domain.RenderJob, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -310,6 +357,10 @@ func (store *MemoryRenderJobStore) CaptureManifest(_ context.Context, capture po
 	}
 	if err := store.requireFence(job, capture.FencingToken); err != nil {
 		return domain.RenderJob{}, err
+	}
+	// Cancel race: only running jobs may capture. cancel_requested/terminal lose.
+	if job.Lifecycle != domain.JobRunning {
+		return domain.RenderJob{}, ports.ErrRenderJobConflict
 	}
 	if job.Manifest.ID != "" {
 		if job.Manifest.ID != capture.Manifest.ID {
@@ -350,8 +401,19 @@ func (store *MemoryRenderJobStore) PlaceOutput(_ context.Context, request ports.
 		if err := store.requireFence(job, request.FencingToken); err != nil {
 			return ports.PlacementResult{}, err
 		}
-	} else if job.Lifecycle != domain.JobCompleted {
-		return ports.PlacementResult{}, ports.ErrRenderJobConflict
+	} else {
+		// Fence 0 is placement-only recovery for terminal jobs that already hold
+		// an immutable manifest (completed or storage-cap failed). Never re-render.
+		switch job.Lifecycle {
+		case domain.JobCompleted:
+			// ok
+		case domain.JobFailed:
+			if job.Manifest.ID == "" {
+				return ports.PlacementResult{}, ports.ErrRenderJobConflict
+			}
+		default:
+			return ports.PlacementResult{}, ports.ErrRenderJobConflict
+		}
 	}
 
 	key := domain.PlacementKey{
@@ -701,6 +763,9 @@ func (*UnavailableRenderJobStore) MarkAdmissionSettled(context.Context, domain.J
 	return domain.RenderJob{}, ports.ErrDependencyUnavailable
 }
 func (*UnavailableRenderJobStore) MarkPromptPurged(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) RenewWorkerLease(context.Context, domain.JobRef, domain.FencingToken, ports.WorkerLease) (domain.RenderJob, error) {
 	return domain.RenderJob{}, ports.ErrDependencyUnavailable
 }
 

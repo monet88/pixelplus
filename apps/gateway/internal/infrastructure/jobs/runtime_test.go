@@ -85,6 +85,71 @@ func TestRuntimeRedeliversSameReferenceAfterHandlerError(t *testing.T) {
 	}
 }
 
+// Enqueue is nonblocking without a Run consumer and idempotent by job identity.
+func TestRuntimeEnqueueNonblockingAndIdempotent(t *testing.T) {
+	t.Parallel()
+
+	runtime := jobs.New()
+	if err := runtime.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	ref := ports.SafeJobReference{
+		TenantID: domain.Identifier("tenant_1"),
+		JobID:    domain.Identifier("job_once"),
+	}
+	// Enqueue before Run must not block.
+	done := make(chan error, 1)
+	go func() {
+		_, err := runtime.Enqueue(context.Background(), ref)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Enqueue before Run: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Enqueue blocked without consumer (deadlock)")
+	}
+
+	// Second Enqueue of same identity is idempotent success.
+	if _, err := runtime.Enqueue(context.Background(), ref); err != nil {
+		t.Fatalf("idempotent Enqueue: %v", err)
+	}
+
+	// One Run delivers the reference once (not twice).
+	var calls atomic.Int32
+	got := make(chan struct{}, 2)
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- runtime.Run(context.Background(), func(_ context.Context, r ports.SafeJobReference) error {
+			calls.Add(1)
+			got <- struct{}{}
+			if r.JobID != ref.JobID {
+				t.Errorf("job_id = %s, want %s", r.JobID, ref.JobID)
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler not invoked")
+	}
+	// Give a short window for a spurious second delivery.
+	select {
+	case <-got:
+		t.Fatal("idempotent publication delivered twice without re-arm")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("handler calls = %d, want 1", calls.Load())
+	}
+	_ = runtime.Close(context.Background())
+	<-runResult
+}
+
 func TestRuntimeRejectsASecondConsumer(t *testing.T) {
 	t.Parallel()
 

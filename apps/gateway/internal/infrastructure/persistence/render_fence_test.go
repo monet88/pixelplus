@@ -205,6 +205,129 @@ func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
 	}
 }
 
+// CaptureManifest requires lifecycle running; cancel_requested wins (no capture).
+func TestCaptureManifestRejectsCancelRequested(t *testing.T) {
+	t.Parallel()
+
+	store := persistence.NewMemoryRenderJobStore()
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	now := domain.NewTimestamp(time.Date(2026, 7, 24, 16, 0, 0, 0, time.UTC))
+	job := domain.NewQueuedRenderJob(
+		"job_cap_cancel", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		"opaque-digest", nil, "", "pa_1", 1, "fp", "idem", now,
+	)
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: job}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	claim, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "w1", Now: now,
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := store.Cancel(context.Background(), ports.CancelMutation{
+		Principal: principal, JobID: job.JobID, RequestedBy: "key_a", Now: now,
+	}); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	_, err = store.CaptureManifest(context.Background(), ports.ManifestCapture{
+		JobRef: job.JobRef(), FencingToken: claim.FencingToken,
+		Manifest: domain.ResultManifest{ID: "man_x", Entries: []domain.OutputEntry{{ID: "e0"}}},
+		Now:      now,
+	})
+	if !errors.Is(err, ports.ErrRenderJobConflict) {
+		t.Fatalf("CaptureManifest after cancel = %v, want conflict", err)
+	}
+}
+
+// Failed jobs with immutable manifest may place with fence 0 (placement-only retry).
+func TestPlaceOutputFenceZeroAllowedForFailedWithManifest(t *testing.T) {
+	t.Parallel()
+
+	store := persistence.NewMemoryRenderJobStore()
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	now := domain.NewTimestamp(time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC))
+	job := domain.NewQueuedRenderJob(
+		"job_fail_place", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		"opaque-digest", nil, "", "pa_1", 1, "fp", "idem", now,
+	)
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: job}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	claim, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "w1", Now: now,
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	entryID := domain.NewOutputEntryID(job.JobID, 0)
+	if _, err := store.CaptureManifest(context.Background(), ports.ManifestCapture{
+		JobRef: job.JobRef(), FencingToken: claim.FencingToken,
+		Manifest: domain.ResultManifest{
+			ID: "man_fail", Entries: []domain.OutputEntry{{
+				ID: entryID, Position: 0, DeliveryState: domain.OutputPending, Checksum: "c",
+			}},
+		},
+		Now: now,
+	}); err != nil {
+		t.Fatalf("CaptureManifest: %v", err)
+	}
+	if _, err := store.Transition(context.Background(), ports.FencedTransition{
+		JobRef: job.JobRef(), FencingToken: claim.FencingToken, To: domain.JobFailed,
+		FailureClass: domain.ErrCodeStorageCapExceeded, CommitStatus: domain.CommitCommitted,
+		ClearLease: true, Now: now,
+	}); err != nil {
+		t.Fatalf("Transition failed: %v", err)
+	}
+	result, err := store.PlaceOutput(context.Background(), ports.PlacementRequest{
+		JobRef: job.JobRef(), FencingToken: 0, EntryID: entryID,
+		Asset: domain.Asset{ID: "asset_out", ContentType: domain.ContentTypePNG, ByteSize: 3, Checksum: "c"},
+		Now:   now,
+	})
+	if err != nil {
+		t.Fatalf("PlaceOutput fence 0 on failed: %v", err)
+	}
+	if result.Entry.DeliveryState != domain.OutputAvailable {
+		t.Fatalf("delivery = %v, want available", result.Entry.DeliveryState)
+	}
+}
+
+// RenewWorkerLease extends HeartbeatAt and LeaseExpiresAt under the fence.
+func TestRenewWorkerLeaseExtendsHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	store := persistence.NewMemoryRenderJobStore()
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	base := time.Date(2026, 7, 24, 18, 0, 0, 0, time.UTC)
+	now := domain.NewTimestamp(base)
+	job := domain.NewQueuedRenderJob(
+		"job_hb", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		"opaque-digest", nil, "", "pa_1", 1, "fp", "idem", now,
+	)
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: job}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	claim, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "w1", Now: now, ExpiresAt: domain.NewTimestamp(base.Add(2 * time.Minute)),
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	renewAt := domain.NewTimestamp(base.Add(30 * time.Second))
+	renewed, err := store.RenewWorkerLease(context.Background(), job.JobRef(), claim.FencingToken, ports.WorkerLease{
+		WorkerID: "w1", Now: renewAt, ExpiresAt: domain.NewTimestamp(base.Add(3 * time.Minute)),
+	})
+	if err != nil {
+		t.Fatalf("RenewWorkerLease: %v", err)
+	}
+	if renewed.HeartbeatAt != renewAt {
+		t.Fatalf("HeartbeatAt = %v, want %v", renewed.HeartbeatAt, renewAt)
+	}
+	if renewed.LeaseExpiresAt.Time().Before(base.Add(2*time.Minute + time.Second)) {
+		t.Fatalf("LeaseExpiresAt not extended: %v", renewed.LeaseExpiresAt)
+	}
+}
+
 // Post-manifest recovery claim continues finalize without treating the job as unclaimable.
 func TestPostManifestRecoveryClaimIsRecoveryOnly(t *testing.T) {
 	t.Parallel()

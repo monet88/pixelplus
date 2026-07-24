@@ -26,6 +26,7 @@ func (s *stubStaging) Put(_ context.Context, put ports.StagingPut) error {
 func (s *stubStaging) Use(context.Context, ports.StagingAccess, func([]byte) error) error {
 	return ports.ErrStagingNotFound
 }
+func (s *stubStaging) Delete(context.Context, ports.StagingIdentity) error { return nil }
 
 type capturePromptAdapter struct {
 	seen atomic.Value

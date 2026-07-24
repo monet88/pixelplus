@@ -82,6 +82,9 @@ func (s *claimGateJobs) MarkAdmissionSettled(ctx context.Context, ref domain.Job
 func (s *claimGateJobs) MarkPromptPurged(ctx context.Context, ref domain.JobRef) (domain.RenderJob, error) {
 	return s.inner.MarkPromptPurged(ctx, ref)
 }
+func (s *claimGateJobs) RenewWorkerLease(ctx context.Context, ref domain.JobRef, token domain.FencingToken, lease ports.WorkerLease) (domain.RenderJob, error) {
+	return s.inner.RenewWorkerLease(ctx, ref, token, lease)
+}
 
 // TestRunWorkersRetainsReferenceOnClaimDependency mirrors
 // jobs.TestRuntimeRedeliversSameReferenceAfterHandlerError: start Run, Enqueue

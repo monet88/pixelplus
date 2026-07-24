@@ -3,10 +3,15 @@ package persistence
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
+
+// DefaultStagingRetention is the foundation bound for storage-cap staging when
+// Put omits ExpiresAt on a capped path. Numeric production tuning is #17.
+const DefaultStagingRetention = 24 * time.Hour
 
 // MemoryRenderStagingStore is a process-local controlled staging store for
 // fixtures. It is NOT restart-durable production storage; production must use
@@ -20,6 +25,7 @@ type stagedBlob struct {
 	contentType string
 	data        []byte
 	tenant      domain.TenantID
+	expiresAt   domain.Timestamp
 }
 
 // NewMemoryRenderStagingStore builds an empty process-local staging store.
@@ -57,11 +63,13 @@ func (store *MemoryRenderStagingStore) Put(_ context.Context, put ports.StagingP
 		contentType: put.ContentType,
 		data:        copied,
 		tenant:      put.Identity.TenantID,
+		expiresAt:   put.ExpiresAt,
 	}
 	return nil
 }
 
 // Use injects a copy of staged bytes into the callback after Tenant match.
+// Expired blobs are cleared and return ErrStagingExpired.
 func (store *MemoryRenderStagingStore) Use(_ context.Context, access ports.StagingAccess, use func([]byte) error) error {
 	if use == nil || !access.Identity.Valid() {
 		return ports.ErrStagingNotFound
@@ -69,16 +77,33 @@ func (store *MemoryRenderStagingStore) Use(_ context.Context, access ports.Stagi
 	if access.Principal.TenantID != "" && access.Principal.TenantID != access.Identity.TenantID {
 		return ports.ErrStagingNotFound
 	}
+	key := stagingKey(access.Identity)
 	store.mu.Lock()
-	blob, ok := store.byKey[stagingKey(access.Identity)]
+	blob, ok := store.byKey[key]
 	if !ok || blob.tenant != access.Identity.TenantID {
 		store.mu.Unlock()
 		return ports.ErrStagingNotFound
+	}
+	if !blob.expiresAt.IsZero() && !access.Now.IsZero() && !access.Now.Time().Before(blob.expiresAt.Time()) {
+		delete(store.byKey, key)
+		store.mu.Unlock()
+		return ports.ErrStagingExpired
 	}
 	copied := make([]byte, len(blob.data))
 	copy(copied, blob.data)
 	store.mu.Unlock()
 	return use(copied)
+}
+
+// Delete purges staged bytes after successful placement (or operator cleanup).
+func (store *MemoryRenderStagingStore) Delete(_ context.Context, identity ports.StagingIdentity) error {
+	if !identity.Valid() {
+		return nil
+	}
+	store.mu.Lock()
+	delete(store.byKey, stagingKey(identity))
+	store.mu.Unlock()
+	return nil
 }
 
 // UnavailableRenderStagingStore is the production fail-closed default when no
@@ -98,6 +123,11 @@ func (*UnavailableRenderStagingStore) Put(context.Context, ports.StagingPut) err
 // Use fails closed.
 func (*UnavailableRenderStagingStore) Use(context.Context, ports.StagingAccess, func([]byte) error) error {
 	return ports.ErrDependencyUnavailable
+}
+
+// Delete is a no-op success (nothing durable to purge).
+func (*UnavailableRenderStagingStore) Delete(context.Context, ports.StagingIdentity) error {
+	return nil
 }
 
 // Restore fails closed so composition keeps readiness closed when this store is wired.
