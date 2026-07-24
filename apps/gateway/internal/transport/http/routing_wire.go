@@ -51,12 +51,8 @@ func toRoutingPolicyWire(policy domain.RoutingPolicy) routingPolicyWire {
 	for _, unit := range policy.LeasePolicy.EligibleUnits {
 		units = append(units, string(unit))
 	}
-	updatedAt := timestampString(policy.UpdatedAt)
-	if updatedAt == "" {
-		// System default / never-written policy still exposes a stable required
-		// date-time field without inventing a write event.
-		updatedAt = "1970-01-01T00:00:00Z"
-	}
+	// updated_at is domain-owned (including SystemDefaultUpdatedAt on the
+	// fail-closed projection). Transport does not invent audit timestamps.
 	return routingPolicyWire{
 		CandidateAccounts: candidates,
 		SelectionOrder:    selection,
@@ -71,7 +67,7 @@ func toRoutingPolicyWire(policy domain.RoutingPolicy) routingPolicyWire {
 			Enabled:       policy.LeasePolicy.Enabled,
 			EligibleUnits: units,
 		},
-		UpdatedAt: updatedAt,
+		UpdatedAt: timestampString(policy.UpdatedAt),
 		UpdatedBy: string(policy.UpdatedBy),
 	}
 }

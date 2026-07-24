@@ -42,9 +42,11 @@ dependency_unavailable — only existing canonical vocabulary.
 
 ## Data Model
 
-No SQL migration. Memory store for tests/foundation; File store follows the
-account/health exclusive-lock append pattern. `Replace` is one atomic
-write under the store lock (revision/mutation counter for fixtures).
+No SQL migration. Memory store for tests/foundation; File store uses the
+same Windows-safe **append-only JSONL + exclusive O_EXCL lock** pattern as
+`FileAccountStore`. Restore/Read/Replace reload the ledger and apply
+**latest-row-wins per Tenant**. `Replace` is one logical mutation (append one
+line under the store lock). Compaction is deferred.
 
 ## UI / Platform Impact
 

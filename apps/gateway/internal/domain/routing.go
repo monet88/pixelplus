@@ -1,5 +1,7 @@
 package domain
 
+import "time"
+
 // LeaseUnit names a unit of work that may acquire an account lease under
 // Tenant Routing Policy (routing/fallback/affinity/leases spec §5.2).
 type LeaseUnit string
@@ -56,9 +58,16 @@ type RoutingPolicy struct {
 // returned when no durable policy row exists yet.
 const SystemDefaultUpdatedBy ClientAPIKeyID = "system_default"
 
+// SystemDefaultUpdatedAt is the deterministic server-owned audit instant for the
+// fail-closed projection when no durable policy row exists. It is not a
+// wall-clock write event; Unix epoch UTC keeps required OpenAPI date-time
+// `updated_at` stable and RFC3339-parseable without inventing a Tenant actor.
+var SystemDefaultUpdatedAt = NewTimestamp(time.Date(1970, time.January, 1, 0, 0, 0, 0, time.UTC))
+
 // FailClosedDefaultRoutingPolicy returns the system default singleton when no
 // Tenant policy has been written: empty candidates and fallback disabled
-// (routing spec §6.5 / §8.2, NF-NOPOLICY posture).
+// (routing spec §6.5 / §8.2, NF-NOPOLICY posture). updated_at/updated_by are
+// always server-owned and valid on the wire.
 func FailClosedDefaultRoutingPolicy() RoutingPolicy {
 	return RoutingPolicy{
 		CandidateAccounts: []ProviderAccountID{},
@@ -68,6 +77,7 @@ func FailClosedDefaultRoutingPolicy() RoutingPolicy {
 		FallbackAuthModes: []AuthMode{},
 		Affinity:          AffinityPolicy{Enabled: false},
 		LeasePolicy:       LeasePolicy{Enabled: false, EligibleUnits: []LeaseUnit{}},
+		UpdatedAt:         SystemDefaultUpdatedAt,
 		UpdatedBy:         SystemDefaultUpdatedBy,
 	}
 }

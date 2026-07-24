@@ -204,7 +204,9 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		routingRestoreErr = restorer.Restore(startupContext)
 		if routingRestoreErr != nil {
 			logger.Error("routing policy startup recovery failed; readiness stays closed", "error", routingRestoreErr)
-			dependencies.Routing = persistence.NewMemoryRoutingPolicyStore()
+			// Fail closed: do not substitute an empty Memory store that would look
+			// like "no policy" and accept writes against lost durability.
+			dependencies.Routing = persistence.NewUnavailableRoutingPolicyStore()
 		}
 	}
 	jobRestoreErr := runtime.jobs.Restore(startupContext)

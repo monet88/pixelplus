@@ -3,6 +3,7 @@ package contracttest_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -137,6 +138,8 @@ func decodeRoutingPolicy(t *testing.T, payload []byte) map[string]any {
 }
 
 // AC: missing policy fails closed to system default (empty candidates, fallback off).
+// Required wire fields updated_at (RFC3339 date-time) and updated_by are
+// server-owned on the fail-closed singleton (domain SystemDefault*).
 func TestRoutingPolicyMissingFailsClosedDefault(t *testing.T) {
 	t.Parallel()
 
@@ -151,6 +154,14 @@ func TestRoutingPolicyMissingFailsClosedDefault(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
 	}
 	body := decodeRoutingPolicy(t, payload)
+	for _, field := range []string{
+		"candidate_accounts", "selection_order", "fallback_enabled", "fallback_chain",
+		"fallback_auth_modes", "affinity", "lease_policy", "updated_at", "updated_by",
+	} {
+		if _, ok := body[field]; !ok {
+			t.Fatalf("missing required RoutingPolicy field %q (body=%s)", field, payload)
+		}
+	}
 	if body["fallback_enabled"] != false {
 		t.Fatalf("fallback_enabled = %v, want false", body["fallback_enabled"])
 	}
@@ -160,8 +171,29 @@ func TestRoutingPolicyMissingFailsClosedDefault(t *testing.T) {
 	if accounts, _ := body["candidate_accounts"].([]any); len(accounts) != 0 {
 		t.Fatalf("candidate_accounts = %v, want empty", accounts)
 	}
-	if body["updated_by"] != "system_default" {
-		t.Fatalf("updated_by = %v, want system_default", body["updated_by"])
+	if modes, _ := body["fallback_auth_modes"].([]any); len(modes) != 0 {
+		t.Fatalf("fallback_auth_modes = %v, want empty", modes)
+	}
+	if order, _ := body["selection_order"].([]any); len(order) != 0 {
+		t.Fatalf("selection_order = %v, want empty", order)
+	}
+	if body["updated_by"] != string(domain.SystemDefaultUpdatedBy) {
+		t.Fatalf("updated_by = %v, want exact %q", body["updated_by"], domain.SystemDefaultUpdatedBy)
+	}
+	updatedAt, ok := body["updated_at"].(string)
+	if !ok || updatedAt == "" {
+		t.Fatalf("updated_at = %v, want non-empty date-time string", body["updated_at"])
+	}
+	parsed, err := time.Parse(time.RFC3339, updatedAt)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339Nano, updatedAt)
+	}
+	if err != nil {
+		t.Fatalf("updated_at = %q is not RFC3339/RFC3339Nano: %v", updatedAt, err)
+	}
+	wantAt := domain.SystemDefaultUpdatedAt.Time().UTC()
+	if !parsed.UTC().Equal(wantAt) {
+		t.Fatalf("updated_at instant = %v, want deterministic system default %v", parsed.UTC(), wantAt)
 	}
 	if harness.vault.putCalls.Load() != 0 || harness.vault.validCalls.Load() != 0 {
 		t.Fatalf("vault was accessed on GET routing policy")
@@ -650,4 +682,243 @@ func TestRoutingPolicyDoesNotWidenModels(t *testing.T) {
 			}
 		}
 	}
+}
+
+// AC: missing/null required RoutingPolicyFields arrays are invalid_request;
+// malformed provider_account_id is 400 before lookup; fallback_enabled=true
+// with empty chain is invalid (spec §8.1 "fallback_chain when fallback_enabled").
+func TestRoutingPolicyStrictRequestShape(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		seedEligibleAccount(h, "tenant_a", "pa_shape_ok", domain.AuthModeChatGPTCodexOAuth)
+	})
+	before := harness.routing.mutationsCount()
+	beforeVisible := harness.accounts.visibleCalls.Load()
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "null_candidate_accounts",
+			body: `{
+				"candidate_accounts": null,
+				"selection_order": [],
+				"fallback_enabled": false,
+				"fallback_chain": [],
+				"fallback_auth_modes": [],
+				"affinity": {"enabled": false},
+				"lease_policy": {"enabled": false, "eligible_units": []}
+			}`,
+		},
+		{
+			name: "missing_fallback_chain",
+			body: `{
+				"candidate_accounts": [],
+				"selection_order": [],
+				"fallback_enabled": false,
+				"fallback_auth_modes": [],
+				"affinity": {"enabled": false},
+				"lease_policy": {"enabled": false, "eligible_units": []}
+			}`,
+		},
+		{
+			name: "null_lease_eligible_units",
+			body: `{
+				"candidate_accounts": [],
+				"selection_order": [],
+				"fallback_enabled": false,
+				"fallback_chain": [],
+				"fallback_auth_modes": [],
+				"affinity": {"enabled": false},
+				"lease_policy": {"enabled": false, "eligible_units": null}
+			}`,
+		},
+		{
+			name: "malformed_provider_account_id",
+			body: `{
+				"candidate_accounts": ["not-a-pa-id"],
+				"selection_order": ["not-a-pa-id"],
+				"fallback_enabled": false,
+				"fallback_chain": [],
+				"fallback_auth_modes": [],
+				"affinity": {"enabled": false},
+				"lease_policy": {"enabled": false, "eligible_units": []}
+			}`,
+		},
+		{
+			// Authority: docs/spec/tenant-scoped-routing-fallback-affinity-leases.md
+			// §8.1 "fallback_chain when fallback_enabled" + I-ROUTE-FALLBACK-OPTIN.
+			name: "fallback_enabled_empty_chain",
+			body: `{
+				"candidate_accounts": ["pa_shape_ok"],
+				"selection_order": ["pa_shape_ok"],
+				"fallback_enabled": true,
+				"fallback_chain": [],
+				"fallback_auth_modes": [],
+				"affinity": {"enabled": false},
+				"lease_policy": {"enabled": false, "eligible_units": []}
+			}`,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			response, payload := harness.do(t, requestSpec{
+				method: http.MethodPut,
+				path:   "/v1/routing-policy",
+				bearer: tenantAKey,
+				body:   tc.body,
+			})
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body=%s)", response.StatusCode, payload)
+			}
+			if decodeError(t, payload)["code"] != "invalid_request" {
+				t.Fatalf("code = %v, want invalid_request", decodeError(t, payload)["code"])
+			}
+		})
+	}
+
+	if harness.routing.mutationsCount() != before {
+		t.Fatalf("store mutated on shape rejects")
+	}
+	if harness.accounts.visibleCalls.Load() != beforeVisible {
+		t.Fatalf("account.Visible ran on pure shape rejects, want 0 extra")
+	}
+	if harness.vault.putCalls.Load() != 0 || harness.probe.callCount.Load() != 0 {
+		t.Fatalf("vault/adapter accessed on shape rejects")
+	}
+}
+
+// AC: over-quota admission rejects with 429 before candidate existence/
+// capability validation (auth → scope → size/shape → admission → candidates).
+func TestRoutingPolicyQuotaBeforeCandidateValidation(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.admission.rejectStage = ports.AdmissionStageQuota
+	})
+	beforeMut := harness.routing.mutationsCount()
+	beforeVisible := harness.accounts.visibleCalls.Load()
+	beforeCapGet := harness.capabilities.getCalls.Load()
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		// Unknown candidate would 404 if validation ran before admission.
+		body: validPolicyBody("pa_quota_unknown"),
+	})
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (body=%s)", response.StatusCode, payload)
+	}
+	if decodeError(t, payload)["code"] != "quota_exhausted" {
+		t.Fatalf("code = %v, want quota_exhausted", decodeError(t, payload)["code"])
+	}
+	if harness.accounts.visibleCalls.Load() != beforeVisible {
+		t.Fatalf("account.Visible ran before admission reject")
+	}
+	if harness.capabilities.getCalls.Load() != beforeCapGet {
+		t.Fatalf("capability.Get ran before admission reject")
+	}
+	if harness.routing.mutationsCount() != beforeMut {
+		t.Fatalf("routing store mutated on quota reject")
+	}
+	if harness.vault.putCalls.Load() != 0 || harness.probe.callCount.Load() != 0 {
+		t.Fatalf("vault/adapter accessed on quota reject")
+	}
+}
+
+// AC: foreign, unknown, and deleted candidate ids are non-enumerating
+// resource_not_found with identical status/body (strip request_id only) and
+// zero Vault/Adapter/routing-store mutation.
+func TestRoutingPolicyCandidateNotFoundNonEnumeration(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		seedEligibleAccount(h, "tenant_b", "pa_foreign_enum", domain.AuthModeChatGPTCodexOAuth)
+		deleted := activeProbedAccount("pa_deleted_enum", domain.AuthModeChatGPTCodexOAuth)
+		deleted.Lifecycle = domain.LifecycleDeleted
+		h.seedAccount("tenant_a", deleted)
+	})
+	beforeMut := harness.routing.mutationsCount()
+
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{name: "foreign", id: "pa_foreign_enum"},
+		{name: "unknown", id: "pa_unknown_enum_xyz"},
+		{name: "deleted", id: "pa_deleted_enum"},
+	}
+
+	var baseline map[string]any
+	var baselineStatus int
+	for i, tc := range cases {
+		response, payload := harness.do(t, requestSpec{
+			method: http.MethodPut,
+			path:   "/v1/routing-policy",
+			bearer: tenantAKey,
+			body:   validPolicyBody(tc.id),
+		})
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404 (body=%s)", tc.name, response.StatusCode, payload)
+		}
+		body := decodeError(t, payload)
+		if body["code"] != "resource_not_found" {
+			t.Fatalf("%s code = %v, want resource_not_found", tc.name, body["code"])
+		}
+		if _, ok := body["resource_reference"]; ok {
+			t.Fatalf("%s leaked resource_reference: %v", tc.name, body["resource_reference"])
+		}
+		normalized := stripRequestID(body)
+		if i == 0 {
+			baseline = normalized
+			baselineStatus = response.StatusCode
+			continue
+		}
+		if response.StatusCode != baselineStatus {
+			t.Fatalf("%s status diverged: got %d want %d", tc.name, response.StatusCode, baselineStatus)
+		}
+		if !mapsEqual(normalized, baseline) {
+			t.Fatalf("%s body diverged after stripping request_id:\n got  %#v\n want %#v", tc.name, normalized, baseline)
+		}
+	}
+
+	if harness.routing.mutationsCount() != beforeMut {
+		t.Fatalf("routing store mutated on not-found rejects")
+	}
+	if harness.vault.putCalls.Load() != 0 || harness.probe.callCount.Load() != 0 {
+		t.Fatalf("vault/adapter accessed on not-found rejects")
+	}
+}
+
+func stripRequestID(body map[string]any) map[string]any {
+	out := make(map[string]any, len(body))
+	for k, v := range body {
+		if k == "request_id" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func mapsEqual(a, b map[string]any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok {
+			return false
+		}
+		// JSON numbers decode as float64; strings compare directly.
+		if fmt.Sprint(av) != fmt.Sprint(bv) {
+			return false
+		}
+	}
+	return true
 }

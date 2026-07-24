@@ -91,6 +91,8 @@ func (service *ProviderAccountService) ReplaceRoutingPolicy(ctx context.Context,
 		return RoutingPolicyResult{}, service.fail(ctx, sc, domain.NewForbidden())
 	}
 
+	// A2 size, then strict shape. Normative order is auth → scope → size/shape →
+	// admission → candidate validation → atomic write (issue #52 / #8 §6).
 	if command.OversizeBody {
 		return RoutingPolicyResult{}, service.fail(ctx, sc, domain.NewRequestTooLarge())
 	}
@@ -103,14 +105,17 @@ func (service *ProviderAccountService) ReplaceRoutingPolicy(ctx context.Context,
 		return RoutingPolicyResult{}, service.fail(ctx, sc, *shapeErr)
 	}
 
-	// Validate every referenced id before admission debit settles into a write.
-	// Failures never call Replace (I-ROUTE-POLICY-SCOPE, issue #52 proof 4).
-	if canonical, ok := service.validatePolicyCandidates(ctx, principal, policy); !ok {
+	// A3–A5 admission before any candidate existence/capability lookup so an
+	// over-quota caller never enumerates accounts and never mutates the store.
+	reservation, canonical, ok := service.admit(ctx, principal, operationReplaceRoutingPolicy)
+	if !ok {
 		return RoutingPolicyResult{}, service.fail(ctx, sc, canonical)
 	}
 
-	reservation, canonical, ok := service.admit(ctx, principal, operationReplaceRoutingPolicy)
-	if !ok {
+	// Validate every referenced id only after admission. Failures never call
+	// Replace (I-ROUTE-POLICY-SCOPE, issue #52 proof 4).
+	if canonical, ok := service.validatePolicyCandidates(ctx, principal, policy); !ok {
+		service.release(ctx, reservation)
 		return RoutingPolicyResult{}, service.fail(ctx, sc, canonical)
 	}
 
@@ -168,6 +173,12 @@ func normalizeRoutingPolicyFields(input domain.RoutingPolicy) (domain.RoutingPol
 			return domain.RoutingPolicy{}, ptrInvalid()
 		}
 	}
+	// When fallback is enabled, an ordered chain is required (§8.1
+	// "fallback_chain when fallback_enabled"; I-ROUTE-FALLBACK-OPTIN / §6.6).
+	// An empty chain with enabled=true is not a declared ordered policy chain.
+	if input.FallbackEnabled && len(fallback) == 0 {
+		return domain.RoutingPolicy{}, ptrInvalid()
+	}
 
 	// Grok Web SSO is never accepted as a fallback Auth Mode (#7 §6.3 / §5.5).
 	for _, mode := range modes {
@@ -213,7 +224,9 @@ func uniqueAccountIDs(ids []domain.ProviderAccountID) ([]domain.ProviderAccountI
 	seen := make(map[domain.ProviderAccountID]struct{}, len(ids))
 	out := make([]domain.ProviderAccountID, 0, len(ids))
 	for _, id := range ids {
-		if id == "" {
+		// Pattern check before any store lookup so malformed ids never become
+		// resource_not_found (OpenAPI `^pa_[A-Za-z0-9_]+$`).
+		if !id.Valid() {
 			return nil, ptrInvalid()
 		}
 		if _, ok := seen[id]; ok {
