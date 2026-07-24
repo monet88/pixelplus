@@ -3,6 +3,7 @@ package persistence
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
@@ -97,6 +98,11 @@ func (store *MemoryRenderJobStore) Load(_ context.Context, ref domain.JobRef) (d
 
 // ClaimWorker atomically claims a queued (or recoverable running) job.
 // lease.Now advances UpdatedAt and progress timestamps.
+//
+// Lease expiry recovery (#14 §6.4): a running job whose fence is past
+// LeaseExpiresAt may be reclaimed only when CommitStatus is not_started and
+// PayloadSent is false. After payload / committed / unknown, reclaim is refused
+// so recovery cannot start a second generation.
 func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.JobRef, lease ports.WorkerLease) (ports.WorkerClaim, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -106,8 +112,17 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 		return ports.WorkerClaim{}, err
 	}
 
-	// Same worker redelivery with matching fence is idempotent ownership.
-	if job.Lifecycle == domain.JobRunning && job.WorkerID == lease.WorkerID && job.LeaseHeld {
+	now := lease.Now
+	if now.IsZero() {
+		// Fail closed on missing clock injection rather than inventing wall time.
+		return ports.WorkerClaim{}, ports.ErrDependencyUnavailable
+	}
+
+	// Treat an expired fence as not held for reclaim evaluation.
+	leaseActive := job.LeaseHeld && !leaseExpired(job, now)
+
+	// Same worker redelivery with an active fence is idempotent ownership.
+	if job.Lifecycle == domain.JobRunning && job.WorkerID == lease.WorkerID && leaseActive {
 		return ports.WorkerClaim{Job: cloneJob(job), FencingToken: job.WorkerFencingToken, AlreadyOwned: true}, nil
 	}
 
@@ -115,18 +130,24 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 	case domain.JobQueued:
 		// take claim
 	case domain.JobRunning:
-		// Recoverable only when not_started and worker lease not held.
-		if job.LeaseHeld || job.CommitStatus != domain.CommitNotStarted {
+		// Active non-expired fence still owned by another worker.
+		if leaseActive {
+			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
+		}
+		// Expired or released fence: reclaim only when no payload was sent and
+		// commit status remains not_started. PayloadSent / non-not_started forbids
+		// a second generation (lease expiry ≠ re-render).
+		if job.CommitStatus != domain.CommitNotStarted || job.Attempt.PayloadSent {
 			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 		}
 	default:
 		return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 	}
 
-	now := lease.Now
-	if now.IsZero() {
-		// Fail closed on missing clock injection rather than inventing wall time.
-		return ports.WorkerClaim{}, ports.ErrDependencyUnavailable
+	expiresAt := lease.ExpiresAt
+	if expiresAt.IsZero() {
+		// Foundation default TTL; #17 tunes production numeric limits.
+		expiresAt = domain.NewTimestamp(now.Time().Add(defaultWorkerLeaseTTL))
 	}
 
 	store.nextFence++
@@ -135,6 +156,7 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 	job.WorkerFencingToken = store.nextFence
 	job.WorkerID = lease.WorkerID
 	job.LeaseHeld = true
+	job.LeaseExpiresAt = expiresAt
 	job.StateRevision++
 	job.UpdatedAt = now
 	job.Progress = domain.JobProgress{
@@ -144,6 +166,20 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 	}
 	store.saveLocked(job)
 	return ports.WorkerClaim{Job: cloneJob(job), FencingToken: job.WorkerFencingToken}, nil
+}
+
+// defaultWorkerLeaseTTL is the process-local foundation lease bound when the
+// worker does not supply ExpiresAt. Numeric production tuning is owned by #17.
+const defaultWorkerLeaseTTL = 2 * time.Minute
+
+func leaseExpired(job domain.RenderJob, now domain.Timestamp) bool {
+	if !job.LeaseHeld {
+		return true
+	}
+	if job.LeaseExpiresAt.IsZero() {
+		return false
+	}
+	return !now.Time().Before(job.LeaseExpiresAt.Time())
 }
 
 // ObserveAttempt updates the attempt ledger under the current fence.

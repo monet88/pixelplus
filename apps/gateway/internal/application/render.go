@@ -398,18 +398,25 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	}
 
 	// Vault presence gate: credential version must be authorized before enqueue.
-	if _, err := service.vault.Validate(ctx, ports.CredentialValidation{
+	// Valid=false is account_not_usable (usability), not only a dependency error.
+	validation, err := service.vault.Validate(ctx, ports.CredentialValidation{
 		Principal: principal,
 		AccountID: account.ID,
 		AuthMode:  account.AuthMode,
 		Version:   account.Credential.Version,
-	}); err != nil {
+	})
+	if err != nil {
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
 		if errors.Is(err, ports.ErrCredentialAbsent) {
 			return RenderJobResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationSubmitCredential))
 		}
 		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	if !validation.Valid {
+		service.release(ctx, reservation)
+		service.abandon(ctx, identity)
+		return RenderJobResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationSubmitCredential))
 	}
 
 	jobID, err := service.ids.New(domain.IdentifierKindJob)
@@ -463,21 +470,24 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	// recovers this job rather than abandoning and creating a replacement.
 	// If enqueue fails, matching retry re-attempts publication (#14 §3.3).
 	if err := service.replay.Complete(ctx, identity, ports.RenderReplayResult{Job: persisted}); err != nil {
-		service.release(ctx, reservation)
+		// Job row may exist; keep occupancy until a later terminal path settles it.
+		// Uncertain replay leaves the client to retry; do not free concurrency early.
 		return RenderJobResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
 	}
 
 	published, err := service.ensureQueuePublished(ctx, persisted)
 	if err != nil {
-		service.release(ctx, reservation)
-		// Do NOT abandon: durable job + terminal replay exist. Client retry with
-		// the same key recovers the same job and re-attempts enqueue.
+		// Do NOT abandon and do NOT release admission: durable job + terminal
+		// replay exist. Occupancy is held until job terminal (#8 §7.4 / #14 §7.3).
+		// Client retry with the same key recovers the same job and re-enqueues.
 		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	// Refresh terminal with QueuePublished=true for pure matching replays.
 	_ = service.replay.Complete(ctx, identity, ports.RenderReplayResult{Job: published})
 
-	service.release(ctx, reservation)
+	// Hold the create admission reservation through job terminal (complete /
+	// fail / cancel). Releasing here would free concurrency while the job is
+	// still executable (#8 Active Render Jobs / #14 residual occupancy).
 	service.observeSuccess(ctx, sc, ports.AuditRenderJobCreated, principal, published, 202)
 	return RenderJobResult{Job: published, RequestID: sc.requestID}, nil
 }
@@ -587,6 +597,8 @@ func (service *RenderService) CancelRenderJob(ctx context.Context, command Cance
 	// Purge confidential prompt on terminal cancel (queued→canceled).
 	if job.Lifecycle == domain.JobCanceled {
 		service.purgePrompt(ctx, principal.TenantID, job.JobID)
+		// Create-time occupancy is released only at accounting terminal.
+		service.releaseJobAdmission(ctx, job)
 	}
 
 	action := ports.AuditRenderJobCanceled
@@ -665,9 +677,15 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	claim, err := service.jobs.ClaimWorker(ctx, ref, ports.WorkerLease{WorkerID: workerID, Now: service.nowTS()})
+	now := service.nowTS()
+	claim, err := service.jobs.ClaimWorker(ctx, ref, ports.WorkerLease{
+		WorkerID:  workerID,
+		Now:       now,
+		ExpiresAt: domain.NewTimestamp(now.Time().Add(2 * time.Minute)),
+	})
 	if err != nil {
-		// Concurrent claimant / terminal / cancel — discard without Provider work.
+		// Concurrent claimant / terminal / cancel / post-payload lease expiry —
+		// discard without Provider work (lease expiry ≠ re-render).
 		if errors.Is(err, domain.ErrJobNotClaimable) || errors.Is(err, ports.ErrRenderJobNotVisible) || errors.Is(err, ports.ErrDependencyUnavailable) {
 			return nil
 		}
@@ -678,12 +696,15 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 
 	// Queued cancel may have won; re-load and exit without Provider.
 	if job.Lifecycle == domain.JobCancelRequested || job.Lifecycle.Terminal() {
+		if job.Lifecycle.Terminal() {
+			service.releaseJobAdmission(ctx, job)
+		}
 		return nil
 	}
 
 	// Job→account continuity binding for this execution (not exclusive account mutex).
 	if err := service.jobs.BindAccountLease(ctx, ref, fence, job.ProviderAccountID); err != nil {
-		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobFailed,
@@ -705,13 +726,13 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		Scopes:         domain.NewScopeSet(domain.ScopeJobsManage, domain.ScopeAssetsRead, domain.ScopeAssetsWrite),
 	}
 
-	// Recheck cancel before payload.
+	// Recheck cancel before preflight/payload (honest cancel; no new attempt).
 	current, err := service.jobs.Load(ctx, ref)
 	if err != nil {
 		return err
 	}
 	if current.Lifecycle == domain.JobCancelRequested {
-		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobCanceled,
@@ -724,13 +745,33 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return nil
 	}
 
-	// Attempt ledger before payload.
-	now := service.nowTS()
+	// Pre-payload re-gates: Account / Health / Capability / model / Input Assets /
+	// Vault Valid. Fail closed without Provider payload on reject (#14 §6.5).
+	account, preflightClass, preflightOK := service.preflightExecute(ctx, principal, job)
+	if !preflightOK {
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
+			JobRef:       ref,
+			FencingToken: fence,
+			To:           domain.JobFailed,
+			FailureStage: preflightFailureStage(preflightClass),
+			FailureClass: preflightClass,
+			CommitStatus: domain.CommitNotStarted,
+			ClearLease:   true,
+			Now:          service.nowTS(),
+		}); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Attempt ledger before payload (still not_started until send boundary).
+	now = service.nowTS()
 	attempt := domain.UpstreamAttempt{
 		ID:                domain.NewAttemptID(job.JobID, 1),
 		ProviderAccountID: job.ProviderAccountID,
 		CredentialVersion: job.CredentialVersion,
 		CommitStatus:      domain.CommitNotStarted,
+		PayloadSent:       false,
 		Sequence:          1,
 		CreatedAt:         now,
 		UpdatedAt:         now,
@@ -754,7 +795,8 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	// Mark not_committed immediately before payload send boundary.
+	// Durable pre-send observation: commit class moves to not_committed while
+	// PayloadSent remains false until the send fact is itself persisted.
 	now = service.nowTS()
 	attempt.CommitStatus = domain.CommitNotCommitted
 	attempt.PayloadSent = false
@@ -773,14 +815,34 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
+	// Durable payload-send truth BEFORE Adapter call: once this ObserveAttempt
+	// commits, lease recovery MUST NOT start a second generation (#14 §6.2–6.4).
+	now = service.nowTS()
+	attempt.PayloadSent = true
+	attempt.UpdatedAt = now
+	if _, err := service.jobs.ObserveAttempt(ctx, ports.AttemptObservation{
+		JobRef:       ref,
+		FencingToken: fence,
+		Attempt:      attempt,
+		Phase:        domain.PhaseUpstream,
+		CommitStatus: domain.CommitNotCommitted,
+		Now:          now,
+	}); err != nil {
+		if errors.Is(err, domain.ErrStaleFence) {
+			return nil
+		}
+		return err
+	}
+
 	// Payload send boundary: AuthorizedRender stages Provider bytes into
 	// RenderStagingStore and returns only safe manifest metadata (ADR 0009).
-	attempt.PayloadSent = true
+	// AuthMode is enforced on the protected surface (Validate + Adapter).
 	manifestID := domain.NewResultManifestID(attempt.ID)
 	outcome, renderErr := service.authorized.Render(ctx, ports.AuthorizedRenderRequest{
 		Principal: principal,
 		JobRef:    ref,
 		AccountID: job.ProviderAccountID,
+		AuthMode:  account.AuthMode,
 		Version:   job.CredentialVersion,
 		Invocation: domain.RenderInvocation{
 			TenantID:          job.TenantID,
@@ -800,8 +862,18 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	})
 
 	if renderErr != nil {
-		// After payload transmission, absence of authoritative non-commit is unknown.
+		// After durable PayloadSent, absence of authoritative non-commit is unknown.
+		// Map credential usability rejects to account_not_usable when possible.
 		commit := domain.CommitUnknown
+		failureClass := domain.ErrCodeDependencyUnavailable
+		failureStage := domain.StageDependency
+		if errors.Is(renderErr, ports.ErrCredentialAbsent) {
+			// PayloadSent was durably true; preserve unknown (no re-render) and
+			// surface usability class for operators/clients.
+			commit = domain.CommitUnknown
+			failureClass = domain.ErrCodeAccountNotUsable
+			failureStage = domain.StageRouting
+		}
 		attempt.CommitStatus = commit
 		now = service.nowTS()
 		if err := service.persistAttempt(ctx, ports.AttemptObservation{
@@ -810,9 +882,9 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		}); err != nil {
 			return err
 		}
-		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
-			FailureStage: domain.StageDependency, FailureClass: domain.ErrCodeDependencyUnavailable,
+			FailureStage: failureStage, FailureClass: failureClass,
 			CommitStatus: commit, ClearLease: true, Now: now,
 		}); err != nil {
 			return err
@@ -823,7 +895,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	switch outcome.Class {
 	case domain.RenderOutcomeNotCommitted:
 		attempt.CommitStatus = domain.CommitNotCommitted
-		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
 			FailureStage: domain.StageInternal, FailureClass: domain.ErrCodeInternal,
 			CommitStatus: domain.CommitNotCommitted, ClearLease: true, Now: service.nowTS(),
@@ -833,7 +905,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return nil
 	case domain.RenderOutcomeUnknown:
 		attempt.CommitStatus = domain.CommitUnknown
-		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
 			FailureStage: domain.StageRecovery, FailureClass: domain.ErrCodeInternal,
 			CommitStatus: domain.CommitUnknown, ClearLease: true, Now: service.nowTS(),
@@ -845,7 +917,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		// fall through — bytes already staged; only metadata remains
 	default:
 		attempt.CommitStatus = domain.CommitUnknown
-		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
 			FailureStage: domain.StageInternal, FailureClass: domain.ErrCodeInternal,
 			CommitStatus: domain.CommitUnknown, ClearLease: true, Now: service.nowTS(),
@@ -856,12 +928,14 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 
 	// Cancel race after result: if cancel_requested won before capture, drain to canceled.
+	// Honest: response after cancel mid-flight does not claim upstream aborted when the
+	// Provider already committed; we stop client delivery and settle terminal.
 	current, err = service.jobs.Load(ctx, ref)
 	if err != nil {
 		return err
 	}
 	if current.Lifecycle == domain.JobCancelRequested {
-		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
 			CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
 		}); err != nil {
@@ -872,7 +946,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 
 	manifest := outcome.Manifest
 	if manifest.ID == "" || len(manifest.Entries) == 0 {
-		if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef: ref, FencingToken: fence, To: domain.JobFailed,
 			FailureStage: domain.StageInternal, FailureClass: domain.ErrCodeInternal,
 			CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
@@ -918,7 +992,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 				}
 				continue
 			}
-			if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+			if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 				JobRef: ref, FencingToken: fence, To: domain.JobFailed,
 				FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeInternal,
 				CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
@@ -930,7 +1004,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 
 	completeAt := service.nowTS()
-	if err := service.persistTerminal(ctx, job.TenantID, ports.FencedTransition{
+	if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 		JobRef: ref, FencingToken: fence, To: domain.JobCompleted,
 		CommitStatus: domain.CommitCommitted,
 		Progress: domain.JobProgress{
@@ -954,12 +1028,118 @@ func (service *RenderService) persistAttempt(ctx context.Context, observation po
 
 // persistTerminal applies a terminal transition; only ErrStaleFence is discarded.
 // Other durable mutation errors return so redelivery can recover without a second render.
-func (service *RenderService) persistTerminal(ctx context.Context, tenant domain.TenantID, transition ports.FencedTransition) error {
-	_, err := service.fencedTerminal(ctx, tenant, transition)
-	if err != nil && errors.Is(err, domain.ErrStaleFence) {
-		return nil
+// On successful terminal, create-time admission occupancy is released once (#8 §7.4).
+func (service *RenderService) persistTerminal(ctx context.Context, job domain.RenderJob, transition ports.FencedTransition) error {
+	terminal, err := service.fencedTerminal(ctx, job.TenantID, transition)
+	if err != nil {
+		if errors.Is(err, domain.ErrStaleFence) {
+			return nil
+		}
+		return err
 	}
-	return err
+	if terminal.Lifecycle.Terminal() {
+		service.releaseJobAdmission(ctx, terminal)
+	}
+	return nil
+}
+
+// preflightExecute re-gates Account/Health/Capability/model/Input Assets and
+// Vault Valid before any payload. Returns the live account for AuthMode surface.
+func (service *RenderService) preflightExecute(
+	ctx context.Context,
+	principal domain.SecurityPrincipal,
+	job domain.RenderJob,
+) (domain.ProviderAccount, domain.ErrorCode, bool) {
+	account, err := service.accounts.Visible(ctx, principal, job.ProviderAccountID)
+	if err != nil {
+		return domain.ProviderAccount{}, domain.ErrCodeAccountNotUsable, false
+	}
+	if canonical, ok := service.candidateRejection(ctx, principal, account, job.Operation, job.Model, service.clock.Now()); !ok {
+		if canonical.Code != "" {
+			return domain.ProviderAccount{}, canonical.Code, false
+		}
+		return domain.ProviderAccount{}, domain.ErrCodeAccountNotUsable, false
+	}
+	// Input Assets (and mask) must remain same-Tenant visible and correct kind.
+	for _, assetID := range job.InputAssetIDs {
+		if assetID == "" {
+			continue
+		}
+		asset, err := service.assets.Visible(ctx, principal, assetID)
+		if err != nil {
+			return domain.ProviderAccount{}, domain.ErrCodeResourceNotFound, false
+		}
+		if asset.Kind != domain.AssetKindInput {
+			return domain.ProviderAccount{}, domain.ErrCodeInvalidRequest, false
+		}
+	}
+	if job.MaskAssetID != "" {
+		mask, err := service.assets.Visible(ctx, principal, job.MaskAssetID)
+		if err != nil {
+			return domain.ProviderAccount{}, domain.ErrCodeResourceNotFound, false
+		}
+		if mask.Kind != domain.AssetKindMask {
+			return domain.ProviderAccount{}, domain.ErrCodeInvalidRequest, false
+		}
+	}
+	validation, err := service.vault.Validate(ctx, ports.CredentialValidation{
+		Principal: principal,
+		AccountID: account.ID,
+		AuthMode:  account.AuthMode,
+		Version:   job.CredentialVersion,
+	})
+	if err != nil {
+		if errors.Is(err, ports.ErrCredentialAbsent) {
+			return domain.ProviderAccount{}, domain.ErrCodeAccountNotUsable, false
+		}
+		return domain.ProviderAccount{}, domain.ErrCodeDependencyUnavailable, false
+	}
+	if !validation.Valid {
+		return domain.ProviderAccount{}, domain.ErrCodeAccountNotUsable, false
+	}
+	return account, "", true
+}
+
+// releaseJobAdmission settles the create-time occupancy for one job at terminal.
+// Reconstructs the reservation from durable job identity (#8 Active Render Jobs).
+func (service *RenderService) releaseJobAdmission(ctx context.Context, job domain.RenderJob) {
+	op, ok := createAdmissionOperation(job.Operation)
+	if !ok {
+		return
+	}
+	service.release(ctx, ports.AdmissionReservation{
+		Principal: domain.SecurityPrincipal{
+			TenantID:       job.TenantID,
+			ClientAPIKeyID: job.ClientAPIKeyID,
+		},
+		Operation: op,
+	})
+}
+
+func createAdmissionOperation(op domain.RenderOperation) (domain.OperationToken, bool) {
+	switch op {
+	case domain.RenderOpImageGeneration:
+		return operationCreateImageGeneration, true
+	case domain.RenderOpImageEdit:
+		return operationCreateImageEdit, true
+	case domain.RenderOpInpaint:
+		return operationCreateImageInpaint, true
+	default:
+		return "", false
+	}
+}
+
+func preflightFailureStage(class domain.ErrorCode) domain.FailureStage {
+	switch class {
+	case domain.ErrCodeCapabilityUnsupported, domain.ErrCodeCapabilityUnverified, domain.ErrCodeSnapshotStale:
+		return domain.StageCapability
+	case domain.ErrCodeResourceNotFound, domain.ErrCodeInvalidRequest:
+		return domain.StageAsset
+	case domain.ErrCodeDependencyUnavailable:
+		return domain.StageDependency
+	default:
+		return domain.StageRouting
+	}
 }
 
 func (service *RenderService) nowTS() domain.Timestamp {

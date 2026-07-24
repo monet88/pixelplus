@@ -39,21 +39,25 @@ func TestRunStartsProductionCompositionAndShutsDown(t *testing.T) {
 
 	client := &http.Client{Timeout: time.Second}
 	deadline := time.Now().Add(2 * time.Second)
+	// Production composition without durable Render Job stores must keep /readyz
+	// closed (503). Healthz still proves the process accepted traffic (#54 Standards).
+	var readyzStatus int
 	for {
 		response, requestErr := client.Get("http://" + address + "/readyz")
 		if requestErr == nil {
+			readyzStatus = response.StatusCode
 			response.Body.Close()
-			if response.StatusCode != http.StatusOK {
-				cancel()
-				t.Fatalf("GET /readyz status = %d, want %d", response.StatusCode, http.StatusOK)
-			}
 			break
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("production readiness did not start: %v", requestErr)
+			t.Fatalf("production gateway did not start: %v", requestErr)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if readyzStatus != http.StatusServiceUnavailable {
+		cancel()
+		t.Fatalf("GET /readyz status = %d, want %d (production lacks durable render foundation)", readyzStatus, http.StatusServiceUnavailable)
 	}
 
 	response, err := client.Get("http://" + address + "/healthz")

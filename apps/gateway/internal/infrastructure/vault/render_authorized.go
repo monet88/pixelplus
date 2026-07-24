@@ -173,13 +173,18 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 	if service.prompts == nil || service.adapter == nil || service.staging == nil {
 		return domain.RenderOutcome{}, ports.ErrRenderAdapterUnavailable
 	}
-	if _, err := service.vault.Validate(ctx, ports.CredentialValidation{
+	validation, err := service.vault.Validate(ctx, ports.CredentialValidation{
 		Principal: request.Principal,
 		AccountID: request.AccountID,
 		AuthMode:  request.AuthMode,
 		Version:   request.Version,
-	}); err != nil {
+	})
+	if err != nil {
 		return domain.RenderOutcome{}, err
+	}
+	// Valid=false is a usability reject, not only a dependency error (#15/#46).
+	if !validation.Valid {
+		return domain.RenderOutcome{}, ports.ErrCredentialAbsent
 	}
 
 	plan := request.Capture
@@ -203,7 +208,7 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 		TenantID: domain.TenantID(request.JobRef.TenantID),
 		JobID:    request.JobRef.JobID,
 	}
-	err := service.prompts.Use(ctx, access, func(plaintext string) error {
+	err = service.prompts.Use(ctx, access, func(plaintext string) error {
 		injection := promptInjection{material: plaintext}
 		outcome, renderErr = service.adapter.Render(ctx, ports.RenderCommand{
 			Principal:  request.Principal,

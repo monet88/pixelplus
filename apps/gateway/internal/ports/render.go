@@ -30,9 +30,12 @@ type RenderJobCreation struct {
 
 // WorkerLease is the identity a worker presents when claiming a job.
 // Now is the injected observation instant for claim timestamps (required).
+// ExpiresAt, when non-zero, bounds the fence lifetime for expiry recovery
+// (#14 §6.4). Zero means the store applies its foundation default.
 type WorkerLease struct {
-	WorkerID domain.Identifier
-	Now      domain.Timestamp
+	WorkerID  domain.Identifier
+	Now       domain.Timestamp
+	ExpiresAt domain.Timestamp
 }
 
 // WorkerClaim is the fenced ownership grant returned by an atomic claim.

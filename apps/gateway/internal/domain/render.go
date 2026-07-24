@@ -262,8 +262,12 @@ type RenderJob struct {
 	WorkerFencingToken FencingToken
 	WorkerID           Identifier
 	LeaseHeld          bool
-	CancelRequestedAt  Timestamp
-	CancelRequestedBy  ClientAPIKeyID
+	// LeaseExpiresAt is the worker fence expiry. After expiry, a new worker may
+	// reclaim only when CommitStatus is not_started and PayloadSent is false
+	// (#14 §6.4). Expiry never authorizes a second generation after payload.
+	LeaseExpiresAt    Timestamp
+	CancelRequestedAt Timestamp
+	CancelRequestedBy ClientAPIKeyID
 	FailureStage       FailureStage
 	FailureClass       ErrorCode
 	CommitStatus       CommitStatus

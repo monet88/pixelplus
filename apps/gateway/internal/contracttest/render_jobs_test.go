@@ -133,7 +133,8 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 }
 
 // countingRenderAdapter is a controlled Provider render surface. It records the
-// exact prompt plaintext injected via PromptInjection for ADR 0009 proof.
+// exact prompt plaintext injected via PromptInjection for ADR 0009 proof and
+// the AuthMode surface passed into the Adapter.
 type countingRenderAdapter struct {
 	harness *renderHarness
 	outcome domain.RenderOutcome
@@ -142,10 +143,13 @@ type countingRenderAdapter struct {
 	block <-chan struct{}
 	// entered signals that Render has started (after reading prompt).
 	entered chan struct{}
+	// lastAuthMode is the AuthMode on the last RenderCommand (safe surface).
+	lastAuthMode atomic.Value // domain.AuthMode
 }
 
-func (adapter *countingRenderAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	adapter.harness.renderCalls.Add(1)
+	adapter.lastAuthMode.Store(cmd.AuthMode)
 	if prompt != nil {
 		_ = prompt.Use(func(plaintext string) error {
 			adapter.harness.lastPrompt.Store(plaintext)
@@ -1087,6 +1091,219 @@ func TestEnqueueFailureAfterCreateRecoversSameJobOnRetry(t *testing.T) {
 	}
 	if n := len(h.fixture.EnqueuedReferences()); n != 1 {
 		t.Fatalf("enqueue count after pure replay = %d, want 1", n)
+	}
+}
+
+// Spec: create admission occupancy is held until job terminal — not released on
+// HTTP create response. Worker complete (or cancel) settles Reconcile once.
+func TestAdmissionReservationHeldUntilJobTerminal(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_admit_hold")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-admit-hold",
+		body:    `{"model":"gpt-image-1","prompt":"hold occupancy"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	if admits := h.admission.admitCalls.Load(); admits != 1 {
+		t.Fatalf("admit calls after create = %d, want 1", admits)
+	}
+	if recon := h.admission.reconcileCalls.Load(); recon != 0 {
+		t.Fatalf("reconcile after create = %d, want 0 (occupancy held for job lifetime)", recon)
+	}
+
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{
+		TenantID: "tenant_a",
+		JobID:    domain.Identifier(jobID),
+	}); err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+	if recon := h.admission.reconcileCalls.Load(); recon != 1 {
+		t.Fatalf("reconcile after terminal complete = %d, want 1", recon)
+	}
+}
+
+// Spec: worker re-gates Account/Health/Capability before payload; drain after
+// create fails the job with zero Provider calls.
+func TestWorkerPregateRejectsDrainWithoutProviderCall(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_pregate_drain")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-pregate-drain",
+		body:    `{"model":"gpt-image-1","prompt":"preflight me"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+
+	// Post-create: mark account draining so worker preflight fails.
+	account := h.storedAccount(t, domain.SecurityPrincipal{
+		TenantID: "tenant_a", ClientAPIKeyID: "key_a",
+		Scopes: domain.NewScopeSet(domain.ScopeAccountsRead),
+	}, "pa_pregate_drain")
+	account.Controls.Drain = domain.DrainDraining
+	h.seedAccount("tenant_a", account)
+
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{
+		TenantID: "tenant_a",
+		JobID:    domain.Identifier(jobID),
+	}); err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != 0 {
+		t.Fatalf("render calls = %d, want 0 after preflight reject", calls)
+	}
+
+	get, getPayload := h.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/render-jobs/" + jobID,
+		bearer: tenantAKey,
+	})
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d (body=%s)", get.StatusCode, getPayload)
+	}
+	var final map[string]any
+	_ = json.Unmarshal(getPayload, &final)
+	if final["lifecycle_state"] != "failed" {
+		t.Fatalf("lifecycle = %v, want failed (body=%s)", final["lifecycle_state"], getPayload)
+	}
+	if final["failure_class"] != "account_not_usable" {
+		t.Fatalf("failure_class = %v, want account_not_usable", final["failure_class"])
+	}
+}
+
+// Spec: Vault Valid=false is usability reject at create (account_not_usable).
+func TestVaultValidFalseRejectsCreateAsAccountNotUsable(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_vault_invalid")
+		h.vault.validResult = ports.CredentialValidationResult{Valid: false}
+	})
+
+	response, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-vault-invalid",
+		body:    `{"model":"gpt-image-1","prompt":"no usable cred"}`,
+	})
+	if response.StatusCode == http.StatusAccepted {
+		t.Fatalf("status = 202, want reject for Valid=false (body=%s)", payload)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 0 {
+		t.Fatalf("enqueue count = %d, want 0", n)
+	}
+	if calls := h.renderCalls.Load(); calls != 0 {
+		t.Fatalf("render calls = %d, want 0", calls)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(payload, &body)
+	errObj, _ := body["error"].(map[string]any)
+	if errObj == nil {
+		// Wire may flatten code at top level depending on transport.
+		if code, _ := body["code"].(string); code != "account_not_usable" {
+			t.Fatalf("body = %s, want account_not_usable", payload)
+		}
+		return
+	}
+	if code, _ := errObj["code"].(string); code != "account_not_usable" {
+		t.Fatalf("error.code = %v, want account_not_usable (body=%s)", errObj["code"], payload)
+	}
+}
+
+// Spec: AuthMode is passed into the protected Adapter surface on worker render.
+func TestWorkerPassesAuthModeToAdapterSurface(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_authmode_surface")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-authmode",
+		body:    `{"model":"gpt-image-1","prompt":"auth mode surface"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{
+		TenantID: "tenant_a",
+		JobID:    domain.Identifier(jobID),
+	}); err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+	got, _ := h.adapter.lastAuthMode.Load().(domain.AuthMode)
+	if got != domain.AuthModeChatGPTCodexOAuth {
+		t.Fatalf("adapter AuthMode = %q, want %q", got, domain.AuthModeChatGPTCodexOAuth)
+	}
+}
+
+// Spec: queued cancel is terminal without Provider and releases create occupancy.
+func TestQueuedCancelReleasesAdmissionWithoutProvider(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_cancel_admit")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-cancel-admit",
+		body:    `{"model":"gpt-image-1","prompt":"cancel occupancy"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d", create.StatusCode)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+	reconAfterCreate := h.admission.reconcileCalls.Load()
+
+	cancel, cancelPayload := h.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/render-jobs/" + jobID + "/cancel",
+		bearer: tenantAKey,
+	})
+	if cancel.StatusCode != http.StatusOK {
+		t.Fatalf("cancel status = %d (body=%s)", cancel.StatusCode, cancelPayload)
+	}
+	if calls := h.renderCalls.Load(); calls != 0 {
+		t.Fatalf("render calls = %d, want 0", calls)
+	}
+	// cancel admits once (request-scoped) and releaseJobAdmission for create +
+	// cancel defer Reconcile → at least +2 reconciles from create-held state.
+	if recon := h.admission.reconcileCalls.Load(); recon <= reconAfterCreate {
+		t.Fatalf("reconcile after cancel = %d, want > %d", recon, reconAfterCreate)
 	}
 }
 

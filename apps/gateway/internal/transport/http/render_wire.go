@@ -19,9 +19,12 @@ type renderJobWire struct {
 	ProviderAccountID string            `json:"provider_account_id,omitempty"`
 	OutputEntries     []outputEntryWire `json:"output_entries,omitempty"`
 	CommitStatus      string            `json:"commit_status,omitempty"`
-	Cancel            *cancelFieldsWire `json:"cancel,omitempty"`
-	CreatedAt         string            `json:"created_at"`
-	UpdatedAt         string            `json:"updated_at"`
+	// FailureClass/Stage are safe terminal classifications only (no secrets).
+	FailureClass string            `json:"failure_class,omitempty"`
+	FailureStage string            `json:"failure_stage,omitempty"`
+	Cancel       *cancelFieldsWire `json:"cancel,omitempty"`
+	CreatedAt    string            `json:"created_at"`
+	UpdatedAt    string            `json:"updated_at"`
 	// re_render is always false on output-retry responses when present.
 	ReRender *bool `json:"re_render,omitempty"`
 }
@@ -73,6 +76,12 @@ func toRenderJobWire(job domain.RenderJob) renderJobWire {
 	}
 	if job.CommitStatus.Valid() && job.CommitStatus != domain.CommitNotStarted {
 		wire.CommitStatus = string(job.CommitStatus)
+	}
+	if job.Lifecycle == domain.JobFailed && job.FailureClass != "" {
+		wire.FailureClass = string(job.FailureClass)
+		if job.FailureStage != "" {
+			wire.FailureStage = string(job.FailureStage)
+		}
 	}
 	if len(job.OutputEntries) > 0 {
 		wire.OutputEntries = make([]outputEntryWire, 0, len(job.OutputEntries))
