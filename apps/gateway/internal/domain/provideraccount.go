@@ -455,7 +455,14 @@ func (mode AuthMode) SupportsRefresh() bool {
 // before any durable side effect. Gated/experimental modes are a separate
 // feature-flag + Tenant-acknowledgement concern (#7/#9) and are not gated here.
 func (mode AuthMode) Prohibited() bool {
-	return mode == AuthModeGrokWebSSO
+	return mode.RiskStatus() == RiskProhibited
+}
+
+// Experimental reports whether the Auth Mode is experimental under the product
+// risk envelope. Production has no lab-profile signal, so routing policy
+// candidates and durable mode lists fail closed for experimental modes.
+func (mode AuthMode) Experimental() bool {
+	return mode.RiskStatus() == RiskExperimental
 }
 
 // AcceptsCredentialSubmission reports whether a direct credential submission is

@@ -9,6 +9,27 @@ import (
 // matches the frozen Public API pattern `^pa_[A-Za-z0-9_]+$`.
 type ProviderAccountID string
 
+// Valid reports whether the id matches the frozen OpenAPI pattern
+// `^pa_[A-Za-z0-9_]+$` (at least one character after the `pa_` prefix).
+func (id ProviderAccountID) Valid() bool {
+	s := string(id)
+	if len(s) < 4 || s[:3] != "pa_" {
+		return false
+	}
+	for i := 3; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Timestamp is a server-owned instant. The zero value means "not set" and is
 // omitted from safe projections.
 type Timestamp struct {

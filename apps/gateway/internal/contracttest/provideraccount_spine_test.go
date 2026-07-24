@@ -40,6 +40,7 @@ type spineHarness struct {
 	capabilities *stubCapabilityStore
 	capability   *stubCapabilityAdapter
 	circuits     *stubCircuitStore
+	routing      *countingRoutingPolicyStore
 	clock        *mutableTestClock
 }
 
@@ -107,7 +108,13 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 			tenantAKey: {
 				TenantID:       "tenant_a",
 				ClientAPIKeyID: "key_a",
-				Scopes:         domain.NewScopeSet(domain.ScopeAccountsRead, domain.ScopeAccountsManage, domain.ScopeCapabilitiesRead),
+				Scopes: domain.NewScopeSet(
+					domain.ScopeAccountsRead,
+					domain.ScopeAccountsManage,
+					domain.ScopeCapabilitiesRead,
+					domain.ScopeRoutingRead,
+					domain.ScopeRoutingManage,
+				),
 			},
 			readOnly: {
 				TenantID:       "tenant_a",
@@ -117,7 +124,13 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 			tenantBKey: {
 				TenantID:       "tenant_b",
 				ClientAPIKeyID: "key_b",
-				Scopes:         domain.NewScopeSet(domain.ScopeAccountsRead, domain.ScopeAccountsManage, domain.ScopeCapabilitiesRead),
+				Scopes: domain.NewScopeSet(
+					domain.ScopeAccountsRead,
+					domain.ScopeAccountsManage,
+					domain.ScopeCapabilitiesRead,
+					domain.ScopeRoutingRead,
+					domain.ScopeRoutingManage,
+				),
 			},
 		},
 	}
@@ -137,6 +150,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		capabilities: newStubCapabilityStore(log),
 		capability:   newStubCapabilityAdapter(log),
 		circuits:     newStubCircuitStore(log),
+		routing:      newCountingRoutingPolicyStore(),
 		clock:        &mutableTestClock{now: spineFixtureTime},
 	}
 	if configure != nil {
@@ -158,6 +172,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		Capabilities: harness.capabilities,
 		Capability:   harness.capability,
 		Circuits:     harness.circuits,
+		Routing:      harness.routing,
 		Clock:        harness.clock,
 	})
 	if err != nil {

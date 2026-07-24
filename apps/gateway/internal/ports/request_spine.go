@@ -268,6 +268,12 @@ const (
 	AuditCapabilitySnapshotRead AuditAction = "capability_snapshot.read"
 	// AuditModelsListed records a Tenant-owned offerable model list projection.
 	AuditModelsListed AuditAction = "models.listed"
+	// AuditRoutingPolicyRead records a successful Tenant Routing Policy read.
+	// It never carries foreign account ids or credential material.
+	AuditRoutingPolicyRead AuditAction = "routing_policy.read"
+	// AuditRoutingPolicyReplaced records a successful atomic Routing Policy
+	// replace. Payload is safe actor/Tenant/outcome fields only.
+	AuditRoutingPolicyReplaced AuditAction = "routing_policy.replaced"
 	// AuditProviderHealthTransition records a durable health condition transition
 	// (cooldown create/renew, recovery success, dependency-failure renewal, hard
 	// auth rejection). Payload is safe fields only (health/cooldown spec §19).
