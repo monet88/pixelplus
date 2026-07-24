@@ -14,6 +14,7 @@ import (
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/contracttest"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
+	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/persistence"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
@@ -27,6 +28,8 @@ type renderHarness struct {
 	adapter          *countingRenderAdapter
 	enqueueFailTimes int
 	enqueueError     error
+	// renderJobs, when set, injects a controlled RenderJobStore into composition.
+	renderJobs ports.RenderJobStore
 }
 
 func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarness {
@@ -124,6 +127,9 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	if h.enqueueFailTimes > 0 {
 		opts.EnqueueFailTimes = h.enqueueFailTimes
 		opts.EnqueueError = h.enqueueError
+	}
+	if h.renderJobs != nil {
+		opts.RenderJobs = h.renderJobs
 	}
 	fixture, err := contracttest.NewFixture(opts)
 	if err != nil {
@@ -1224,6 +1230,121 @@ func TestEnqueueFailureAfterCreateRecoversSameJobOnRetry(t *testing.T) {
 	}
 	if n := len(h.fixture.EnqueuedReferences()); n != 1 {
 		t.Fatalf("enqueue count after pure replay = %d, want 1", n)
+	}
+}
+
+// P1-3: post-manifest recovery claim finalizes without a second Provider render.
+func TestPostManifestRecoveryFinalizesWithoutSecondRender(t *testing.T) {
+	t.Parallel()
+
+	store := persistence.NewMemoryRenderJobStore()
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_manifest_rec")
+		h.renderJobs = store
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-manifest-rec",
+		body:    `{"model":"gpt-image-1","prompt":"recover finalize"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+	ref := domain.JobRef{TenantID: "tenant_a", JobID: domain.Identifier(jobID)}
+
+	// First worker: full render + complete (proves happy path still works).
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), ref); err != nil {
+		t.Fatalf("first ExecuteJob: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls after first = %d, want 1", calls)
+	}
+
+	// Simulate post-manifest crash recovery on a second job: create, claim,
+	// capture manifest, expire lease, then recovery ExecuteJob with zero render.
+	create2, payload2 := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-manifest-rec-2",
+		body:    `{"model":"gpt-image-1","prompt":"recover only"}`,
+	})
+	if create2.StatusCode != http.StatusAccepted {
+		t.Fatalf("create2 status = %d (body=%s)", create2.StatusCode, payload2)
+	}
+	var job2 map[string]any
+	_ = json.Unmarshal(payload2, &job2)
+	jobID2 := job2["job_id"].(string)
+	ref2 := domain.JobRef{TenantID: "tenant_a", JobID: domain.Identifier(jobID2)}
+
+	base := spineFixtureTime
+	claim, err := store.ClaimWorker(t.Context(), ref2, ports.WorkerLease{
+		WorkerID:  "crash_worker",
+		Now:       domain.NewTimestamp(base),
+		ExpiresAt: domain.NewTimestamp(base.Add(5 * time.Second)),
+	})
+	if err != nil {
+		t.Fatalf("ClaimWorker setup: %v", err)
+	}
+	// Record payload + committed capture without calling the Adapter.
+	attempt := domain.UpstreamAttempt{
+		ID:           domain.NewAttemptID(domain.Identifier(jobID2), 1),
+		CommitStatus: domain.CommitCommitted, PayloadSent: true, Sequence: 1,
+		CreatedAt: domain.NewTimestamp(base), UpdatedAt: domain.NewTimestamp(base),
+	}
+	if _, err := store.ObserveAttempt(t.Context(), ports.AttemptObservation{
+		JobRef: ref2, FencingToken: claim.FencingToken, Attempt: attempt,
+		Phase: domain.PhaseUpstream, CommitStatus: domain.CommitCommitted, Now: domain.NewTimestamp(base),
+	}); err != nil {
+		t.Fatalf("ObserveAttempt: %v", err)
+	}
+	// Stage one output under the same identity recovery will place.
+	entryID := domain.NewOutputEntryID(domain.Identifier(jobID2), 0)
+	checksum := domain.StagingChecksum(fixtureMinimalPNG())
+	// Staging is composition-owned; place recovery without staging will fail closed
+	// to failed without render — still proves RecoveryOnly path zero Adapter calls.
+	if _, err := store.CaptureManifest(t.Context(), ports.ManifestCapture{
+		JobRef: ref2, FencingToken: claim.FencingToken,
+		Manifest: domain.ResultManifest{
+			ID: domain.NewResultManifestID(attempt.ID), AttemptID: attempt.ID,
+			Entries: []domain.OutputEntry{{
+				ID: entryID, Position: 0, DeliveryState: domain.OutputPending,
+				ContentType: domain.ContentTypePNG, ByteSize: int64(len(fixtureMinimalPNG())),
+				Checksum: checksum,
+			}},
+			StagingChecksum: checksum,
+		},
+		Now: domain.NewTimestamp(base),
+	}); err != nil {
+		t.Fatalf("CaptureManifest: %v", err)
+	}
+
+	// Expire lease then recovery ExecuteJob.
+	before := h.renderCalls.Load()
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), ref2); err != nil {
+		t.Fatalf("recovery ExecuteJob: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != before {
+		t.Fatalf("render calls after recovery = %d, want %d (zero replacement render)", calls, before)
+	}
+	get, getPayload := h.do(t, requestSpec{
+		method: http.MethodGet, path: "/v1/render-jobs/" + jobID2, bearer: tenantAKey,
+	})
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d (body=%s)", get.StatusCode, getPayload)
+	}
+	var final map[string]any
+	_ = json.Unmarshal(getPayload, &final)
+	// Recovery without staging yields failed (fail closed) or completed if place works —
+	// either is terminal and must not be running.
+	if final["lifecycle_state"] == "running" || final["lifecycle_state"] == "queued" {
+		t.Fatalf("lifecycle after recovery = %v, want terminal", final["lifecycle_state"])
 	}
 }
 

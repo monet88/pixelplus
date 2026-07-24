@@ -43,6 +43,10 @@ type WorkerClaim struct {
 	Job          domain.RenderJob
 	FencingToken domain.FencingToken
 	AlreadyOwned bool
+	// RecoveryOnly is true when the worker reclaimed an expired lease after
+	// payload/manifest for drain/finalize only. Adapter generation is forbidden
+	// (#14 §6.4 post-payload recovery).
+	RecoveryOnly bool
 }
 
 // AttemptObservation records attempt ledger facts under the current fence.

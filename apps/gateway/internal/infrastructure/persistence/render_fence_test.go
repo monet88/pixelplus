@@ -191,12 +191,64 @@ func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
 		t.Fatalf("ObserveAttempt PayloadSent: %v", err)
 	}
 
-	// Post-payload expiry: reclaim must fail (lease expiry ≠ re-render).
+	// Post-payload expiry: recovery claim is allowed, but RecoveryOnly forbids re-render.
 	post := domain.NewTimestamp(base.Add(5 * time.Minute))
-	if _, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+	claim3, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
 		WorkerID: "worker_3",
 		Now:      post,
-	}); !errors.Is(err, domain.ErrJobNotClaimable) {
-		t.Fatalf("ClaimWorker after payload+expiry = %v, want ErrJobNotClaimable", err)
+	})
+	if err != nil {
+		t.Fatalf("ClaimWorker after payload+expiry: %v", err)
+	}
+	if !claim3.RecoveryOnly {
+		t.Fatal("post-payload reclaim must set RecoveryOnly=true (no second generation)")
+	}
+}
+
+// Post-manifest recovery claim continues finalize without treating the job as unclaimable.
+func TestPostManifestRecoveryClaimIsRecoveryOnly(t *testing.T) {
+	t.Parallel()
+
+	store := persistence.NewMemoryRenderJobStore()
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	base := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	now := domain.NewTimestamp(base)
+	job := domain.NewQueuedRenderJob(
+		"job_manifest_rec", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		domain.DigestPrompt("p"), nil, "", "pa_1", 1, "fp", "idem", now,
+	)
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: job}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	claim, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "w1", Now: now, ExpiresAt: domain.NewTimestamp(base.Add(10 * time.Second)),
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	manifest := domain.ResultManifest{
+		ID: "man_rec", AttemptID: "att_1",
+		Entries: []domain.OutputEntry{{
+			ID: domain.NewOutputEntryID(job.JobID, 0), Position: 0,
+			DeliveryState: domain.OutputPending, Checksum: "c",
+		}},
+	}
+	if _, err := store.CaptureManifest(context.Background(), ports.ManifestCapture{
+		JobRef: job.JobRef(), FencingToken: claim.FencingToken, Manifest: manifest, Now: now,
+	}); err != nil {
+		t.Fatalf("CaptureManifest: %v", err)
+	}
+	// Expire lease.
+	rec, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "w2", Now: domain.NewTimestamp(base.Add(time.Minute)),
+	})
+	if err != nil {
+		t.Fatalf("recovery claim: %v", err)
+	}
+	if !rec.RecoveryOnly {
+		t.Fatal("manifest recovery claim must be RecoveryOnly")
+	}
+	if rec.Job.Manifest.ID != "man_rec" {
+		t.Fatalf("manifest = %q, want man_rec", rec.Job.Manifest.ID)
 	}
 }

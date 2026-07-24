@@ -99,10 +99,9 @@ func (store *MemoryRenderJobStore) Load(_ context.Context, ref domain.JobRef) (d
 // ClaimWorker atomically claims a queued (or recoverable running) job.
 // lease.Now advances UpdatedAt and progress timestamps.
 //
-// Lease expiry recovery (#14 §6.4): a running job whose fence is past
-// LeaseExpiresAt may be reclaimed only when CommitStatus is not_started and
-// PayloadSent is false. After payload / committed / unknown, reclaim is refused
-// so recovery cannot start a second generation.
+// Lease expiry recovery (#14 §6.4): pre-payload reclaim may resume render;
+// post-payload/manifest reclaim is RecoveryOnly (drain/finalize, never a second
+// Provider generation).
 func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.JobRef, lease ports.WorkerLease) (ports.WorkerClaim, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -126,25 +125,29 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 		return ports.WorkerClaim{Job: cloneJob(job), FencingToken: job.WorkerFencingToken, AlreadyOwned: true}, nil
 	}
 
+	recoveryOnly := false
 	switch job.Lifecycle {
 	case domain.JobQueued:
-		// take claim
+		// take claim for first execution
 	case domain.JobRunning:
 		// Active non-expired fence still owned by another worker.
 		if leaseActive {
 			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 		}
-		// Expired or released fence: reclaim only when no payload was sent and
-		// commit class still allows safe pre-commit resume (#14 §6.2–6.4).
-		// PayloadSent or committed/unknown forbids a second generation.
-		if job.Attempt.PayloadSent {
-			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
-		}
-		switch job.CommitStatus {
-		case domain.CommitNotStarted, domain.CommitNotCommitted, "":
-			// reclaim ok
-		default:
-			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
+		// Expired/released fence:
+		// - Pre-payload: full claim (may render)
+		// - Post-payload / manifest present: recovery-only claim (drain/finalize,
+		//   never a second Provider generation) (#14 §6.4).
+		if job.Attempt.PayloadSent || job.CommitStatus == domain.CommitCommitted ||
+			job.CommitStatus == domain.CommitUnknown || job.Manifest.ID != "" {
+			recoveryOnly = true
+		} else {
+			switch job.CommitStatus {
+			case domain.CommitNotStarted, domain.CommitNotCommitted, "":
+				// full reclaim ok
+			default:
+				return ports.WorkerClaim{}, domain.ErrJobNotClaimable
+			}
 		}
 	default:
 		return ports.WorkerClaim{}, domain.ErrJobNotClaimable
@@ -158,20 +161,28 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 
 	store.nextFence++
 	job.Lifecycle = domain.JobRunning
-	job.ExecutionPhase = domain.PhasePreflight
+	if !recoveryOnly {
+		job.ExecutionPhase = domain.PhasePreflight
+	}
 	job.WorkerFencingToken = store.nextFence
 	job.WorkerID = lease.WorkerID
 	job.LeaseHeld = true
 	job.LeaseExpiresAt = expiresAt
 	job.StateRevision++
 	job.UpdatedAt = now
-	job.Progress = domain.JobProgress{
-		Source:    domain.ProgressEstimated,
-		Value:     0,
-		UpdatedAt: now,
+	if !recoveryOnly {
+		job.Progress = domain.JobProgress{
+			Source:    domain.ProgressEstimated,
+			Value:     0,
+			UpdatedAt: now,
+		}
 	}
 	store.saveLocked(job)
-	return ports.WorkerClaim{Job: cloneJob(job), FencingToken: job.WorkerFencingToken}, nil
+	return ports.WorkerClaim{
+		Job:          cloneJob(job),
+		FencingToken: job.WorkerFencingToken,
+		RecoveryOnly: recoveryOnly,
+	}, nil
 }
 
 // defaultWorkerLeaseTTL is the process-local foundation lease bound when the

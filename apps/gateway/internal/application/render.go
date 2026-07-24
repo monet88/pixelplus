@@ -722,6 +722,11 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return nil
 	}
 
+	// Post-payload / post-manifest recovery: drain or finalize without Adapter.
+	if claim.RecoveryOnly {
+		return service.recoverAttemptWithoutRender(ctx, ref, job, fence)
+	}
+
 	// Job→account continuity binding for this execution (not exclusive account mutex).
 	if err := service.jobs.BindAccountLease(ctx, ref, fence, job.ProviderAccountID); err != nil {
 		if err := service.persistTerminal(ctx, job, ports.FencedTransition{
@@ -1010,6 +1015,82 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 	return nil
+}
+
+// recoverAttemptWithoutRender finalizes or fails a post-payload attempt using
+// durable attempt/manifest facts only. Never calls Provider Adapter (#14 §6.4).
+func (service *RenderService) recoverAttemptWithoutRender(
+	ctx context.Context,
+	ref domain.JobRef,
+	job domain.RenderJob,
+	fence domain.FencingToken,
+) error {
+	// Cancel wins without Provider.
+	current, err := service.jobs.Load(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if current.Lifecycle == domain.JobCancelRequested {
+		return service.persistTerminal(ctx, job, ports.FencedTransition{
+			JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
+			CommitStatus: current.CommitStatus, ClearLease: true, Now: service.nowTS(),
+		})
+	}
+	if current.Lifecycle.Terminal() {
+		service.releaseJobAdmission(ctx, current)
+		return nil
+	}
+
+	principal := domain.SecurityPrincipal{
+		TenantID:       job.TenantID,
+		ClientAPIKeyID: job.ClientAPIKeyID,
+		Scopes:         domain.NewScopeSet(domain.ScopeJobsManage, domain.ScopeAssetsRead, domain.ScopeAssetsWrite),
+	}
+
+	// Manifest already captured: complete placement and mark completed.
+	if current.Manifest.ID != "" && len(current.OutputEntries) > 0 {
+		for _, entry := range current.OutputEntries {
+			if entry.DeliveryState == domain.OutputAvailable && entry.AssetID != "" {
+				continue
+			}
+			if placeErr := service.placeEntryFromStaging(ctx, principal, current, entry, fence); placeErr != nil {
+				if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
+					// Issue #54 acceptance: placement not durable → do not complete.
+					return service.persistTerminal(ctx, job, ports.FencedTransition{
+						JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+						FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeStorageCapExceeded,
+						CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
+					})
+				}
+				// Staging missing after committed capture: fail closed, no re-render.
+				return service.persistTerminal(ctx, job, ports.FencedTransition{
+					JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+					FailureStage: domain.StageRecovery, FailureClass: domain.ErrCodeInternal,
+					CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
+				})
+			}
+		}
+		completeAt := service.nowTS()
+		return service.persistTerminal(ctx, job, ports.FencedTransition{
+			JobRef: ref, FencingToken: fence, To: domain.JobCompleted,
+			CommitStatus: domain.CommitCommitted,
+			Progress: domain.JobProgress{
+				Source: domain.ProgressEstimated, Value: 100, UpdatedAt: completeAt,
+			},
+			ClearLease: true, Now: completeAt,
+		})
+	}
+
+	// Payload sent / unknown commit without capture: fail closed, never re-render.
+	commit := current.CommitStatus
+	if commit == "" || commit == domain.CommitNotStarted {
+		commit = domain.CommitUnknown
+	}
+	return service.persistTerminal(ctx, job, ports.FencedTransition{
+		JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+		FailureStage: domain.StageRecovery, FailureClass: domain.ErrCodeInternal,
+		CommitStatus: commit, ClearLease: true, Now: service.nowTS(),
+	})
 }
 
 // fencedPayloadSendBoundary records PayloadSent=true under the worker fence at
