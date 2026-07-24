@@ -81,6 +81,7 @@ type Options struct {
 	RenderJobs    ports.RenderJobStore
 	RenderReplay  ports.RenderReplayStore
 	RenderAdapter ports.RenderAdapter
+	RenderStaging ports.RenderStagingStore
 	RenderAudit   ports.RenderAuditRecorder
 }
 
@@ -141,6 +142,7 @@ func NewFixture(options Options) (*Fixture, error) {
 		RenderJobs:    options.RenderJobs,
 		RenderReplay:  options.RenderReplay,
 		RenderAdapter: options.RenderAdapter,
+		RenderStaging: options.RenderStaging,
 		RenderAudit:   options.RenderAudit,
 	})
 	if err != nil {

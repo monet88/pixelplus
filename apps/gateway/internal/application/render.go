@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -111,6 +110,7 @@ type RenderService struct {
 	routing      ports.RoutingPolicyStore
 	assets       ports.AssetMetadataStore
 	content      ports.AssetContentStore
+	staging      ports.RenderStagingStore
 	vault        ports.CredentialVault
 	prompts      ports.RenderPromptStore
 	authorized   ports.AuthorizedRender
@@ -135,7 +135,10 @@ type RenderDependencies struct {
 	Routing      ports.RoutingPolicyStore
 	Assets       ports.AssetMetadataStore
 	Content      ports.AssetContentStore
-	Vault        ports.CredentialVault
+	// Staging holds temporary Provider result bytes for capture/placement retry.
+	// Required; production fail-closed default lives in composition.
+	Staging ports.RenderStagingStore
+	Vault   ports.CredentialVault
 	// Prompts is the Put-only confidential port for create-time prompt intake.
 	Prompts ports.RenderPromptStore
 	// Authorized is the protected render boundary (Vault + confidential + Adapter).
@@ -170,6 +173,8 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		return nil, errors.New("application: asset metadata store is required")
 	case dependencies.Content == nil:
 		return nil, errors.New("application: asset content store is required")
+	case dependencies.Staging == nil:
+		return nil, errors.New("application: render staging store is required")
 	case dependencies.Vault == nil:
 		return nil, errors.New("application: credential vault is required")
 	case dependencies.Prompts == nil:
@@ -201,6 +206,7 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		routing:      dependencies.Routing,
 		assets:       dependencies.Assets,
 		content:      dependencies.Content,
+		staging:      dependencies.Staging,
 		vault:        dependencies.Vault,
 		prompts:      dependencies.Prompts,
 		authorized:   dependencies.Authorized,
@@ -866,9 +872,33 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		CapturedAt:      domain.NewTimestamp(service.clock.Now()),
 	}
 
-	// Stage content in-memory via a side channel on the service path: store
-	// staged bytes in a process-local map keyed by entry for placement.
-	service.stageOutputs(job.JobID, outputs)
+	// Stage result bytes through the injected RenderStagingStore (Tenant +
+	// manifest + entry + checksum). Never use package-global maps.
+	for i, entry := range entries {
+		if err := service.staging.Put(ctx, ports.StagingPut{
+			Identity: ports.StagingIdentity{
+				TenantID:   job.TenantID,
+				JobID:      job.JobID,
+				ManifestID: manifest.ID,
+				EntryID:    entry.ID,
+				Checksum:   entry.Checksum,
+			},
+			ContentType: contentType,
+			Data:        outputs[i],
+		}); err != nil {
+			_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+				JobRef:       ref,
+				FencingToken: fence,
+				To:           domain.JobFailed,
+				FailureStage: domain.StageDependency,
+				FailureClass: domain.ErrCodeDependencyUnavailable,
+				CommitStatus: domain.CommitCommitted,
+				ClearLease:   true,
+				Now:          service.nowTS(),
+			})
+			return nil
+		}
+	}
 
 	if _, err := service.jobs.CaptureManifest(ctx, ports.ManifestCapture{
 		JobRef:       ref,
@@ -889,9 +919,8 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	if err != nil {
 		return err
 	}
-	for i, entry := range jobAfter.OutputEntries {
-		data := outputs[i]
-		if placeErr := service.placeOutputBytes(ctx, principal, jobAfter, entry, data, fence); placeErr != nil {
+	for _, entry := range jobAfter.OutputEntries {
+		if placeErr := service.placeEntryFromStaging(ctx, principal, jobAfter, entry, fence); placeErr != nil {
 			// Storage cap: remain completed with pending delivery later.
 			if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
 				_, _ = service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
@@ -942,35 +971,40 @@ func (service *RenderService) nowTS() domain.Timestamp {
 	return domain.NewTimestamp(service.clock.Now())
 }
 
-// staged holds process-local staged output bytes for placement/retry in the
-// foundation slice (no separate staging backend yet).
-var stagedOutputs = struct {
-	mu sync.Mutex
-	m  map[domain.Identifier][][]byte
-}{m: make(map[domain.Identifier][][]byte)}
-
-func (service *RenderService) stageOutputs(jobID domain.Identifier, outputs [][]byte) {
-	copied := make([][]byte, len(outputs))
-	for i, data := range outputs {
-		buf := make([]byte, len(data))
-		copy(buf, data)
-		copied[i] = buf
+func (service *RenderService) stagingIdentity(job domain.RenderJob, entry domain.OutputEntry) ports.StagingIdentity {
+	return ports.StagingIdentity{
+		TenantID:   job.TenantID,
+		JobID:      job.JobID,
+		ManifestID: job.Manifest.ID,
+		EntryID:    entry.ID,
+		Checksum:   entry.Checksum,
 	}
-	stagedOutputs.mu.Lock()
-	stagedOutputs.m[jobID] = copied
-	stagedOutputs.mu.Unlock()
 }
 
-func (service *RenderService) stagedFor(jobID domain.Identifier, index int) ([]byte, bool) {
-	stagedOutputs.mu.Lock()
-	defer stagedOutputs.mu.Unlock()
-	outputs, ok := stagedOutputs.m[jobID]
-	if !ok || index < 0 || index >= len(outputs) {
-		return nil, false
+// placeEntryFromStaging Uses staged bytes then commits a permanent Asset and
+// records placement on the job store. No package-global state.
+func (service *RenderService) placeEntryFromStaging(
+	ctx context.Context,
+	principal domain.SecurityPrincipal,
+	job domain.RenderJob,
+	entry domain.OutputEntry,
+	fence domain.FencingToken,
+) error {
+	var placeErr error
+	err := service.staging.Use(ctx, ports.StagingAccess{
+		Principal: principal,
+		Identity:  service.stagingIdentity(job, entry),
+	}, func(data []byte) error {
+		placeErr = service.placeOutputBytes(ctx, principal, job, entry, data, fence)
+		return placeErr
+	})
+	if err != nil {
+		if errors.Is(err, ports.ErrStagingNotFound) || errors.Is(err, ports.ErrDependencyUnavailable) {
+			return err
+		}
+		return err
 	}
-	out := make([]byte, len(outputs[index]))
-	copy(out, outputs[index])
-	return out, true
+	return placeErr
 }
 
 func (service *RenderService) placeOutputBytes(
@@ -1048,23 +1082,21 @@ func (service *RenderService) placeFromManifest(
 		}
 		return result, domain.CanonicalError{}
 	}
-	data, ok := service.stagedFor(job.JobID, entry.Position)
-	if !ok {
-		// No staged bytes available: mark failed delivery without re-render.
-		result, err := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
-			JobRef:              job.JobRef(),
-			FencingToken:        fence,
-			EntryID:             entry.ID,
-			DeliveryStateForced: domain.OutputFailed,
-			FailureClass:        string(domain.ErrCodeInternal),
-			Now:                 service.nowTS(),
-		})
-		if err != nil {
-			return ports.PlacementResult{}, service.dependencyCanonical(err)
+	if err := service.placeEntryFromStaging(ctx, principal, job, entry, fence); err != nil {
+		if errors.Is(err, ports.ErrStagingNotFound) || errors.Is(err, ports.ErrDependencyUnavailable) {
+			result, placeErr := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
+				JobRef:              job.JobRef(),
+				FencingToken:        fence,
+				EntryID:             entry.ID,
+				DeliveryStateForced: domain.OutputFailed,
+				FailureClass:        string(domain.ErrCodeInternal),
+				Now:                 service.nowTS(),
+			})
+			if placeErr != nil {
+				return ports.PlacementResult{}, service.dependencyCanonical(placeErr)
+			}
+			return result, domain.CanonicalError{}
 		}
-		return result, domain.CanonicalError{}
-	}
-	if err := service.placeOutputBytes(ctx, principal, job, entry, data, fence); err != nil {
 		if errors.Is(err, ports.ErrStorageCapExceeded) {
 			result, placeErr := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
 				JobRef:              job.JobRef(),

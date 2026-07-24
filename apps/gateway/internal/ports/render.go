@@ -159,6 +159,55 @@ type RenderReplayStore interface {
 	Abandon(context.Context, domain.ReplayIdentity) error
 }
 
+// StagingIdentity is the stable key for one staged Provider output entry.
+// It is Tenant-scoped and binds manifest + entry + checksum so placement retry
+// never reopens a different capture (#14 §8.3, ADR 0009 RenderStagingStore).
+type StagingIdentity struct {
+	TenantID   domain.TenantID
+	JobID      domain.Identifier
+	ManifestID domain.ResultManifestID
+	EntryID    domain.OutputEntryID
+	Checksum   string
+}
+
+// Valid reports whether the identity is usable for Put/Use.
+func (id StagingIdentity) Valid() bool {
+	return id.TenantID != "" && id.JobID != "" && id.ManifestID != "" && id.EntryID != "" && id.Checksum != ""
+}
+
+// StagingPut stores temporary result bytes under a stable identity. Permanent
+// Asset objects do not live here — only capture staging for placement/retry.
+type StagingPut struct {
+	Identity    StagingIdentity
+	ContentType string
+	Data        []byte
+}
+
+// StagingAccess authorizes purpose-bound use of staged bytes for placement.
+// Application never receives plaintext as a return value; Use injects into a
+// callback only.
+type StagingAccess struct {
+	Principal domain.SecurityPrincipal
+	Identity  StagingIdentity
+}
+
+// ErrStagingNotFound reports missing or non-visible staged material for the
+// requested identity (same-Tenant non-enumeration at the application boundary).
+var ErrStagingNotFound = errors.New("render staging material not found")
+
+// RenderStagingStore owns temporary Provider result bytes for capture and
+// placement retry. It is distinct from AssetContentStore (permanent Assets) and
+// from job metadata. Application must inject this port — never use package-
+// global maps (ADR 0009, #14 §8).
+//
+// Put is idempotent by StagingIdentity (same checksum). Use injects a copy of
+// bytes into the callback and returns ErrStagingNotFound when the identity is
+// unknown or Tenant does not match.
+type RenderStagingStore interface {
+	Put(context.Context, StagingPut) error
+	Use(context.Context, StagingAccess, func([]byte) error) error
+}
+
 // RenderPromptIntake is the transient create-time handoff of prompt material
 // into the confidential store. Application forwards it once and never retains
 // or logs it (ADR 0009 TenantConfidentialStore / I-FAIL-CLOSED-SENSITIVE).

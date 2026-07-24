@@ -111,6 +111,7 @@ type Dependencies struct {
 	RenderReplay     ports.RenderReplayStore
 	RenderAdapter    ports.RenderAdapter
 	RenderPrompts    ports.RenderPromptStore
+	RenderStaging    ports.RenderStagingStore
 	AuthorizedRender ports.AuthorizedRender
 	RenderAudit      ports.RenderAuditRecorder
 }
@@ -419,6 +420,14 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 			jobs = persistence.NewUnavailableRenderJobStore()
 		}
 	}
+	staging := dependencies.RenderStaging
+	if staging == nil {
+		if config.AllowInMemoryRenderJobs {
+			staging = persistence.NewMemoryRenderStagingStore()
+		} else {
+			staging = persistence.NewUnavailableRenderStagingStore()
+		}
+	}
 	accounts := dependencies.Accounts
 	if accounts == nil {
 		accounts = persistence.NewMemoryAccountStore()
@@ -495,6 +504,7 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 		Routing:      routing,
 		Assets:       metadata,
 		Content:      content,
+		Staging:      staging,
 		Vault:        vault,
 		Prompts:      prompts,
 		Authorized:   authorized,
