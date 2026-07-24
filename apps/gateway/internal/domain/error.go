@@ -126,6 +126,12 @@ const (
 	// when a Provider Account is not usable for the requested operation
 	// (frozen ErrorAccountNotUsable example).
 	RemediationAccountRemediation Remediation = "account_remediation"
+	// RemediationWaitProviderCooldown asks the Tenant to wait for the Provider
+	// rate/quota cooldown to elapse before retrying. It is the health-condition
+	// remediation for a `cooling_down` scope; a finite retry_after_seconds
+	// accompanies it only when the matching gate is time-waitable (health spec
+	// §17.7 retry_after_class provider_cooldown).
+	RemediationWaitProviderCooldown Remediation = "wait_provider_cooldown"
 	// RemediationCapabilityUnverified asks the Tenant to wait for / trigger a
 	// probe because no usable Capability Snapshot exists yet.
 	RemediationCapabilityUnverified Remediation = "capability_unverified"
@@ -182,14 +188,17 @@ const (
 // the same ErrCodeResourceNotFound value with no ResourceReference so they are
 // observationally indistinguishable (#6 section 5.1, #16 I-ERROR-NON-ENUM).
 type CanonicalError struct {
-	Code             ErrorCode
-	Category         ErrorCategory
-	StatusClass      StatusClass
-	Retryability     Retryability
-	Remediation      Remediation
-	FailureStage     FailureStage
-	RetryAfterClass  string
-	IdempotencyState IdempotencyState
+	Code            ErrorCode
+	Category        ErrorCategory
+	StatusClass     StatusClass
+	Retryability    Retryability
+	Remediation     Remediation
+	FailureStage    FailureStage
+	RetryAfterClass string
+	// RetryAfterSeconds carries a finite relative wait only when the blocking
+	// condition is time-bounded. Zero omits the optional public field.
+	RetryAfterSeconds int
+	IdempotencyState  IdempotencyState
 	// RequestID is the server-owned correlation id for this Public API error.
 	// It is set at the boundary that emits the error and is never a client
 	// value that authorizes access (#16 section 3.1, 3.3).
@@ -453,6 +462,25 @@ func NewAccountNotUsable(remediation Remediation) CanonicalError {
 	}
 }
 
+// NewProviderCooldownBlocked builds the pre-attempt failure for a Provider
+// cooldown or circuit gate. A positive wait is finite and may be exposed;
+// circuit gates without a known open-until carry only the retry class.
+func NewProviderCooldownBlocked(retryAfterSeconds int) CanonicalError {
+	if retryAfterSeconds < 0 {
+		retryAfterSeconds = 0
+	}
+	return CanonicalError{
+		Code:              ErrCodeAccountNotUsable,
+		Category:          CategoryRouting,
+		StatusClass:       StatusAccountPolicy,
+		Retryability:      RetryAfter,
+		Remediation:       RemediationWaitProviderCooldown,
+		FailureStage:      StageRouting,
+		RetryAfterClass:   "provider_cooldown",
+		RetryAfterSeconds: retryAfterSeconds,
+	}
+}
+
 // NewCapabilityUnverified builds the capability failure returned when no
 // Capability Snapshot exists yet for a same-Tenant account, or a requested
 // operation remains unverified. Management snapshot reads use this for the
@@ -509,6 +537,21 @@ func NewDependencyUnavailable() CanonicalError {
 		Remediation:     RemediationWaitAdmission,
 		FailureStage:    StageDependency,
 		RetryAfterClass: "dependency_recovery",
+	}
+}
+
+// NewRecoveryPermitOccupied builds the fail-closed outcome when a half-open
+// recovery permit is already owned for the cooling condition. It is deliberately
+// non-time-based (no retry_after_seconds) so clients do not hammer a revision
+// that cannot be reclaimed until a lifecycle epoch or successful settlement.
+func NewRecoveryPermitOccupied() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeAccountNotUsable,
+		Category:     CategoryRouting,
+		StatusClass:  StatusAccountPolicy,
+		Retryability: RetryOperatorActionRequired,
+		Remediation:  RemediationContactOperator,
+		FailureStage: StageRouting,
 	}
 }
 

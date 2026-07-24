@@ -29,6 +29,12 @@ type Options struct {
 	Admission  ports.AdmissionStore
 	Replay     ports.ReplayStore
 	Accounts   ports.AccountStore
+	// Health is injected independently so public-proof fixtures can control
+	// health durability without coupling to AccountStore lifecycle rows.
+	Health     ports.HealthStore
+	// Clock overrides the fixture's controlled clock when non-nil (e.g. for
+	// advancing past cooldown timers without reseeding durable health).
+	Clock      ports.Clock
 	Audit      ports.AuditRecorder
 	Telemetry  ports.TelemetryRecorder
 	RequestLog ports.RequestLogRecorder
@@ -57,6 +63,12 @@ type Options struct {
 	// snapshot minting and model listing through real composition.
 	Capabilities ports.CapabilityStore
 	Capability   ports.CapabilityAdapter
+
+	// Provider Surface Circuit gate (#51). A nil port keeps the foundation
+	// closed-circuit store (every surface closed, nothing to block); a controlled
+	// fake proves an open cross-Tenant surface blocks matching new work through
+	// real composition without exposing the corroborating evidence.
+	Circuits ports.CircuitStore
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -76,15 +88,20 @@ func NewFixture(options Options) (*Fixture, error) {
 	events := &eventLog{}
 	jobs := newControlledJobRuntime(events, options.RecoveryError, options.JobRuntimeCloseGate)
 
+	clock := ports.Clock(&controlledClock{next: fixtureStartTime})
+	if options.Clock != nil {
+		clock = options.Clock
+	}
 	runtime, err := composition.New(composition.Config{}, composition.Dependencies{
 		Runtime: jobs,
-		Clock:   &controlledClock{next: fixtureStartTime},
+		Clock:   clock,
 		IDs:     &controlledIDs{},
 
 		Principal:  options.Principal,
 		Admission:  options.Admission,
 		Replay:     options.Replay,
 		Accounts:   options.Accounts,
+		Health:     options.Health,
 		Audit:      options.Audit,
 		Telemetry:  options.Telemetry,
 		RequestLog: options.RequestLog,
@@ -100,6 +117,8 @@ func NewFixture(options Options) (*Fixture, error) {
 
 		Capabilities: options.Capabilities,
 		Capability:   options.Capability,
+
+		Circuits: options.Circuits,
 	})
 	if err != nil {
 		return nil, err

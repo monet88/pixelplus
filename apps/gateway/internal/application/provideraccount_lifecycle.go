@@ -82,7 +82,7 @@ func (service *ProviderAccountService) DisableProviderAccount(ctx context.Contex
 	}
 	defer service.release(ctx, reservation)
 
-	persisted, canonical, ok := service.persistDisable(ctx, principal, command.AccountID, domain.NewTimestamp(sc.start))
+	persisted, canonical, ok := service.persistDisable(ctx, principal, command.AccountID, domain.NewTimestamp(sc.start), sc.requestID)
 	if !ok {
 		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
@@ -94,7 +94,7 @@ func (service *ProviderAccountService) DisableProviderAccount(ctx context.Contex
 // persistDisable re-reads the account, re-checks the lifecycle gate, and writes
 // WithDisabled under OAuth/pending fences. One conflict retry absorbs a single
 // concurrent claim/cutover without clobbering the newer row.
-func (service *ProviderAccountService) persistDisable(ctx context.Context, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, now domain.Timestamp) (domain.ProviderAccount, domain.CanonicalError, bool) {
+func (service *ProviderAccountService) persistDisable(ctx context.Context, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, now domain.Timestamp, requestID domain.Identifier) (domain.ProviderAccount, domain.CanonicalError, bool) {
 	for attempt := 0; attempt < 2; attempt++ {
 		latest, err := service.accounts.Visible(ctx, principal, accountID)
 		if err != nil {
@@ -121,8 +121,33 @@ func (service *ProviderAccountService) persistDisable(ctx context.Context, princ
 			update.RequireOAuthMarker = latest.ActiveOAuthAuthorizationID
 		}
 
+		// Lifecycle disable first, then administrative ClearPermit. Clearing the
+		// permit before a failed lifecycle CAS would leave a still-active account
+		// more open to a fresh recovery claim (gate relaxation). Health-first is
+		// only allowed when it cannot relax product usability.
+		//
+		// ExpectedPermit is intentionally empty: management disable is the
+		// administrative unconditional clear (any present recovery permit).
+		// Request-owned post-claim cleanup must pass ExpectedPermit = claimed permit.
+		lifecycle := disabled
+		lifecycle.Health = domain.HealthSummary{}
+		lifecycle.RecoveryPermit = domain.RecoveryPermit{}
+		update.Account = lifecycle
 		persisted, err := service.accounts.Update(ctx, update)
 		if err == nil {
+			if _, healthErr := service.health.ClearPermit(ctx, ports.PermitClear{
+				Principal: principal, AccountID: disabled.ID,
+				// Administrative clear: ExpectedPermit empty — drop any owner.
+				Audit: service.healthAudit(principal, disabled.ID, disabled.AuthMode, requestID),
+			}); healthErr != nil && !errors.Is(healthErr, ports.ErrHealthNotFound) {
+				// Lifecycle is already disabled: surface dependency so the client
+				// retries; permit may still be occupied until a successful clear.
+				return domain.ProviderAccount{}, service.dependencyCanonical(healthErr), false
+			}
+			if snap, snapErr := service.health.Read(ctx, principal, disabled.ID); snapErr == nil {
+				persisted = composeAccountHealth(persisted, snap)
+			}
+			persisted.RecoveryPermit = domain.RecoveryPermit{}
 			return persisted, domain.CanonicalError{}, true
 		}
 		if errors.Is(err, ports.ErrAccountUpdateConflict) && attempt == 0 {
@@ -191,17 +216,31 @@ func (service *ProviderAccountService) EnableProviderAccount(ctx context.Context
 		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
 
-	pending := latest.WithEnableProbePending(domain.NewTimestamp(sc.start))
+	now := domain.NewTimestamp(sc.start)
+	pending := latest.WithEnableProbePending(now)
+	// Health reset before lifecycle write; audit under store lock before persist.
+	tr, err := service.health.ResetForEnableProbe(ctx, ports.EnableProbeReset{
+		Principal: principal, AccountID: pending.ID,
+		CredentialVersion: pending.Credential.Version, ObservedAt: now,
+		Audit: service.healthAudit(principal, pending.ID, pending.AuthMode, sc.requestID),
+	})
+	if err != nil {
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	lifecycle := pending
+	lifecycle.Health = domain.HealthSummary{}
+	lifecycle.RecoveryPermit = domain.RecoveryPermit{}
 	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
 		Principal:                  principal,
-		Account:                    pending,
+		Account:                    lifecycle,
 		RequireEmptyOAuthMarker:    true,
 		RequireEmptyPendingVersion: true,
+		RequireLifecycle:           latest.Lifecycle,
+		RequireControlsMatch:       true,
+		RequireControls:            latest.Controls,
 	})
 	if err != nil {
 		if errors.Is(err, ports.ErrAccountUpdateConflict) {
-			// Map the fence loss to the same soft-gate classes: re-read to choose
-			// complete_oauth vs account_remediation rather than internal_error.
 			current, visibleErr := service.accounts.Visible(ctx, principal, command.AccountID)
 			if visibleErr != nil {
 				return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(visibleErr))
@@ -213,16 +252,26 @@ func (service *ProviderAccountService) EnableProviderAccount(ctx context.Context
 		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
+	persisted.Health = tr.Result.Health
+	persisted.RecoveryPermit = domain.RecoveryPermit{}
+	persisted = projectAccountHealth(persisted)
 
 	service.observeSuccess(ctx, sc, ports.AuditProviderAccountEnabled, principal, persisted.ID, 202)
 	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
 }
 
-// enableSoftGate enforces enable-only-from-disabled plus the single-flight OAuth
-// and replacement ownership windows (management contract §4.5, §4.6).
+// enableSoftGate enforces enable-only-from-disabled, the Auth Mode execution and
+// quarantine controls, plus the single-flight OAuth/replacement ownership windows
+// (management contract §4.5, §4.6; health controls §13.8, §15.2, §16.3).
 func (service *ProviderAccountService) enableSoftGate(account domain.ProviderAccount) (domain.CanonicalError, bool) {
 	if !account.Lifecycle.AcceptsEnable() {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+	}
+	if !account.Controls.AuthModeExecutionEnabled {
+		return domain.NewAuthModeUnavailable(), false
+	}
+	if account.Controls.Quarantine == domain.QuarantineQuarantined {
+		return domain.NewAccountNotUsable(domain.RemediationContactOperator), false
 	}
 	if account.ActiveOAuthAuthorizationID != "" {
 		return domain.NewAccountNotUsable(domain.RemediationCompleteOAuth), false

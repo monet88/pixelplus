@@ -26,6 +26,26 @@ func NewSlogAuditRecorder(logger *slog.Logger) *SlogAuditRecorder {
 
 // Record writes one safe audit event.
 func (recorder *SlogAuditRecorder) Record(_ context.Context, event ports.AuditEvent) error {
+	recorder.log(event)
+	return nil
+}
+
+// RecordBatch accepts the complete logical mutation as one call. The batch is
+// accepted wholly before any emission; there is no sequential per-event
+// accept/fail path. Slog delivery itself cannot fail, so once accepted every
+// event in the batch is emitted (or none were accepted).
+func (recorder *SlogAuditRecorder) RecordBatch(_ context.Context, events []ports.AuditEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	// Accept first (no fail path for slog), then emit the whole batch.
+	for _, event := range events {
+		recorder.log(event)
+	}
+	return nil
+}
+
+func (recorder *SlogAuditRecorder) log(event ports.AuditEvent) {
 	recorder.logger.Info("gateway.audit",
 		"action", string(event.Action),
 		"tenant_id", string(event.TenantID),
@@ -34,7 +54,6 @@ func (recorder *SlogAuditRecorder) Record(_ context.Context, event ports.AuditEv
 		"request_id", string(event.RequestID),
 		"outcome", event.Outcome,
 	)
-	return nil
 }
 
 // SlogTelemetryRecorder emits safe operational telemetry aggregated by stable
@@ -92,6 +111,7 @@ func (recorder *SlogRequestLogRecorder) Record(_ context.Context, log ports.Requ
 
 var (
 	_ ports.AuditRecorder      = (*SlogAuditRecorder)(nil)
+	_ ports.AuditBatchRecorder = (*SlogAuditRecorder)(nil)
 	_ ports.TelemetryRecorder  = (*SlogTelemetryRecorder)(nil)
 	_ ports.RequestLogRecorder = (*SlogRequestLogRecorder)(nil)
 )

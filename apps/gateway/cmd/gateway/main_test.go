@@ -29,6 +29,8 @@ func TestRunStartsProductionCompositionAndShutsDown(t *testing.T) {
 				return address
 			case "PIXELPLUS_GATEWAY_STARTUP_TIMEOUT", "PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT":
 				return "2s"
+			case "PROVIDER_ACCOUNT_STORE_PATH":
+				return t.TempDir() + "/accounts.json"
 			default:
 				return ""
 			}
@@ -285,15 +287,21 @@ func (*blockingProcessRuntime) Close(context.Context) error {
 }
 
 func TestServeListenerDrainsInFlightRequestOnShutdown(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	// Reserve then re-bind so the test owns a free address without racing
+	// another process that might grab 127.0.0.1:0 between close and listen.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve test address: %v", err)
 	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
+	address := probe.Addr().String()
+	if err := probe.Close(); err != nil {
 		t.Fatalf("release test address: %v", err)
 	}
 
+	// Listen on the test goroutine before Serve or the client start. Calling
+	// mustListen inside the serve goroutine races: the client can dial before
+	// Listen returns and get connection refused (especially under -race).
+	listener := mustListen(t, address)
 	runtime := newDrainingProcessRuntime()
 	serveResult := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -302,17 +310,30 @@ func TestServeListenerDrainsInFlightRequestOnShutdown(t *testing.T) {
 		serveResult <- serveListener(ctx, processConfig{
 			address:         address,
 			shutdownTimeout: 2 * time.Second,
-		}, runtime, mustListen(t, address))
+		}, runtime, listener)
 	}()
 
 	statusResult := make(chan int, 1)
 	requestErr := make(chan error, 1)
 	go func() {
+		// Poll until Serve is accepting, matching TestRunStartsProductionCompositionAndShutsDown.
+		// Only the successful in-flight GET is held for the drain assertion.
 		client := &http.Client{Timeout: 3 * time.Second}
-		response, err := client.Get("http://" + address + "/healthz")
-		if err != nil {
-			requestErr <- err
-			return
+		deadline := time.Now().Add(2 * time.Second)
+		var (
+			response *http.Response
+			getErr   error
+		)
+		for {
+			response, getErr = client.Get("http://" + address + "/healthz")
+			if getErr == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				requestErr <- getErr
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 		defer response.Body.Close()
 		statusResult <- response.StatusCode

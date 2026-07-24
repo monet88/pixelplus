@@ -27,6 +27,10 @@ var ErrNotReady = errors.New("gateway runtime is not ready")
 // Config contains parsed, non-secret composition settings.
 type Config struct {
 	StartupTimeout time.Duration
+	// ProviderAccountStorePath is the durable file path for Provider Account
+	// state. Either this or an explicit Accounts port is required so production
+	// never silently loses cooldowns and recovery permits across restarts.
+	ProviderAccountStorePath string
 }
 
 // Dependencies contains the controlled foundation ports owned by this slice.
@@ -46,6 +50,9 @@ type Dependencies struct {
 	Admission  ports.AdmissionStore
 	Replay     ports.ReplayStore
 	Accounts   ports.AccountStore
+	// Health owns scoped conditions and recovery permits independently of
+	// AccountStore lifecycle metadata (ADR 0009 HealthStore catalogue).
+	Health     ports.HealthStore
 	Audit      ports.AuditRecorder
 	Telemetry  ports.TelemetryRecorder
 	RequestLog ports.RequestLogRecorder
@@ -66,6 +73,14 @@ type Dependencies struct {
 	// never invents model evidence; contract tests inject controlled fakes.
 	Capabilities ports.CapabilityStore
 	Capability   ports.CapabilityAdapter
+
+	// Provider Surface Circuit gate (#51). A nil port keeps the foundation
+	// closed-circuit store composition substitutes by default: with no
+	// correlation evaluator wired there is no corroborated evidence, so every
+	// surface reports closed (nothing to block). A wired-but-failing store fails
+	// closed instead (health/cooldown spec §12). Contract tests inject a
+	// controlled fake to prove an open surface blocks matching new work.
+	Circuits ports.CircuitStore
 
 	// Asset exchange request-spine ports (#53). When a port is nil, New
 	// substitutes the production foundation implementation so the real
@@ -120,6 +135,30 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		logger = slog.Default()
 	}
 
+	accounts := dependencies.Accounts
+	if accounts == nil {
+		if config.ProviderAccountStorePath != "" {
+			accounts = persistence.NewFileAccountStore(config.ProviderAccountStorePath)
+		} else {
+			// Tests and fixtures rely on the in-process foundation store. Production
+			// entry points must supply a durable ProviderAccountStorePath.
+			accounts = persistence.NewMemoryAccountStore()
+		}
+	}
+	dependencies.Accounts = accounts
+
+	health := dependencies.Health
+	if health == nil {
+		if config.ProviderAccountStorePath != "" {
+			// Companion ledger beside the account path so health durability is
+			// independent of AccountStore while sharing the same volume root.
+			health = persistence.NewFileHealthStore(config.ProviderAccountStorePath + ".health.ledger")
+		} else {
+			health = persistence.NewMemoryHealthStore()
+		}
+	}
+	dependencies.Health = health
+
 	runtime := &Runtime{
 		worker: application.NewFoundationJobExecutor(),
 		jobs:   dependencies.Runtime,
@@ -131,12 +170,24 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancelStartup()
 
-	if err := runtime.jobs.Restore(startupContext); err != nil {
-		logger.Error("gateway startup recovery failed; readiness stays closed", "error", err)
-		runtime.ready.Store(false)
-	} else {
-		runtime.ready.Store(true)
+	accountRestoreErr := accounts.Restore(startupContext)
+	if accountRestoreErr != nil {
+		logger.Error("provider account startup recovery failed; readiness stays closed", "error", accountRestoreErr)
+		// Do not expose a partially restored or empty account view to direct product
+		// traffic. The fail-closed substitute makes every account-backed path return
+		// dependency_unavailable until a new composition successfully restores state.
+		dependencies.Accounts = persistence.NewUnavailableAccountStore()
 	}
+	healthRestoreErr := health.Restore(startupContext)
+	if healthRestoreErr != nil {
+		logger.Error("provider health startup recovery failed; readiness stays closed", "error", healthRestoreErr)
+		dependencies.Health = persistence.NewUnavailableHealthStore()
+	}
+	jobRestoreErr := runtime.jobs.Restore(startupContext)
+	if jobRestoreErr != nil {
+		logger.Error("gateway startup recovery failed; readiness stays closed", "error", jobRestoreErr)
+	}
+	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && jobRestoreErr == nil)
 
 	service, err := newProviderAccountService(dependencies)
 	if err != nil {
@@ -173,6 +224,10 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 	if accounts == nil {
 		accounts = persistence.NewMemoryAccountStore()
 	}
+	health := dependencies.Health
+	if health == nil {
+		health = persistence.NewMemoryHealthStore()
+	}
 	audit := dependencies.Audit
 	if audit == nil {
 		audit = observability.NewSlogAuditRecorder(dependencies.Logger)
@@ -206,17 +261,23 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 	if capability == nil {
 		capability = vaultpkg.NewFailClosedCapabilityAdapter()
 	}
+	circuits := dependencies.Circuits
+	if circuits == nil {
+		circuits = persistence.NewClosedCircuitStore()
+	}
 
 	return application.NewProviderAccountService(application.ProviderAccountDependencies{
 		Principal:    principal,
 		Admission:    admission,
 		Replay:       replay,
 		Accounts:     accounts,
+		Health:       health,
 		Vault:        vault,
 		Probe:        probe,
 		OAuth:        oauth,
 		Capabilities: capabilities,
 		Capability:   capability,
+		Circuits:     circuits,
 		Audit:        audit,
 		Telemetry:    telemetry,
 		RequestLog:   requestLog,

@@ -38,13 +38,14 @@ type ProviderAccountGateway interface {
 
 type providerAccountHandler struct {
 	gateway ProviderAccountGateway
+	clock   clock
 	ids     idGenerator
 }
 
 // registerProviderAccountRoutes attaches the stable /v1 Provider Account routes
 // to the mux. The server base is /v1, matching the frozen OpenAPI server url.
-func registerProviderAccountRoutes(mux *http.ServeMux, gateway ProviderAccountGateway, ids idGenerator) {
-	handler := providerAccountHandler{gateway: gateway, ids: ids}
+func registerProviderAccountRoutes(mux *http.ServeMux, gateway ProviderAccountGateway, clock clock, ids idGenerator) {
+	handler := providerAccountHandler{gateway: gateway, clock: clock, ids: ids}
 	mux.HandleFunc("POST /v1/provider-accounts", handler.create)
 	mux.HandleFunc("GET /v1/provider-accounts", handler.list)
 	mux.HandleFunc("GET /v1/provider-accounts/{provider_account_id}", handler.get)
@@ -115,7 +116,7 @@ func (handler providerAccountHandler) create(writer http.ResponseWriter, request
 		writeGatewayError(writer, err)
 		return
 	}
-	writeAccountOperation(writer, http.StatusCreated, result)
+	writeAccountOperation(writer, http.StatusCreated, result, handler.clock.Now())
 }
 
 // directCredentialSubmissionRequest mirrors the frozen
@@ -181,7 +182,7 @@ func (handler providerAccountHandler) submitCredentialFor(writer http.ResponseWr
 		writeGatewayError(writer, err)
 		return
 	}
-	writeAccountOperation(writer, http.StatusAccepted, result)
+	writeAccountOperation(writer, http.StatusAccepted, result, handler.clock.Now())
 }
 
 // probeRequest mirrors the frozen ProbeRequest wire schema. The optional scope
@@ -237,7 +238,7 @@ func (handler providerAccountHandler) probe(writer http.ResponseWriter, request 
 		writeGatewayError(writer, err)
 		return
 	}
-	writeAccountOperation(writer, http.StatusOK, result)
+	writeAccountOperation(writer, http.StatusOK, result, handler.clock.Now())
 }
 
 func (handler providerAccountHandler) get(writer http.ResponseWriter, request *http.Request) {
@@ -254,7 +255,7 @@ func (handler providerAccountHandler) get(writer http.ResponseWriter, request *h
 		writeGatewayError(writer, err)
 		return
 	}
-	writeAccount(writer, http.StatusOK, result.Account)
+	writeAccount(writer, http.StatusOK, result.Account, handler.clock.Now())
 }
 
 // disable blocks new use of a Provider Account without deleting the record. It
@@ -274,7 +275,7 @@ func (handler providerAccountHandler) disable(writer http.ResponseWriter, reques
 		writeGatewayError(writer, err)
 		return
 	}
-	writeAccountOperation(writer, http.StatusOK, result)
+	writeAccountOperation(writer, http.StatusOK, result, handler.clock.Now())
 }
 
 // enable enters the current-credential-version probe path for a disabled
@@ -294,7 +295,7 @@ func (handler providerAccountHandler) enable(writer http.ResponseWriter, request
 		writeGatewayError(writer, err)
 		return
 	}
-	writeAccountOperation(writer, http.StatusAccepted, result)
+	writeAccountOperation(writer, http.StatusAccepted, result, handler.clock.Now())
 }
 
 // delete stops new use/decrypt, revokes every stored credential version, and
@@ -327,7 +328,7 @@ func (handler providerAccountHandler) list(writer http.ResponseWriter, request *
 		writeGatewayError(writer, err)
 		return
 	}
-	writeAccountList(writer, result.Accounts)
+	writeAccountList(writer, result.Accounts, handler.clock.Now())
 }
 
 // bearerMaterial extracts the raw Client API Key bearer string. The value is

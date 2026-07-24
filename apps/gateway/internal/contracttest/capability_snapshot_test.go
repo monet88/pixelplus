@@ -75,7 +75,7 @@ func TestProbeSuccessMintsCapabilitySnapshot(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_cap", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_cap", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -149,7 +149,7 @@ func TestGetCapabilitySnapshotMissingIsUnverified(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_nosnap", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_nosnap", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -181,7 +181,7 @@ func TestGetCapabilitySnapshotForeignNotFound(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_b", activeProbedAccount("pa_foreign_cap", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_b", activeProbedAccount("pa_foreign_cap", domain.AuthModeChatGPTCodexOAuth))
 		h.capabilities.seed("tenant_b", sampleObservationSnapshot("pa_foreign_cap", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
 	})
 
@@ -223,7 +223,7 @@ func TestGetCapabilitySnapshotScopeAnyOf(t *testing.T) {
 			ClientAPIKeyID: "key_z",
 			Scopes:         domain.NewScopeSet(domain.ScopeAssetsRead, domain.ScopeAssetsWrite),
 		}
-		h.accounts.seed("tenant_a", activeProbedAccount("pa_scope", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeProbedAccount("pa_scope", domain.AuthModeChatGPTCodexOAuth))
 		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_scope", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
 	})
 
@@ -269,17 +269,17 @@ func TestListModelsOnlyFreshOfferablePairs(t *testing.T) {
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		active := activeProbedAccount("pa_models", domain.AuthModeChatGPTCodexOAuth)
-		h.accounts.seed("tenant_a", active)
+		h.seedAccount("tenant_a", active)
 		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_models", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
 
 		// Stale snapshot for another same-Tenant account must not offer.
 		staleAccount := activeProbedAccount("pa_stale", domain.AuthModeChatGPTCodexOAuth)
-		h.accounts.seed("tenant_a", staleAccount)
+		h.seedAccount("tenant_a", staleAccount)
 		stale := sampleObservationSnapshot("pa_stale", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime.Add(-30*time.Minute))
 		h.capabilities.seed("tenant_a", stale)
 
 		// Foreign tenant snapshot must never leak.
-		h.accounts.seed("tenant_b", activeProbedAccount("pa_foreign_models", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_b", activeProbedAccount("pa_foreign_models", domain.AuthModeChatGPTCodexOAuth))
 		h.capabilities.seed("tenant_b", sampleObservationSnapshot("pa_foreign_models", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
 	})
 
@@ -329,6 +329,153 @@ func TestListModelsOnlyFreshOfferablePairs(t *testing.T) {
 	}
 }
 
+// AC: an operation-scoped cooldown removes only the matching offer. The account
+// summary may still report cooling_down because it is the worst scoped state,
+// but that summary must not flatten image_generation evidence into unrelated
+// chat/chat_streaming buckets (§3.8, Example A, I-HEALTH-SCOPED).
+func TestListModelsHonorsMatchingScopedHealth(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		accountID := domain.ProviderAccountID("pa_scoped_health")
+		account := activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime.Add(time.Minute)),
+		)
+		h.seedAccount("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/models",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	data, _ := body["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("data len = %d, want chat model preserved by unrelated image cooldown", len(data))
+	}
+	model, _ := data[0].(map[string]any)
+	x, _ := model["x_pixelplus"].(map[string]any)
+	offers, _ := x["offers"].([]any)
+	if len(offers) != 2 {
+		t.Fatalf("offers len = %d, want chat + chat_streaming preserved", len(offers))
+	}
+}
+
+// AC: a Provider Surface Circuit blocks only its matching operation and never
+// rewrites the owning account's lifecycle, health, or administrative controls.
+func TestListModelsHonorsScopedProviderSurfaceCircuit(t *testing.T) {
+	t.Parallel()
+
+	accountID := domain.ProviderAccountID("pa_circuit")
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
+		h.seedAccount("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+		h.circuits.set(ports.CircuitSurface{
+			Provider:  domain.ProviderChatGPT,
+			AuthMode:  domain.AuthModeChatGPTCodexOAuth,
+			Surface:   "/backend-api/models",
+			Operation: domain.CapabilityOpChat,
+		}, ports.CircuitState{Open: true})
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/models",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("models status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	data, _ := body["data"].([]any)
+	if len(data) != 1 {
+		t.Fatalf("data len = %d, want 1 model with the non-matching offer", len(data))
+	}
+	model, _ := data[0].(map[string]any)
+	x, _ := model["x_pixelplus"].(map[string]any)
+	offers, _ := x["offers"].([]any)
+	if len(offers) != 1 {
+		t.Fatalf("offers len = %d, want only chat_streaming", len(offers))
+	}
+	offer, _ := offers[0].(map[string]any)
+	if offer["operation"] != "chat_streaming" {
+		t.Fatalf("remaining operation = %v, want chat_streaming", offer["operation"])
+	}
+	if calls := harness.circuits.callCount.Load(); calls != 2 {
+		t.Fatalf("circuit checks = %d, want 2 offerable pairs", calls)
+	}
+
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/" + string(accountID),
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("account status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	var account map[string]any
+	if err := json.Unmarshal(payload, &account); err != nil {
+		t.Fatalf("decode account: %v", err)
+	}
+	if account["lifecycle_state"] != "active" {
+		t.Fatalf("lifecycle_state = %v, want active", account["lifecycle_state"])
+	}
+	health, _ := account["health"].(map[string]any)
+	if health["summary_state"] != "healthy" {
+		t.Fatalf("health.summary_state = %v, want healthy", health["summary_state"])
+	}
+	controls, _ := account["administrative_controls"].(map[string]any)
+	if controls["drain_state"] != "off" || controls["quarantine_state"] != "off" || controls["auth_mode_execution_enabled"] != true {
+		t.Fatalf("administrative_controls changed after circuit gate: %v", controls)
+	}
+}
+
+// AC: a wired but unavailable circuit store fails closed without exposing its
+// corroborating evidence or allowing a possibly-open matching surface.
+func TestListModelsFailsClosedWhenCircuitStateUnavailable(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		accountID := domain.ProviderAccountID("pa_circuit_unavailable")
+		h.seedAccount("tenant_a", activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth))
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+		h.circuits.queryErr = ports.ErrCircuitUnavailable
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/models",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want safe 200 projection (body=%s)", response.StatusCode, payload)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	data, _ := body["data"].([]any)
+	if len(data) != 0 {
+		t.Fatalf("data len = %d, want 0 when circuit state is unavailable", len(data))
+	}
+}
+
 // AC: version-mismatched snapshot remains inspectable but never offerable.
 func TestListModelsOmitsCredentialVersionMismatch(t *testing.T) {
 	t.Parallel()
@@ -337,7 +484,7 @@ func TestListModelsOmitsCredentialVersionMismatch(t *testing.T) {
 		account := activeProbedAccount("pa_version_bind", domain.AuthModeChatGPTCodexOAuth)
 		// Current account is version 2; stored snapshot is still bound to v1.
 		account.Credential.Version = 2
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_version_bind", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
 	})
 
@@ -389,8 +536,11 @@ func TestListModelsOmitsNonRoutableActiveAccounts(t *testing.T) {
 			mut: func(account *domain.ProviderAccount) {
 				account.Health.SummaryState = domain.HealthBlocked
 				account.Health.Conditions = []domain.HealthCondition{{
-					Scope: domain.HealthScope{Kind: domain.HealthScopeAccount},
-					State: domain.HealthBlocked,
+					Scope:             domain.HealthScope{Kind: domain.HealthScopeAccount},
+					State:             domain.HealthBlocked,
+					Reason:            domain.HealthReasonProviderAccountBanned,
+					CredentialVersion: account.Credential.Version,
+					Remediation:       domain.RemediationContactOperator,
 				}}
 			},
 		},
@@ -399,8 +549,13 @@ func TestListModelsOmitsNonRoutableActiveAccounts(t *testing.T) {
 			mut: func(account *domain.ProviderAccount) {
 				account.Health.SummaryState = domain.HealthCoolingDown
 				account.Health.Conditions = []domain.HealthCondition{{
-					Scope: domain.HealthScope{Kind: domain.HealthScopeAccount},
-					State: domain.HealthCoolingDown,
+					Scope:             domain.HealthScope{Kind: domain.HealthScopeAccount},
+					State:             domain.HealthCoolingDown,
+					Reason:            domain.HealthReasonProviderRateLimited,
+					CredentialVersion: account.Credential.Version,
+					Remediation:       domain.RemediationWaitProviderCooldown,
+					ConditionRevision: 1,
+					BackoffLevel:      1,
 				}}
 			},
 		},
@@ -416,6 +571,18 @@ func TestListModelsOmitsNonRoutableActiveAccounts(t *testing.T) {
 				account.Controls.Quarantine = domain.QuarantineQuarantined
 			},
 		},
+		{
+			name: "tenant_disabled",
+			mut: func(account *domain.ProviderAccount) {
+				*account = account.WithDisabled(domain.NewTimestamp(spineFixtureTime.Add(time.Second)))
+			},
+		},
+		{
+			name: "auth_mode_killed",
+			mut: func(account *domain.ProviderAccount) {
+				account.Controls.AuthModeExecutionEnabled = false
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -426,7 +593,7 @@ func TestListModelsOmitsNonRoutableActiveAccounts(t *testing.T) {
 			harness := newSpineHarness(t, func(h *spineHarness) {
 				account := activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
 				tc.mut(&account)
-				h.accounts.seed("tenant_a", account)
+				h.seedAccount("tenant_a", account)
 				h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
 			})
 
@@ -469,13 +636,152 @@ func TestListModelsOmitsNonRoutableActiveAccounts(t *testing.T) {
 	}
 }
 
+// AC #51 / PR #81: GET capability-snapshot with a matching open CircuitStore
+// remains 200 inspectable. Matching operation fact is offerable=false; an
+// unrelated operation stays offerable=true. Circuit evidence is never exposed.
+func TestGetCapabilitySnapshotHonorsMatchingOpenCircuit(t *testing.T) {
+	t.Parallel()
+
+	accountID := domain.ProviderAccountID("pa_snap_circuit")
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
+		h.seedAccount("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+		// Open circuit only for chat (matches sample snapshot probe surface).
+		h.circuits.set(ports.CircuitSurface{
+			Provider:  domain.ProviderChatGPT,
+			AuthMode:  domain.AuthModeChatGPTCodexOAuth,
+			Surface:   "/backend-api/models",
+			Operation: domain.CapabilityOpChat,
+		}, ports.CircuitState{Open: true})
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/" + string(accountID) + "/capability-snapshot",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 inspectable snapshot (body=%s)", response.StatusCode, payload)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(payload, &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	// Circuit gate is applied privately: no circuit_* / open-circuit keys on the wire.
+	for _, leak := range []string{"circuit", "circuit_state", "circuit_open", "surface_open", "open_until"} {
+		if _, ok := snapshot[leak]; ok {
+			t.Fatalf("snapshot top-level leaked %q: %s", leak, payload)
+		}
+	}
+	operations, _ := snapshot["operations"].(map[string]any)
+	chat, _ := operations["chat"].(map[string]any)
+	image, _ := operations["image_generation"].(map[string]any)
+	if chat["offerable"] != false {
+		t.Fatalf("chat.offerable = %v, want false for matching open circuit", chat["offerable"])
+	}
+	if image["offerable"] != true {
+		t.Fatalf("image_generation.offerable = %v, want true for unrelated operation", image["offerable"])
+	}
+	// chat_streaming shares the same probe surface; open circuit is scoped by Operation=chat only.
+	stream, _ := operations["chat_streaming"].(map[string]any)
+	if stream["offerable"] != true {
+		t.Fatalf("chat_streaming.offerable = %v, want true (circuit scoped to chat operation)", stream["offerable"])
+	}
+	if harness.circuits.callCount.Load() == 0 {
+		t.Fatal("circuit SurfaceOpen never called")
+	}
+}
+
+// Unreadable CircuitStore: snapshot stays 200 inspectable but every operation
+// fact is fail-closed offerable=false without exposing circuit errors/evidence.
+func TestGetCapabilitySnapshotFailsClosedWhenCircuitUnreadable(t *testing.T) {
+	t.Parallel()
+
+	accountID := domain.ProviderAccountID("pa_snap_circuit_unavail")
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.seedAccount("tenant_a", activeProbedAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth))
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(accountID, domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+		h.circuits.queryErr = ports.ErrCircuitUnavailable
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/" + string(accountID) + "/capability-snapshot",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 inspectable (body=%s)", response.StatusCode, payload)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(payload, &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	for _, leak := range []string{"circuit", "circuit_state", "circuit_open", "error", "code", "dependency_unavailable"} {
+		if _, ok := snapshot[leak]; ok {
+			t.Fatalf("snapshot top-level leaked %q on unreadable circuit: %s", leak, payload)
+		}
+	}
+	operations, _ := snapshot["operations"].(map[string]any)
+	if len(operations) == 0 {
+		t.Fatal("operations empty; want inspectable facts with offerable=false")
+	}
+	for name, raw := range operations {
+		fact, _ := raw.(map[string]any)
+		if fact["offerable"] != false {
+			t.Fatalf("operations[%s].offerable = %v, want false when circuit unreadable", name, fact["offerable"])
+		}
+	}
+}
+
+// AC #51: management inspection stays available but must not advertise an
+// operation as offerable when a matching operation-scoped cooldown blocks it.
+// An unrelated operation remains truthful and offerable.
+func TestGetCapabilitySnapshotHonorsMatchingScopedHealth(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount("pa_snapshot_scoped_health", domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime.Add(time.Minute)),
+		)
+		h.seedAccount("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(account.ID, account.AuthMode, account.Credential.Version, spineFixtureTime))
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/provider-accounts/pa_snapshot_scoped_health/capability-snapshot",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 inspectable snapshot (body=%s)", response.StatusCode, payload)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(payload, &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	operations, _ := snapshot["operations"].(map[string]any)
+	chat, _ := operations["chat"].(map[string]any)
+	image, _ := operations["image_generation"].(map[string]any)
+	if chat["offerable"] != true {
+		t.Fatalf("chat.offerable = %v, want true for unrelated operation", chat["offerable"])
+	}
+	if image["offerable"] != false {
+		t.Fatalf("image_generation.offerable = %v, want false for matching cooldown", image["offerable"])
+	}
+}
+
 // AC: dual-level status projection advertises the weaker of model and op facts.
 func TestListModelsProjectsWeakerOperationStatus(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeProbedAccount("pa_weaker", domain.AuthModeChatGPTCodexOAuth)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		snapshot := sampleObservationSnapshot("pa_weaker", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime)
 		// Model says verified chat; account-level chat fact is only conditional.
 		snapshot.Operations[domain.CapabilityOpChat] = domain.CapabilityFact{
@@ -522,7 +828,7 @@ func TestListModelsRequiresCapabilitiesRead(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeProbedAccount("pa_models_scope", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeProbedAccount("pa_models_scope", domain.AuthModeChatGPTCodexOAuth))
 		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_models_scope", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
 	})
 
@@ -545,7 +851,7 @@ func TestProbeCapabilityObservationFailurePreventsActivation(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_obs_fail", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_obs_fail", domain.AuthModeChatGPTCodexOAuth))
 		h.capability.observeErr = ports.ErrDependencyUnavailable
 	})
 
@@ -585,8 +891,22 @@ func TestProbeCapabilityStorePutFailurePreventsActivation(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_put_fail", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_put_fail", domain.AuthModeChatGPTCodexOAuth))
 		h.capabilities.putErr = ports.ErrDependencyUnavailable
+		h.capabilities.putHook = func() {
+			concurrent, err := h.accounts.Visible(t.Context(), managePrincipal(), "pa_put_fail")
+			if err != nil {
+				t.Errorf("concurrent Visible: %v", err)
+				return
+			}
+			concurrent.Lifecycle = domain.LifecycleDisabled
+			concurrent.Controls.Quarantine = domain.QuarantineQuarantined
+			if _, err := h.accounts.Update(t.Context(), ports.AccountUpdate{
+				Principal: managePrincipal(), Account: concurrent,
+			}); err != nil {
+				t.Errorf("concurrent control update: %v", err)
+			}
+		}
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -620,6 +940,16 @@ func TestProbeCapabilityStorePutFailurePreventsActivation(t *testing.T) {
 	if account["lifecycle_state"] == "active" {
 		t.Fatalf("lifecycle_state became active after capability put failure")
 	}
+	if account["lifecycle_state"] != "disabled" {
+		t.Fatalf("lifecycle_state = %v, want concurrent disabled state preserved", account["lifecycle_state"])
+	}
+	stored, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_put_fail")
+	if err != nil {
+		t.Fatalf("visible after capability failure: %v", err)
+	}
+	if stored.Controls.Quarantine != domain.QuarantineQuarantined {
+		t.Fatalf("quarantine = %v, want concurrent quarantine preserved", stored.Controls.Quarantine)
+	}
 
 	// No durable authorizing snapshot was published.
 	response, payload = harness.do(t, requestSpec{
@@ -641,7 +971,7 @@ func TestGetCapabilitySnapshotReturnsStaleForInspection(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeProbedAccount("pa_stale_read", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeProbedAccount("pa_stale_read", domain.AuthModeChatGPTCodexOAuth))
 		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_stale_read", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime.Add(-30*time.Minute)))
 	})
 

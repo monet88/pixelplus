@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // ProviderAccountID is the stable, safe-to-expose Provider Account id. It
 // matches the frozen Public API pattern `^pa_[A-Za-z0-9_]+$`.
@@ -54,4 +57,31 @@ func (timestamp Timestamp) IsZero() bool {
 // Time returns the underlying UTC instant.
 func (timestamp Timestamp) Time() time.Time {
 	return timestamp.value
+}
+
+// MarshalJSON encodes the timestamp as an RFC3339 UTC string. The zero value
+// serializes as JSON null so it round-trips cleanly through durable storage.
+func (timestamp Timestamp) MarshalJSON() ([]byte, error) {
+	if timestamp.IsZero() {
+		return []byte("null"), nil
+	}
+	return json.Marshal(timestamp.value.UTC().Format(time.RFC3339Nano))
+}
+
+// UnmarshalJSON decodes an RFC3339 UTC string or JSON null into a Timestamp.
+func (timestamp *Timestamp) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		timestamp.value = time.Time{}
+		return nil
+	}
+	var raw string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	value, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return err
+	}
+	timestamp.value = value.UTC()
+	return nil
 }
