@@ -83,6 +83,11 @@ type Options struct {
 	RenderAdapter ports.RenderAdapter
 	RenderStaging ports.RenderStagingStore
 	RenderAudit   ports.RenderAuditRecorder
+
+	// EnqueueFailTimes fails the first N Enqueue calls with EnqueueError (or
+	// dependency unavailable) so contract tests prove create+publication recovery.
+	EnqueueFailTimes int
+	EnqueueError     error
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -101,6 +106,10 @@ type Fixture struct {
 func NewFixture(options Options) (*Fixture, error) {
 	events := &eventLog{}
 	jobs := newControlledJobRuntime(events, options.RecoveryError, options.JobRuntimeCloseGate)
+	if options.EnqueueFailTimes > 0 {
+		jobs.enqueueFailRemaining.Store(int32(options.EnqueueFailTimes))
+		jobs.enqueueError = options.EnqueueError
+	}
 
 	clock := ports.Clock(&controlledClock{next: fixtureStartTime})
 	if options.Clock != nil {
@@ -264,6 +273,11 @@ type controlledJobRuntime struct {
 	// one secret-free reference.
 	enqueueMu   sync.Mutex
 	enqueueRefs []ports.SafeJobReference
+	// enqueueFailRemaining, when >0, fails the next Enqueue calls with
+	// enqueueError (or ErrDependencyUnavailable) then decrements — used to
+	// prove durable create + publication recovery (#14 §3.3).
+	enqueueFailRemaining atomic.Int32
+	enqueueError         error
 }
 
 func newControlledJobRuntime(events *eventLog, recoveryError error, closeGate <-chan struct{}) *controlledJobRuntime {
@@ -284,6 +298,16 @@ func (runtime *controlledJobRuntime) Restore(context.Context) error {
 func (runtime *controlledJobRuntime) Enqueue(_ context.Context, reference ports.SafeJobReference) (ports.EnqueueReceipt, error) {
 	if _, err := reference.JobRef(); err != nil {
 		return ports.EnqueueReceipt{}, err
+	}
+	if remaining := runtime.enqueueFailRemaining.Load(); remaining > 0 {
+		if runtime.enqueueFailRemaining.CompareAndSwap(remaining, remaining-1) {
+			runtime.events.add("job_runtime.enqueue_fail")
+			err := runtime.enqueueError
+			if err == nil {
+				err = ports.ErrDependencyUnavailable
+			}
+			return ports.EnqueueReceipt{}, err
+		}
 	}
 	runtime.enqueueMu.Lock()
 	runtime.enqueueRefs = append(runtime.enqueueRefs, reference)

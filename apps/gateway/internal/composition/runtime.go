@@ -460,23 +460,28 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 	if vault == nil {
 		vault = vaultpkg.NewFailClosedCredentialVault()
 	}
-	// Confidential prompt store + authorized render share one memory boundary so
-	// create-time Put and worker-time resolution agree. Explicit overrides are
-	// honored when both are supplied (advanced fixtures).
+	// Confidential prompt store: production fail-closed unless controlled memory
+	// is explicitly allowed (fixtures) or injected. Never auto-create Memory when
+	// AllowInMemoryRenderJobs is false.
 	prompts := dependencies.RenderPrompts
+	if prompts == nil {
+		if config.AllowInMemoryRenderJobs {
+			prompts = vaultpkg.NewMemoryRenderPromptStore()
+		} else {
+			prompts = vaultpkg.NewFailClosedRenderPromptStore()
+		}
+	}
 	authorized := dependencies.AuthorizedRender
-	if prompts == nil || authorized == nil {
+	if authorized == nil {
 		adapter := dependencies.RenderAdapter
 		if adapter == nil {
 			adapter = vaultpkg.NewFailClosedRenderAdapter()
 		}
-		mem := vaultpkg.NewMemoryRenderPromptStore()
-		auth := vaultpkg.NewAuthorizedRenderService(mem, vault, adapter)
-		if prompts == nil {
-			prompts = auth.PromptStore()
-		}
-		if authorized == nil {
-			authorized = auth
+		// When prompts is fail-closed, authorized render still wires but Put/Use fail closed.
+		if prompts != nil && adapter != nil {
+			authorized = vaultpkg.NewAuthorizedRenderService(prompts, vault, adapter)
+		} else {
+			authorized = vaultpkg.NewFailClosedAuthorizedRender()
 		}
 	}
 	audit := dependencies.RenderAudit

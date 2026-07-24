@@ -471,6 +471,21 @@ func (store *MemoryRenderJobStore) ReleaseAccountLease(_ context.Context, ref do
 	return nil
 }
 
+// MarkQueuePublished records successful SafeJobReference acceptance.
+func (store *MemoryRenderJobStore) MarkQueuePublished(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	job, err := store.loadLocked(ref)
+	if err != nil {
+		return domain.RenderJob{}, err
+	}
+	job.QueuePublished = true
+	job.StateRevision++
+	store.saveLocked(job)
+	return cloneJob(job), nil
+}
+
 func (store *MemoryRenderJobStore) loadLocked(ref domain.JobRef) (domain.RenderJob, error) {
 	jobs, ok := store.byTenant[domain.TenantID(ref.TenantID)]
 	if !ok {
@@ -565,6 +580,9 @@ func (*UnavailableRenderJobStore) AccountLeaseHolder(context.Context, domain.Ten
 }
 func (*UnavailableRenderJobStore) ReleaseAccountLease(context.Context, domain.JobRef, domain.FencingToken) error {
 	return ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
 }
 
 // MemoryRenderReplayStore is the process-local create-idempotency store for

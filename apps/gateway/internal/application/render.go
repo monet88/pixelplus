@@ -355,10 +355,24 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	}
 	switch decision.Outcome {
 	case ports.ReplayClaimed:
+		// sole owner continues below
 	case ports.ReplayTerminal:
+		// Matching replay: same job. If queue publication never succeeded,
+		// recover by re-enqueueing without creating a replacement (#14 §3.3).
+		job := decision.TerminalJob
+		if !job.QueuePublished {
+			published, err := service.ensureQueuePublished(ctx, job)
+			if err != nil {
+				// Job exists; return dependency failure so the client may retry the same key.
+				return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+			}
+			// Refresh terminal projection so later replays see QueuePublished.
+			_ = service.replay.Complete(ctx, identity, ports.RenderReplayResult{Job: published})
+			job = published
+		}
 		service.recordTelemetry(ctx, sc.operation, "", 202)
 		service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), 202, "ok", sc.start)
-		return RenderJobResult{Job: decision.TerminalJob, RequestID: sc.requestID}, nil
+		return RenderJobResult{Job: job, RequestID: sc.requestID}, nil
 	case ports.ReplayInProgress:
 		return RenderJobResult{}, service.fail(ctx, sc, domain.NewIdempotencyInProgress())
 	case ports.ReplayConflict:
@@ -423,9 +437,10 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		command.idempotencyKey,
 		now,
 	)
+	// Queue publication starts false; mark true only after Enqueue accepts.
+	job.QueuePublished = false
 
-	// Bind confidential prompt before the job becomes executable. Put accepts
-	// transient intake; application does not read it back.
+	// Bind confidential prompt before the job becomes executable.
 	if err := service.prompts.Put(ctx, ports.RenderPromptIntake{
 		TenantID: principal.TenantID,
 		JobID:    jobID,
@@ -438,28 +453,65 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 
 	persisted, err := service.jobs.Create(ctx, ports.RenderJobCreation{Principal: principal, Job: job})
 	if err != nil {
+		service.purgePrompt(ctx, principal.TenantID, jobID)
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
 		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
-	if _, err := service.queue.Enqueue(ctx, ports.SafeJobReference{
-		TenantID: domain.Identifier(principal.TenantID),
-		JobID:    persisted.JobID,
-	}); err != nil {
-		service.release(ctx, reservation)
-		service.abandon(ctx, identity)
-		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
-	}
-
+	// Complete replay to terminal BEFORE enqueue so a later matching request
+	// recovers this job rather than abandoning and creating a replacement.
+	// If enqueue fails, matching retry re-attempts publication (#14 §3.3).
 	if err := service.replay.Complete(ctx, identity, ports.RenderReplayResult{Job: persisted}); err != nil {
 		service.release(ctx, reservation)
 		return RenderJobResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
 	}
 
+	published, err := service.ensureQueuePublished(ctx, persisted)
+	if err != nil {
+		service.release(ctx, reservation)
+		// Do NOT abandon: durable job + terminal replay exist. Client retry with
+		// the same key recovers the same job and re-attempts enqueue.
+		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	// Refresh terminal with QueuePublished=true for pure matching replays.
+	_ = service.replay.Complete(ctx, identity, ports.RenderReplayResult{Job: published})
+
 	service.release(ctx, reservation)
-	service.observeSuccess(ctx, sc, ports.AuditRenderJobCreated, principal, persisted, 202)
-	return RenderJobResult{Job: persisted, RequestID: sc.requestID}, nil
+	service.observeSuccess(ctx, sc, ports.AuditRenderJobCreated, principal, published, 202)
+	return RenderJobResult{Job: published, RequestID: sc.requestID}, nil
+}
+
+// ensureQueuePublished enqueues the SafeJobReference once and marks the job
+// published. Idempotent when already published.
+func (service *RenderService) ensureQueuePublished(ctx context.Context, job domain.RenderJob) (domain.RenderJob, error) {
+	if job.QueuePublished {
+		return job, nil
+	}
+	if _, err := service.queue.Enqueue(ctx, ports.SafeJobReference{
+		TenantID: domain.Identifier(job.TenantID),
+		JobID:    job.JobID,
+	}); err != nil {
+		return job, err
+	}
+	return service.jobs.MarkQueuePublished(ctx, job.JobRef())
+}
+
+func (service *RenderService) purgePrompt(ctx context.Context, tenant domain.TenantID, jobID domain.Identifier) {
+	_ = service.prompts.Delete(ctx, ports.RenderPromptAccess{TenantID: tenant, JobID: jobID})
+}
+
+// fencedTerminal applies a fenced transition and purges confidential prompt when
+// the resulting lifecycle is terminal (completed/failed/canceled).
+func (service *RenderService) fencedTerminal(ctx context.Context, tenant domain.TenantID, transition ports.FencedTransition) (domain.RenderJob, error) {
+	job, err := service.jobs.Transition(ctx, transition)
+	if err != nil {
+		return domain.RenderJob{}, err
+	}
+	if job.Lifecycle.Terminal() {
+		service.purgePrompt(ctx, tenant, job.JobID)
+	}
+	return job, nil
 }
 
 // GetRenderJob reads one same-Tenant job status.
@@ -532,10 +584,12 @@ func (service *RenderService) CancelRenderJob(ctx context.Context, command Cance
 		return RenderJobResult{}, service.fail(ctx, sc, service.jobVisibilityCanonical(err))
 	}
 
-	action := ports.AuditRenderJobCanceled
-	if job.Lifecycle == domain.JobCancelRequested {
-		action = ports.AuditRenderJobCanceled
+	// Purge confidential prompt on terminal cancel (queued→canceled).
+	if job.Lifecycle == domain.JobCanceled {
+		service.purgePrompt(ctx, principal.TenantID, job.JobID)
 	}
+
+	action := ports.AuditRenderJobCanceled
 	service.observeSuccess(ctx, sc, action, principal, job, 200)
 	return RenderJobResult{Job: job, RequestID: sc.requestID}, nil
 }
@@ -629,7 +683,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 
 	// Job→account continuity binding for this execution (not exclusive account mutex).
 	if err := service.jobs.BindAccountLease(ctx, ref, fence, job.ProviderAccountID); err != nil {
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobFailed,
@@ -655,7 +709,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 	if current.Lifecycle == domain.JobCancelRequested {
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobCanceled,
@@ -754,7 +808,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			CommitStatus: commit,
 			Now:          now,
 		})
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobFailed,
@@ -771,7 +825,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	case domain.RenderOutcomeNotCommitted:
 		// Authoritative pre-commit rejection: fail without replacement in this slice.
 		attempt.CommitStatus = domain.CommitNotCommitted
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobFailed,
@@ -784,7 +838,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return nil
 	case domain.RenderOutcomeUnknown:
 		attempt.CommitStatus = domain.CommitUnknown
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobFailed,
@@ -799,7 +853,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		// fall through to capture
 	default:
 		attempt.CommitStatus = domain.CommitUnknown
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobFailed,
@@ -820,7 +874,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	if current.Lifecycle == domain.JobCancelRequested {
 		// Spec: if result already in hand we still capture then decide; for
 		// simplicity with CAS, cancel_requested before capture suppresses completed.
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobCanceled,
@@ -835,7 +889,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	if len(outputs) == 0 {
 		// Committed success without capturable bytes is fail-closed capture
 		// failure — never synthesize fixture PNG in production domain/app.
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+		_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 			JobRef:       ref,
 			FencingToken: fence,
 			To:           domain.JobFailed,
@@ -886,7 +940,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			ContentType: contentType,
 			Data:        outputs[i],
 		}); err != nil {
-			_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+			_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 				JobRef:       ref,
 				FencingToken: fence,
 				To:           domain.JobFailed,
@@ -933,7 +987,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 				})
 				continue
 			}
-			_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+			_, _ = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 				JobRef:       ref,
 				FencingToken: fence,
 				To:           domain.JobFailed,
@@ -948,7 +1002,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 
 	completeAt := service.nowTS()
-	_, err = service.jobs.Transition(ctx, ports.FencedTransition{
+	_, err = service.fencedTerminal(ctx, job.TenantID, ports.FencedTransition{
 		JobRef:       ref,
 		FencingToken: fence,
 		To:           domain.JobCompleted,

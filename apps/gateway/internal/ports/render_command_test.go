@@ -19,7 +19,8 @@ func TestRenderCommandHasNoPromptField(t *testing.T) {
 		t.Fatal("AuthorizedRenderRequest must not carry Prompt; the port resolves confidential material internally")
 	}
 	// AuthorizedRender is the application-facing port; RenderAdapter is the
-	// post-authorization low-level surface.
+	// post-authorization low-level surface with PromptInjection, not a Prompt field.
 	var _ ports.AuthorizedRender = nil
 	var _ ports.RenderPromptStore = nil
+	var _ ports.PromptInjection = nil
 }

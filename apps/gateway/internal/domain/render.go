@@ -267,9 +267,14 @@ type RenderJob struct {
 	FailureStage       FailureStage
 	FailureClass       ErrorCode
 	CommitStatus       CommitStatus
-	CreatedAt          Timestamp
-	UpdatedAt          Timestamp
-	TerminalAt         Timestamp
+	// QueuePublished is true after the SafeJobReference was accepted by the
+	// queue. Durable create may succeed before publication; matching retry must
+	// recover the same job and re-attempt enqueue without creating a replacement
+	// (#14 §3.3).
+	QueuePublished bool
+	CreatedAt      Timestamp
+	UpdatedAt      Timestamp
+	TerminalAt     Timestamp
 }
 
 // JobRef returns the durable ownership identity shared with workers.

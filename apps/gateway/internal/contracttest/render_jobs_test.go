@@ -18,7 +18,11 @@ import (
 // composition.Runtime.Handler and the exported JobExecutor only.
 type renderHarness struct {
 	*spineHarness
-	renderCalls atomic.Int32
+	renderCalls      atomic.Int32
+	lastPrompt       atomic.Value // string seen by controlled adapter PromptInjection
+	adapter          *countingRenderAdapter
+	enqueueFailTimes int
+	enqueueError     error
 }
 
 func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarness {
@@ -93,7 +97,8 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 		configure(h)
 	}
 
-	fixture, err := contracttest.NewFixture(contracttest.Options{
+	h.adapter = &countingRenderAdapter{harness: h}
+	opts := contracttest.Options{
 		Principal:     h.principal,
 		Admission:     h.admission,
 		Replay:        h.replay,
@@ -110,8 +115,13 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 		Circuits:      h.circuits,
 		Routing:       h.routing,
 		Clock:         h.clock,
-		RenderAdapter: &countingRenderAdapter{harness: h},
-	})
+		RenderAdapter: h.adapter,
+	}
+	if h.enqueueFailTimes > 0 {
+		opts.EnqueueFailTimes = h.enqueueFailTimes
+		opts.EnqueueError = h.enqueueError
+	}
+	fixture, err := contracttest.NewFixture(opts)
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)
 	}
@@ -122,16 +132,36 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	return h
 }
 
-// countingRenderAdapter is a controlled Provider render surface. Slice-1 create
-// must not invoke it; later worker slices assert call counts.
+// countingRenderAdapter is a controlled Provider render surface. It records the
+// exact prompt plaintext injected via PromptInjection for ADR 0009 proof.
 type countingRenderAdapter struct {
 	harness *renderHarness
 	outcome domain.RenderOutcome
 	err     error
+	// block, when non-nil, blocks Render until closed (running cancel tests).
+	block <-chan struct{}
+	// entered signals that Render has started (after reading prompt).
+	entered chan struct{}
 }
 
-func (adapter *countingRenderAdapter) Render(_ context.Context, _ ports.RenderCommand) (domain.RenderOutcome, error) {
+func (adapter *countingRenderAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection) (domain.RenderOutcome, error) {
 	adapter.harness.renderCalls.Add(1)
+	if prompt != nil {
+		_ = prompt.Use(func(plaintext string) error {
+			adapter.harness.lastPrompt.Store(plaintext)
+			return nil
+		})
+	}
+	if adapter.entered != nil {
+		select {
+		case <-adapter.entered:
+		default:
+			close(adapter.entered)
+		}
+	}
+	if adapter.block != nil {
+		<-adapter.block
+	}
 	if adapter.err != nil {
 		return domain.RenderOutcome{}, adapter.err
 	}
@@ -656,40 +686,7 @@ func TestUnknownCommitAfterPayloadNeverRerenders(t *testing.T) {
 	h := newRenderHarness(t, func(h *renderHarness) {
 		seedRoutableImageAccount(h, "pa_render_unknown")
 	})
-	// Configure adapter via type assertion on the fixture's injected adapter —
-	// recreate harness with outcome preset.
-	h = newRenderHarness(t, func(h *renderHarness) {
-		seedRoutableImageAccount(h, "pa_render_unknown")
-	})
-	// The counting adapter is created inside newRenderHarness; set outcome by
-	// replacing through a dedicated harness field is not exported. Instead
-	// mutate via a second path: we re-seed using a custom Options adapter.
-	// Simpler approach: execute with default success is covered; for unknown,
-	// build a dedicated fixture here.
-	// Build a one-off fixture with unknown outcome adapter.
-	adapter := &countingRenderAdapter{
-		harness: h,
-		outcome: domain.RenderOutcome{Class: domain.RenderOutcomeUnknown, Commit: domain.CommitUnknown},
-	}
-	fixture, err := contracttest.NewFixture(contracttest.Options{
-		Principal:     h.principal,
-		Admission:     h.admission,
-		Accounts:      h.accounts,
-		Health:        h.health,
-		Vault:         h.vault,
-		Capabilities:  h.capabilities,
-		Circuits:      h.circuits,
-		Routing:       h.routing,
-		Clock:         h.clock,
-		RenderAdapter: adapter,
-	})
-	if err != nil {
-		t.Fatalf("NewFixture: %v", err)
-	}
-	t.Cleanup(func() { closeFixture(t, fixture) })
-	// Rebind harness fixture for do() helper.
-	h.fixture = fixture
-	h.renderCalls.Store(0)
+	h.adapter.outcome = domain.RenderOutcome{Class: domain.RenderOutcomeUnknown, Commit: domain.CommitUnknown}
 
 	create, payload := h.do(t, requestSpec{
 		method:  http.MethodPost,
@@ -706,14 +703,14 @@ func TestUnknownCommitAfterPayloadNeverRerenders(t *testing.T) {
 	jobID := job["job_id"].(string)
 	ref := domain.JobRef{TenantID: "tenant_a", JobID: domain.Identifier(jobID)}
 
-	if err := fixture.Runtime().Worker().ExecuteJob(t.Context(), ref); err != nil {
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), ref); err != nil {
 		t.Fatalf("ExecuteJob: %v", err)
 	}
 	if calls := h.renderCalls.Load(); calls != 1 {
 		t.Fatalf("render calls = %d, want 1", calls)
 	}
 	// Redelivery must not re-render when commit is unknown/failed terminal.
-	if err := fixture.Runtime().Worker().ExecuteJob(t.Context(), ref); err != nil {
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), ref); err != nil {
 		t.Fatalf("ExecuteJob redelivery: %v", err)
 	}
 	if calls := h.renderCalls.Load(); calls != 1 {
@@ -962,5 +959,205 @@ func TestConcurrentWorkerClaimRendersOnce(t *testing.T) {
 	}
 	if calls := h.renderCalls.Load(); calls != 1 {
 		t.Fatalf("render calls under concurrent claim = %d, want 1", calls)
+	}
+}
+
+// Finding A: authorized path injects exact create prompt into controlled adapter;
+// prompt is not on public wire and is not retained after completion.
+func TestAuthorizedRenderInjectsExactPromptNotOnWire(t *testing.T) {
+	t.Parallel()
+
+	const wantPrompt = "exact-prompt-injection-proof"
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_prompt_inj")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-prompt-inj",
+		body:    `{"model":"gpt-image-1","prompt":"` + wantPrompt + `"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	if _, ok := job["prompt"]; ok {
+		t.Fatalf("public create response must not include prompt: %v", job)
+	}
+	jobID := job["job_id"].(string)
+
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{
+		TenantID: "tenant_a",
+		JobID:    domain.Identifier(jobID),
+	}); err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+	got, _ := h.lastPrompt.Load().(string)
+	if got != wantPrompt {
+		t.Fatalf("adapter prompt = %q, want %q (authorized injection)", got, wantPrompt)
+	}
+
+	get, getPayload := h.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/render-jobs/" + jobID,
+		bearer: tenantAKey,
+	})
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d (body=%s)", get.StatusCode, getPayload)
+	}
+	var status map[string]any
+	_ = json.Unmarshal(getPayload, &status)
+	if _, ok := status["prompt"]; ok {
+		t.Fatalf("status projection must not include prompt: %v", status)
+	}
+}
+
+// Finding C / §3.3: durable create + enqueue failure must not abandon replay;
+// matching retry recovers the same job and completes publication without a second job.
+func TestEnqueueFailureAfterCreateRecoversSameJobOnRetry(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_enq_fail")
+		h.enqueueFailTimes = 1
+		h.enqueueError = ports.ErrDependencyUnavailable
+	})
+
+	first, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-enq-recover",
+		body:    `{"model":"gpt-image-1","prompt":"publish me"}`,
+	})
+	if first.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d, want 503 after enqueue failure (body=%s)", first.StatusCode, payload)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 0 {
+		t.Fatalf("successful enqueues after fail = %d, want 0", n)
+	}
+
+	// Matching retry recovers the durable job and re-attempts enqueue.
+	second, payload2 := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-enq-recover",
+		body:    `{"model":"gpt-image-1","prompt":"publish me"}`,
+	})
+	if second.StatusCode != http.StatusAccepted {
+		t.Fatalf("retry status = %d, want 202 (body=%s)", second.StatusCode, payload2)
+	}
+	var job map[string]any
+	if err := json.Unmarshal(payload2, &job); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	jobID, _ := job["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("missing job_id on recovery: %v", job)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 1 {
+		t.Fatalf("enqueue count after recovery = %d, want 1", n)
+	}
+	if string(h.fixture.EnqueuedReferences()[0].JobID) != jobID {
+		t.Fatalf("enqueued job_id = %s, want %s", h.fixture.EnqueuedReferences()[0].JobID, jobID)
+	}
+
+	// Third matching request is pure terminal replay — no second enqueue.
+	third, payload3 := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-enq-recover",
+		body:    `{"model":"gpt-image-1","prompt":"publish me"}`,
+	})
+	if third.StatusCode != http.StatusAccepted {
+		t.Fatalf("third status = %d (body=%s)", third.StatusCode, payload3)
+	}
+	var job3 map[string]any
+	_ = json.Unmarshal(payload3, &job3)
+	if job3["job_id"] != jobID {
+		t.Fatalf("third job_id = %v, want %s (no replacement)", job3["job_id"], jobID)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 1 {
+		t.Fatalf("enqueue count after pure replay = %d, want 1", n)
+	}
+}
+
+// Running cancel first exposes cancel_requested (honest), not immediate canceled.
+func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_cancel_running")
+	})
+	block := make(chan struct{})
+	entered := make(chan struct{})
+	h.adapter.block = block
+	h.adapter.entered = entered
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-cancel-running",
+		body:    `{"model":"gpt-image-1","prompt":"cancel while running"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{
+			TenantID: "tenant_a",
+			JobID:    domain.Identifier(jobID),
+		})
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker did not enter render")
+	}
+
+	cancel, cancelPayload := h.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/render-jobs/" + jobID + "/cancel",
+		bearer: tenantAKey,
+	})
+	if cancel.StatusCode != http.StatusOK {
+		t.Fatalf("cancel status = %d (body=%s)", cancel.StatusCode, cancelPayload)
+	}
+	var mid map[string]any
+	_ = json.Unmarshal(cancelPayload, &mid)
+	if mid["lifecycle_state"] != "cancel_requested" {
+		t.Fatalf("mid cancel lifecycle = %v, want cancel_requested (honest)", mid["lifecycle_state"])
+	}
+
+	close(block)
+	if err := <-errCh; err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+
+	get, getPayload := h.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/render-jobs/" + jobID,
+		bearer: tenantAKey,
+	})
+	var final map[string]any
+	_ = json.Unmarshal(getPayload, &final)
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d (body=%s)", get.StatusCode, getPayload)
+	}
+	// After worker observes cancel_requested, terminal is canceled (not completed).
+	if final["lifecycle_state"] != "canceled" {
+		t.Fatalf("final lifecycle = %v, want canceled", final["lifecycle_state"])
 	}
 }

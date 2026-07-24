@@ -139,6 +139,9 @@ type RenderJobStore interface {
 	AccountLeaseHolder(context.Context, domain.TenantID, domain.ProviderAccountID) (domain.Identifier, bool, error)
 	// ReleaseAccountLease clears the worker fence hold for the job.
 	ReleaseAccountLease(context.Context, domain.JobRef, domain.FencingToken) error
+	// MarkQueuePublished records that the SafeJobReference was accepted by the
+	// queue for this job (durable create may precede publication; #14 §3.3).
+	MarkQueuePublished(context.Context, domain.JobRef) (domain.RenderJob, error)
 }
 
 // RenderReplayDecision carries a terminal job for create replay.
@@ -219,11 +222,20 @@ type RenderPromptIntake struct {
 	Material string
 }
 
+// RenderPromptAccess authorizes purpose-bound Use of stored prompt material.
+type RenderPromptAccess struct {
+	TenantID domain.TenantID
+	JobID    domain.Identifier
+}
+
 // RenderPromptStore is the purpose-bound confidential port for render prompts.
-// Put accepts transient intake at create. Application never receives plaintext
-// back; only AuthorizedRender resolves material inside its boundary.
+// Put accepts transient intake at create. Delete purges on terminal/rollback.
+// Use injects plaintext into a callback for the authorized infrastructure
+// boundary only — application never receives plaintext as a return value.
 type RenderPromptStore interface {
 	Put(context.Context, RenderPromptIntake) error
+	Use(context.Context, RenderPromptAccess, func(plaintext string) error) error
+	Delete(context.Context, RenderPromptAccess) error
 }
 
 // AuthorizedRenderRequest is the application-facing request for one upstream
@@ -248,8 +260,7 @@ type AuthorizedRender interface {
 }
 
 // RenderCommand is the safe Adapter invocation after authorization. It never
-// carries prompt plaintext or credential material — those are injected only
-// inside the AuthorizedRender / Vault boundary, not via this ordinary command.
+// carries prompt plaintext or credential material as durable fields.
 type RenderCommand struct {
 	Principal  domain.SecurityPrincipal
 	AccountID  domain.ProviderAccountID
@@ -258,12 +269,21 @@ type RenderCommand struct {
 	Invocation domain.RenderInvocation
 }
 
+// PromptInjection grants the Adapter a single-call, Use-scoped view of prompt
+// plaintext constructed only inside AuthorizedRender. Application never obtains
+// a populated injection; credential plaintext remains Vault-owned and is not
+// exposed here when CredentialVault only supports Validate.
+type PromptInjection interface {
+	// Use invokes fn with prompt plaintext for this call frame only. The
+	// plaintext must not be retained by the Adapter beyond the call.
+	Use(func(plaintext string) error) error
+}
+
 // RenderAdapter runs one controlled generation/edit/inpaint attempt after the
-// authorized boundary has already resolved secrets. Fail-closed when no
-// Provider surface is configured. Application code must not call this directly
-// with confidential material; it uses AuthorizedRender.
+// authorized boundary has resolved secrets. Prompt is injected only via
+// PromptInjection for this call. Application must not call this port directly.
 type RenderAdapter interface {
-	Render(context.Context, RenderCommand) (domain.RenderOutcome, error)
+	Render(context.Context, RenderCommand, PromptInjection) (domain.RenderOutcome, error)
 }
 
 // RenderAuditAction names a Render Job product/security audit event.
