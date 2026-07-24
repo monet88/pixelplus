@@ -366,6 +366,10 @@ func TestCancelRequestedExpiredLeaseRecoversWithoutRender(t *testing.T) {
 	if jobs.job.Lifecycle != domain.JobCanceled {
 		t.Fatalf("lifecycle = %v, want canceled", jobs.job.Lifecycle)
 	}
+	// Before payload: commit truth remains not_started (Provider never received work).
+	if jobs.job.CommitStatus != domain.CommitNotStarted {
+		t.Fatalf("commit status = %q, want not_started for pre-payload cancel recovery", jobs.job.CommitStatus)
+	}
 	if !jobs.job.PromptPurged || !jobs.job.AdmissionSettled {
 		t.Fatalf("cleanup incomplete purged=%v settled=%v", jobs.job.PromptPurged, jobs.job.AdmissionSettled)
 	}
@@ -389,6 +393,64 @@ func TestCancelRequestedExpiredLeaseRecoversWithoutRender(t *testing.T) {
 	}
 	if counter.calls.Load() != 0 {
 		t.Fatalf("render after terminal redelivery = %d, want 0", counter.calls.Load())
+	}
+}
+
+// Post-payload cancel recovery must not finalize canceled+not_started: PayloadSent
+// means the Provider may have received work, so terminal commit truth is unknown
+// unless stronger evidence already exists (#14 §6.2 / §6.4).
+func TestCancelRequestedExpiredLeaseAfterPayloadSentFinalizesUnknown(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 24, 22, 0, 0, 0, time.UTC)
+	jobs := &cancelRecoverStore{}
+	job := domain.NewQueuedRenderJob(
+		"job_cr_ps", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		"d", nil, "", "pa_1", 1, "fp", "idem", domain.NewTimestamp(base),
+	)
+	job.Lifecycle = domain.JobCancelRequested
+	job.LeaseHeld = true
+	job.LeaseExpiresAt = domain.NewTimestamp(base.Add(time.Minute))
+	job.WorkerID = "w_dead"
+	job.WorkerFencingToken = 1
+	job.CommitStatus = domain.CommitNotStarted
+	job.Attempt = domain.UpstreamAttempt{
+		ID:           domain.NewAttemptID(job.JobID, 1),
+		CommitStatus: domain.CommitNotStarted,
+		PayloadSent:  true,
+		Sequence:     1,
+		CreatedAt:    domain.NewTimestamp(base),
+		UpdatedAt:    domain.NewTimestamp(base.Add(30 * time.Second)),
+	}
+	job.PromptPurged = false
+	job.AdmissionSettled = false
+	jobs.job = job
+	jobs.fence = 1
+
+	counter := &countingNoopAuthorized{}
+	prompts := &cleanupPromptStore{material: map[string]string{"tenant_a/job_cr_ps": "secret-prompt"}}
+	svc, err := application.NewRenderService(application.RenderDependencies{
+		Principal: noopPrincipal{}, Admission: &keyedAdmissionStore{settled: map[string]struct{}{}},
+		Replay: noopRenderReplay{}, Jobs: jobs, Accounts: noopAccounts{}, Capabilities: noopCapabilities{},
+		Routing: noopRouting{}, Assets: noopAssets{}, Content: noopContent{}, Staging: noopStaging{},
+		Vault: noopVault{}, Prompts: prompts, Authorized: counter, Digester: noopDigester{},
+		Queue: noopQueue{}, Audit: &failOnceAudit{}, Telemetry: noopTelemetry{}, RequestLog: noopRequestLog{},
+		Clock: fixedClock{now: base.Add(5 * time.Minute)}, IDs: fixedIDs{},
+	})
+	if err != nil {
+		t.Fatalf("NewRenderService: %v", err)
+	}
+
+	if err := svc.ExecuteJob(context.Background(), job.JobRef()); err != nil {
+		t.Fatalf("recovery ExecuteJob: %v", err)
+	}
+	if counter.calls.Load() != 0 {
+		t.Fatalf("Provider render calls = %d, want 0", counter.calls.Load())
+	}
+	if jobs.job.Lifecycle != domain.JobCanceled {
+		t.Fatalf("lifecycle = %v, want canceled", jobs.job.Lifecycle)
+	}
+	if jobs.job.CommitStatus != domain.CommitUnknown {
+		t.Fatalf("commit status = %q, want unknown after payload-sent cancel recovery", jobs.job.CommitStatus)
 	}
 }
 

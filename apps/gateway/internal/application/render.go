@@ -1287,9 +1287,16 @@ func (service *RenderService) recoverAttemptWithoutRender(
 		return err
 	}
 	if current.Lifecycle == domain.JobCancelRequested {
+		// PayloadSent without stronger commit evidence means the Provider may have
+		// received work; terminal cancel must not claim not_started (#14 §6.2/§6.4).
+		// Preserve authoritative not_committed / committed / already-unknown.
+		commit := current.CommitStatus
+		if current.Attempt.PayloadSent && (commit == "" || commit == domain.CommitNotStarted) {
+			commit = domain.CommitUnknown
+		}
 		return service.persistTerminal(ctx, job, ports.FencedTransition{
 			JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
-			CommitStatus: current.CommitStatus, ClearLease: true, Now: service.nowTS(),
+			CommitStatus: commit, ClearLease: true, Now: service.nowTS(),
 		})
 	}
 	if current.Lifecycle.Terminal() {
