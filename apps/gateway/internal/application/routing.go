@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
@@ -111,7 +112,7 @@ func (service *ProviderAccountService) ReplaceRoutingPolicy(ctx context.Context,
 		return RoutingPolicyResult{}, service.fail(ctx, sc, canonical)
 	}
 
-	if canonical, ok := service.validatePolicyCandidates(ctx, principal, policy); !ok {
+	if canonical, ok := service.validatePolicyCandidates(ctx, principal, policy, sc.start); !ok {
 		service.release(ctx, reservation)
 		return RoutingPolicyResult{}, service.fail(ctx, sc, canonical)
 	}
@@ -166,7 +167,9 @@ func ptrInvalid() *domain.CanonicalError {
 // validatePolicyCandidates loads and eligibility-checks every referenced id
 // before a single Replace. Order per id: ownership visibility → allowlist →
 // eligibility. Cross-mode set is selection_order ∪ fallback_chain.
-func (service *ProviderAccountService) validatePolicyCandidates(ctx context.Context, principal domain.SecurityPrincipal, policy domain.RoutingPolicy) (domain.CanonicalError, bool) {
+// now is the request-start instant (sc.start); all freshness/offerability
+// checks use this single instant so TTL-boundary evaluation is deterministic.
+func (service *ProviderAccountService) validatePolicyCandidates(ctx context.Context, principal domain.SecurityPrincipal, policy domain.RoutingPolicy, now time.Time) (domain.CanonicalError, bool) {
 	refs := make([]domain.ProviderAccountID, 0, len(policy.CandidateAccounts)+len(policy.SelectionOrder)+len(policy.FallbackChain))
 	seen := make(map[domain.ProviderAccountID]struct{})
 	for _, id := range append(append(append([]domain.ProviderAccountID{}, policy.CandidateAccounts...), policy.SelectionOrder...), policy.FallbackChain...) {
@@ -188,7 +191,7 @@ func (service *ProviderAccountService) validatePolicyCandidates(ctx context.Cont
 		if !principal.AllowsProviderAccount(id) {
 			return domain.NewForbidden(), false
 		}
-		if canonical, ok := service.policyCandidateRejection(ctx, principal, account); !ok {
+		if canonical, ok := service.policyCandidateRejection(ctx, principal, account, now); !ok {
 			return canonical, false
 		}
 		modesByAccount[id] = account.AuthMode
@@ -228,8 +231,9 @@ func (service *ProviderAccountService) validatePolicyCandidates(ctx context.Cont
 }
 
 // policyCandidateRejection applies usability/risk/health/capability/circuit
-// gates for a same-Tenant, allowlist-permitted account.
-func (service *ProviderAccountService) policyCandidateRejection(ctx context.Context, principal domain.SecurityPrincipal, account domain.ProviderAccount) (domain.CanonicalError, bool) {
+// gates for a same-Tenant, allowlist-permitted account. now is the request
+// start instant — freshness and pair offerability must not re-sample clock.
+func (service *ProviderAccountService) policyCandidateRejection(ctx context.Context, principal domain.SecurityPrincipal, account domain.ProviderAccount, now time.Time) (domain.CanonicalError, bool) {
 	// Production fail-closed: experimental modes have no lab profile.
 	if account.AuthMode.Experimental() {
 		return domain.NewAuthModeUnavailable(), false
@@ -275,7 +279,7 @@ func (service *ProviderAccountService) policyCandidateRejection(ctx context.Cont
 		}
 		return service.dependencyCanonical(err), false
 	}
-	derived := snapshot.WithDerivedFreshness(service.clock.Now())
+	derived := snapshot.WithDerivedFreshness(now)
 	switch derived.Freshness {
 	case domain.SnapshotStale, domain.SnapshotInvalid:
 		return domain.NewSnapshotStale(), false
@@ -290,7 +294,7 @@ func (service *ProviderAccountService) policyCandidateRejection(ctx context.Cont
 	hasOffer := false
 	for _, model := range derived.Models {
 		for _, op := range domain.PrimaryCapabilityOperations() {
-			if !derived.IsOfferablePair(op, model, service.clock.Now()) {
+			if !derived.IsOfferablePair(op, model, now) {
 				continue
 			}
 			if accountHealthBlocksPair(account, op, model.ModelSlug) {

@@ -1286,6 +1286,46 @@ func TestRoutingPolicyRejectsDrainAndQuarantine(t *testing.T) {
 	}
 }
 
+// AC: candidate eligibility uses one request-start instant for freshness and
+// pair offerability (ListModels precedent). At the TTL boundary, a multi-Now
+// path can see Fresh then later unofferable pairs and wrongly return
+// capability_unsupported; the request-start instant that is still within TTL
+// must accept (authority-derived success), never flip mid-request.
+func TestRoutingPolicyCandidateFreshnessUsesRequestStartInstant(t *testing.T) {
+	t.Parallel()
+
+	// Snapshot verified at fixture time; clock starts one second before
+	// DefaultProbeLiveTTL expiry. Each Now() advances 1s: sc.start is still
+	// Fresh, but a second Now() for IsOfferablePair crosses the budget and
+	// makes every pair unofferable under the multi-instant bug.
+	verifiedAt := spineFixtureTime
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount("pa_ttl_edge", domain.AuthModeChatGPTCodexOAuth)
+		h.seedAccount("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot(
+			"pa_ttl_edge", domain.AuthModeChatGPTCodexOAuth, 1, verifiedAt,
+		))
+		// Position clock so request-start is within TTL, but a later Now() is not.
+		h.clock.mu.Lock()
+		h.clock.now = verifiedAt.Add(domain.DefaultProbeLiveTTL - time.Second)
+		h.clock.mu.Unlock()
+	})
+	before := harness.routing.mutationsCount()
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   validPolicyBody("pa_ttl_edge"),
+	})
+	// Normative: sc.start is still within DefaultProbeLiveTTL → candidate eligible.
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 at request-start-fresh boundary (body=%s)", response.StatusCode, payload)
+	}
+	if harness.routing.mutationsCount() != before+1 {
+		t.Fatalf("mutations = %d, want %d", harness.routing.mutationsCount(), before+1)
+	}
+}
+
 // AC: open Provider Surface Circuit omits all offerable pairs → candidate is
 // capability_unsupported (distinct from circuit dependency 503).
 func TestRoutingPolicyRejectsOpenCircuit(t *testing.T) {

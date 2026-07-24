@@ -52,11 +52,16 @@ func (store *MemoryRoutingPolicyStore) Read(_ context.Context, principal domain.
 	return cloneRoutingPolicy(policy), nil
 }
 
-// Replace atomically overwrites the Tenant singleton.
+// Replace validates durable invariants before any map mutation (same authority
+// as FileRoutingPolicyStore.Replace), then atomically overwrites the Tenant
+// singleton. Rejected writes leave map state and Mutations/Revision unchanged.
 func (store *MemoryRoutingPolicyStore) Replace(_ context.Context, change ports.RoutingPolicyChange) (domain.RoutingPolicy, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	policy := cloneRoutingPolicy(change.Policy)
+	if err := validateDurableRoutingPolicy(policy); err != nil {
+		return domain.RoutingPolicy{}, fmt.Errorf("%w: %v", ports.ErrDependencyUnavailable, err)
+	}
 	store.byTenant[change.Principal.TenantID] = policy
 	store.mutations.Add(1)
 	store.revision.Add(1)
