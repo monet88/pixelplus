@@ -340,12 +340,38 @@ type RenderCaptureSink interface {
 	Accept(position int, contentType string, data []byte) error
 }
 
+// CredentialInjection grants the Adapter a single-call, Use-scoped view of
+// Provider credential material. Material is minted only inside
+// RenderCredentialAuthorizer.Authorize and must never cross into application,
+// domain, wire, logs, or durable job fields (ADR 0009).
+type CredentialInjection interface {
+	Use(func(secretMaterial string) error) error
+}
+
+// RenderCredentialAuthorizer is the vault-owned capability for render execution.
+// Authorize validates the credential identity and, only on success, invokes fn
+// with a callback-scoped CredentialInjection. It never returns plaintext to
+// callers outside fn. Absent credential / auth mismatch / fail-closed state
+// must return without calling fn so Adapter is never entered.
+type RenderCredentialAuthorizer interface {
+	Authorize(context.Context, CredentialValidation, func(CredentialInjection) error) error
+}
+
 // RenderAdapter runs one controlled generation/edit/inpaint attempt after the
-// authorized boundary has resolved secrets. Prompt and input/mask Asset bytes
-// are injected via protected Use-scoped values; output bytes go only to
-// RenderCaptureSink. RenderCommand never carries content bytes.
+// authorized boundary has resolved secrets. Prompt, input/mask Asset bytes, and
+// credentials are injected via protected Use-scoped values; output bytes go only
+// to RenderCaptureSink. RenderCommand never carries content bytes. Adapter is
+// structurally incomplete without CredentialInjection (cannot succeed after
+// Validate alone).
 type RenderAdapter interface {
-	Render(context.Context, RenderCommand, PromptInjection, InputAssetInjection, RenderCaptureSink) (domain.RenderOutcome, error)
+	Render(context.Context, RenderCommand, PromptInjection, InputAssetInjection, CredentialInjection, RenderCaptureSink) (domain.RenderOutcome, error)
+}
+
+// Restorer is an optional recovery contract for durable render persistence.
+// Memory fixtures may no-op; Unavailable stores return dependency failure.
+// composition.New runs Restore before Ready=true (#54 Standards P1-C).
+type Restorer interface {
+	Restore(context.Context) error
 }
 
 // ErrRenderDigesterUnavailable is returned when the digester cannot mint a
@@ -380,6 +406,9 @@ const (
 	AuditRenderJobRead      RenderAuditAction = "render_job.read"
 	AuditRenderOutputRetry  RenderAuditAction = "render_job.output_retry"
 	AuditRenderOutputPlaced RenderAuditAction = "render_job.output_placed"
+	// AuditRenderProtectedAccess is recorded at the AuthorizedRender boundary
+	// BEFORE credential authorization and BEFORE prompt/asset plaintext release.
+	AuditRenderProtectedAccess RenderAuditAction = "render_job.protected_access"
 )
 
 // RenderAuditEvent is a secret-free product/security audit projection.

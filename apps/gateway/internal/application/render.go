@@ -504,7 +504,9 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	// Hold the create admission reservation through job terminal (complete /
 	// fail / cancel). Releasing here would free concurrency while the job is
 	// still executable (#8 Active Render Jobs / #14 residual occupancy).
-	service.observeSuccess(ctx, sc, ports.AuditRenderJobCreated, principal, published, 202)
+	if err := service.observeSuccess(ctx, sc, ports.AuditRenderJobCreated, principal, published, 202); err != nil {
+		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
 	return RenderJobResult{Job: published, RequestID: sc.requestID}, nil
 }
 
@@ -622,7 +624,9 @@ func (service *RenderService) GetRenderJob(ctx context.Context, query GetRenderJ
 		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
-	service.observeSuccess(ctx, sc, ports.AuditRenderJobRead, principal, job, 200)
+	if err := service.observeSuccess(ctx, sc, ports.AuditRenderJobRead, principal, job, 200); err != nil {
+		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
 	return RenderJobResult{Job: job, RequestID: sc.requestID}, nil
 }
 
@@ -685,7 +689,9 @@ func (service *RenderService) CancelRenderJob(ctx context.Context, command Cance
 		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(relErr))
 	}
 
-	service.observeSuccess(ctx, sc, ports.AuditRenderJobCanceled, principal, job, 200)
+	if err := service.observeSuccess(ctx, sc, ports.AuditRenderJobCanceled, principal, job, 200); err != nil {
+		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
 	return RenderJobResult{Job: job, RequestID: sc.requestID}, nil
 }
 
@@ -746,7 +752,9 @@ func (service *RenderService) RetryRenderJobOutput(ctx context.Context, command 
 		if relErr := service.release(ctx, reservation); relErr != nil {
 			return OutputDeliveryResult{}, service.fail(ctx, sc, service.dependencyCanonical(relErr))
 		}
-		service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, job, 202)
+		if err := service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, job, 202); err != nil {
+			return OutputDeliveryResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		}
 		return OutputDeliveryResult{Job: job, Entry: entry, RequestID: sc.requestID}, nil
 	}
 
@@ -761,7 +769,9 @@ func (service *RenderService) RetryRenderJobOutput(ctx context.Context, command 
 	if relErr := service.release(ctx, reservation); relErr != nil {
 		return OutputDeliveryResult{}, service.fail(ctx, sc, service.dependencyCanonical(relErr))
 	}
-	service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, result.Job, 202)
+	if err := service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, result.Job, 202); err != nil {
+		return OutputDeliveryResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
 	return OutputDeliveryResult{Job: result.Job, Entry: result.Entry, RequestID: sc.requestID}, nil
 }
 
@@ -796,6 +806,11 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 	job := claim.Job
 	fence := claim.FencingToken
+
+	// Claimed audit after durable fence grant (P1-B). Failure redelivers; no Provider yet.
+	if err := service.recordJobAudit(ctx, ports.AuditRenderJobClaimed, job, "success"); err != nil {
+		return err
+	}
 
 	// Queued cancel may have won; re-load and exit without Provider.
 	if job.Lifecycle == domain.JobCancelRequested || job.Lifecycle.Terminal() {
@@ -1228,7 +1243,9 @@ func (service *RenderService) persistAttempt(ctx context.Context, observation po
 // persistTerminal applies a terminal transition; only ErrStaleFence is discarded.
 // Other durable mutation errors return so redelivery can recover without a second render.
 // After terminal write, cleanup debt (prompt purge + admission settle) must succeed
-// or return so redelivery retries cleanup without Provider render.
+// or return so redelivery retries cleanup without Provider render. Terminal lifecycle
+// audits (completed/failed/canceled) surface Record errors so redelivery retries
+// audit without Provider re-render (Standards P1-B).
 func (service *RenderService) persistTerminal(ctx context.Context, job domain.RenderJob, transition ports.FencedTransition) error {
 	terminal, err := service.fencedTerminal(ctx, job.TenantID, transition)
 	if err != nil {
@@ -1237,10 +1254,46 @@ func (service *RenderService) persistTerminal(ctx context.Context, job domain.Re
 		}
 		return err
 	}
-	if terminal.Lifecycle.Terminal() {
-		return service.finishTerminalCleanup(ctx, terminal)
+	if !terminal.Lifecycle.Terminal() {
+		return nil
 	}
-	return nil
+	if err := service.finishTerminalCleanup(ctx, terminal); err != nil {
+		return err
+	}
+	return service.recordJobAudit(ctx, terminalAuditAction(terminal.Lifecycle), terminal, "success")
+}
+
+func terminalAuditAction(state domain.JobLifecycleState) ports.RenderAuditAction {
+	switch state {
+	case domain.JobCompleted:
+		return ports.AuditRenderJobCompleted
+	case domain.JobCanceled:
+		return ports.AuditRenderJobCanceled
+	default:
+		return ports.AuditRenderJobFailed
+	}
+}
+
+// recordJobAudit writes a secret-free worker/lifecycle audit event. Errors are
+// never ignored (P1-B): callers surface them for redelivery without re-render.
+func (service *RenderService) recordJobAudit(
+	ctx context.Context,
+	action ports.RenderAuditAction,
+	job domain.RenderJob,
+	outcome string,
+) error {
+	if service.audit == nil {
+		return ports.ErrDependencyUnavailable
+	}
+	return service.audit.Record(ctx, ports.RenderAuditEvent{
+		Action:         action,
+		TenantID:       job.TenantID,
+		ClientAPIKeyID: job.ClientAPIKeyID,
+		JobID:          job.JobID,
+		AccountID:      job.ProviderAccountID,
+		Outcome:        outcome,
+		Lifecycle:      job.Lifecycle,
+	})
 }
 
 // preflightExecute re-gates Account/Health/Capability/model/Input Assets and
@@ -1395,7 +1448,11 @@ func (service *RenderService) placeEntryFromStaging(
 		}
 		return err
 	}
-	return placeErr
+	if placeErr != nil {
+		return placeErr
+	}
+	// Output placed audit after durable placement (P1-B).
+	return service.recordJobAudit(ctx, ports.AuditRenderOutputPlaced, job, "success")
 }
 
 func (service *RenderService) placeOutputBytes(
@@ -1813,8 +1870,13 @@ func (service *RenderService) fail(ctx context.Context, sc spineContext, canonic
 	return canonical
 }
 
-func (service *RenderService) observeSuccess(ctx context.Context, sc spineContext, action ports.RenderAuditAction, principal domain.SecurityPrincipal, job domain.RenderJob, statusCode int) {
-	_ = service.audit.Record(ctx, ports.RenderAuditEvent{
+// observeSuccess records product audit + telemetry for a successful HTTP path.
+// Audit Record errors are never ignored (P1-B); callers must fail closed.
+func (service *RenderService) observeSuccess(ctx context.Context, sc spineContext, action ports.RenderAuditAction, principal domain.SecurityPrincipal, job domain.RenderJob, statusCode int) error {
+	if service.audit == nil {
+		return ports.ErrDependencyUnavailable
+	}
+	if err := service.audit.Record(ctx, ports.RenderAuditEvent{
 		Action:         action,
 		TenantID:       principal.TenantID,
 		ClientAPIKeyID: principal.ClientAPIKeyID,
@@ -1823,9 +1885,12 @@ func (service *RenderService) observeSuccess(ctx context.Context, sc spineContex
 		RequestID:      sc.requestID,
 		Outcome:        "success",
 		Lifecycle:      job.Lifecycle,
-	})
+	}); err != nil {
+		return err
+	}
 	service.recordTelemetry(ctx, sc.operation, "", statusCode)
 	service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), statusCode, "ok", sc.start)
+	return nil
 }
 
 func (service *RenderService) recordTelemetry(ctx context.Context, operation domain.OperationToken, code domain.ErrorCode, statusCode int) {

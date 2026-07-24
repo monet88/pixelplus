@@ -115,6 +115,10 @@ type Dependencies struct {
 	RenderStaging    ports.RenderStagingStore
 	AuthorizedRender ports.AuthorizedRender
 	RenderAudit      ports.RenderAuditRecorder
+	// RenderCredentialAuthorizer mints callback-scoped credential material for
+	// Adapter entry (ADR 0009). Production missing inject stays not-ready;
+	// AllowInMemory fixtures install a permissive fixture authorizer.
+	RenderCredentialAuthorizer ports.RenderCredentialAuthorizer
 	// RenderDigester produces keyed create fingerprints. Production without an
 	// injected digester (or fixture AllowInMemory key) fails readiness closed.
 	RenderDigester ports.RenderDigester
@@ -244,19 +248,32 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	digester, digesterUsable := resolveRenderDigester(config, dependencies)
 	dependencies.RenderDigester = digester
 
-	// ADR 0009: replay/job recovery (and render confidential/staging durability)
-	// must be restored before Ready. Production without explicit durable render
-	// ports or controlled in-memory mode keeps readiness closed so /readyz does
-	// not advertise execution readiness against unavailable stores.
-	renderDurabilityReady := (config.AllowInMemoryRenderJobs ||
+	// Materialize controlled in-memory render ports before Restore so recovery
+	// runs on the instances that will serve product work (Standards P1-C).
+	if config.AllowInMemoryRenderJobs {
+		ensureInMemoryRenderPorts(&dependencies)
+	}
+
+	// Recovery-before-ready (P1-C): restore job/replay/prompt/staging when present.
+	// Missing production injects keep readiness closed via durability gate below;
+	// explicit Unavailable injects fail Restore and also keep readiness closed.
+	renderRestoreErr := restoreRenderPorts(startupContext, dependencies)
+	if renderRestoreErr != nil {
+		logger.Error("render durability startup recovery failed; readiness stays closed", "error", renderRestoreErr)
+	}
+
+	// ADR 0009 / P1-A/C: production without durable render ports + credential
+	// authorizer + usable digester must not advertise execution readiness.
+	// Fixtures use AllowInMemoryRenderJobs (auto memory + fixture authorizer).
+	renderDurabilityReady := digesterUsable && renderRestoreErr == nil && (config.AllowInMemoryRenderJobs ||
 		(dependencies.RenderJobs != nil &&
 			dependencies.RenderReplay != nil &&
 			dependencies.RenderPrompts != nil &&
-			dependencies.RenderStaging != nil)) && digesterUsable
+			dependencies.RenderStaging != nil &&
+			dependencies.RenderCredentialAuthorizer != nil))
 	if !renderDurabilityReady {
-		logger.Error("render job durability or usable digester not configured; readiness stays closed")
+		logger.Error("render job durability, authorizer, or usable digester not configured; readiness stays closed")
 	}
-	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil && jobRestoreErr == nil && renderDurabilityReady)
 
 	service, err := newProviderAccountService(dependencies)
 	if err != nil {
@@ -286,7 +303,64 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	runtime.worker = renderService
 	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service, renderService)
 
+	// Pre-ready QueuePublished recovery (P1-C): internal path has no Ready guard
+	// so startup can re-publish without circular dependency. Failure keeps Ready
+	// closed and blocks workers — never warn-and-continue.
+	unpublishedErr := runtime.recoverUnpublishedQueues(startupContext)
+	if unpublishedErr != nil {
+		logger.Error("unpublished queue recovery failed; readiness stays closed", "error", unpublishedErr)
+	}
+
+	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil &&
+		jobRestoreErr == nil && renderRestoreErr == nil && unpublishedErr == nil && renderDurabilityReady)
+
 	return runtime, nil
+}
+
+// ensureInMemoryRenderPorts installs process-local controlled render foundations
+// for fixture AllowInMemory mode before Restore/Ready evaluation.
+func ensureInMemoryRenderPorts(dependencies *Dependencies) {
+	if dependencies == nil {
+		return
+	}
+	if dependencies.RenderJobs == nil {
+		dependencies.RenderJobs = persistence.NewMemoryRenderJobStore()
+	}
+	if dependencies.RenderReplay == nil {
+		dependencies.RenderReplay = persistence.NewMemoryRenderReplayStore()
+	}
+	if dependencies.RenderPrompts == nil {
+		dependencies.RenderPrompts = vaultpkg.NewMemoryRenderPromptStore()
+	}
+	if dependencies.RenderStaging == nil {
+		dependencies.RenderStaging = persistence.NewMemoryRenderStagingStore()
+	}
+	if dependencies.RenderCredentialAuthorizer == nil {
+		dependencies.RenderCredentialAuthorizer = vaultpkg.NewPermissiveFixtureRenderCredentialAuthorizer()
+	}
+}
+
+// restoreRenderPorts runs Restorer.Restore on present render durability ports.
+func restoreRenderPorts(ctx context.Context, dependencies Dependencies) error {
+	var first error
+	for _, candidate := range []any{
+		dependencies.RenderJobs,
+		dependencies.RenderReplay,
+		dependencies.RenderPrompts,
+		dependencies.RenderStaging,
+	} {
+		if candidate == nil {
+			continue
+		}
+		restorer, ok := candidate.(ports.Restorer)
+		if !ok {
+			continue
+		}
+		if err := restorer.Restore(ctx); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // newProviderAccountService wires the Provider Account request-spine service.
@@ -508,16 +582,31 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 			prompts = vaultpkg.NewFailClosedRenderPromptStore()
 		}
 	}
+	audit := dependencies.RenderAudit
+	if audit == nil {
+		audit = observability.NewSlogRenderAuditRecorder(dependencies.Logger)
+	}
 	authorized := dependencies.AuthorizedRender
 	if authorized == nil {
 		adapter := dependencies.RenderAdapter
 		if adapter == nil {
 			adapter = vaultpkg.NewFailClosedRenderAdapter()
 		}
+		// P1-A: credential capability is vault-owned; production without inject
+		// uses fail-closed authorizer (Adapter never entered). Fixtures use the
+		// permissive fixture authorizer installed by ensureInMemoryRenderPorts.
+		authorizer := dependencies.RenderCredentialAuthorizer
+		if authorizer == nil {
+			if config.AllowInMemoryRenderJobs {
+				authorizer = vaultpkg.NewPermissiveFixtureRenderCredentialAuthorizer()
+			} else {
+				authorizer = vaultpkg.NewFailClosedRenderCredentialAuthorizer()
+			}
+		}
 		if prompts != nil && adapter != nil && staging != nil {
 			// content is required so edit/inpaint can inject same-Tenant Asset
 			// bytes inside the authorized boundary without application seeing them.
-			authorized = vaultpkg.NewAuthorizedRenderService(prompts, vault, adapter, staging, content)
+			authorized = vaultpkg.NewAuthorizedRenderService(prompts, authorizer, adapter, staging, content, audit)
 		} else {
 			authorized = vaultpkg.NewFailClosedAuthorizedRender()
 		}
@@ -526,10 +615,6 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 	digester := dependencies.RenderDigester
 	if digester == nil {
 		digester, _ = resolveRenderDigester(config, dependencies)
-	}
-	audit := dependencies.RenderAudit
-	if audit == nil {
-		audit = observability.NewSlogRenderAuditRecorder(dependencies.Logger)
 	}
 	telemetry := dependencies.Telemetry
 	if telemetry == nil {
@@ -617,9 +702,18 @@ func (runtime *Runtime) Ready() bool {
 }
 
 // RecoverUnpublishedQueues re-enqueues durable jobs with QueuePublished=false
-// without a client retry. Safe to call after startup when Ready.
+// without a client retry. Public entry requires Ready (post-startup operators).
 func (runtime *Runtime) RecoverUnpublishedQueues(ctx context.Context) error {
 	if runtime == nil || !runtime.Ready() {
+		return ErrNotReady
+	}
+	return runtime.recoverUnpublishedQueues(ctx)
+}
+
+// recoverUnpublishedQueues is the internal recovery path used before Ready and
+// from RunWorkers. It must not check Ready (avoids circular startup guard, P1-C).
+func (runtime *Runtime) recoverUnpublishedQueues(ctx context.Context) error {
+	if runtime == nil {
 		return ErrNotReady
 	}
 	if recoverer, ok := runtime.worker.(interface {
@@ -637,9 +731,9 @@ func (runtime *Runtime) RunWorkers(ctx context.Context) error {
 	}
 
 	// Autonomous publication recovery before consuming the queue (#14 §3.3).
-	if err := runtime.RecoverUnpublishedQueues(ctx); err != nil {
-		runtime.logger.Warn("unpublished queue recovery incomplete", "error", err)
-		// Continue workers; remaining unpublished jobs stay recoverable.
+	// Required recovery failures fail closed — never warn-and-continue (P1-C).
+	if err := runtime.recoverUnpublishedQueues(ctx); err != nil {
+		return err
 	}
 
 	workerContext, cancelWorkers := context.WithCancel(ctx)

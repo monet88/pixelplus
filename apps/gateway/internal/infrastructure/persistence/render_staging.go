@@ -27,6 +27,9 @@ func NewMemoryRenderStagingStore() *MemoryRenderStagingStore {
 	return &MemoryRenderStagingStore{byKey: make(map[string]stagedBlob)}
 }
 
+// Restore is a no-op for process-local memory (already in-memory).
+func (*MemoryRenderStagingStore) Restore(context.Context) error { return nil }
+
 func stagingKey(id ports.StagingIdentity) string {
 	return string(id.TenantID) + "/" + string(id.JobID) + "/" + string(id.ManifestID) + "/" + string(id.EntryID) + "/" + id.Checksum
 }
@@ -97,7 +100,14 @@ func (*UnavailableRenderStagingStore) Use(context.Context, ports.StagingAccess, 
 	return ports.ErrDependencyUnavailable
 }
 
+// Restore fails closed so composition keeps readiness closed when this store is wired.
+func (*UnavailableRenderStagingStore) Restore(context.Context) error {
+	return ports.ErrDependencyUnavailable
+}
+
 var (
 	_ ports.RenderStagingStore = (*MemoryRenderStagingStore)(nil)
 	_ ports.RenderStagingStore = (*UnavailableRenderStagingStore)(nil)
+	_ ports.Restorer           = (*MemoryRenderStagingStore)(nil)
+	_ ports.Restorer           = (*UnavailableRenderStagingStore)(nil)
 )

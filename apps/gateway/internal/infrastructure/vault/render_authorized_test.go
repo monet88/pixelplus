@@ -31,7 +31,7 @@ type capturePromptAdapter struct {
 	seen atomic.Value
 }
 
-func (a *capturePromptAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection, _ ports.InputAssetInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (a *capturePromptAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection, _ ports.InputAssetInjection, _ ports.CredentialInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	if prompt != nil {
 		_ = prompt.Use(func(p string) error {
 			a.seen.Store(p)
@@ -49,13 +49,39 @@ func (a *capturePromptAdapter) Render(_ context.Context, _ ports.RenderCommand, 
 	}, nil
 }
 
-type alwaysValidVault struct{}
-
-func (alwaysValidVault) Put(context.Context, ports.CredentialIntake) error { return nil }
-func (alwaysValidVault) Validate(context.Context, ports.CredentialValidation) (ports.CredentialValidationResult, error) {
-	return ports.CredentialValidationResult{Valid: true}, nil
+// fixtureAuthorizer mints opaque material for unit tests of AuthorizedRender.
+func fixtureAuthorizer() ports.RenderCredentialAuthorizer {
+	return vaultpkg.NewPermissiveFixtureRenderCredentialAuthorizer()
 }
-func (alwaysValidVault) Revoke(context.Context, ports.CredentialValidation) error { return nil }
+
+// noopAudit succeeds every Record (unit tests that do not assert audit order).
+type noopAudit struct{}
+
+func (noopAudit) Record(context.Context, ports.RenderAuditEvent) error { return nil }
+
+// recordingAudit captures protected-access order for P1-B proofs.
+type recordingAudit struct {
+	actions []ports.RenderAuditAction
+	fail    error
+}
+
+func (a *recordingAudit) Record(_ context.Context, event ports.RenderAuditEvent) error {
+	if a.fail != nil {
+		return a.fail
+	}
+	a.actions = append(a.actions, event.Action)
+	return nil
+}
+
+// countingAdapter counts Render entries (proves Adapter never entered).
+type countingAdapter struct {
+	calls atomic.Int32
+}
+
+func (a *countingAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.InputAssetInjection, ports.CredentialInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+	a.calls.Add(1)
+	return domain.RenderOutcome{Class: domain.RenderOutcomeSuccess, Commit: domain.CommitCommitted}, nil
+}
 
 // countingSendBoundary records when MarkPayloadSent is invoked.
 type countingSendBoundary struct {
@@ -75,7 +101,7 @@ type markThenFailAdapter struct {
 	fail error
 }
 
-func (a *markThenFailAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.InputAssetInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (a *markThenFailAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.InputAssetInjection, ports.CredentialInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	return domain.RenderOutcome{}, a.fail
 }
 
@@ -100,7 +126,7 @@ type captureAssetAdapter struct {
 	mask  atomic.Value
 }
 
-func (a *captureAssetAdapter) Render(_ context.Context, _ ports.RenderCommand, _ ports.PromptInjection, assets ports.InputAssetInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (a *captureAssetAdapter) Render(_ context.Context, _ ports.RenderCommand, _ ports.PromptInjection, assets ports.InputAssetInjection, _ ports.CredentialInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	if assets != nil {
 		_ = assets.Use(func(inputs []ports.InputAssetMaterial, mask *ports.InputAssetMaterial) error {
 			if len(inputs) > 0 {
@@ -130,7 +156,7 @@ func TestAuthorizedRenderInjectsInputAndMaskAssetBytes(t *testing.T) {
 		"asset_msk": {ContentType: domain.ContentTypePNG, Data: []byte("MASK-BYTES")},
 	}}
 	adapter := &captureAssetAdapter{}
-	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, &stubStaging{}, content)
+	auth := vaultpkg.NewAuthorizedRenderService(prompts, fixtureAuthorizer(), adapter, &stubStaging{}, content, noopAudit{})
 	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
 		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
 		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_edit"},
@@ -164,7 +190,7 @@ func TestPayloadSendBoundaryOnlyAtAdapterEntry(t *testing.T) {
 	staging := &stubStaging{}
 	boundary := &countingSendBoundary{}
 	// No prompt stored → Use fails before MarkPayloadSent.
-	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, &capturePromptAdapter{}, staging, nil)
+	auth := vaultpkg.NewAuthorizedRenderService(prompts, fixtureAuthorizer(), &capturePromptAdapter{}, staging, nil, noopAudit{})
 	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
 		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
 		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_pre"},
@@ -192,7 +218,7 @@ func TestPayloadSendBoundaryOnlyAtAdapterEntry(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 	adapter := &markThenFailAdapter{fail: errors.New("adapter boom")}
-	auth = vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, staging, nil)
+	auth = vaultpkg.NewAuthorizedRenderService(prompts, fixtureAuthorizer(), adapter, staging, nil, noopAudit{})
 	boundary2 := &countingSendBoundary{}
 	_, err = auth.Render(context.Background(), ports.AuthorizedRenderRequest{
 		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
@@ -221,7 +247,7 @@ func TestAuthorizedRenderInjectsPromptViaUseNotCommand(t *testing.T) {
 	prompts := vaultpkg.NewMemoryRenderPromptStore()
 	staging := &stubStaging{}
 	adapter := &capturePromptAdapter{}
-	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, staging, nil)
+	auth := vaultpkg.NewAuthorizedRenderService(prompts, fixtureAuthorizer(), adapter, staging, nil, noopAudit{})
 
 	if err := prompts.Put(context.Background(), ports.RenderPromptIntake{
 		TenantID: "tenant_a",
@@ -287,5 +313,143 @@ func TestFailClosedPromptStoreRejectsPut(t *testing.T) {
 	})
 	if !errors.Is(err, ports.ErrDependencyUnavailable) {
 		t.Fatalf("Put error = %v, want ErrDependencyUnavailable", err)
+	}
+}
+
+// P1-A: fail-closed authorizer never enters Adapter (no CredentialInjection mint).
+func TestFailClosedAuthorizerNeverEntersAdapter(t *testing.T) {
+	t.Parallel()
+
+	prompts := vaultpkg.NewMemoryRenderPromptStore()
+	_ = prompts.Put(context.Background(), ports.RenderPromptIntake{
+		TenantID: "tenant_a", JobID: "job_authz", Material: "p",
+	})
+	adapter := &countingAdapter{}
+	auth := vaultpkg.NewAuthorizedRenderService(
+		prompts,
+		vaultpkg.NewFailClosedRenderCredentialAuthorizer(),
+		adapter,
+		&stubStaging{},
+		nil,
+		noopAudit{},
+	)
+	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
+		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_authz"},
+		AccountID: "pa_1",
+		Version:   1,
+		Invocation: domain.RenderInvocation{
+			TenantID: "tenant_a", JobID: "job_authz", AttemptID: "att_1", Model: "m",
+		},
+		Capture: ports.RenderCapturePlan{
+			TenantID: "tenant_a", JobID: "job_authz", AttemptID: "att_1", ManifestID: "man_1",
+		},
+	})
+	if !errors.Is(err, ports.ErrCredentialAbsent) {
+		t.Fatalf("Render err = %v, want ErrCredentialAbsent", err)
+	}
+	if adapter.calls.Load() != 0 {
+		t.Fatalf("Adapter calls = %d, want 0", adapter.calls.Load())
+	}
+}
+
+// P1-B: audit failure before authorize blocks Adapter and plaintext release.
+func TestAuditFailureBeforeAuthorizeBlocksAdapter(t *testing.T) {
+	t.Parallel()
+
+	prompts := vaultpkg.NewMemoryRenderPromptStore()
+	_ = prompts.Put(context.Background(), ports.RenderPromptIntake{
+		TenantID: "tenant_a", JobID: "job_audit", Material: "secret",
+	})
+	adapter := &countingAdapter{}
+	audit := &recordingAudit{fail: ports.ErrDependencyUnavailable}
+	auth := vaultpkg.NewAuthorizedRenderService(
+		prompts, fixtureAuthorizer(), adapter, &stubStaging{}, nil, audit,
+	)
+	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
+		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_audit"},
+		AccountID: "pa_1",
+		Version:   1,
+		Invocation: domain.RenderInvocation{
+			TenantID: "tenant_a", JobID: "job_audit", AttemptID: "att_1", Model: "m",
+		},
+		Capture: ports.RenderCapturePlan{
+			TenantID: "tenant_a", JobID: "job_audit", AttemptID: "att_1", ManifestID: "man_1",
+		},
+	})
+	if !errors.Is(err, ports.ErrDependencyUnavailable) {
+		t.Fatalf("Render err = %v, want audit dependency failure", err)
+	}
+	if adapter.calls.Load() != 0 {
+		t.Fatalf("Adapter calls = %d, want 0 after audit failure", adapter.calls.Load())
+	}
+}
+
+// P1-B: protected_access is recorded before Adapter entry on the success path.
+func TestProtectedAccessAuditBeforeAdapter(t *testing.T) {
+	t.Parallel()
+
+	prompts := vaultpkg.NewMemoryRenderPromptStore()
+	_ = prompts.Put(context.Background(), ports.RenderPromptIntake{
+		TenantID: "tenant_a", JobID: "job_order", Material: "p",
+	})
+	audit := &recordingAudit{}
+	adapter := &countingAdapter{}
+	auth := vaultpkg.NewAuthorizedRenderService(
+		prompts, fixtureAuthorizer(), adapter, &stubStaging{}, nil, audit,
+	)
+	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
+		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_order"},
+		AccountID: "pa_1",
+		Version:   1,
+		Invocation: domain.RenderInvocation{
+			TenantID: "tenant_a", JobID: "job_order", AttemptID: "att_1", Model: "m",
+		},
+		Capture: ports.RenderCapturePlan{
+			TenantID: "tenant_a", JobID: "job_order", AttemptID: "att_1", ManifestID: "man_1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(audit.actions) == 0 || audit.actions[0] != ports.AuditRenderProtectedAccess {
+		t.Fatalf("audit actions = %v, want protected_access first", audit.actions)
+	}
+	if adapter.calls.Load() != 1 {
+		t.Fatalf("Adapter calls = %d, want 1", adapter.calls.Load())
+	}
+}
+
+// P1-B: missing audit recorder fails closed (no skip of protected-access).
+func TestMissingAuditFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	prompts := vaultpkg.NewMemoryRenderPromptStore()
+	_ = prompts.Put(context.Background(), ports.RenderPromptIntake{
+		TenantID: "tenant_a", JobID: "job_no_audit", Material: "p",
+	})
+	adapter := &countingAdapter{}
+	auth := vaultpkg.NewAuthorizedRenderService(
+		prompts, fixtureAuthorizer(), adapter, &stubStaging{}, nil, nil,
+	)
+	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
+		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_no_audit"},
+		AccountID: "pa_1",
+		Version:   1,
+		Invocation: domain.RenderInvocation{
+			TenantID: "tenant_a", JobID: "job_no_audit", AttemptID: "att_1", Model: "m",
+		},
+		Capture: ports.RenderCapturePlan{
+			TenantID: "tenant_a", JobID: "job_no_audit", AttemptID: "att_1", ManifestID: "man_1",
+		},
+	})
+	if !errors.Is(err, ports.ErrDependencyUnavailable) {
+		t.Fatalf("Render err = %v, want ErrDependencyUnavailable", err)
+	}
+	if adapter.calls.Load() != 0 {
+		t.Fatalf("Adapter calls = %d, want 0", adapter.calls.Load())
 	}
 }

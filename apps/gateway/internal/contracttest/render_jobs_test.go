@@ -173,7 +173,7 @@ type countingRenderAdapter struct {
 	lastMask  atomic.Value // []byte
 }
 
-func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, assets ports.InputAssetInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, assets ports.InputAssetInjection, cred ports.CredentialInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	adapter.harness.renderCalls.Add(1)
 	adapter.lastAuthMode.Store(cmd.AuthMode)
 	if prompt != nil {

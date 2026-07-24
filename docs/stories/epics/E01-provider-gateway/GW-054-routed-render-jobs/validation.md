@@ -60,5 +60,16 @@ GitNexus detect_changes(scope=compare, base_ref=main)
 
 ## Acceptance Evidence
 
-Pending implementation and independent verification.
+Standards P1-A/B/C security capability (credential authorizer, audit-before-allow,
+recovery-before-ready) is implemented on `feature/issue-54-routed-render-jobs`
+with focused package tests green. Remaining queue/E2E hardening (nonblocking
+publication, `controlledJobRuntime` delivery, create→`RunWorkers`→GET completed)
+is tracked as a separate local wave and is not mixed into the standards commit.
+
+Proof commands (from `apps/gateway`):
+
+```text
+go test ./internal/composition/ ./internal/infrastructure/vault/ ./internal/application/ ./internal/infrastructure/persistence/ ./internal/contracttest/ -count=1
+go test ./... -count=1
+```
 

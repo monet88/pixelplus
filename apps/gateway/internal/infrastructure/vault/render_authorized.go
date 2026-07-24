@@ -61,6 +61,9 @@ func (store *MemoryRenderPromptStore) Delete(_ context.Context, access ports.Ren
 	return nil
 }
 
+// Restore is a no-op for process-local memory (already in-memory).
+func (*MemoryRenderPromptStore) Restore(context.Context) error { return nil }
+
 // Len reports retained prompt count (test observation only).
 func (store *MemoryRenderPromptStore) Len() int {
 	store.mu.Lock()
@@ -137,67 +140,70 @@ func (s *stagingCaptureSink) manifest() domain.ResultManifest {
 	}
 }
 
-// AuthorizedRenderService is the protected render boundary.
-//
-// Limitation (honest): CredentialVault currently supports only Validate/Put/Revoke —
-// credential plaintext is not injected into the Adapter. When Vault.Render(SecretMaterial)
-// lands it must inject credentials inside the Vault without returning them to application.
-// Input/mask Asset bytes are fetched here and injected into the Adapter without
-// returning content to application.
+// AuthorizedRenderService is the protected render boundary (ADR 0009).
+// Credential material is minted only via RenderCredentialAuthorizer (never
+// Validate-only). Audit-before-allow records protected access intent before any
+// credential/prompt/asset plaintext release.
 type AuthorizedRenderService struct {
-	prompts ports.RenderPromptStore
-	vault   ports.CredentialVault
-	adapter ports.RenderAdapter
-	staging ports.RenderStagingStore
-	content ports.AssetContentStore
+	prompts    ports.RenderPromptStore
+	authorizer ports.RenderCredentialAuthorizer
+	adapter    ports.RenderAdapter
+	staging    ports.RenderStagingStore
+	content    ports.AssetContentStore
+	audit      ports.RenderAuditRecorder
 }
 
 // NewAuthorizedRenderService wires the authorized render boundary.
-// content may be nil only for generation-only fixtures that never resolve inputs.
 func NewAuthorizedRenderService(
 	prompts ports.RenderPromptStore,
-	vault ports.CredentialVault,
+	authorizer ports.RenderCredentialAuthorizer,
 	adapter ports.RenderAdapter,
 	staging ports.RenderStagingStore,
 	content ports.AssetContentStore,
+	audit ports.RenderAuditRecorder,
 ) *AuthorizedRenderService {
-	if vault == nil {
-		vault = NewFailClosedCredentialVault()
+	if authorizer == nil {
+		authorizer = NewFailClosedRenderCredentialAuthorizer()
 	}
 	return &AuthorizedRenderService{
-		prompts: prompts,
-		vault:   vault,
-		adapter: adapter,
-		staging: staging,
-		content: content,
+		prompts:    prompts,
+		authorizer: authorizer,
+		adapter:    adapter,
+		staging:    staging,
+		content:    content,
+		audit:      audit,
 	}
 }
 
-// Render resolves Vault Validate + prompt Use + input/mask Asset bytes, invokes
-// the Adapter with a capture sink that stages bytes, and returns only safe
-// manifest metadata. Asset/prompt bytes never cross into application.
+// Render audits protected-access intent, authorizes credentials, resolves
+// prompt/input assets, invokes Adapter with Use-scoped injections, and returns
+// only safe manifest metadata.
 func (service *AuthorizedRenderService) Render(ctx context.Context, request ports.AuthorizedRenderRequest) (domain.RenderOutcome, error) {
-	if service.prompts == nil || service.adapter == nil || service.staging == nil {
+	if service.prompts == nil || service.adapter == nil || service.staging == nil || service.authorizer == nil {
 		return domain.RenderOutcome{}, ports.ErrRenderAdapterUnavailable
 	}
-	validation, err := service.vault.Validate(ctx, ports.CredentialValidation{
+
+	// Audit-before-allow (P1-B): intent must succeed before any secret/plaintext
+	// release. Missing audit fails closed — never skip protected-access record.
+	if service.audit == nil {
+		return domain.RenderOutcome{}, ports.ErrDependencyUnavailable
+	}
+	if err := service.audit.Record(ctx, ports.RenderAuditEvent{
+		Action:         ports.AuditRenderProtectedAccess,
+		TenantID:       request.Principal.TenantID,
+		ClientAPIKeyID: request.Principal.ClientAPIKeyID,
+		JobID:          request.JobRef.JobID,
+		AccountID:      request.AccountID,
+		Outcome:        "intent",
+	}); err != nil {
+		return domain.RenderOutcome{}, err
+	}
+
+	validation := ports.CredentialValidation{
 		Principal: request.Principal,
 		AccountID: request.AccountID,
 		AuthMode:  request.AuthMode,
 		Version:   request.Version,
-	})
-	if err != nil {
-		return domain.RenderOutcome{}, err
-	}
-	// Valid=false is a usability reject, not only a dependency error (#15/#46).
-	if !validation.Valid {
-		return domain.RenderOutcome{}, ports.ErrCredentialAbsent
-	}
-
-	// Resolve input/mask Asset bytes inside the protected boundary only.
-	assetInjection, err := service.loadInputAssets(ctx, request)
-	if err != nil {
-		return domain.RenderOutcome{}, err
 	}
 
 	plan := request.Capture
@@ -213,36 +219,42 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 	if plan.ManifestID == "" && plan.AttemptID != "" {
 		plan.ManifestID = domain.NewResultManifestID(plan.AttemptID)
 	}
-
 	sink := &stagingCaptureSink{ctx: ctx, staging: service.staging, plan: plan}
+
 	var outcome domain.RenderOutcome
 	var renderErr error
-	access := ports.RenderPromptAccess{
-		TenantID: domain.TenantID(request.JobRef.TenantID),
-		JobID:    request.JobRef.JobID,
-	}
-	err = service.prompts.Use(ctx, access, func(plaintext string) error {
-		injection := promptInjection{material: plaintext}
-		// Send-boundary fact: durable PayloadSent only when Adapter entry is
-		// imminent — after Validate + confidential resolve, not earlier.
-		if request.SendBoundary != nil {
-			if markErr := request.SendBoundary.MarkPayloadSent(ctx); markErr != nil {
-				return markErr
-			}
+
+	// Credential capability first: fail-closed without Adapter entry.
+	err := service.authorizer.Authorize(ctx, validation, func(cred ports.CredentialInjection) error {
+		// Asset/prompt plaintext only after credential authorization accepted.
+		assetInjection, err := service.loadInputAssets(ctx, request)
+		if err != nil {
+			return err
 		}
-		outcome, renderErr = service.adapter.Render(ctx, ports.RenderCommand{
-			Principal:  request.Principal,
-			AccountID:  request.AccountID,
-			AuthMode:   request.AuthMode,
-			Version:    request.Version,
-			Invocation: request.Invocation,
-		}, injection, assetInjection, sink)
-		return renderErr
+		access := ports.RenderPromptAccess{
+			TenantID: domain.TenantID(request.JobRef.TenantID),
+			JobID:    request.JobRef.JobID,
+		}
+		return service.prompts.Use(ctx, access, func(plaintext string) error {
+			injection := promptInjection{material: plaintext}
+			if request.SendBoundary != nil {
+				if markErr := request.SendBoundary.MarkPayloadSent(ctx); markErr != nil {
+					return markErr
+				}
+			}
+			outcome, renderErr = service.adapter.Render(ctx, ports.RenderCommand{
+				Principal:  request.Principal,
+				AccountID:  request.AccountID,
+				AuthMode:   request.AuthMode,
+				Version:    request.Version,
+				Invocation: request.Invocation,
+			}, injection, assetInjection, cred, sink)
+			return renderErr
+		})
 	})
 	if err != nil {
 		return domain.RenderOutcome{}, err
 	}
-	// Attach safe staged metadata for successful/committed paths.
 	if outcome.Class == domain.RenderOutcomeSuccess || outcome.Class == domain.RenderOutcomeCommitted {
 		outcome.Manifest = sink.manifest()
 		if outcome.Commit == "" {
@@ -280,12 +292,9 @@ func (service *AuthorizedRenderService) loadInputAssets(ctx context.Context, req
 		if err != nil {
 			return nil, err
 		}
-		// Copy so Adapter cannot observe shared backing store slices.
 		data := append([]byte(nil), content.Data...)
 		inputs = append(inputs, ports.InputAssetMaterial{
-			AssetID:     id,
-			ContentType: content.ContentType,
-			Data:        data,
+			AssetID: id, ContentType: content.ContentType, Data: data,
 		})
 	}
 	var mask *ports.InputAssetMaterial
@@ -296,9 +305,7 @@ func (service *AuthorizedRenderService) loadInputAssets(ctx context.Context, req
 		}
 		data := append([]byte(nil), content.Data...)
 		m := ports.InputAssetMaterial{
-			AssetID:     request.MaskAssetID,
-			ContentType: content.ContentType,
-			Data:        data,
+			AssetID: request.MaskAssetID, ContentType: content.ContentType, Data: data,
 		}
 		mask = &m
 	}
@@ -335,12 +342,6 @@ func (*FailClosedRenderPromptStore) Use(context.Context, ports.RenderPromptAcces
 func (*FailClosedRenderPromptStore) Delete(context.Context, ports.RenderPromptAccess) error {
 	return nil
 }
-
-var (
-	_ ports.RenderPromptStore = (*MemoryRenderPromptStore)(nil)
-	_ ports.RenderPromptStore = (*FailClosedRenderPromptStore)(nil)
-	_ ports.AuthorizedRender  = (*AuthorizedRenderService)(nil)
-	_ ports.AuthorizedRender  = (*FailClosedAuthorizedRender)(nil)
-	_ ports.PromptInjection   = promptInjection{}
-	_ ports.RenderCaptureSink = (*stagingCaptureSink)(nil)
-)
+func (*FailClosedRenderPromptStore) Restore(context.Context) error {
+	return ports.ErrDependencyUnavailable
+}

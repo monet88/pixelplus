@@ -40,6 +40,9 @@ func NewMemoryRenderJobStore() *MemoryRenderJobStore {
 	}
 }
 
+// Restore is a no-op for process-local memory (already in-memory).
+func (*MemoryRenderJobStore) Restore(context.Context) error { return nil }
+
 func (store *MemoryRenderJobStore) tenantJobs(tenant domain.TenantID) map[domain.Identifier]domain.RenderJob {
 	jobs, ok := store.byTenant[tenant]
 	if !ok {
@@ -701,6 +704,11 @@ func (*UnavailableRenderJobStore) MarkPromptPurged(context.Context, domain.JobRe
 	return domain.RenderJob{}, ports.ErrDependencyUnavailable
 }
 
+// Restore fails closed so composition keeps readiness closed when this store is wired.
+func (*UnavailableRenderJobStore) Restore(context.Context) error {
+	return ports.ErrDependencyUnavailable
+}
+
 // MemoryRenderReplayStore is the process-local create-idempotency store for
 // image jobs (controlled/in-process; not restart-durable).
 type MemoryRenderReplayStore struct {
@@ -718,6 +726,9 @@ type renderReplayRecord struct {
 func NewMemoryRenderReplayStore() *MemoryRenderReplayStore {
 	return &MemoryRenderReplayStore{records: make(map[domain.ReplayScope]*renderReplayRecord)}
 }
+
+// Restore is a no-op for process-local memory (already in-memory).
+func (*MemoryRenderReplayStore) Restore(context.Context) error { return nil }
 
 // Claim atomically binds the scope+key to the fingerprint or resolves a repeat.
 func (store *MemoryRenderReplayStore) Claim(_ context.Context, identity domain.ReplayIdentity) (ports.RenderReplayDecision, error) {
@@ -773,4 +784,7 @@ var (
 	_ ports.RenderJobStore    = (*MemoryRenderJobStore)(nil)
 	_ ports.RenderJobStore    = (*UnavailableRenderJobStore)(nil)
 	_ ports.RenderReplayStore = (*MemoryRenderReplayStore)(nil)
+	_ ports.Restorer          = (*MemoryRenderJobStore)(nil)
+	_ ports.Restorer          = (*UnavailableRenderJobStore)(nil)
+	_ ports.Restorer          = (*MemoryRenderReplayStore)(nil)
 )
