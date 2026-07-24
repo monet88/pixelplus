@@ -112,7 +112,8 @@ type RenderService struct {
 	assets       ports.AssetMetadataStore
 	content      ports.AssetContentStore
 	vault        ports.CredentialVault
-	render       ports.RenderAdapter
+	prompts      ports.RenderPromptStore
+	authorized   ports.AuthorizedRender
 	queue        ports.JobRuntime
 	audit        ports.RenderAuditRecorder
 	telemetry    ports.TelemetryRecorder
@@ -135,13 +136,17 @@ type RenderDependencies struct {
 	Assets       ports.AssetMetadataStore
 	Content      ports.AssetContentStore
 	Vault        ports.CredentialVault
-	Render       ports.RenderAdapter
-	Queue        ports.JobRuntime
-	Audit        ports.RenderAuditRecorder
-	Telemetry    ports.TelemetryRecorder
-	RequestLog   ports.RequestLogRecorder
-	Clock        ports.Clock
-	IDs          ports.IDGenerator
+	// Prompts is the Put-only confidential port for create-time prompt intake.
+	Prompts ports.RenderPromptStore
+	// Authorized is the protected render boundary (Vault + confidential + Adapter).
+	// Application never hands prompt/credential plaintext to an ordinary Adapter.
+	Authorized ports.AuthorizedRender
+	Queue      ports.JobRuntime
+	Audit      ports.RenderAuditRecorder
+	Telemetry  ports.TelemetryRecorder
+	RequestLog ports.RequestLogRecorder
+	Clock      ports.Clock
+	IDs        ports.IDGenerator
 }
 
 // NewRenderService validates and wires the Render Job spine dependencies.
@@ -167,8 +172,10 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		return nil, errors.New("application: asset content store is required")
 	case dependencies.Vault == nil:
 		return nil, errors.New("application: credential vault is required")
-	case dependencies.Render == nil:
-		return nil, errors.New("application: render adapter is required")
+	case dependencies.Prompts == nil:
+		return nil, errors.New("application: render prompt store is required")
+	case dependencies.Authorized == nil:
+		return nil, errors.New("application: authorized render port is required")
 	case dependencies.Queue == nil:
 		return nil, errors.New("application: job runtime is required")
 	case dependencies.Audit == nil:
@@ -195,7 +202,8 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		assets:       dependencies.Assets,
 		content:      dependencies.Content,
 		vault:        dependencies.Vault,
-		render:       dependencies.Render,
+		prompts:      dependencies.Prompts,
+		authorized:   dependencies.Authorized,
 		queue:        dependencies.Queue,
 		audit:        dependencies.Audit,
 		telemetry:    dependencies.Telemetry,
@@ -391,13 +399,16 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		return RenderJobResult{}, service.fail(ctx, sc, domain.NewInternalError())
 	}
 	now := domain.NewTimestamp(sc.start)
+	// Job metadata stores only a non-secret digest; plaintext goes to the
+	// confidential port and is never retained on the durable job row (ADR 0009).
+	promptDigest := domain.DigestPrompt(command.prompt)
 	job := domain.NewQueuedRenderJob(
 		jobID,
 		principal.TenantID,
 		principal.ClientAPIKeyID,
 		command.operation,
 		command.model,
-		command.prompt,
+		promptDigest,
 		command.inputs,
 		command.mask,
 		account.ID,
@@ -406,8 +417,18 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		command.idempotencyKey,
 		now,
 	)
-	// Prompt is held only for worker execution via durable job row in-memory;
-	// public wire projection never re-emits it (transport omits the field).
+
+	// Bind confidential prompt before the job becomes executable. Put accepts
+	// transient intake; application does not read it back.
+	if err := service.prompts.Put(ctx, ports.RenderPromptIntake{
+		TenantID: principal.TenantID,
+		JobID:    jobID,
+		Material: command.prompt,
+	}); err != nil {
+		service.release(ctx, reservation)
+		service.abandon(ctx, identity)
+		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
 
 	persisted, err := service.jobs.Create(ctx, ports.RenderJobCreation{Principal: principal, Job: job})
 	if err != nil {
@@ -665,25 +686,6 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	// Vault authorize (presence) then Adapter render — no plaintext to application.
-	if _, err := service.vault.Validate(ctx, ports.CredentialValidation{
-		Principal: principal,
-		AccountID: job.ProviderAccountID,
-		Version:   job.CredentialVersion,
-	}); err != nil {
-		status := domain.CommitNotStarted
-		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
-			JobRef:       ref,
-			FencingToken: fence,
-			To:           domain.JobFailed,
-			FailureStage: domain.StageDependency,
-			FailureClass: domain.ErrCodeDependencyUnavailable,
-			CommitStatus: status,
-			ClearLease:   true,
-		})
-		return nil
-	}
-
 	// Mark not_committed immediately before payload send boundary.
 	attempt.CommitStatus = domain.CommitNotCommitted
 	attempt.PayloadSent = false
@@ -701,13 +703,15 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	// Payload send boundary: once Adapter is invoked, missing response → unknown.
+	// Payload send boundary: AuthorizedRender resolves Vault credential +
+	// confidential prompt inside its boundary. Application never supplies or
+	// receives prompt/credential plaintext on this path (ADR 0009).
 	attempt.PayloadSent = true
-	outcome, renderErr := service.render.Render(ctx, ports.RenderCommand{
+	outcome, renderErr := service.authorized.Render(ctx, ports.AuthorizedRenderRequest{
 		Principal: principal,
+		JobRef:    ref,
 		AccountID: job.ProviderAccountID,
 		Version:   job.CredentialVersion,
-		Prompt:    job.Prompt,
 		Invocation: domain.RenderInvocation{
 			TenantID:          job.TenantID,
 			JobID:             job.JobID,
@@ -774,7 +778,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			ClearLease:   true,
 		})
 		return nil
-	case domain.RenderOutcomeSuccess, domain.RenderOutcomeCommitted, domain.RenderOutcomeStorageCapLater:
+	case domain.RenderOutcomeSuccess, domain.RenderOutcomeCommitted:
 		// fall through to capture
 	default:
 		attempt.CommitStatus = domain.CommitUnknown
@@ -810,7 +814,18 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 
 	outputs := outcome.Outputs
 	if len(outputs) == 0 {
-		outputs = [][]byte{domain.MinimalPNG()}
+		// Committed success without capturable bytes is fail-closed capture
+		// failure — never synthesize fixture PNG in production domain/app.
+		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
+			JobRef:       ref,
+			FencingToken: fence,
+			To:           domain.JobFailed,
+			FailureStage: domain.StageInternal,
+			FailureClass: domain.ErrCodeInternal,
+			CommitStatus: domain.CommitCommitted,
+			ClearLease:   true,
+		})
+		return nil
 	}
 	contentType := outcome.ContentType
 	if contentType == "" {
@@ -854,22 +869,13 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 
 	// Place each output Asset by stable placement key before completed.
+	// Storage-cap is a placement/delivery outcome, not a Provider render class.
 	jobAfter, err := service.jobs.Load(ctx, ref)
 	if err != nil {
 		return err
 	}
 	for i, entry := range jobAfter.OutputEntries {
 		data := outputs[i]
-		if outcome.Class == domain.RenderOutcomeStorageCapLater {
-			_, _ = service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
-				JobRef:              ref,
-				FencingToken:        fence,
-				EntryID:             entry.ID,
-				DeliveryStateForced: domain.OutputPending,
-				FailureClass:        string(domain.ErrCodeStorageCapExceeded),
-			})
-			continue
-		}
 		if placeErr := service.placeOutputBytes(ctx, principal, jobAfter, entry, data, fence); placeErr != nil {
 			// Storage cap: remain completed with pending delivery later.
 			if errors.Is(placeErr, ports.ErrStorageCapExceeded) {

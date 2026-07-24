@@ -149,22 +149,60 @@ type RenderReplayStore interface {
 	Abandon(context.Context, domain.ReplayIdentity) error
 }
 
-// RenderCommand authorizes one controlled upstream render for a job attempt.
-// It never carries plaintext credentials; the controlled Adapter proves
-// execution counts without decrypting material (mirrors ProbeCommand).
+// RenderPromptIntake is the transient create-time handoff of prompt material
+// into the confidential store. Application forwards it once and never retains
+// or logs it (ADR 0009 TenantConfidentialStore / I-FAIL-CLOSED-SENSITIVE).
+type RenderPromptIntake struct {
+	TenantID domain.TenantID
+	JobID    domain.Identifier
+	// Material is the raw prompt. It never enters RenderJob metadata, status
+	// projections, audit, or ordinary Adapter commands.
+	Material string
+}
+
+// RenderPromptStore is the purpose-bound confidential port for render prompts.
+// Put accepts transient intake at create. Application never receives plaintext
+// back; only AuthorizedRender resolves material inside its boundary.
+type RenderPromptStore interface {
+	Put(context.Context, RenderPromptIntake) error
+}
+
+// AuthorizedRenderRequest is the application-facing request for one upstream
+// render. It carries only safe identities and the job reference so the
+// authorized port can resolve Vault credential + confidential prompt material
+// internally. Application never supplies prompt or credential plaintext.
+type AuthorizedRenderRequest struct {
+	Principal  domain.SecurityPrincipal
+	JobRef     domain.JobRef
+	AccountID  domain.ProviderAccountID
+	AuthMode   domain.AuthMode
+	Version    int
+	Invocation domain.RenderInvocation
+}
+
+// AuthorizedRender is the protected execution boundary for one render attempt.
+// Implementations resolve credential (Vault) and prompt (confidential store)
+// inside the port and inject them into the Adapter without returning plaintext
+// to application code (ADR 0009 CredentialVault.Render / confidential ports).
+type AuthorizedRender interface {
+	Render(context.Context, AuthorizedRenderRequest) (domain.RenderOutcome, error)
+}
+
+// RenderCommand is the safe Adapter invocation after authorization. It never
+// carries prompt plaintext or credential material — those are injected only
+// inside the AuthorizedRender / Vault boundary, not via this ordinary command.
 type RenderCommand struct {
 	Principal  domain.SecurityPrincipal
 	AccountID  domain.ProviderAccountID
 	AuthMode   domain.AuthMode
 	Version    int
 	Invocation domain.RenderInvocation
-	// Prompt is transient application-owned content for controlled adapters
-	// that synthesize outcomes; it never enters durable job status projections.
-	Prompt string
 }
 
-// RenderAdapter runs one controlled generation/edit/inpaint attempt.
-// Fail-closed when no Provider surface is configured.
+// RenderAdapter runs one controlled generation/edit/inpaint attempt after the
+// authorized boundary has already resolved secrets. Fail-closed when no
+// Provider surface is configured. Application code must not call this directly
+// with confidential material; it uses AuthorizedRender.
 type RenderAdapter interface {
 	Render(context.Context, RenderCommand) (domain.RenderOutcome, error)
 }

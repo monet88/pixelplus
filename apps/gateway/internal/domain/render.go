@@ -233,6 +233,9 @@ type UpstreamAttempt struct {
 }
 
 // RenderJob is the Tenant-owned durable unit of one image request (#14 §3).
+// Prompt plaintext is never stored here (ADR 0009 TenantConfidentialStore /
+// confidential port). Only a non-secret PromptDigest may appear on the job
+// metadata row for fingerprint binding and audit-safe correlation.
 type RenderJob struct {
 	TenantID           TenantID
 	JobID              Identifier
@@ -241,7 +244,10 @@ type RenderJob struct {
 	RequestFingerprint Fingerprint
 	Operation          RenderOperation
 	Model              string
-	Prompt             string
+	// PromptDigest is the non-secret SHA-256 hex digest of the create-time
+	// prompt. It is not reversible and is safe on status projections that omit
+	// it; confidential material lives only in the protected confidential port.
+	PromptDigest       string
 	InputAssetIDs      []AssetID
 	MaskAssetID        AssetID
 	ProviderAccountID  ProviderAccountID
@@ -293,6 +299,16 @@ var ErrStaleFence = errors.New("stale render job fencing token")
 var ErrJobNotClaimable = errors.New("render job is not claimable")
 
 // CanTransition reports whether from→to is an allowed lifecycle edge (§4.2).
+//
+// Spec edges only:
+//
+//	queued → running | canceled
+//	running → running | cancel_requested | completed | failed
+//	cancel_requested → canceled | failed
+//
+// running → canceled is forbidden (must first persist cancel_requested).
+// cancel_requested → completed is forbidden (completion races from running
+// before the cancel CAS; once cancel wins, only canceled/failed remain).
 func CanTransition(from, to JobLifecycleState) bool {
 	if from == to && from.Terminal() {
 		return true // idempotent terminal no-op
@@ -301,9 +317,9 @@ func CanTransition(from, to JobLifecycleState) bool {
 	case JobQueued:
 		return to == JobRunning || to == JobCanceled
 	case JobRunning:
-		return to == JobRunning || to == JobCancelRequested || to == JobCompleted || to == JobFailed || to == JobCanceled
+		return to == JobRunning || to == JobCancelRequested || to == JobCompleted || to == JobFailed
 	case JobCancelRequested:
-		return to == JobCanceled || to == JobFailed || to == JobCompleted
+		return to == JobCanceled || to == JobFailed
 	case JobCanceled, JobFailed, JobCompleted:
 		return false
 	default:
@@ -312,13 +328,15 @@ func CanTransition(from, to JobLifecycleState) bool {
 }
 
 // NewQueuedRenderJob builds a newly admitted queued job with immutable inputs.
+// promptDigest is the non-secret digest of the create-time prompt; callers must
+// never pass raw prompt plaintext into this constructor.
 func NewQueuedRenderJob(
 	jobID Identifier,
 	tenantID TenantID,
 	keyID ClientAPIKeyID,
 	operation RenderOperation,
 	model string,
-	prompt string,
+	promptDigest string,
 	inputs []AssetID,
 	mask AssetID,
 	accountID ProviderAccountID,
@@ -335,7 +353,7 @@ func NewQueuedRenderJob(
 		RequestFingerprint: fingerprint,
 		Operation:          operation,
 		Model:              model,
-		Prompt:             prompt,
+		PromptDigest:       promptDigest,
 		InputAssetIDs:      append([]AssetID(nil), inputs...),
 		MaskAssetID:        mask,
 		ProviderAccountID:  accountID,
@@ -354,20 +372,32 @@ func NewQueuedRenderJob(
 	}
 }
 
-// NewCreateRenderJobFingerprint builds a stable fingerprint over create inputs.
-// Prompt content is digested so the replay record never stores prompt plaintext.
+// DigestPrompt returns the non-secret SHA-256 hex digest of prompt material.
+// The digest is safe to store on job metadata; the plaintext is not.
+func DigestPrompt(prompt string) string {
+	sum := sha256.Sum256([]byte(prompt))
+	return hex.EncodeToString(sum[:])
+}
+
+// NewCreateRenderJobFingerprint builds a stable SHA-256 hex fingerprint over
+// the create inputs that determine the durable side effect. The return value is
+// always a 64-char lowercase hex digest — never raw concatenated field material
+// and never prompt plaintext (#20 section 5.2, ADR 0009).
 func NewCreateRenderJobFingerprint(operation RenderOperation, model, prompt string, inputs []AssetID, mask AssetID) Fingerprint {
 	const separator = "\x1f"
 	h := sha256.New()
+	_, _ = h.Write([]byte("create_render_job"))
+	_, _ = h.Write([]byte(separator))
+	_, _ = h.Write([]byte(operation))
+	_, _ = h.Write([]byte(separator))
+	_, _ = h.Write([]byte(model))
+	_, _ = h.Write([]byte(separator))
 	_, _ = h.Write([]byte(prompt))
-	promptDigest := hex.EncodeToString(h.Sum(nil))
-	raw := "create_render_job" + separator +
-		string(operation) + separator +
-		model + separator +
-		promptDigest + separator +
-		joinAssetIDs(inputs) + separator +
-		string(mask)
-	return Fingerprint(raw)
+	_, _ = h.Write([]byte(separator))
+	_, _ = h.Write([]byte(joinAssetIDs(inputs)))
+	_, _ = h.Write([]byte(separator))
+	_, _ = h.Write([]byte(mask))
+	return Fingerprint(hex.EncodeToString(h.Sum(nil)))
 }
 
 func joinAssetIDs(ids []AssetID) string {
@@ -405,30 +435,17 @@ func StagingChecksum(data []byte) string {
 // DefaultOutputContentType is the MVP generated image media type.
 const DefaultOutputContentType = ContentTypePNG
 
-// MinimalPNG is a tiny valid 1x1 PNG used by controlled render outcomes so
-// output placement can reuse #13 image validation without a Provider SDK.
-func MinimalPNG() []byte {
-	// 1x1 transparent PNG.
-	return []byte{
-		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
-		0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-		0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
-		0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
-		0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
-		0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-	}
-}
-
 // RenderOutcomeClass classifies a controlled Provider render result.
+// Storage-cap is not a Provider outcome; it is an output placement/delivery
+// failure class handled after capture (#14 §8.3).
 type RenderOutcomeClass string
 
-// Controlled render outcome classes for the Adapter port.
+// Controlled Provider render outcome classes for the Adapter port.
 const (
-	RenderOutcomeSuccess         RenderOutcomeClass = "success"
-	RenderOutcomeNotCommitted    RenderOutcomeClass = "not_committed"
-	RenderOutcomeCommitted       RenderOutcomeClass = "committed"
-	RenderOutcomeUnknown         RenderOutcomeClass = "unknown"
-	RenderOutcomeStorageCapLater RenderOutcomeClass = "storage_cap_later"
+	RenderOutcomeSuccess      RenderOutcomeClass = "success"
+	RenderOutcomeNotCommitted RenderOutcomeClass = "not_committed"
+	RenderOutcomeCommitted    RenderOutcomeClass = "committed"
+	RenderOutcomeUnknown      RenderOutcomeClass = "unknown"
 )
 
 // RenderInvocation is the safe, non-secret render request the Adapter receives.

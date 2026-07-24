@@ -99,13 +99,15 @@ type Dependencies struct {
 	AssetAudit    ports.AssetAuditRecorder
 
 	// Render Job ports (#54). When a port is nil, New substitutes foundation
-	// implementations. The real JobExecutor is wired only when Jobs store and
-	// Render adapter paths are available; otherwise the fail-closed foundation
-	// executor remains. Contract tests inject controlled fakes.
-	RenderJobs    ports.RenderJobStore
-	RenderReplay  ports.RenderReplayStore
-	RenderAdapter ports.RenderAdapter
-	RenderAudit   ports.RenderAuditRecorder
+	// implementations. Contract tests inject controlled fakes. RenderAdapter is
+	// the low-level controlled surface wrapped by AuthorizedRender so application
+	// never receives a port that accepts confidential material.
+	RenderJobs       ports.RenderJobStore
+	RenderReplay     ports.RenderReplayStore
+	RenderAdapter    ports.RenderAdapter
+	RenderPrompts    ports.RenderPromptStore
+	AuthorizedRender ports.AuthorizedRender
+	RenderAudit      ports.RenderAuditRecorder
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -439,9 +441,24 @@ func newRenderService(dependencies Dependencies) (*application.RenderService, er
 	if vault == nil {
 		vault = vaultpkg.NewFailClosedCredentialVault()
 	}
-	render := dependencies.RenderAdapter
-	if render == nil {
-		render = vaultpkg.NewFailClosedRenderAdapter()
+	// Confidential prompt store + authorized render share one memory boundary so
+	// create-time Put and worker-time resolution agree. Explicit overrides are
+	// honored when both are supplied (advanced fixtures).
+	prompts := dependencies.RenderPrompts
+	authorized := dependencies.AuthorizedRender
+	if prompts == nil || authorized == nil {
+		adapter := dependencies.RenderAdapter
+		if adapter == nil {
+			adapter = vaultpkg.NewFailClosedRenderAdapter()
+		}
+		mem := vaultpkg.NewMemoryRenderPromptStore()
+		auth := vaultpkg.NewAuthorizedRenderService(mem, vault, adapter)
+		if prompts == nil {
+			prompts = auth.PromptStore()
+		}
+		if authorized == nil {
+			authorized = auth
+		}
 	}
 	audit := dependencies.RenderAudit
 	if audit == nil {
@@ -469,7 +486,8 @@ func newRenderService(dependencies Dependencies) (*application.RenderService, er
 		Assets:       metadata,
 		Content:      content,
 		Vault:        vault,
-		Render:       render,
+		Prompts:      prompts,
+		Authorized:   authorized,
 		Queue:        dependencies.Runtime,
 		Audit:        audit,
 		Telemetry:    telemetry,
