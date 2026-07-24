@@ -196,18 +196,6 @@ type AccountUpdate struct {
 	// first-connect probe activation cannot clobber an in-flight replacement that
 	// staged after the writer loaded its snapshot.
 	RequireEmptyPendingVersion bool
-	// RequireEmptyRecoveryPermit rejects the write unless no half-open scoped
-	// recovery attempt is currently owned. It atomically claims the single permit
-	// before Vault validation or the Probe Adapter runs.
-	RequireEmptyRecoveryPermit bool
-	// RequireRecoveryPermitOwner, when non-empty, rejects the write unless the
-	// stored recovery permit belongs to this request. Scope/revision/version remain
-	// bound in Account and are checked by RequireRecoveryCondition below.
-	RequireRecoveryPermitOwner domain.Identifier
-	// RequireRecoveryCondition fences settlement against a renewed or replaced
-	// condition. The current stored account must still carry the exact scope,
-	// condition revision, and credential version represented by this permit.
-	RequireRecoveryCondition domain.RecoveryPermit
 	// RequireLifecycle, when non-empty, rejects the write unless the currently
 	// stored lifecycle equals this value. This prevents stale probe/recovery
 	// snapshots from resurrecting a disabled account or overwriting a concurrent
@@ -221,16 +209,18 @@ type AccountUpdate struct {
 	// pointer-free struct cannot distinguish "not set" from "set to zero", so this
 	// boolean gates the check.
 	RequireControlsMatch bool
-	// Patch mode: when any Patch* field is true, Update mutates the existing row
-	// in place instead of replacing it with Account. This lets no-signal active
-	// re-probes record LastProbedAt without resurrecting concurrent health or
-	// recovery-permit changes.
+	// PatchLastProbedAt mutates only LastProbedAt/UpdatedAt on the existing row
+	// so a no-signal active re-probe cannot resurrect concurrent lifecycle fields.
+	// Health authority is never stored on AccountStore rows.
 	PatchLastProbedAt bool
 	LastProbedAt      domain.Timestamp
-	// PatchClearRecoveryPermit clears the stored recovery permit without touching
-	// health or lifecycle. Combined with RequireRecoveryPermitOwner it settles a
-	// claimed permit safely when the health change is already persisted another way.
-	PatchClearRecoveryPermit bool
+	// PatchLastAllocatedVersion reserves one monotonic credential version without
+	// advancing lifecycle/current credential state before Vault.Put succeeds.
+	// RequireLastAllocatedVersionMatch makes zero a valid observed CAS value.
+	PatchLastAllocatedVersion        bool
+	RequireLastAllocatedVersionMatch bool
+	RequireLastAllocatedVersion      int
+	LastAllocatedVersion             int
 }
 
 // AuditAction names a product/security audit event.
@@ -278,10 +268,15 @@ const (
 	AuditCapabilitySnapshotRead AuditAction = "capability_snapshot.read"
 	// AuditModelsListed records a Tenant-owned offerable model list projection.
 	AuditModelsListed AuditAction = "models.listed"
+	// AuditProviderHealthTransition records a durable health condition transition
+	// (cooldown create/renew, recovery success, dependency-failure renewal, hard
+	// auth rejection). Payload is safe fields only (health/cooldown spec §19).
+	AuditProviderHealthTransition AuditAction = "provider_health.transition"
 )
 
 // AuditEvent is a secret-free product/security audit projection. It carries
 // safe actor, Tenant, resource, and outcome fields only (#21 observability).
+// Health transition fields are optional and never carry raw Provider payloads.
 type AuditEvent struct {
 	Action            AuditAction
 	TenantID          domain.TenantID
@@ -289,12 +284,42 @@ type AuditEvent struct {
 	ProviderAccountID domain.ProviderAccountID
 	RequestID         domain.Identifier
 	Outcome           string
+	// AuthMode is the account's Auth Mode for health transitions (safe enum).
+	AuthMode domain.AuthMode
+	// OldState/NewState and OldReason/NewReason are the prior/new health axes.
+	OldState  domain.HealthState
+	NewState  domain.HealthState
+	OldReason domain.HealthReason
+	NewReason domain.HealthReason
+	// Scope is the affected health scope kind/operation/model (safe ids only).
+	Scope domain.HealthScope
+	// CredentialVersion is the business credential version for the condition.
+	CredentialVersion int
+	// SourceClass is the internal evidence class (upstream_attempt, etc.).
+	SourceClass domain.HealthSourceClass
+	// ConditionRevision is the fenced revision after the transition.
+	ConditionRevision int
+	// RetryTimingClass is the safe retry class (e.g. provider_cooldown) when a
+	// finite wait is authorized; empty otherwise.
+	RetryTimingClass string
+	// RetryNotBefore is the safe absolute wait bound when authorized.
+	RetryNotBefore domain.Timestamp
+	// ProbeID correlates the probe/attempt that produced the observation.
+	ProbeID domain.Identifier
 }
 
 // AuditRecorder writes the secret-free audit projection. A failing recorder is
 // a typed dependency outcome for the application to classify.
 type AuditRecorder interface {
 	Record(context.Context, AuditEvent) error
+}
+
+// AuditBatchRecorder accepts one logical audit mutation as an indivisible
+// batch. Health transitions that can emit more than one event require this
+// capability so a recorder cannot expose event 1 and then fail event 2 while
+// the corresponding HealthStore mutation is aborted.
+type AuditBatchRecorder interface {
+	RecordBatch(context.Context, []AuditEvent) error
 }
 
 // TelemetryEvent aggregates by stable safe code, stage, and operation only. It

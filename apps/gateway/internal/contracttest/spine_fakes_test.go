@@ -153,6 +153,19 @@ func (store *stubReplayStore) Complete(_ context.Context, identity domain.Replay
 	return nil
 }
 
+// lastTerminalAccount returns the first completed terminal account projection
+// (for proving Complete stored effective health, not AccountStore-stripped rows).
+func (store *stubReplayStore) lastTerminalAccount() (domain.ProviderAccount, bool) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, record := range store.records {
+		if record.terminal && record.account.ID != "" {
+			return record.account, true
+		}
+	}
+	return domain.ProviderAccount{}, false
+}
+
 func (store *stubReplayStore) Abandon(_ context.Context, identity domain.ReplayIdentity) error {
 	store.abandonCalls.Add(1)
 	store.log.add("replay.abandon")
@@ -179,6 +192,10 @@ type stubAccountStore struct {
 	createErr  error
 	updateErr  error
 	restoreErr error
+	// updateFailAtCall forces exactly one numbered Update call to fail. This lets
+	// tests distinguish a successful version reservation from a failed lifecycle
+	// commit in a two-update credential submission.
+	updateFailAtCall atomic.Int32
 	// updateFailTimes forces the next N Update calls to return updateErr (or
 	// ErrDependencyUnavailable when updateErr is nil) so partial-success recovery
 	// after vault put can be contract-tested.
@@ -263,8 +280,14 @@ func (store *stubAccountStore) List(_ context.Context, principal domain.Security
 // resolves to ErrAccountNotVisible so a lifecycle transition can never target a
 // resource the principal cannot see (#6 section 5.1).
 func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpdate) (domain.ProviderAccount, error) {
-	store.updateCalls.Add(1)
+	call := store.updateCalls.Add(1)
 	store.log.add("account.update")
+	if failAt := store.updateFailAtCall.Load(); failAt > 0 && call == failAt {
+		if store.updateErr != nil {
+			return domain.ProviderAccount{}, store.updateErr
+		}
+		return domain.ProviderAccount{}, ports.ErrDependencyUnavailable
+	}
 	if remaining := store.updateFailTimes.Load(); remaining > 0 {
 		store.updateFailTimes.Add(-1)
 		if store.updateErr != nil {
@@ -300,60 +323,108 @@ func (store *stubAccountStore) Update(_ context.Context, update ports.AccountUpd
 	if update.RequireEmptyPendingVersion && existing.PendingCredentialVersion != 0 {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
-	if update.RequireEmptyRecoveryPermit && existing.RecoveryPermit.Owner != "" {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if update.RequireRecoveryPermitOwner != "" && existing.RecoveryPermit.Owner != update.RequireRecoveryPermitOwner {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if required := update.RequireRecoveryCondition; required.Owner != "" && !stubAccountHasRecoveryCondition(existing, required) {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
 	if update.RequireLifecycle != "" && existing.Lifecycle != update.RequireLifecycle {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
 	if update.RequireControlsMatch && existing.Controls != update.RequireControls {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
-	if update.PatchLastProbedAt || update.PatchClearRecoveryPermit {
-		if update.PatchLastProbedAt {
-			existing.Credential.LastProbedAt = update.LastProbedAt
-			existing.UpdatedAt = update.LastProbedAt
-		}
-		if update.PatchClearRecoveryPermit {
-			existing.RecoveryPermit = domain.RecoveryPermit{}
-		}
+	if update.RequireLastAllocatedVersionMatch && existing.Credential.LastAllocatedVersion != update.RequireLastAllocatedVersion {
+		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+	}
+	if update.PatchLastProbedAt {
+		existing.Credential.LastProbedAt = update.LastProbedAt
+		existing.UpdatedAt = update.LastProbedAt
+		existing.Health = domain.HealthSummary{}
+		existing.RecoveryPermit = domain.RecoveryPermit{}
 		accounts[update.Account.ID] = existing
 		return existing, nil
 	}
-	accounts[update.Account.ID] = update.Account
-	return update.Account, nil
+	if update.PatchLastAllocatedVersion {
+		if update.LastAllocatedVersion <= existing.Credential.LastAllocatedVersion ||
+			update.LastAllocatedVersion <= existing.Credential.Version {
+			return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+		}
+		existing.Credential.LastAllocatedVersion = update.LastAllocatedVersion
+		existing.Health = domain.HealthSummary{}
+		existing.RecoveryPermit = domain.RecoveryPermit{}
+		accounts[update.Account.ID] = existing
+		return existing, nil
+	}
+	// AccountStore rows never carry health authority.
+	next := update.Account
+	next.Health = domain.HealthSummary{}
+	next.RecoveryPermit = domain.RecoveryPermit{}
+	accounts[update.Account.ID] = next
+	return next, nil
 }
 
-func stubAccountHasRecoveryCondition(account domain.ProviderAccount, required domain.RecoveryPermit) bool {
-	if account.Credential.Version != required.CredentialVersion {
-		return false
-	}
-	for _, condition := range account.Health.Conditions {
-		if condition.Scope == required.Scope &&
-			condition.ConditionRevision == required.ConditionRevision &&
-			condition.CredentialVersion == required.CredentialVersion {
-			return true
+// seedAccount strips health from the account row and returns the health projection
+// the fixture must seed into HealthStore independently.
+func seedAccountHealth(account domain.ProviderAccount) (domain.ProviderAccount, domain.HealthSummary, domain.RecoveryPermit) {
+	health := account.Health
+	permit := account.RecoveryPermit
+	account.Health = domain.HealthSummary{}
+	account.RecoveryPermit = domain.RecoveryPermit{}
+	if health.SummaryState == "" && len(health.Conditions) == 0 {
+		// Default draft-like projection when callers only set lifecycle.
+		health = domain.HealthSummary{
+			SummaryState: domain.HealthHealthy,
+			Conditions: []domain.HealthCondition{{
+				Scope:             domain.HealthScope{Kind: domain.HealthScopeAccount},
+				State:             domain.HealthHealthy,
+				Reason:            domain.HealthReasonProbeSucceeded,
+				CredentialVersion: account.Credential.Version,
+				Remediation:       domain.RemediationNone,
+				SourceClass:       domain.HealthSourceRequiredProbe,
+			}},
+		}
+		if account.Lifecycle == domain.LifecycleDraft || account.Lifecycle == domain.LifecyclePendingProbe || account.Lifecycle == domain.LifecyclePendingValidation {
+			health = domain.HealthSummary{
+				SummaryState: domain.HealthUnknown,
+				Conditions: []domain.HealthCondition{{
+					Scope:             domain.HealthScope{Kind: domain.HealthScopeAccount},
+					State:             domain.HealthUnknown,
+					Reason:            domain.HealthReasonInitialUnprobed,
+					CredentialVersion: account.Credential.Version,
+					Remediation:       domain.RemediationNone,
+					SourceClass:       domain.HealthSourceRequiredProbe,
+				}},
+			}
 		}
 	}
-	return false
+	return account, health, permit
 }
 
 // captureAudit records the safe audit projections emitted by the spine.
 type captureAudit struct {
-	mu     sync.Mutex
-	events []ports.AuditEvent
+	mu       sync.Mutex
+	events   []ports.AuditEvent
+	failErr  error
+	failNext atomic.Int32
 }
 
 func (recorder *captureAudit) Record(_ context.Context, event ports.AuditEvent) error {
+	return recorder.RecordBatch(context.Background(), []ports.AuditEvent{event})
+}
+
+// RecordBatch is all-or-nothing: on failure none of the batch events are stored.
+// There is no sequential per-event visibility.
+func (recorder *captureAudit) RecordBatch(_ context.Context, events []ports.AuditEvent) error {
+	if recorder.failNext.Load() > 0 {
+		recorder.failNext.Add(-1)
+		if recorder.failErr != nil {
+			return recorder.failErr
+		}
+		return ports.ErrDependencyUnavailable
+	}
+	if len(events) == 0 {
+		return nil
+	}
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
-	recorder.events = append(recorder.events, event)
+	// Append only after accept — rejected batches never appear in snapshot().
+	recorder.events = append(recorder.events, events...)
 	return nil
 }
 
@@ -540,6 +611,7 @@ type stubCapabilityStore struct {
 	listCalls atomic.Int32
 	putCalls  atomic.Int32
 	putErr    error
+	putHook   func()
 }
 
 func newStubCapabilityStore(log *spineLog) *stubCapabilityStore {
@@ -589,6 +661,9 @@ func (store *stubCapabilityStore) List(_ context.Context, principal domain.Secur
 func (store *stubCapabilityStore) Put(_ context.Context, principal domain.SecurityPrincipal, snapshot domain.CapabilitySnapshot) error {
 	store.putCalls.Add(1)
 	store.log.add("capability.put")
+	if store.putHook != nil {
+		store.putHook()
+	}
 	if store.putErr != nil {
 		return store.putErr
 	}

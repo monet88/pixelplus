@@ -50,6 +50,9 @@ type Dependencies struct {
 	Admission  ports.AdmissionStore
 	Replay     ports.ReplayStore
 	Accounts   ports.AccountStore
+	// Health owns scoped conditions and recovery permits independently of
+	// AccountStore lifecycle metadata (ADR 0009 HealthStore catalogue).
+	Health     ports.HealthStore
 	Audit      ports.AuditRecorder
 	Telemetry  ports.TelemetryRecorder
 	RequestLog ports.RequestLogRecorder
@@ -144,6 +147,18 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	}
 	dependencies.Accounts = accounts
 
+	health := dependencies.Health
+	if health == nil {
+		if config.ProviderAccountStorePath != "" {
+			// Companion ledger beside the account path so health durability is
+			// independent of AccountStore while sharing the same volume root.
+			health = persistence.NewFileHealthStore(config.ProviderAccountStorePath + ".health.ledger")
+		} else {
+			health = persistence.NewMemoryHealthStore()
+		}
+	}
+	dependencies.Health = health
+
 	runtime := &Runtime{
 		worker: application.NewFoundationJobExecutor(),
 		jobs:   dependencies.Runtime,
@@ -163,11 +178,16 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		// dependency_unavailable until a new composition successfully restores state.
 		dependencies.Accounts = persistence.NewUnavailableAccountStore()
 	}
+	healthRestoreErr := health.Restore(startupContext)
+	if healthRestoreErr != nil {
+		logger.Error("provider health startup recovery failed; readiness stays closed", "error", healthRestoreErr)
+		dependencies.Health = persistence.NewUnavailableHealthStore()
+	}
 	jobRestoreErr := runtime.jobs.Restore(startupContext)
 	if jobRestoreErr != nil {
 		logger.Error("gateway startup recovery failed; readiness stays closed", "error", jobRestoreErr)
 	}
-	runtime.ready.Store(accountRestoreErr == nil && jobRestoreErr == nil)
+	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && jobRestoreErr == nil)
 
 	service, err := newProviderAccountService(dependencies)
 	if err != nil {
@@ -203,6 +223,10 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 	accounts := dependencies.Accounts
 	if accounts == nil {
 		accounts = persistence.NewMemoryAccountStore()
+	}
+	health := dependencies.Health
+	if health == nil {
+		health = persistence.NewMemoryHealthStore()
 	}
 	audit := dependencies.Audit
 	if audit == nil {
@@ -247,6 +271,7 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 		Admission:    admission,
 		Replay:       replay,
 		Accounts:     accounts,
+		Health:       health,
 		Vault:        vault,
 		Probe:        probe,
 		OAuth:        oauth,

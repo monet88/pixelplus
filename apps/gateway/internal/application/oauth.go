@@ -344,6 +344,26 @@ func (service *ProviderAccountService) GetOAuthAuthorization(ctx context.Context
 					submitted = latest.WithSubmittedCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
 					submitted = submitted.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
 				}
+				// OAuth and direct credential intake share one credential-epoch rule.
+				// HealthStore must fence to the stored version before AccountStore
+				// advances lifecycle/metadata; missing health aborts settlement.
+				epoch := ports.CredentialEpochReset{
+					Principal: principal, AccountID: latest.ID,
+					NewCredentialVersion: nextVersion,
+					ObservedAt:           domain.NewTimestamp(sc.start),
+					Audit:                service.healthAudit(principal, latest.ID, latest.AuthMode, sc.requestID),
+				}
+				if polled.Authorization.Purpose == domain.OAuthPurposeReauthenticate {
+					epoch.PreserveCredentialVersion = latest.Credential.Version
+				}
+				if _, err := service.health.ResetForCredentialEpoch(ctx, epoch); err != nil {
+					_ = service.vault.Revoke(ctx, ports.CredentialValidation{
+						Principal: principal, AccountID: latest.ID, AuthMode: latest.AuthMode, Version: nextVersion,
+					})
+					return OAuthAuthorizationResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+				}
+				submitted.Health = domain.HealthSummary{}
+				submitted.RecoveryPermit = domain.RecoveryPermit{}
 				if _, err := service.accounts.Update(ctx, ports.AccountUpdate{
 					Principal:          principal,
 					Account:            submitted,

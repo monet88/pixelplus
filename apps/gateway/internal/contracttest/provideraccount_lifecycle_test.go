@@ -28,7 +28,7 @@ func TestDisableBlocksUseWithoutRewritingHealth(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeAccount("pa_disable", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeAccount("pa_disable", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -73,7 +73,7 @@ func TestDisableRejectsDraft(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_draftdisable", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_draftdisable", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -100,7 +100,7 @@ func TestDisableIsIdempotent(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_disable_idem", domain.AuthModeChatGPTCodexOAuth)
 		account.Lifecycle = domain.LifecycleDisabled
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -127,7 +127,7 @@ func TestDisableRejectsRevoked(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_disable_revoked", domain.AuthModeChatGPTCodexOAuth)
 		account.Lifecycle = domain.LifecycleRevoked
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -151,7 +151,7 @@ func TestDisableRequiresManageScope(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeAccount("pa_disable_scope", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeAccount("pa_disable_scope", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -180,8 +180,8 @@ func TestDisableNonEnumerationIsIndistinguishable(t *testing.T) {
 	deleted := activeAccount("pa_deleted", domain.AuthModeChatGPTCodexOAuth)
 	deleted.Lifecycle = domain.LifecycleDeleted
 	seed := func(h *spineHarness) {
-		h.accounts.seed("tenant_b", foreign)
-		h.accounts.seed("tenant_a", deleted)
+		h.seedAccount("tenant_b", foreign)
+		h.seedAccount("tenant_a", deleted)
 	}
 
 	cases := []struct {
@@ -237,7 +237,7 @@ func TestEnableReturnsPendingProbeThenActivates(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_enable", domain.AuthModeChatGPTCodexOAuth)
 		account.Lifecycle = domain.LifecycleDisabled
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -296,7 +296,7 @@ func TestEnableClearsOccupiedRecoveryPermit(t *testing.T) {
 		)
 		account = account.WithRecoveryPermitClaimed(decision.Permit)
 		account.Lifecycle = domain.LifecycleDisabled
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -333,7 +333,7 @@ func TestEnableProbeAuthFailureLandsReauthRequired(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_enable_fail", domain.AuthModeChatGPTCodexOAuth)
 		account.Lifecycle = domain.LifecycleDisabled
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.probe.outcome.Authenticated = false
 	})
 
@@ -364,7 +364,7 @@ func TestEnableRejectsNonDisabled(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeAccount("pa_enable_active", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeAccount("pa_enable_active", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -419,7 +419,7 @@ func TestEnableRejectsQuarantineAndAuthModeKill(t *testing.T) {
 				account := activeAccount(accountID, domain.AuthModeChatGPTCodexOAuth)
 				account.Lifecycle = domain.LifecycleDisabled
 				testCase.mutate(&account)
-				h.accounts.seed("tenant_a", account)
+				h.seedAccount("tenant_a", account)
 			})
 
 			response, payload := harness.do(t, requestSpec{
@@ -460,7 +460,7 @@ func TestEnableRejectedWhileReplacementInFlight(t *testing.T) {
 		account.Credential.LastAllocatedVersion = 2
 		account.PendingCredentialVersion = 2
 		account.PendingOrigin = domain.LifecycleDisabled
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -492,7 +492,7 @@ func TestDisableIntentWinsOverReplacementProbeCutover(t *testing.T) {
 		account.Credential.LastAllocatedVersion = 2
 		account.PendingCredentialVersion = 2
 		account.PendingOrigin = domain.LifecycleActive
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	// Disable while the replacement is pending: intent must become sticky.
@@ -544,7 +544,7 @@ func TestDisableIntentWinsOverPendingValidation(t *testing.T) {
 		account.Credential.LastAllocatedVersion = 2
 		account.PendingCredentialVersion = 2
 		account.PendingOrigin = domain.LifecycleActive
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	// Disable while validation is still pending: intent must become sticky by
@@ -589,7 +589,7 @@ func TestDeleteRevokesAllVersionsThenNotFound(t *testing.T) {
 		account.Credential.LastAllocatedVersion = 2
 		account.PendingCredentialVersion = 2
 		account.PendingOrigin = domain.LifecycleActive
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -649,7 +649,7 @@ func TestDeletedAccountEvidenceIsNotRestorable(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeAccount("pa_delete_hold", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeAccount("pa_delete_hold", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, _ := harness.do(t, requestSpec{
@@ -694,8 +694,8 @@ func TestDeleteNonEnumerationIsIndistinguishable(t *testing.T) {
 	deleted := activeAccount("pa_deleted", domain.AuthModeChatGPTCodexOAuth)
 	deleted.Lifecycle = domain.LifecycleDeleted
 	seed := func(h *spineHarness) {
-		h.accounts.seed("tenant_b", foreign)
-		h.accounts.seed("tenant_a", deleted)
+		h.seedAccount("tenant_b", foreign)
+		h.seedAccount("tenant_a", deleted)
 	}
 
 	cases := []struct {
@@ -750,7 +750,7 @@ func TestDeleteRequiresManageScope(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeAccount("pa_delete_scope", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeAccount("pa_delete_scope", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -786,7 +786,7 @@ func TestDisableIntentWinsOverStaleProbeSnapshot(t *testing.T) {
 		account.Credential.LastAllocatedVersion = 2
 		account.PendingCredentialVersion = 2
 		account.PendingOrigin = domain.LifecycleActive
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	// Capture the pre-disable snapshot a concurrent probe would have loaded.
@@ -859,7 +859,7 @@ func TestEnableRejectedWhileOAuthInFlight(t *testing.T) {
 		account := activeAccount("pa_enable_oauth", domain.AuthModeChatGPTCodexOAuth)
 		account.Lifecycle = domain.LifecycleDisabled
 		account.ActiveOAuthAuthorizationID = "oa_inflight_enable"
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -901,8 +901,8 @@ func TestEnableRequiresManageScopeAndNonEnumeration(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_enable_scope", domain.AuthModeChatGPTCodexOAuth)
 		account.Lifecycle = domain.LifecycleDisabled
-		h.accounts.seed("tenant_a", account)
-		h.accounts.seed("tenant_b", activeAccount("pa_enable_foreign", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", account)
+		h.seedAccount("tenant_b", activeAccount("pa_enable_foreign", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -941,7 +941,7 @@ func TestEnableEmptyOAuthFenceRejectsConcurrentMarkerClaim(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_enable_fence", domain.AuthModeChatGPTCodexOAuth)
 		account.Lifecycle = domain.LifecycleDisabled
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	// Simulate OAuth claiming the single-flight marker after enable's soft gate.
@@ -983,13 +983,59 @@ func TestEnableEmptyOAuthFenceRejectsConcurrentMarkerClaim(t *testing.T) {
 	}
 }
 
+// A concurrent revoke/quarantine after the enable re-read but before its
+// AccountStore write remains authoritative. The enable CAS fails instead of
+// restoring the stale disabled snapshot as pending_probe.
+func TestEnableDoesNotOverwriteConcurrentLifecycleOrControls(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_enable_concurrent_control", domain.AuthModeChatGPTCodexOAuth)
+		account.Lifecycle = domain.LifecycleDisabled
+		h.seedAccount("tenant_a", account)
+		h.health.enableResetHook = func() {
+			concurrent, err := h.accounts.Visible(t.Context(), managePrincipal(), account.ID)
+			if err != nil {
+				t.Errorf("concurrent Visible: %v", err)
+				return
+			}
+			concurrent.Lifecycle = domain.LifecycleRevoked
+			concurrent.Controls.Quarantine = domain.QuarantineQuarantined
+			if _, err := h.accounts.Update(t.Context(), ports.AccountUpdate{
+				Principal: managePrincipal(), Account: concurrent,
+			}); err != nil {
+				t.Errorf("concurrent update: %v", err)
+			}
+		}
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_enable_concurrent_control/enable",
+		bearer: tenantAKey,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	stored, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_enable_concurrent_control")
+	if err != nil {
+		t.Fatalf("Visible: %v", err)
+	}
+	if stored.Lifecycle != domain.LifecycleRevoked {
+		t.Fatalf("lifecycle = %s, want concurrent revoked", stored.Lifecycle)
+	}
+	if stored.Controls.Quarantine != domain.QuarantineQuarantined {
+		t.Fatalf("quarantine = %s, want concurrent quarantined", stored.Controls.Quarantine)
+	}
+}
+
 // AC (delete fail-closed when vault revoke fails): a revoke dependency error
 // must not mark the account deleted; non-use is preserved for conservative retry.
 func TestDeleteRevokeFailureDoesNotMarkDeleted(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeAccount("pa_delete_revoke_fail", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeAccount("pa_delete_revoke_fail", domain.AuthModeChatGPTCodexOAuth))
 		h.vault.revokeErr = ports.ErrDependencyUnavailable
 	})
 
@@ -1020,7 +1066,7 @@ func TestDeleteConcurrentLoserIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeAccount("pa_delete_race", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeAccount("pa_delete_race", domain.AuthModeChatGPTCodexOAuth))
 		// Force the deleted transition write to observe "already gone" after revoke,
 		// which is the concurrent-loser shape (Visible passed, Update lost the race).
 		h.accounts.updateErr = ports.ErrAccountNotVisible
@@ -1051,7 +1097,7 @@ func TestEnableHealthCarriesInitialUnprobedCondition(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_enable_health", domain.AuthModeChatGPTCodexOAuth)
 		account.Lifecycle = domain.LifecycleDisabled
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{

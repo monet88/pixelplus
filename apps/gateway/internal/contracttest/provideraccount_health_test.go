@@ -1,6 +1,7 @@
 package contracttest_test
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +13,44 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
+
+// Create ordering (item 11): HealthStore.Initialize must succeed before
+// AccountStore.Create. A failed health init returns dependency_unavailable with
+// no visible account and no terminal replay completion.
+func TestCreateHealthInitFailureLeavesNoVisibleAccount(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		h.health.initErr = ports.ErrDependencyUnavailable
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/provider-accounts",
+		bearer:  tenantAKey,
+		idemKey: "create-health-init-fail",
+		body:    `{"provider":"chatgpt","auth_mode":"chatgpt_codex_oauth","label":"primary"}`,
+	})
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", response.StatusCode, payload)
+	}
+	if harness.health.initCalls.Load() != 1 {
+		t.Fatalf("health Initialize calls = %d, want 1", harness.health.initCalls.Load())
+	}
+	if harness.accounts.createCalls.Load() != 0 {
+		t.Fatalf("account Create calls = %d, want 0 when health init fails first", harness.accounts.createCalls.Load())
+	}
+	// No durable account for the tenant.
+	listed, err := harness.accounts.List(t.Context(), harness.principal.principals[tenantAKey])
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("listed accounts = %d, want 0 after failed health init", len(listed))
+	}
+	// Replay must not be terminal so a retry can re-claim.
+	// (replay Complete is only after successful create; no Complete call expected)
+}
 
 // AC1 (Health State and Health Reason remain separate and conditions retain
 // account, operation, or model scope with version/revision fencing): an account
@@ -47,7 +86,7 @@ func TestScopedHealthConditionsProjectSeparatelyWithoutFencingFields(t *testing.
 			RetryNotBefore:    domain.NewTimestamp(spineFixtureTime.Add(30_000_000_000)), // +30s
 			SourceClass:       domain.HealthSourceUpstreamAttempt,
 		})
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -115,7 +154,7 @@ func TestProbeRateSignalCreatesDurableScopedCooldown(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_cooldown_op", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_cooldown_op", domain.AuthModeChatGPTCodexOAuth))
 		// The probe proves authentication AND surfaces a validated operation-bucket
 		// rate-limit signal. The evidenced scope is operation image_generation, so
 		// the narrowest proven scope is operation, never the whole account.
@@ -238,7 +277,7 @@ func TestMalformedProviderRetryHintUsesSafePolicyWaitAndAuditsClassification(t *
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			harness := newSpineHarness(t, func(h *spineHarness) {
-				h.accounts.seed("tenant_a", probeableAccount("pa_malformed_hint_"+tc.name, domain.AuthModeChatGPTCodexOAuth))
+				h.seedAccount("tenant_a", probeableAccount("pa_malformed_hint_"+tc.name, domain.AuthModeChatGPTCodexOAuth))
 				h.probe.outcome = ports.ProbeOutcome{
 					Authenticated:     true,
 					Signal:            tc.signal,
@@ -258,10 +297,7 @@ func TestMalformedProviderRetryHintUsesSafePolicyWaitAndAuditsClassification(t *
 			}
 
 			principal := harness.principal.principals[tenantAKey]
-			stored, err := harness.accounts.Visible(t.Context(), principal, domain.ProviderAccountID("pa_malformed_hint_"+tc.name))
-			if err != nil {
-				t.Fatalf("Visible() error = %v", err)
-			}
+			stored := harness.storedAccount(t, principal, domain.ProviderAccountID("pa_malformed_hint_"+tc.name))
 			var cooldown domain.HealthCondition
 			for _, condition := range stored.Health.Conditions {
 				if condition.Scope.Kind == domain.HealthScopeOperation {
@@ -304,10 +340,14 @@ func TestCooldownRestoresBeforeRestartedFixtureIsReady(t *testing.T) {
 		domain.HealthReasonProviderRateLimited,
 		domain.NewTimestamp(spineFixtureTime.Add(time.Minute)),
 	)
-	accounts.seed("tenant_a", account)
+	healthStore := newStubHealthStore()
+	stripped, health, permit := seedAccountHealth(account)
+	accounts.seed("tenant_a", stripped)
+	healthStore.Seed("tenant_a", account.ID, health, permit)
 
 	first := newSpineHarness(t, func(h *spineHarness) {
 		h.accounts = accounts
+		h.health = healthStore
 	})
 	if first.fixture.Runtime().Ready() != true {
 		t.Fatal("first runtime not ready after account restore")
@@ -316,6 +356,7 @@ func TestCooldownRestoresBeforeRestartedFixtureIsReady(t *testing.T) {
 
 	second := newSpineHarness(t, func(h *spineHarness) {
 		h.accounts = accounts
+		h.health = healthStore
 	})
 	if second.fixture.Runtime().Ready() != true {
 		t.Fatal("restarted runtime not ready after account restore")
@@ -475,7 +516,7 @@ func TestNonTimeHealthGateSuppressesRetryTiming(t *testing.T) {
 					domain.NewTimestamp(spineFixtureTime.Add(30*time.Second)),
 				)
 				tc.mut(&account)
-				h.accounts.seed("tenant_a", account)
+				h.seedAccount("tenant_a", account)
 			})
 
 			response, payload := harness.do(t, requestSpec{
@@ -503,7 +544,7 @@ func TestProbeRateSignalWithoutHintUsesBoundedPolicyCooldown(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_cooldown_default", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_cooldown_default", domain.AuthModeChatGPTCodexOAuth))
 		h.probe.outcome = ports.ProbeOutcome{
 			Authenticated: true,
 			Signal:        ports.ProbeSignalRateLimited,
@@ -560,7 +601,7 @@ func TestProbeRateSignalUnknownScopeNormalizesAccountWide(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_cooldown_unknown", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_cooldown_unknown", domain.AuthModeChatGPTCodexOAuth))
 		// The probe proves authentication but the rate-limit signal carries no safe
 		// bucket metadata: the evidenced scope kind is empty/unknown.
 		h.probe.outcome = ports.ProbeOutcome{
@@ -638,7 +679,7 @@ func TestElapsedCooldownTimerDoesNotHealByTime(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", scopedCooldownAccount("pa_no_heal", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", scopedCooldownAccount("pa_no_heal", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -683,7 +724,7 @@ func TestRecoveryProbeResolvesOnlyMatchingScope(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", scopedCooldownAccount("pa_recover_scope", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", scopedCooldownAccount("pa_recover_scope", domain.AuthModeChatGPTCodexOAuth))
 		// The recovery probe authenticates and surfaces NO fresh rate/quota signal,
 		// so it is a scoped authoritative success for the probed bucket.
 		h.probe.outcome = ports.ProbeOutcome{Authenticated: true}
@@ -747,7 +788,7 @@ func TestQuarantinedAccountBlocksGenericProbeBeforeProtectedWork(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_probe_quarantined", domain.AuthModeChatGPTCodexOAuth)
 		account.Controls.Quarantine = domain.QuarantineQuarantined
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -777,7 +818,7 @@ func TestAuthModeKillProbeUsesAuthModeRemediation(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount("pa_probe_auth_mode_kill", domain.AuthModeChatGPTCodexOAuth)
 		account.Controls.AuthModeExecutionEnabled = false
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -841,7 +882,7 @@ func TestOpenProviderSurfaceCircuitBlocksMatchingConnectionProbe(t *testing.T) {
 			accountID := domain.ProviderAccountID("pa_probe_circuit_" + strings.ReplaceAll(testCase.name, " ", "_"))
 			harness := newSpineHarness(t, func(h *spineHarness) {
 				account := activeAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
-				h.accounts.seed("tenant_a", account)
+				h.seedAccount("tenant_a", account)
 				if testCase.seedSnapshot {
 					h.capabilities.seed("tenant_a", sampleObservationSnapshot(account.ID, account.AuthMode, account.Credential.Version, spineFixtureTime))
 				}
@@ -886,7 +927,7 @@ func TestAccountScopeProbeCannotBypassCircuitOnAnotherSnapshotSurface(t *testing
 	}
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := activeAccount(string(accountID), domain.AuthModeChatGPTCodexOAuth)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		snapshot := sampleObservationSnapshot(account.ID, account.AuthMode, account.Credential.Version, spineFixtureTime)
 		snapshot.Provenance[0].ProbeSurface = "/backend-api/chat"
 		snapshot.Operations[domain.CapabilityOpChat] = domain.CapabilityFact{
@@ -943,7 +984,7 @@ func TestProbeRejectsInvalidCircuitScopeBeforeProtectedWork(t *testing.T) {
 			t.Parallel()
 			accountID := "pa_probe_invalid_" + strings.ReplaceAll(testCase.name, " ", "_")
 			harness := newSpineHarness(t, func(h *spineHarness) {
-				h.accounts.seed("tenant_a", activeAccount(accountID, domain.AuthModeChatGPTCodexOAuth))
+				h.seedAccount("tenant_a", activeAccount(accountID, domain.AuthModeChatGPTCodexOAuth))
 			})
 
 			response, payload := harness.do(t, requestSpec{
@@ -977,7 +1018,7 @@ func TestUnavailableProviderSurfaceCircuitFailsConnectionProbeClosed(t *testing.
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", activeAccount("pa_probe_circuit_unavailable", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", activeAccount("pa_probe_circuit_unavailable", domain.AuthModeChatGPTCodexOAuth))
 		h.circuits.queryErr = ports.ErrCircuitUnavailable
 	})
 
@@ -998,9 +1039,9 @@ func TestUnavailableProviderSurfaceCircuitFailsConnectionProbeClosed(t *testing.
 	}
 }
 
-// AC3: a cooldown before retry_not_before remains closed. The request may pass
-// admission, but neither Vault validation nor the Probe Adapter may run because
-// elapsed time is the half-open eligibility gate, not a suggestion.
+// AC3: a cooldown before retry_not_before remains closed. Soft cooldown gates
+// run BEFORE admission, so this path must not debit admission capacity and must
+// not reach Vault validation or the Probe Adapter.
 func TestRecoveryProbeBeforeRetryNotBeforeDoesNotReachAdapter(t *testing.T) {
 	t.Parallel()
 
@@ -1012,7 +1053,7 @@ func TestRecoveryProbeBeforeRetryNotBeforeDoesNotReachAdapter(t *testing.T) {
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime.Add(time.Minute)),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -1032,11 +1073,118 @@ func TestRecoveryProbeBeforeRetryNotBeforeDoesNotReachAdapter(t *testing.T) {
 	if !ok || retryAfter < 1 || retryAfter > 60 {
 		t.Fatalf("retry_after_seconds = %v, want finite 1..60", errBody["retry_after_seconds"])
 	}
+	if calls := harness.admission.admitCalls.Load(); calls != 0 {
+		t.Fatalf("admission.admitCalls = %d, want 0 (soft cooldown gate before admission)", calls)
+	}
 	if calls := harness.vault.validCalls.Load(); calls != 0 {
 		t.Fatalf("vault validate calls = %d, want 0 before half-open eligibility", calls)
 	}
 	if calls := harness.probe.callCount.Load(); calls != 0 {
 		t.Fatalf("probe calls = %d, want 0 before half-open eligibility", calls)
+	}
+}
+
+// Claim CAS loser (after Eligible soft-gate) maps to the same operator-facing
+// 409 recovery_permit_occupied as a pre-claim Occupied decision — never 503.
+// Note: Eligible soft-gate already passed, so admission may have been debited
+// before the CAS loss; the pre-admission Occupied path is proved separately.
+func TestClaimCASLoserMapsToRecoveryPermitOccupied409(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_claim_cas_loser", domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime),
+		)
+		h.seedAccount("tenant_a", account)
+		h.health.forceClaimConflict = true
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_claim_cas_loser/probe",
+		bearer: tenantAKey,
+		body:   `{"scope":{"kind":"operation","operation":"image_generation"}}`,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 CAS-loser occupied (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeError(t, payload)
+	if body["code"] != "account_not_usable" {
+		t.Fatalf("code = %v, want account_not_usable", body["code"])
+	}
+	if body["remediation"] != "contact_operator" {
+		t.Fatalf("remediation = %v, want contact_operator", body["remediation"])
+	}
+	if harness.probe.callCount.Load() != 0 {
+		t.Fatalf("probe calls = %d, want 0 when claim CAS loses", harness.probe.callCount.Load())
+	}
+}
+
+// Occupied permit is recognized at the soft gate BEFORE admission, so a second
+// owner for the same cooling revision never debits capacity.
+func TestOccupiedRecoveryPermitSoftGateSkipsAdmission(t *testing.T) {
+	t.Parallel()
+
+	scope := domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)}
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_occupied_soft", domain.AuthModeChatGPTCodexOAuth)
+		// Timer open so the only soft-gate failure is Occupied (not cooldown wait).
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			scope,
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime),
+		)
+		decision := account.ScopedRecoveryPermit(
+			domain.NewTimestamp(spineFixtureTime),
+			scope,
+			"owner_existing",
+		)
+		if !decision.Eligible && !decision.Occupied {
+			// Force eligibility fence then claim occupancy.
+		}
+		account = account.WithRecoveryPermitClaimed(domain.RecoveryPermit{
+			Owner:             "owner_existing",
+			Scope:             scope,
+			ConditionRevision: account.Health.Conditions[len(account.Health.Conditions)-1].ConditionRevision,
+			CredentialVersion: account.Credential.Version,
+		})
+		// Ensure the seeded condition carries the revision the permit binds.
+		for i := range account.Health.Conditions {
+			if account.Health.Conditions[i].Scope.Operation == string(domain.CapabilityOpImageGeneration) {
+				account.RecoveryPermit.ConditionRevision = account.Health.Conditions[i].ConditionRevision
+				account.RecoveryPermit.CredentialVersion = account.Health.Conditions[i].CredentialVersion
+				break
+			}
+		}
+		h.seedAccount("tenant_a", account)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_occupied_soft/probe",
+		bearer: tenantAKey,
+		body:   `{"scope":{"kind":"operation","operation":"image_generation"}}`,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 occupied (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeError(t, payload)
+	if body["remediation"] != "contact_operator" {
+		t.Fatalf("remediation = %v, want contact_operator", body["remediation"])
+	}
+	if calls := harness.admission.admitCalls.Load(); calls != 0 {
+		t.Fatalf("admission.admitCalls = %d, want 0 (Occupied soft gate before admission)", calls)
+	}
+	if harness.probe.callCount.Load() != 0 {
+		t.Fatalf("probe calls = %d, want 0", harness.probe.callCount.Load())
+	}
+	if harness.vault.validCalls.Load() != 0 {
+		t.Fatalf("vault validate = %d, want 0", harness.vault.validCalls.Load())
 	}
 }
 
@@ -1056,7 +1204,7 @@ func TestConcurrentRecoveryProbesGrantExactlyOnePermit(t *testing.T) {
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.probe.entered = entered
 		h.probe.release = release
 	})
@@ -1103,8 +1251,14 @@ func TestConcurrentRecoveryProbesGrantExactlyOnePermit(t *testing.T) {
 		if loser.err != nil {
 			t.Fatalf("loser request error = %v", loser.err)
 		}
-		if loser.status != http.StatusServiceUnavailable {
-			t.Fatalf("loser status = %d, want 503 CAS conflict (body=%s)", loser.status, loser.body)
+		// Occupied permit is recognized pre-CAS as operator-facing 409 (stable,
+		// non-time). CAS conflict is not the primary loser path when Occupied is set.
+		if loser.status != http.StatusConflict {
+			t.Fatalf("loser status = %d, want 409 occupied permit (body=%s)", loser.status, loser.body)
+		}
+		loserBody := decodeError(t, loser.body)
+		if loserBody["remediation"] != "contact_operator" {
+			t.Fatalf("loser remediation = %v, want contact_operator", loserBody["remediation"])
 		}
 	case <-time.After(time.Second):
 		t.Fatal("second recovery did not fail while permit was owned")
@@ -1123,7 +1277,7 @@ func TestConcurrentRecoveryProbesGrantExactlyOnePermit(t *testing.T) {
 	}
 }
 
-func TestRecoveryDependencyFailureKeepsActiveLifecycleAndConsumesRevisionPermit(t *testing.T) {
+func TestRecoveryDependencyFailureRenewsCooldownAndConsumesPermit(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
@@ -1134,7 +1288,7 @@ func TestRecoveryDependencyFailureKeepsActiveLifecycleAndConsumesRevisionPermit(
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.probe.probeErr = ports.ErrDependencyUnavailable
 	})
 
@@ -1153,29 +1307,66 @@ func TestRecoveryDependencyFailureKeepsActiveLifecycleAndConsumesRevisionPermit(
 	}
 
 	principal := harness.principal.principals[tenantAKey]
-	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_dependency")
-	if err != nil {
-		t.Fatalf("Visible() after dependency failure error = %v", err)
-	}
+	stored := harness.storedAccount(t, principal, "pa_recover_dependency")
 	if stored.Lifecycle != domain.LifecycleActive {
 		t.Fatalf("lifecycle = %s, want active after non-authoritative dependency failure", stored.Lifecycle)
 	}
 	if stored.Health.SummaryState != domain.HealthCoolingDown {
-		t.Fatalf("health = %s, want cooling_down unchanged", stored.Health.SummaryState)
+		t.Fatalf("health = %s, want cooling_down after dependency-failure renewal", stored.Health.SummaryState)
 	}
-	if stored.RecoveryPermit.Owner == "" {
-		t.Fatal("recovery permit was released after dependency failure; revision could be retried without bound")
+	// Permit must be consumed so the revision cannot deadlock forever; the renewed
+	// cooldown timer blocks immediate retry instead.
+	if stored.RecoveryPermit.Owner != "" {
+		t.Fatalf("recovery permit owner = %q, want cleared after dependency-failure renewal", stored.RecoveryPermit.Owner)
+	}
+	var renewedRevision int
+	var retryNotBefore time.Time
+	for _, condition := range stored.Health.Conditions {
+		if condition.Scope.Kind == domain.HealthScopeOperation &&
+			condition.Scope.Operation == string(domain.CapabilityOpImageGeneration) {
+			renewedRevision = condition.ConditionRevision
+			retryNotBefore = condition.RetryNotBefore.Time()
+		}
+	}
+	if renewedRevision < 2 {
+		t.Fatalf("condition revision = %d, want >= 2 after progressive renewal", renewedRevision)
+	}
+	if !retryNotBefore.After(spineFixtureTime) {
+		t.Fatalf("retry_not_before = %v, want after fixture start so immediate retry is blocked", retryNotBefore)
 	}
 
+	// Immediate retry is blocked by the renewed cooldown timer (409 provider_cooldown).
 	secondResponse, secondPayload := probe()
-	if secondResponse.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("second status = %d, want 503 occupied-permit conflict (body=%s)", secondResponse.StatusCode, secondPayload)
+	if secondResponse.StatusCode != http.StatusConflict {
+		t.Fatalf("second status = %d, want 409 provider_cooldown (body=%s)", secondResponse.StatusCode, secondPayload)
 	}
-	if calls := harness.vault.validCalls.Load(); calls != 1 {
-		t.Fatalf("vault validate calls = %d, want 1 across both requests", calls)
+	secondBody := decodeError(t, secondPayload)
+	if secondBody["retry_after_class"] != "provider_cooldown" {
+		t.Fatalf("second retry_after_class = %v, want provider_cooldown", secondBody["retry_after_class"])
+	}
+	if secondBody["remediation"] != "wait_provider_cooldown" {
+		t.Fatalf("second remediation = %v, want wait_provider_cooldown", secondBody["remediation"])
 	}
 	if calls := harness.probe.callCount.Load(); calls != 1 {
-		t.Fatalf("probe calls = %d, want exactly 1 for the consumed condition revision", calls)
+		t.Fatalf("probe calls = %d, want exactly 1 while renewed cooldown blocks", calls)
+	}
+
+	// Advance the controlled Clock past the renewed timer; do not reseed health.
+	// Then recover the adapter and prove exactly one new permit + success.
+	wait := retryNotBefore.Sub(spineFixtureTime) + time.Second
+	if wait < time.Minute {
+		wait = time.Minute
+	}
+	harness.clock.advance(wait)
+	harness.probe.probeErr = nil
+	harness.probe.outcome = ports.ProbeOutcome{Authenticated: true}
+
+	thirdResponse, thirdPayload := probe()
+	if thirdResponse.StatusCode != http.StatusOK {
+		t.Fatalf("third status = %d, want 200 recovery after dependency recovery (body=%s)", thirdResponse.StatusCode, thirdPayload)
+	}
+	if calls := harness.probe.callCount.Load(); calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (one failed + one successful recovery)", calls)
 	}
 }
 
@@ -1193,7 +1384,7 @@ func TestRecoveryCredentialRejectionConsumesPermit(t *testing.T) {
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.probe.outcome = ports.ProbeOutcome{Authenticated: false}
 	})
 
@@ -1208,10 +1399,7 @@ func TestRecoveryCredentialRejectionConsumesPermit(t *testing.T) {
 	}
 
 	principal := harness.principal.principals[tenantAKey]
-	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_rejected")
-	if err != nil {
-		t.Fatalf("Visible() after rejection error = %v", err)
-	}
+	stored := harness.storedAccount(t, principal, "pa_recover_rejected")
 	if stored.Lifecycle != domain.LifecycleReauthRequired {
 		t.Fatalf("lifecycle = %s, want reauth_required", stored.Lifecycle)
 	}
@@ -1234,7 +1422,7 @@ func TestRecoveryFreshSignalAtDifferentScopeRenewsClaimedRevision(t *testing.T) 
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.probe.outcome = ports.ProbeOutcome{
 			Authenticated:     true,
 			Signal:            ports.ProbeSignalRateLimited,
@@ -1254,10 +1442,7 @@ func TestRecoveryFreshSignalAtDifferentScopeRenewsClaimedRevision(t *testing.T) 
 	}
 
 	principal := harness.principal.principals[tenantAKey]
-	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_cross_signal")
-	if err != nil {
-		t.Fatalf("Visible() after fresh signal error = %v", err)
-	}
+	stored := harness.storedAccount(t, principal, "pa_recover_cross_signal")
 	if stored.RecoveryPermit.Owner != "" {
 		t.Fatalf("recovery permit owner = %q, want consumed by renewed claimed revision", stored.RecoveryPermit.Owner)
 	}
@@ -1278,6 +1463,77 @@ func TestRecoveryFreshSignalAtDifferentScopeRenewsClaimedRevision(t *testing.T) 
 	if !accountCooling {
 		t.Fatal("fresh account-scope signal was not overlaid")
 	}
+	// Claimed-scope renew must keep the EXISTING reason class, not the fresh
+	// signal's reason. Fresh signal reason applies only to its own evidenced scope.
+	for _, condition := range stored.Health.Conditions {
+		if condition.Scope.Kind == domain.HealthScopeOperation &&
+			condition.Scope.Operation == string(domain.CapabilityOpImageGeneration) {
+			if condition.Reason != domain.HealthReasonProviderRateLimited {
+				t.Fatalf("claimed-scope reason = %s, want provider_rate_limited (existing reason preserved)", condition.Reason)
+			}
+		}
+		if condition.Scope.Kind == domain.HealthScopeAccount && condition.State == domain.HealthCoolingDown {
+			if condition.Reason != domain.HealthReasonProviderRateLimited {
+				// Fresh account-scope signal was rate_limited in this fixture.
+				t.Fatalf("fresh-scope reason = %s, want provider_rate_limited from fresh signal", condition.Reason)
+			}
+		}
+	}
+}
+
+// Review-fix: claimed-scope renew preserves existing reason when a different
+// reason class is evidenced at another scope (rate-limited claim + quota signal).
+func TestFreshSignalDifferentReasonClassPreservesClaimedScopeReason(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeAccount("pa_recover_reason_class", domain.AuthModeChatGPTCodexOAuth)
+		account = account.WithScopedCooldown(
+			domain.NewTimestamp(spineFixtureTime),
+			domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+			domain.HealthReasonProviderRateLimited,
+			domain.NewTimestamp(spineFixtureTime),
+		)
+		h.seedAccount("tenant_a", account)
+		h.probe.outcome = ports.ProbeOutcome{
+			Authenticated:     true,
+			Signal:            ports.ProbeSignalQuotaExhausted,
+			SignalScope:       domain.HealthScope{Kind: domain.HealthScopeAccount},
+			RetryAfterSeconds: 60,
+		}
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/provider-accounts/pa_recover_reason_class/probe",
+		bearer: tenantAKey,
+		body:   `{"scope":{"kind":"operation","operation":"image_generation"}}`,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+
+	principal := harness.principal.principals[tenantAKey]
+	stored := harness.storedAccount(t, principal, "pa_recover_reason_class")
+	var sawClaimed, sawFresh bool
+	for _, condition := range stored.Health.Conditions {
+		if condition.Scope.Kind == domain.HealthScopeOperation &&
+			condition.Scope.Operation == string(domain.CapabilityOpImageGeneration) {
+			sawClaimed = true
+			if condition.Reason != domain.HealthReasonProviderRateLimited {
+				t.Fatalf("claimed scope reason = %s, want provider_rate_limited preserved", condition.Reason)
+			}
+		}
+		if condition.Scope.Kind == domain.HealthScopeAccount && condition.State == domain.HealthCoolingDown {
+			sawFresh = true
+			if condition.Reason != domain.HealthReasonProviderQuotaExhausted {
+				t.Fatalf("fresh scope reason = %s, want provider_quota_exhausted from fresh signal", condition.Reason)
+			}
+		}
+	}
+	if !sawClaimed || !sawFresh {
+		t.Fatalf("expected both claimed and fresh scopes; conditions=%+v", stored.Health.Conditions)
+	}
 }
 
 // AC4: renewing the same scoped condition while its recovery probe is in flight
@@ -1296,7 +1552,7 @@ func TestLateRecoverySuccessCannotClearRenewedConditionRevision(t *testing.T) {
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.probe.entered = entered
 		h.probe.release = release
 	})
@@ -1333,18 +1589,18 @@ func TestLateRecoverySuccessCannotClearRenewedConditionRevision(t *testing.T) {
 	}
 
 	principal := harness.principal.principals[tenantAKey]
-	current, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_stale")
-	if err != nil {
-		t.Fatalf("Visible() error = %v", err)
-	}
-	renewed := current.WithScopedCooldown(
-		domain.NewTimestamp(spineFixtureTime.Add(time.Second)),
-		domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
-		domain.HealthReasonProviderRateLimited,
-		domain.NewTimestamp(spineFixtureTime.Add(time.Minute)),
-	)
-	if _, err := harness.accounts.Update(t.Context(), ports.AccountUpdate{Principal: principal, Account: renewed}); err != nil {
-		t.Fatalf("renew cooldown Update() error = %v", err)
+	current := harness.storedAccount(t, principal, "pa_recover_stale")
+	// Concurrent renew of the same scope via HealthStore (not AccountStore).
+	if _, err := harness.health.ObserveCooldown(t.Context(), ports.CooldownObservation{
+		Principal: principal, AccountID: current.ID,
+		Scope:  domain.HealthScope{Kind: domain.HealthScopeOperation, Operation: string(domain.CapabilityOpImageGeneration)},
+		Reason: domain.HealthReasonProviderRateLimited, CredentialVersion: current.Credential.Version,
+		ObservedAt:     domain.NewTimestamp(spineFixtureTime.Add(time.Second)),
+		RetryNotBefore: domain.NewTimestamp(spineFixtureTime.Add(time.Minute)),
+		SourceClass:    domain.HealthSourceUpstreamAttempt,
+		Audit:          func(context.Context, []ports.HealthTransition) error { return nil },
+	}); err != nil {
+		t.Fatalf("concurrent ObserveCooldown() error = %v", err)
 	}
 
 	close(release)
@@ -1353,10 +1609,7 @@ func TestLateRecoverySuccessCannotClearRenewedConditionRevision(t *testing.T) {
 		t.Fatalf("late recovery status = %d, want 503 stale-settlement conflict (body=%s)", responseStatus, responseBody)
 	}
 
-	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_stale")
-	if err != nil {
-		t.Fatalf("Visible() after recovery error = %v", err)
-	}
+	stored := harness.storedAccount(t, principal, "pa_recover_stale")
 	var found bool
 	for _, condition := range stored.Health.Conditions {
 		if condition.Scope.Kind == domain.HealthScopeOperation &&
@@ -1405,7 +1658,7 @@ func TestOperationScopeRecoveryCannotBypassAccountScopeCooldown(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", mixedScopeCooldownAccount("pa_op_no_clear_account", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", mixedScopeCooldownAccount("pa_op_no_clear_account", domain.AuthModeChatGPTCodexOAuth))
 		h.probe.outcome = ports.ProbeOutcome{Authenticated: true}
 	})
 
@@ -1428,10 +1681,7 @@ func TestOperationScopeRecoveryCannotBypassAccountScopeCooldown(t *testing.T) {
 		t.Fatalf("probe calls = %d, want 0 under account-wide cooldown", calls)
 	}
 
-	stored, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_op_no_clear_account")
-	if err != nil {
-		t.Fatalf("visible: %v", err)
-	}
+	stored := harness.storedAccount(t, managePrincipal(), "pa_op_no_clear_account")
 	if stored.RecoveryPermit.Owner != "" {
 		t.Fatalf("recovery permit owner = %q, want no narrower claim", stored.RecoveryPermit.Owner)
 	}
@@ -1453,7 +1703,7 @@ func TestOperationScopeCooldownBlocksCoveredModelProbe(t *testing.T) {
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -1483,7 +1733,7 @@ func TestAccountScopeRecoveryCannotClearOperationCooldown(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", mixedScopeCooldownAccount("pa_account_no_clear_op", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", mixedScopeCooldownAccount("pa_account_no_clear_op", domain.AuthModeChatGPTCodexOAuth))
 		h.probe.outcome = ports.ProbeOutcome{Authenticated: true}
 	})
 
@@ -1548,7 +1798,7 @@ func TestRecoveryPermitCannotResurrectDisabledAccount(t *testing.T) {
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.probe.entered = entered
 		h.probe.release = release
 		h.probe.outcome = ports.ProbeOutcome{Authenticated: true}
@@ -1586,11 +1836,16 @@ func TestRecoveryPermitCannotResurrectDisabledAccount(t *testing.T) {
 	}
 
 	principal := harness.principal.principals[tenantAKey]
-	current, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_disable_race")
-	if err != nil {
-		t.Fatalf("Visible() error = %v", err)
-	}
+	current := harness.storedAccount(t, principal, "pa_recover_disable_race")
 	disabled := current.WithDisabled(domain.NewTimestamp(spineFixtureTime.Add(time.Second)))
+	disabled.Health = domain.HealthSummary{}
+	disabled.RecoveryPermit = domain.RecoveryPermit{}
+	if _, err := harness.health.ClearPermit(t.Context(), ports.PermitClear{
+		Principal: principal, AccountID: disabled.ID,
+		Audit: func(context.Context, []ports.HealthTransition) error { return nil },
+	}); err != nil {
+		t.Fatalf("ClearPermit() error = %v", err)
+	}
 	if _, err := harness.accounts.Update(t.Context(), ports.AccountUpdate{Principal: principal, Account: disabled}); err != nil {
 		t.Fatalf("disable Update() error = %v", err)
 	}
@@ -1601,12 +1856,31 @@ func TestRecoveryPermitCannotResurrectDisabledAccount(t *testing.T) {
 		t.Fatalf("status = %d, want 200 with disabled account preserved (body=%s)", responseStatus, responseBody)
 	}
 
-	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_recover_disable_race")
-	if err != nil {
-		t.Fatalf("Visible() after race error = %v", err)
-	}
+	stored := harness.storedAccount(t, principal, "pa_recover_disable_race")
 	if stored.Lifecycle != domain.LifecycleDisabled {
 		t.Fatalf("lifecycle = %v, want disabled", stored.Lifecycle)
+	}
+	// Late recovery must not settle the cooling condition or re-open a permit after disable.
+	if stored.RecoveryPermit.Owner != "" {
+		t.Fatalf("recovery permit owner = %q, want empty after disable race", stored.RecoveryPermit.Owner)
+	}
+	var cooling *domain.HealthCondition
+	for i := range stored.Health.Conditions {
+		c := &stored.Health.Conditions[i]
+		if c.Scope.Kind == domain.HealthScopeOperation &&
+			c.Scope.Operation == string(domain.CapabilityOpImageGeneration) {
+			cooling = c
+			break
+		}
+	}
+	if cooling == nil || cooling.State != domain.HealthCoolingDown {
+		t.Fatalf("want durable operation cooldown preserved; conditions=%+v", stored.Health.Conditions)
+	}
+	if cooling.ConditionRevision != 1 {
+		t.Fatalf("cooldown revision = %d, want 1 (no stale recovery settlement)", cooling.ConditionRevision)
+	}
+	if cooling.Reason != domain.HealthReasonProviderRateLimited {
+		t.Fatalf("cooldown reason = %s, want provider_rate_limited", cooling.Reason)
 	}
 }
 
@@ -1624,7 +1898,7 @@ func TestIndependentScopedCooldownsDoNotOverwrite(t *testing.T) {
 			domain.HealthReasonProviderRateLimited,
 			domain.NewTimestamp(spineFixtureTime),
 		)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.probe.outcome = ports.ProbeOutcome{
 			Authenticated: true,
 			Signal:        ports.ProbeSignalRateLimited,
@@ -1658,10 +1932,7 @@ func TestIndependentScopedCooldownsDoNotOverwrite(t *testing.T) {
 	}
 
 	principal := harness.principal.principals[tenantAKey]
-	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_independent_scopes")
-	if err != nil {
-		t.Fatalf("Visible() error = %v", err)
-	}
+	stored := harness.storedAccount(t, principal, "pa_independent_scopes")
 	var chatCondition, imageCondition domain.HealthCondition
 	for _, condition := range stored.Health.Conditions {
 		if condition.Scope.Kind == domain.HealthScopeOperation && condition.Scope.Operation == string(domain.CapabilityOpChat) {
@@ -1686,7 +1957,7 @@ func TestUnknownProbeSignalFailsClosed(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_unknown_signal", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_unknown_signal", domain.AuthModeChatGPTCodexOAuth))
 		h.probe.outcome = ports.ProbeOutcome{
 			Authenticated: true,
 			Signal:        "totally_unknown_signal",
@@ -1707,10 +1978,7 @@ func TestUnknownProbeSignalFailsClosed(t *testing.T) {
 	}
 
 	principal := harness.principal.principals[tenantAKey]
-	stored, err := harness.accounts.Visible(t.Context(), principal, "pa_unknown_signal")
-	if err != nil {
-		t.Fatalf("Visible() error = %v", err)
-	}
+	stored := harness.storedAccount(t, principal, "pa_unknown_signal")
 	if stored.Lifecycle == domain.LifecycleActive {
 		t.Fatal("account activated on unknown probe signal")
 	}

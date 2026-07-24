@@ -45,6 +45,10 @@ func RetryTimingAllowed(account domain.ProviderAccount) bool {
 		return false
 	}
 	for _, condition := range account.Health.Conditions {
+		// I-HEALTH-CURRENT-VERSION: historical other-version evidence is not a gate.
+		if condition.CredentialVersion != account.Credential.Version {
+			continue
+		}
 		switch condition.State {
 		case domain.HealthExpired, domain.HealthChallenged, domain.HealthBlocked:
 			return false
@@ -129,6 +133,7 @@ type ProviderAccountService struct {
 	admission    ports.AdmissionStore
 	replay       ports.ReplayStore
 	accounts     ports.AccountStore
+	health       ports.HealthStore
 	vault        ports.CredentialVault
 	probe        ports.ProbeAdapter
 	oauth        ports.OAuthExchangeAdapter
@@ -148,6 +153,7 @@ type ProviderAccountDependencies struct {
 	Admission    ports.AdmissionStore
 	Replay       ports.ReplayStore
 	Accounts     ports.AccountStore
+	Health       ports.HealthStore
 	Vault        ports.CredentialVault
 	Probe        ports.ProbeAdapter
 	OAuth        ports.OAuthExchangeAdapter
@@ -172,6 +178,8 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		return nil, errors.New("application: replay store is required")
 	case dependencies.Accounts == nil:
 		return nil, errors.New("application: account store is required")
+	case dependencies.Health == nil:
+		return nil, errors.New("application: health store is required")
 	case dependencies.Vault == nil:
 		return nil, errors.New("application: credential vault is required")
 	case dependencies.Probe == nil:
@@ -200,6 +208,7 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		admission:    dependencies.Admission,
 		replay:       dependencies.Replay,
 		accounts:     dependencies.Accounts,
+		health:       dependencies.Health,
 		vault:        dependencies.Vault,
 		probe:        dependencies.Probe,
 		oauth:        dependencies.OAuth,
@@ -212,6 +221,106 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		clock:        dependencies.Clock,
 		ids:          dependencies.IDs,
 	}, nil
+}
+
+// loadAccount composes AccountStore lifecycle metadata with HealthStore
+// conditions/permits at the application boundary (ADR 0009). HealthStore is
+// authoritative: a missing health row fails closed (no embedded fallback).
+// Public summary is projected for the current credential version only
+// (I-HEALTH-CURRENT-VERSION); full conditions (including historical versions)
+// are retained.
+func (service *ProviderAccountService) loadAccount(ctx context.Context, principal domain.SecurityPrincipal, id domain.ProviderAccountID) (domain.ProviderAccount, error) {
+	account, err := service.accounts.Visible(ctx, principal, id)
+	if err != nil {
+		return domain.ProviderAccount{}, err
+	}
+	snapshot, err := service.health.Read(ctx, principal, id)
+	if err != nil {
+		if errors.Is(err, ports.ErrHealthNotFound) {
+			return domain.ProviderAccount{}, ports.ErrDependencyUnavailable
+		}
+		return domain.ProviderAccount{}, err
+	}
+	return composeAccountHealth(account, snapshot), nil
+}
+
+// composeAccountHealth attaches HealthStore evidence and projects effective
+// SummaryState for the account's current Credential.Version.
+func composeAccountHealth(account domain.ProviderAccount, snapshot ports.AccountHealth) domain.ProviderAccount {
+	account.Health = snapshot.Health
+	account.RecoveryPermit = snapshot.RecoveryPermit
+	return account.WithEffectiveHealthProjection()
+}
+
+// projectAccountHealth applies current-version summary projection after a
+// HealthStore mutation result is attached (response paths that do not go
+// through loadAccount).
+func projectAccountHealth(account domain.ProviderAccount) domain.ProviderAccount {
+	return account.WithEffectiveHealthProjection()
+}
+
+// healthAudit returns a batch callback the HealthStore invokes once under its
+// exclusive lock with EXACT prior/new transition evidence for the full mutation
+// (1..N events) before durable append. It requires AuditBatchRecorder and issues
+// exactly one RecordBatch call — never sequential Record — so a multi-event
+// mutation cannot expose event 1 and fail event 2.
+func (service *ProviderAccountService) healthAudit(
+	principal domain.SecurityPrincipal,
+	accountID domain.ProviderAccountID,
+	authMode domain.AuthMode,
+	requestID domain.Identifier,
+) ports.HealthMutationAudit {
+	return func(ctx context.Context, transitions []ports.HealthTransition) error {
+		batch, ok := service.audit.(ports.AuditBatchRecorder)
+		if !ok {
+			return ports.ErrDependencyUnavailable
+		}
+		events := make([]ports.AuditEvent, 0, len(transitions))
+		for _, tr := range transitions {
+			event := ports.AuditEvent{
+				Action:            ports.AuditProviderHealthTransition,
+				TenantID:          principal.TenantID,
+				ClientAPIKeyID:    principal.ClientAPIKeyID,
+				ProviderAccountID: accountID,
+				RequestID:         requestID,
+				Outcome:           tr.Outcome,
+				AuthMode:          authMode,
+				OldState:          tr.PriorCondition.State,
+				NewState:          tr.NewCondition.State,
+				OldReason:         tr.PriorCondition.Reason,
+				NewReason:         tr.NewCondition.Reason,
+				Scope:             tr.Scope,
+				CredentialVersion: tr.NewCondition.CredentialVersion,
+				SourceClass:       tr.NewCondition.SourceClass,
+				ConditionRevision: tr.NewCondition.ConditionRevision,
+				ProbeID:           requestID,
+			}
+			if event.CredentialVersion == 0 {
+				event.CredentialVersion = tr.PriorCondition.CredentialVersion
+			}
+			if event.SourceClass == "" {
+				event.SourceClass = tr.PriorCondition.SourceClass
+			}
+			if event.Scope.Kind == "" {
+				event.Scope = tr.PriorCondition.Scope
+			}
+			if !tr.NewCondition.RetryNotBefore.IsZero() {
+				event.RetryTimingClass = "provider_cooldown"
+				event.RetryNotBefore = tr.NewCondition.RetryNotBefore
+			}
+			if tr.NewCondition.State == "" && tr.PriorCondition.State != "" {
+				event.OldState = tr.PriorCondition.State
+				event.OldReason = tr.PriorCondition.Reason
+				event.ConditionRevision = tr.PriorCondition.ConditionRevision
+				event.CredentialVersion = tr.PriorCondition.CredentialVersion
+				event.SourceClass = tr.PriorCondition.SourceClass
+				event.Scope = tr.PriorCondition.Scope
+			}
+			events = append(events, event)
+		}
+		// Single atomic batch boundary — no sequential Record fallback.
+		return batch.RecordBatch(ctx, events)
+	}
 }
 
 // CreateProviderAccount runs the full protected spine and persists exactly one
@@ -290,7 +399,8 @@ func (service *ProviderAccountService) CreateProviderAccount(ctx context.Context
 		// durable side effect, so it MUST NOT emit a second
 		// provider_account.created audit event. Only the safe telemetry and the
 		// single request-log line are recorded for the replayed 201.
-		account := decision.TerminalAccount
+		// Re-project v0 draft summary so effective health is always coherent.
+		account := projectAccountHealth(decision.TerminalAccount)
 		service.recordTelemetry(ctx, sc.operation, "", 201)
 		service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), 201, "ok", sc.start)
 		return ProviderAccountResult{Account: account, RequestID: sc.requestID}, nil
@@ -320,12 +430,28 @@ func (service *ProviderAccountService) CreateProviderAccount(ctx context.Context
 	}
 	draft := domain.NewDraftProviderAccount(accountID, command.Provider, command.AuthMode, command.Label, domain.NewTimestamp(sc.start))
 
-	persisted, err := service.accounts.Create(ctx, ports.AccountCreation{Principal: principal, Account: draft})
-	if err != nil {
+	// Initialize HealthStore first so a visible account never exists without a
+	// durable health row (fail-closed Read). AccountStore create follows.
+	// Audit runs under the store lock with exact transition before append.
+	if _, err := service.health.Initialize(ctx, ports.HealthInitialize{
+		Principal: principal,
+		AccountID: draft.ID,
+		Health:    draft.Health,
+		Audit:     service.healthAudit(principal, draft.ID, draft.AuthMode, sc.requestID),
+	}); err != nil {
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
+	persisted, err := service.accounts.Create(ctx, ports.AccountCreation{Principal: principal, Account: draft})
+	if err != nil {
+		// Health already initialized; fail closed rather than relax lifecycle.
+		service.release(ctx, reservation)
+		service.abandon(ctx, identity)
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	persisted.Health = draft.Health
+	persisted = projectAccountHealth(persisted)
 
 	if err := service.replay.Complete(ctx, identity, ports.ReplayResult{Account: persisted}); err != nil {
 		// The draft is already durably persisted, so the create side effect
@@ -360,7 +486,7 @@ func (service *ProviderAccountService) GetProviderAccount(ctx context.Context, q
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewForbidden())
 	}
 
-	account, err := service.accounts.Visible(ctx, principal, query.AccountID)
+	account, err := service.loadAccount(ctx, principal, query.AccountID)
 	if err != nil {
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
 	}
@@ -399,6 +525,19 @@ func (service *ProviderAccountService) ListProviderAccounts(ctx context.Context,
 	if err != nil {
 		service.release(ctx, reservation)
 		return ProviderAccountsResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	// Compose HealthStore into each listed projection; missing health fails closed.
+	// Summary is projected for each account's current credential version.
+	for i := range accounts {
+		snapshot, snapErr := service.health.Read(ctx, principal, accounts[i].ID)
+		if snapErr != nil {
+			service.release(ctx, reservation)
+			if errors.Is(snapErr, ports.ErrHealthNotFound) {
+				return ProviderAccountsResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+			}
+			return ProviderAccountsResult{}, service.fail(ctx, sc, service.dependencyCanonical(snapErr))
+		}
+		accounts[i] = composeAccountHealth(accounts[i], snapshot)
 	}
 	service.release(ctx, reservation)
 
@@ -467,7 +606,13 @@ func (service *ProviderAccountService) visibilityCanonical(err error) domain.Can
 // dependencyCanonical maps an infrastructure failure to a fail-closed dependency
 // code, never leaking the underlying cause.
 func (service *ProviderAccountService) dependencyCanonical(err error) domain.CanonicalError {
-	if errors.Is(err, ports.ErrDependencyUnavailable) {
+	if errors.Is(err, ports.ErrDependencyUnavailable) || errors.Is(err, ports.ErrHealthNotFound) {
+		return domain.NewDependencyUnavailable()
+	}
+	// HealthStore and AccountStore CAS conflicts are fail-closed dependency
+	// outcomes, not internal faults: a concurrent renew/disable/claim lost the
+	// fence and the client may retry without a permanent 500.
+	if errors.Is(err, ports.ErrAccountUpdateConflict) {
 		return domain.NewDependencyUnavailable()
 	}
 	return domain.NewInternalError()

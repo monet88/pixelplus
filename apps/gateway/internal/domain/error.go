@@ -540,6 +540,21 @@ func NewDependencyUnavailable() CanonicalError {
 	}
 }
 
+// NewRecoveryPermitOccupied builds the fail-closed outcome when a half-open
+// recovery permit is already owned for the cooling condition. It is deliberately
+// non-time-based (no retry_after_seconds) so clients do not hammer a revision
+// that cannot be reclaimed until a lifecycle epoch or successful settlement.
+func NewRecoveryPermitOccupied() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeAccountNotUsable,
+		Category:     CategoryRouting,
+		StatusClass:  StatusAccountPolicy,
+		Retryability: RetryOperatorActionRequired,
+		Remediation:  RemediationContactOperator,
+		FailureStage: StageRouting,
+	}
+}
+
 // NewInternalError builds the fallback for an unclassified internal outcome. It
 // never carries a raw exception string.
 func NewInternalError() CanonicalError {

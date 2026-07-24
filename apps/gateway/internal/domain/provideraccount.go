@@ -1,6 +1,7 @@
 package domain
 
 import "time"
+
 const (
 	// accountCooldownTransientBase/Max bound rate-limit/backoff progressive waits.
 	accountCooldownTransientBase = 30 * time.Second
@@ -9,7 +10,6 @@ const (
 	accountCooldownQuotaBase = 15 * time.Minute
 	accountCooldownQuotaMax  = 24 * time.Hour
 )
-
 
 // Provider names a supported upstream Provider. Values mirror the frozen
 // Public API contract enum.
@@ -205,12 +205,11 @@ type ProviderAccount struct {
 	PendingCredentialVersion int
 	// PendingOrigin preserves the lifecycle state that must survive a failed
 	// replacement or a successful replacement of a disabled account.
-	PendingOrigin       LifecycleState
-	PendingOriginHealth HealthSummary
-	Health              HealthSummary
-	Controls            AdministrativeControls
-	CreatedAt           Timestamp
-	UpdatedAt           Timestamp
+	PendingOrigin LifecycleState
+	Health        HealthSummary
+	Controls      AdministrativeControls
+	CreatedAt     Timestamp
+	UpdatedAt     Timestamp
 	// RiskAcknowledged records whether the owning Tenant accepted the residual
 	// risk themes a `gated`/`experimental` Auth Mode requires (risk envelope
 	// §6.1). It is server-owned account state, never projected to the Public API
@@ -546,7 +545,6 @@ func (account ProviderAccount) withPendingCredential(now Timestamp, expiresAt Ti
 	if replacement {
 		account.PendingCredentialVersion = nextVersion
 		account.PendingOrigin = account.Lifecycle
-		account.PendingOriginHealth = account.Health
 		if account.Lifecycle != LifecycleDisabled {
 			account.Lifecycle = LifecyclePendingValidation
 		}
@@ -639,7 +637,6 @@ func (account ProviderAccount) withProbeActivated(now Timestamp, replacement boo
 		account.PendingCredentialVersion = 0
 	}
 	account.PendingOrigin = ""
-	account.PendingOriginHealth = HealthSummary{}
 	account.RecoveryPermit = RecoveryPermit{}
 	account.Credential.LastProbedAt = now
 	account.Health = HealthSummary{
@@ -725,6 +722,38 @@ func worstConditionState(conditions []HealthCondition) HealthState {
 	return worst
 }
 
+// ProjectEffectiveHealthSummary recomputes SummaryState from conditions fenced
+// to the current usable credential version while retaining the full conditions
+// list (including historical other-version evidence for audit/projection).
+//
+// Durable HealthStore may store SummaryState as worst-across-versions; the
+// Public API / management summary is the most severe *effective* condition for
+// the current credential (§2, §2.6, I-HEALTH-CURRENT-VERSION). Draft accounts
+// with Credential.Version 0 use only version-0 conditions (initial_unprobed).
+func ProjectEffectiveHealthSummary(credentialVersion int, health HealthSummary) HealthSummary {
+	current := make([]HealthCondition, 0, len(health.Conditions))
+	for _, condition := range health.Conditions {
+		if condition.CredentialVersion == credentialVersion {
+			current = append(current, condition)
+		}
+	}
+	if len(current) == 0 {
+		// Historical-only evidence must not invent a hard current summary.
+		health.SummaryState = HealthUnknown
+		return health
+	}
+	health.SummaryState = worstConditionState(current)
+	return health
+}
+
+// WithEffectiveHealthProjection returns a copy whose Health.SummaryState is
+// derived only from current credential-version conditions. Conditions are
+// preserved in full.
+func (account ProviderAccount) WithEffectiveHealthProjection() ProviderAccount {
+	account.Health = ProjectEffectiveHealthSummary(account.Credential.Version, account.Health)
+	return account
+}
+
 // NextCooldownFence returns the normalized scope plus the condition revision and
 // bounded backoff level a newly observed cooldown will receive. Policy timing can
 // therefore be computed before WithScopedCooldown persists the same fence.
@@ -756,13 +785,35 @@ func (account ProviderAccount) NextCooldownFence(scope HealthScope) (HealthScope
 // never changes lifecycle: auth was proven, so an active account stays active
 // with a scoped overlay (§20 I-HEALTH-ORTHOGONAL).
 func (account ProviderAccount) WithScopedCooldown(now Timestamp, scope HealthScope, reason HealthReason, retryNotBefore Timestamp) ProviderAccount {
+	return account.WithScopedCooldownSource(now, scope, reason, retryNotBefore, account.Credential.Version, HealthSourceUpstreamAttempt)
+}
+
+// WithScopedCooldownSource creates or renews a cooling_down condition with an
+// explicit source class and credential version fence. Dependency-failure
+// renewal during a recovery probe MUST use HealthSourceRecoveryProbe rather
+// than fabricating HealthSourceUpstreamAttempt (§11, §19).
+func (account ProviderAccount) WithScopedCooldownSource(
+	now Timestamp,
+	scope HealthScope,
+	reason HealthReason,
+	retryNotBefore Timestamp,
+	credentialVersion int,
+	source HealthSourceClass,
+) ProviderAccount {
 	normalized := normalizeCooldownScope(scope)
+	if source == "" {
+		source = HealthSourceUpstreamAttempt
+	}
 	conditions := make([]HealthCondition, len(account.Health.Conditions))
 	copy(conditions, account.Health.Conditions)
 
 	matched := false
 	for i := range conditions {
 		if !sameScope(conditions[i].Scope, normalized) {
+			continue
+		}
+		// Merge only same credential-version fencing (version coexistence).
+		if conditions[i].CredentialVersion != credentialVersion {
 			continue
 		}
 		if conditions[i].State == HealthCoolingDown {
@@ -772,12 +823,12 @@ func (account ProviderAccount) WithScopedCooldown(now Timestamp, scope HealthSco
 		}
 		conditions[i].State = HealthCoolingDown
 		conditions[i].Reason = reason
-		conditions[i].CredentialVersion = account.Credential.Version
+		conditions[i].CredentialVersion = credentialVersion
 		conditions[i].ObservedAt = now
 		conditions[i].Remediation = RemediationWaitProviderCooldown
 		conditions[i].ConditionRevision++
 		conditions[i].RetryNotBefore = retryNotBefore
-		conditions[i].SourceClass = HealthSourceUpstreamAttempt
+		conditions[i].SourceClass = source
 		matched = true
 		break
 	}
@@ -786,14 +837,14 @@ func (account ProviderAccount) WithScopedCooldown(now Timestamp, scope HealthSco
 			Scope:             normalized,
 			State:             HealthCoolingDown,
 			Reason:            reason,
-			CredentialVersion: account.Credential.Version,
+			CredentialVersion: credentialVersion,
 			ObservedAt:        now,
 			Remediation:       RemediationWaitProviderCooldown,
 			ConditionRevision: 1,
-		BackoffLevel:      1,
-		RetryNotBefore:    retryNotBefore,
-		SourceClass:       HealthSourceUpstreamAttempt,
-	})
+			BackoffLevel:      1,
+			RetryNotBefore:    retryNotBefore,
+			SourceClass:       source,
+		})
 	}
 	account.Health.Conditions = conditions
 	account.Health.SummaryState = worstConditionState(conditions)
@@ -816,21 +867,31 @@ func isTransientHealthState(state HealthState) bool {
 // RecoveryPermitDecision reports whether the requested scope carries a cooldown
 // and whether its half-open time makes the single permit claimable now.
 type RecoveryPermitDecision struct {
-	Permit            RecoveryPermit
-	Cooling           bool
-	Eligible          bool
+	Permit   RecoveryPermit
+	Cooling  bool
+	Eligible bool
+	// Occupied is true when a half-open permit already owns this cooling
+	// condition. Pre-claim Occupied and post-claim CAS conflict both map to the
+	// same stable operator-facing 409 recovery_permit_occupied outcome.
+	Occupied          bool
 	RetryAfterSeconds int
 }
 
 // ScopedRecoveryPermit applies the pre-attempt cooldown hierarchy before it
 // considers half-open ownership. A broader account/operation condition covers a
 // narrower request and must block it; only an exact-scope cooldown may grant the
-// single recovery permit for its own revision.
+// single recovery permit for its own revision. An already-occupied permit for a
+// covering exact cooling condition is reported as Occupied (not Eligible).
 func (account ProviderAccount) ScopedRecoveryPermit(now Timestamp, scope HealthScope, owner Identifier) RecoveryPermitDecision {
 	normalized := normalizeCooldownScope(scope)
 	var exact *HealthCondition
 	for index := range account.Health.Conditions {
 		condition := &account.Health.Conditions[index]
+		// I-HEALTH-CURRENT-VERSION: only the usable credential version may
+		// authorize or block recovery for selection/probe routing.
+		if condition.CredentialVersion != account.Credential.Version {
+			continue
+		}
 		if condition.State != HealthCoolingDown || !cooldownScopeCovers(condition.Scope, normalized) {
 			continue
 		}
@@ -845,6 +906,15 @@ func (account ProviderAccount) ScopedRecoveryPermit(now Timestamp, scope HealthS
 
 	decision := RecoveryPermitDecision{Cooling: true}
 	if exact.CredentialVersion != account.Credential.Version {
+		return decision
+	}
+	// Occupied permit is recognized before timer eligibility so a dependency-
+	// failure residual owner is not mistaken for a timer-open half-open slot.
+	if account.RecoveryPermit.Owner != "" &&
+		sameScope(account.RecoveryPermit.Scope, exact.Scope) &&
+		account.RecoveryPermit.ConditionRevision == exact.ConditionRevision &&
+		account.RecoveryPermit.CredentialVersion == exact.CredentialVersion {
+		decision.Occupied = true
 		return decision
 	}
 	if !exact.RetryNotBefore.IsZero() && now.Time().Before(exact.RetryNotBefore.Time()) {
@@ -946,14 +1016,11 @@ func (account ProviderAccount) WithScopedRecovery(now Timestamp, permit Recovery
 // active/disabled replacements do not demote the prior usable/admin state.
 func (account ProviderAccount) WithPendingCredentialRejected(now Timestamp) ProviderAccount {
 	origin := account.PendingOrigin
-	originHealth := account.PendingOriginHealth
 	account.PendingCredentialVersion = 0
 	account.PendingOrigin = ""
-	account.PendingOriginHealth = HealthSummary{}
 	switch origin {
 	case LifecycleActive, LifecycleDisabled:
 		account.Lifecycle = origin
-		account.Health = originHealth
 		account.UpdatedAt = now
 		return account
 	case LifecycleRevoked:
@@ -991,7 +1058,6 @@ func (account ProviderAccount) WithDisabled(now Timestamp) ProviderAccount {
 	account.RecoveryPermit = RecoveryPermit{}
 	if account.PendingCredentialVersion > 0 {
 		account.PendingOrigin = LifecycleDisabled
-		account.PendingOriginHealth = account.Health
 	}
 	account.UpdatedAt = now
 	return account

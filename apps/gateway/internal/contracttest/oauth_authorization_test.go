@@ -42,7 +42,7 @@ func TestOAuthStartConnectAcceptedCreatesPendingJourney(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -105,7 +105,7 @@ func TestOAuthPollPendingSafeProjection(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_poll", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_poll", domain.AuthModeChatGPTCodexOAuth))
 		h.oauth.nextStatus = domain.OAuthStatusAuthorizationPending
 	})
 	startResp, startPayload := harness.do(t, requestSpec{
@@ -149,7 +149,7 @@ func TestOAuthPollSucceededStoresCredentialWithoutActivating(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_ok", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_ok", domain.AuthModeChatGPTCodexOAuth))
 		h.oauth.nextStatus = domain.OAuthStatusSucceeded
 		h.oauth.material = oauthExchangedMaterial
 	})
@@ -228,7 +228,7 @@ func TestOAuthPollFailedRestoresDraftWithoutVault(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_fail", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_fail", domain.AuthModeChatGPTCodexOAuth))
 		h.oauth.nextStatus = domain.OAuthStatusFailed
 	})
 	startResp, startPayload := harness.do(t, requestSpec{
@@ -281,7 +281,7 @@ func TestOAuthStartSingleFlightRejectsSecondJourney(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_sf", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_sf", domain.AuthModeChatGPTCodexOAuth))
 	})
 	first, firstPayload := harness.do(t, requestSpec{
 		method:  http.MethodPost,
@@ -344,21 +344,21 @@ func TestOAuthStartGatesRejectBeforeAdapter(t *testing.T) {
 	}
 
 	run(t, "/v1/provider-accounts/pa_web/oauth-authorizations", func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_web", domain.AuthModeChatGPTWebAccess))
+		h.seedAccount("tenant_a", usableDraft("pa_web", domain.AuthModeChatGPTWebAccess))
 	}, oauthStartBody("connect", "device"), "invalid_request", http.StatusBadRequest)
 
 	run(t, "/v1/provider-accounts/pa_pending/oauth-authorizations", func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_pending", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_pending", domain.AuthModeChatGPTCodexOAuth))
 	}, oauthStartBody("connect", "device"), "account_not_usable", http.StatusConflict)
 
 	run(t, "/v1/provider-accounts/pa_noack_oauth/oauth-authorizations", func(h *spineHarness) {
 		account := usableDraft("pa_noack_oauth", domain.AuthModeChatGPTCodexOAuth)
 		account.RiskAcknowledged = false
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	}, oauthStartBody("connect", "device"), "account_not_usable", http.StatusConflict)
 
 	run(t, "/v1/provider-accounts/pa_bad_purpose/oauth-authorizations", func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_bad_purpose", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_bad_purpose", domain.AuthModeChatGPTCodexOAuth))
 	}, oauthStartBody("upgrade", "device"), "invalid_request", http.StatusBadRequest)
 }
 
@@ -368,7 +368,7 @@ func TestOAuthStartScopeAndNonEnumeration(t *testing.T) {
 
 	// manage scope required
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_scope", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_scope", domain.AuthModeChatGPTCodexOAuth))
 	})
 	response, payload := harness.do(t, requestSpec{
 		method:  http.MethodPost,
@@ -389,8 +389,8 @@ func TestOAuthStartScopeAndNonEnumeration(t *testing.T) {
 	deleted := usableDraft("pa_oauth_deleted", domain.AuthModeChatGPTCodexOAuth)
 	deleted.Lifecycle = domain.LifecycleDeleted
 	seed := func(h *spineHarness) {
-		h.accounts.seed("tenant_b", foreign)
-		h.accounts.seed("tenant_a", deleted)
+		h.seedAccount("tenant_b", foreign)
+		h.seedAccount("tenant_a", deleted)
 	}
 	var bodies []string
 	for _, id := range []string{"pa_oauth_foreign", "pa_missing_oauth", "pa_oauth_deleted"} {
@@ -430,7 +430,7 @@ func TestDirectSubmitRejectedWhileOAuthJourneyInFlight(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_replace", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_replace", domain.AuthModeChatGPTCodexOAuth))
 	})
 	startResp, startPayload := harness.do(t, requestSpec{
 		method:  http.MethodPost,
@@ -472,7 +472,7 @@ func TestOAuthReauthenticationStagesAndCutsOverPendingVersion(t *testing.T) {
 		account.Lifecycle = domain.LifecycleActive
 		account.Credential.Version = 1
 		account.Credential.LastAllocatedVersion = 1
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.oauth.nextStatus = domain.OAuthStatusSucceeded
 	})
 	startResp, startPayload := harness.do(t, requestSpec{
@@ -531,7 +531,7 @@ func TestOAuthReauthenticationFailurePreservesOriginLifecycle(t *testing.T) {
 				account.Lifecycle = origin
 				account.Credential.Version = 1
 				account.Credential.LastAllocatedVersion = 1
-				h.accounts.seed("tenant_a", account)
+				h.seedAccount("tenant_a", account)
 				h.oauth.nextStatus = domain.OAuthStatusFailed
 			})
 			accountID := "pa_oauth_reauth_fail_" + string(origin)
@@ -574,7 +574,7 @@ func TestOAuthReauthenticationPollRetryReusesPendingVersion(t *testing.T) {
 		account.Lifecycle = domain.LifecycleActive
 		account.Credential.Version = 1
 		account.Credential.LastAllocatedVersion = 1
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.oauth.nextStatus = domain.OAuthStatusSucceeded
 		h.oauth.material = oauthExchangedMaterial
 	})
@@ -636,8 +636,8 @@ func TestOAuthPollNonEnumeration(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_ne_poll", domain.AuthModeChatGPTCodexOAuth))
-		h.accounts.seed("tenant_b", usableDraft("pa_oauth_ne_foreign", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_ne_poll", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_b", usableDraft("pa_oauth_ne_foreign", domain.AuthModeChatGPTCodexOAuth))
 	})
 	// Start a journey on tenant_b so an id exists but is foreign to tenant_a.
 	startResp, startPayload := harness.do(t, requestSpec{
@@ -696,7 +696,7 @@ func TestOAuthPollExpiredRestoresDraftWithoutVault(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_exp", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_exp", domain.AuthModeChatGPTCodexOAuth))
 		// Keep adapter pending so expiry is enforced by the application clock gate.
 		h.oauth.nextStatus = domain.OAuthStatusAuthorizationPending
 	})
@@ -756,7 +756,7 @@ func TestOAuthStartConcurrentDistinctKeysSingleOwner(t *testing.T) {
 
 	hold := make(chan struct{})
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_race_start", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_race_start", domain.AuthModeChatGPTCodexOAuth))
 		h.oauth.startHold = hold
 	})
 
@@ -837,7 +837,7 @@ func TestOAuthStartVsDirectSubmitRace(t *testing.T) {
 
 	hold := make(chan struct{})
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_vs_submit", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_vs_submit", domain.AuthModeChatGPTCodexOAuth))
 		h.oauth.startHold = hold
 	})
 
@@ -923,7 +923,7 @@ func TestOAuthPollConcurrentSuccessOneVaultPut(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_race_poll", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_race_poll", domain.AuthModeChatGPTCodexOAuth))
 		h.oauth.nextStatus = domain.OAuthStatusSucceeded
 		h.oauth.material = oauthExchangedMaterial
 	})
@@ -994,7 +994,7 @@ func TestOAuthStartTerminalReplayReturnsSameAuthorization(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_replay", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_replay", domain.AuthModeChatGPTCodexOAuth))
 	})
 	first, firstPayload := harness.do(t, requestSpec{
 		method:  http.MethodPost,
@@ -1045,7 +1045,7 @@ func TestOAuthStartReplayOutcomesNeverDuplicateWork(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			harness := newSpineHarness(t, func(h *spineHarness) {
-				h.accounts.seed("tenant_a", usableDraft("pa_oauth_replay_"+testCase.name, domain.AuthModeChatGPTCodexOAuth))
+				h.seedAccount("tenant_a", usableDraft("pa_oauth_replay_"+testCase.name, domain.AuthModeChatGPTCodexOAuth))
 				h.replay.forced = testCase.outcome
 			})
 			response, payload := harness.do(t, requestSpec{
@@ -1075,7 +1075,7 @@ func TestOAuthPollRecoversAfterAccountUpdateFailure(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_recover", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_recover", domain.AuthModeChatGPTCodexOAuth))
 		h.oauth.nextStatus = domain.OAuthStatusSucceeded
 		h.oauth.material = oauthExchangedMaterial
 	})
@@ -1140,7 +1140,7 @@ func TestOAuthPollZeroExpiryFailsClosed(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_oauth_zero_exp", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_oauth_zero_exp", domain.AuthModeChatGPTCodexOAuth))
 		h.oauth.nextStatus = domain.OAuthStatusAuthorizationPending
 	})
 	startResp, startPayload := harness.do(t, requestSpec{

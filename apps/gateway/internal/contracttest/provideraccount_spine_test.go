@@ -13,6 +13,7 @@ import (
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/contracttest"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
+	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
 // spineFixtureTime is the deterministic instant used when a test needs to seed
@@ -29,6 +30,7 @@ type spineHarness struct {
 	admission    *stubAdmissionStore
 	replay       *stubReplayStore
 	accounts     *stubAccountStore
+	health       *stubHealthStore
 	audit        *captureAudit
 	telemetry    *captureTelemetry
 	reqLog       *captureRequestLog
@@ -38,6 +40,51 @@ type spineHarness struct {
 	capabilities *stubCapabilityStore
 	capability   *stubCapabilityAdapter
 	circuits     *stubCircuitStore
+	clock        *mutableTestClock
+}
+
+// mutableTestClock is a controlled clock for public composition proofs that
+// need to advance time past cooldown timers without reseeding durable health.
+type mutableTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *mutableTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	value := c.now
+	c.now = c.now.Add(time.Second)
+	return value
+}
+
+func (c *mutableTestClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// seedAccount seeds AccountStore lifecycle and HealthStore conditions independently.
+func (h *spineHarness) seedAccount(tenant domain.TenantID, account domain.ProviderAccount) {
+	stripped, health, permit := seedAccountHealth(account)
+	h.accounts.seed(tenant, stripped)
+	h.health.Seed(tenant, account.ID, health, permit)
+}
+
+// storedAccount composes AccountStore + HealthStore the way production reads do.
+func (h *spineHarness) storedAccount(t *testing.T, principal domain.SecurityPrincipal, id domain.ProviderAccountID) domain.ProviderAccount {
+	t.Helper()
+	account, err := h.accounts.Visible(t.Context(), principal, id)
+	if err != nil {
+		t.Fatalf("accounts.Visible() error = %v", err)
+	}
+	snap, err := h.health.Read(t.Context(), principal, id)
+	if err != nil {
+		t.Fatalf("health.Read() error = %v", err)
+	}
+	account.Health = snap.Health
+	account.RecoveryPermit = snap.RecoveryPermit
+	return account
 }
 
 const (
@@ -80,6 +127,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		admission:    &stubAdmissionStore{log: log},
 		replay:       newStubReplayStore(log),
 		accounts:     newStubAccountStore(log),
+		health:       newStubHealthStore(),
 		audit:        &captureAudit{},
 		telemetry:    &captureTelemetry{},
 		reqLog:       &captureRequestLog{},
@@ -89,6 +137,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		capabilities: newStubCapabilityStore(log),
 		capability:   newStubCapabilityAdapter(log),
 		circuits:     newStubCircuitStore(log),
+		clock:        &mutableTestClock{now: spineFixtureTime},
 	}
 	if configure != nil {
 		configure(harness)
@@ -99,6 +148,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		Admission:    harness.admission,
 		Replay:       harness.replay,
 		Accounts:     harness.accounts,
+		Health:       harness.health,
 		Audit:        harness.audit,
 		Telemetry:    harness.telemetry,
 		RequestLog:   harness.reqLog,
@@ -108,6 +158,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		Capabilities: harness.capabilities,
 		Capability:   harness.capability,
 		Circuits:     harness.circuits,
+		Clock:        harness.clock,
 	})
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)
@@ -268,11 +319,17 @@ func TestCreateIgnoresClientSuppliedTenant(t *testing.T) {
 		t.Fatalf("create status = %d, want 201 (body=%s)", response.StatusCode, payload)
 	}
 	audits := harness.audit.snapshot()
-	if len(audits) != 1 {
-		t.Fatalf("audit events = %d, want 1", len(audits))
+	var created []ports.AuditEvent
+	for _, event := range audits {
+		if event.Action == ports.AuditProviderAccountCreated {
+			created = append(created, event)
+		}
 	}
-	if audits[0].TenantID != "tenant_a" {
-		t.Fatalf("audit tenant = %q, want tenant_a", audits[0].TenantID)
+	if len(created) != 1 {
+		t.Fatalf("provider_account.created audit events = %d, want 1 (total audits=%d)", len(created), len(audits))
+	}
+	if created[0].TenantID != "tenant_a" {
+		t.Fatalf("audit tenant = %q, want tenant_a", created[0].TenantID)
 	}
 }
 
@@ -410,8 +467,8 @@ func TestGetNonEnumerationIsIndistinguishable(t *testing.T) {
 	deleted.Lifecycle = domain.LifecycleDeleted
 
 	seedNonEnumeration := func(h *spineHarness) {
-		h.accounts.seed("tenant_b", foreign)
-		h.accounts.seed("tenant_a", deleted)
+		h.seedAccount("tenant_b", foreign)
+		h.seedAccount("tenant_a", deleted)
 	}
 
 	cases := []struct {
@@ -646,7 +703,7 @@ func TestListReturnsOnlyOwningTenantAccounts(t *testing.T) {
 
 	foreign := domain.NewDraftProviderAccount("pa_foreign", domain.ProviderChatGPT, domain.AuthModeChatGPTCodexOAuth, "b", domain.NewTimestamp(spineFixtureTime))
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_b", foreign)
+		h.seedAccount("tenant_b", foreign)
 	})
 
 	created := harness.createDraft(t, tenantAKey, "idem-list-1", validCreateBody)

@@ -153,7 +153,9 @@ func (service *ProviderAccountService) submitCredential(ctx context.Context, com
 	case ports.ReplayClaimed:
 		// Sole executor: fall through to admission then Vault store.
 	case ports.ReplayTerminal:
-		terminal := decision.TerminalAccount
+		// Terminal record must already hold the effective projection; re-project
+		// defensively so a legacy empty-health record cannot leak.
+		terminal := projectAccountHealth(decision.TerminalAccount)
 		service.recordTelemetry(ctx, sc.operation, "", 202)
 		service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), 202, "ok", sc.start)
 		return ProviderAccountResult{Account: terminal, RequestID: sc.requestID}, nil
@@ -219,16 +221,42 @@ func (service *ProviderAccountService) submitCredential(ctx context.Context, com
 		account = claimed
 	}
 
-	// Store the material through the Vault under the next credential version.
+	// Allocate the next version before Vault.Put. Replacement already reserved its
+	// pending version while claiming the OAuth marker above. First-connect reserves
+	// only LastAllocatedVersion under CAS, leaving lifecycle/current credential
+	// unchanged until the Vault + HealthStore side effects succeed. A failed side
+	// effect therefore consumes the version and a retry cannot reuse its slot.
+	var submitted domain.ProviderAccount
+	nextVersion := account.PendingCredentialVersion
+	if !command.Replacement {
+		submitted = account.WithSubmittedCredential(domain.NewTimestamp(sc.start), domain.Timestamp{}).
+			WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
+		nextVersion = submitted.Credential.Version
+		reserved, reserveErr := service.accounts.Update(ctx, ports.AccountUpdate{
+			Principal:                        principal,
+			Account:                          account,
+			RequireEmptyOAuthMarker:          true,
+			RequireEmptyPendingVersion:       true,
+			RequireLifecycle:                 account.Lifecycle,
+			RequireControlsMatch:             true,
+			RequireControls:                  account.Controls,
+			PatchLastAllocatedVersion:        true,
+			RequireLastAllocatedVersionMatch: true,
+			RequireLastAllocatedVersion:      account.Credential.LastAllocatedVersion,
+			LastAllocatedVersion:             nextVersion,
+		})
+		if reserveErr != nil {
+			service.release(ctx, reservation)
+			service.abandon(ctx, identity)
+			if errors.Is(reserveErr, ports.ErrAccountUpdateConflict) {
+				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+			}
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(reserveErr))
+		}
+		account = reserved
+	}
 	// The application forwards the secret without inspecting or retaining it and
 	// receives nothing secret back.
-	nextVersion := account.PendingCredentialVersion
-	if nextVersion == 0 {
-		nextVersion = account.Credential.LastAllocatedVersion + 1
-		if nextVersion <= account.Credential.Version {
-			nextVersion = account.Credential.Version + 1
-		}
-	}
 	intake := ports.CredentialIntake{
 		Principal: principal,
 		AccountID: account.ID,
@@ -258,7 +286,6 @@ func (service *ProviderAccountService) submitCredential(ctx context.Context, com
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 
-	var submitted domain.ProviderAccount
 	if command.Replacement {
 		if account.PendingCredentialVersion == 0 {
 			service.release(ctx, reservation)
@@ -266,32 +293,68 @@ func (service *ProviderAccountService) submitCredential(ctx context.Context, com
 			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewInternalError())
 		}
 		submitted = account.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
-	} else {
-		submitted = account.WithSubmittedCredential(domain.NewTimestamp(sc.start), domain.Timestamp{})
-		submitted = submitted.WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
 	}
-	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
+	// Lifecycle/metadata only — strip health authority from AccountStore write.
+	submitted.Health = domain.HealthSummary{}
+	submitted.RecoveryPermit = domain.RecoveryPermit{}
+	// Credential epoch: fence HealthStore to the newly stored version before the
+	// AccountStore lifecycle write so product traffic never sees pending/current
+	// metadata advanced while health still authorizes an old credential epoch.
+	nowSubmit := domain.NewTimestamp(sc.start)
+	epoch := ports.CredentialEpochReset{
+		Principal: principal, AccountID: account.ID,
+		NewCredentialVersion: nextVersion, ObservedAt: nowSubmit,
+		Audit: service.healthAudit(principal, account.ID, account.AuthMode, sc.requestID),
+	}
+	if command.Replacement {
+		// Keep still-current usable version evidence; drop foreign-version rows + permit.
+		epoch.PreserveCredentialVersion = account.Credential.Version
+		if epoch.PreserveCredentialVersion <= 0 {
+			epoch.PreserveCredentialVersion = 0
+			// Disabled/draft replacement without a current version: full reset.
+			epoch.NewCredentialVersion = nextVersion
+		}
+	}
+	if _, err := service.health.ResetForCredentialEpoch(ctx, epoch); err != nil {
+		// Missing health is an invariant failure: never advance AccountStore or
+		// complete replay. Vault already holds nextVersion — revoke only that
+		// version so residual material cannot become usable.
+		_ = service.vault.Revoke(ctx, ports.CredentialValidation{
+			Principal: principal, AccountID: account.ID, AuthMode: account.AuthMode, Version: nextVersion,
+		})
+		service.release(ctx, reservation)
+		service.abandon(ctx, identity)
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+	update := ports.AccountUpdate{
 		Principal:               principal,
 		Account:                 submitted,
 		RequireEmptyOAuthMarker: replacementMarker == "",
 		RequireOAuthMarker:      replacementMarker,
 		RequirePendingVersion:   account.PendingCredentialVersion,
-	})
+	}
+	if !command.Replacement {
+		update.RequireLifecycle = account.Lifecycle
+		update.RequireControlsMatch = true
+		update.RequireControls = account.Controls
+		update.RequireLastAllocatedVersionMatch = true
+		update.RequireLastAllocatedVersion = nextVersion
+	}
+	persisted, err := service.accounts.Update(ctx, update)
 	if err != nil {
+		revokeErr := service.vault.Revoke(ctx, ports.CredentialValidation{
+			Principal: principal,
+			AccountID: account.ID,
+			AuthMode:  account.AuthMode,
+			Version:   nextVersion,
+		})
+		if revokeErr != nil {
+			service.release(ctx, reservation)
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
+		}
 		if replacementMarker != "" {
-			// Vault already accepted the material. Revoke the staged version and
-			// restore the origin before abandoning replay; otherwise a fresh
-			// request could overwrite the same version with different material.
-			revokeErr := service.vault.Revoke(ctx, ports.CredentialValidation{
-				Principal: principal,
-				AccountID: account.ID,
-				AuthMode:  account.AuthMode,
-				Version:   account.PendingCredentialVersion,
-			})
-			if revokeErr != nil {
-				service.release(ctx, reservation)
-				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
-			}
+			// Restore the origin before abandoning replay. First-connect leaves its
+			// reserved counter in place so the next request allocates a fresh version.
 			restored := account.WithPendingCredentialRejected(domain.NewTimestamp(service.clock.Now())).WithOAuthJourneyCleared(domain.NewTimestamp(service.clock.Now()))
 			if _, restoreErr := service.accounts.Update(ctx, ports.AccountUpdate{
 				Principal:             principal,
@@ -306,9 +369,23 @@ func (service *ProviderAccountService) submitCredential(ctx context.Context, com
 		service.release(ctx, reservation)
 		service.abandon(ctx, identity)
 		if errors.Is(err, ports.ErrAccountUpdateConflict) {
-			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationCompleteOAuth))
+			if command.Replacement {
+				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAccountNotUsable(domain.RemediationCompleteOAuth))
+			}
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
 		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	}
+
+	// Compose + project BEFORE replay.Complete so the terminal replay record
+	// stores the same safe effective-summary projection as the HTTP response
+	// (not AccountStore-stripped empty health).
+	if snap, err := service.health.Read(ctx, principal, persisted.ID); err != nil {
+		service.release(ctx, reservation)
+		// Lifecycle/credential already advanced; do not abandon (no-steal).
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+	} else {
+		persisted = composeAccountHealth(persisted, snap)
 	}
 
 	if err := service.replay.Complete(ctx, identity, ports.ReplayResult{Account: persisted}); err != nil {
@@ -359,7 +436,8 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 	}
 
 	// Same-Tenant ownership before any gate, Vault use, or Adapter call.
-	account, err := service.accounts.Visible(ctx, principal, command.AccountID)
+	// Compose AccountStore lifecycle with HealthStore conditions/permits.
+	account, err := service.loadAccount(ctx, principal, command.AccountID)
 	if err != nil {
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
 	}
@@ -371,8 +449,37 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 	if canonical, ok := service.probeGate(account); !ok {
 		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
 	}
+	probeVersion := account.Credential.Version
+	if account.PendingCredentialVersion > 0 {
+		probeVersion = account.PendingCredentialVersion
+	}
+	// A prior health-first hard rejection may have committed before its
+	// AccountStore lifecycle write failed. Converge lifecycle metadata without
+	// decrypting or probing the already-rejected credential again.
+	if credentialRejectedAtVersion(account.Health, probeVersion) {
+		if account.PendingCredentialVersion > 0 {
+			return service.pendingProbeRejected(ctx, sc, principal, account)
+		}
+		return service.probeRejected(ctx, sc, principal, account, domain.RecoveryPermit{})
+	}
 
-	// A3-A5: admission after ownership and the pre-adapter gates.
+	// Soft health gates BEFORE admission so blocked cooldown/occupied-permit
+	// attempts do not take capacity (thread G). Claim stays after admission.
+	var pendingClaim domain.RecoveryPermit
+	if account.Lifecycle == domain.LifecycleActive {
+		decision := account.ScopedRecoveryPermit(domain.NewTimestamp(sc.start), command.Scope, sc.requestID)
+		if decision.Occupied {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewRecoveryPermitOccupied())
+		}
+		if decision.Cooling && !decision.Eligible {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewProviderCooldownBlocked(decision.RetryAfterSeconds))
+		}
+		if decision.Eligible {
+			pendingClaim = decision.Permit
+		}
+	}
+
+	// A3-A5: admission after ownership and the pre-adapter soft gates.
 	reservation, canonical, ok := service.admit(ctx, principal, operationProbeProviderAccount)
 	if !ok {
 		return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
@@ -402,44 +509,99 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewProviderCooldownBlocked(0))
 	}
 
-	// A cooldown recovery must atomically own the exact scope/revision/version
-	// before Vault validation or the Adapter runs. Before retry_not_before it stays
-	// closed; after expiry exactly one request can claim the durable marker.
+	// Atomic recovery permit claim after admission when the soft gate found an
+	// eligible half-open slot. CAS remains the hard fence. A CAS loser (another
+	// request claimed first) maps to the same stable 409 occupied outcome as a
+	// pre-claim Occupied decision — never a generic 503.
 	var recoveryPermit domain.RecoveryPermit
-	if account.Lifecycle == domain.LifecycleActive {
-		decision := account.ScopedRecoveryPermit(domain.NewTimestamp(sc.start), command.Scope, sc.requestID)
-		if decision.Cooling && !decision.Eligible {
+	if pendingClaim.Owner != "" {
+		// Close the admission/circuit window before touching HealthStore. This
+		// re-read prevents a disable or administrative-control change that completed
+		// before the claim from granting any half-open protected work.
+		latestBeforeClaim, loadErr := service.loadAccount(ctx, principal, account.ID)
+		if loadErr != nil {
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(loadErr))
+		}
+		if latestBeforeClaim.Lifecycle != domain.LifecycleActive ||
+			latestBeforeClaim.Controls != account.Controls ||
+			latestBeforeClaim.PendingCredentialVersion != 0 {
+			if canonical, ok := service.probeGate(latestBeforeClaim); !ok {
+				return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
+			}
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+		}
+		decision := latestBeforeClaim.ScopedRecoveryPermit(domain.NewTimestamp(sc.start), command.Scope, sc.requestID)
+		if decision.Occupied {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewRecoveryPermitOccupied())
+		}
+		if !decision.Eligible || decision.Permit != pendingClaim {
 			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewProviderCooldownBlocked(decision.RetryAfterSeconds))
 		}
-		if decision.Eligible {
-			claimed := account.WithRecoveryPermitClaimed(decision.Permit)
-			account, err = service.accounts.Update(ctx, ports.AccountUpdate{
-				Principal: principal,
-				Account:   claimed,
-				// Fence lifecycle and administrative controls so a concurrent disable,
-				// quarantine, or drain cannot be resurrected by this stale snapshot.
-				RequireLifecycle:           account.Lifecycle,
-				RequireControlsMatch:       true,
-				RequireControls:            account.Controls,
-				RequireEmptyPendingVersion: true,
-				RequireEmptyRecoveryPermit: true,
-				RequireRecoveryCondition:   decision.Permit,
-			})
-			if err != nil {
-				if errors.Is(err, ports.ErrAccountUpdateConflict) {
-					return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
-				}
-				return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		account = latestBeforeClaim
+		claimed, err := service.health.ClaimRecoveryPermit(ctx, ports.RecoveryPermitClaim{
+			Principal:         principal,
+			AccountID:         account.ID,
+			Owner:             pendingClaim.Owner,
+			Scope:             pendingClaim.Scope,
+			ConditionRevision: pendingClaim.ConditionRevision,
+			CredentialVersion: pendingClaim.CredentialVersion,
+		})
+		if err != nil {
+			if errors.Is(err, ports.ErrAccountUpdateConflict) {
+				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewRecoveryPermitOccupied())
 			}
-			recoveryPermit = decision.Permit
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 		}
+		recoveryPermit = claimed.Permit
+		// Post-claim re-read fence: disable (or other gate change) may have won
+		// between the pre-admission load and this claim. Never reach Vault/Adapter
+		// with a permit if the account is no longer probeable; clear only the
+		// exact permit this request claimed (CAS). A newer/different owner must
+		// be preserved — stale cleanup fails closed without wiping foreign fencing.
+		// Our own successful claim is not treated as foreign Occupied below.
+		latest, loadErr := service.loadAccount(ctx, principal, account.ID)
+		if loadErr != nil {
+			_, _ = service.health.ClearPermit(ctx, ports.PermitClear{
+				Principal: principal, AccountID: account.ID,
+				ExpectedPermit: recoveryPermit,
+				Audit:          service.healthAudit(principal, account.ID, account.AuthMode, sc.requestID),
+			})
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(loadErr))
+		}
+		if canonical, ok := service.probeGate(latest); !ok {
+			_, _ = service.health.ClearPermit(ctx, ports.PermitClear{
+				Principal: principal, AccountID: latest.ID,
+				ExpectedPermit: recoveryPermit,
+				Audit:          service.healthAudit(principal, latest.ID, latest.AuthMode, sc.requestID),
+			})
+			return ProviderAccountResult{}, service.fail(ctx, sc, canonical)
+		}
+		// Durable permit must still be ours after the re-read (no other owner).
+		// Own claim is valid ownership — only a different owner is foreign occupied.
+		if latest.RecoveryPermit.Owner != "" && latest.RecoveryPermit.Owner != recoveryPermit.Owner {
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewRecoveryPermitOccupied())
+		}
+		if latest.RecoveryPermit.Owner == "" {
+			// Claim was lost between write and re-read — fail closed, do not probe.
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+		}
+		if latest.Lifecycle != domain.LifecycleActive || latest.Controls != account.Controls || latest.PendingCredentialVersion != 0 {
+			_, _ = service.health.ClearPermit(ctx, ports.PermitClear{
+				Principal: principal, AccountID: latest.ID,
+				ExpectedPermit: recoveryPermit,
+				Audit:          service.healthAudit(principal, latest.ID, latest.AuthMode, sc.requestID),
+			})
+			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+		}
+		latest.RecoveryPermit = recoveryPermit
+		account = latest
 	}
 
 	// Required validation runs BEFORE the probe so a malformed stored credential
 	// never spends probe budget. A validation failure moves the account to
 	// reauth_required and returns without calling the Adapter (validation failure
 	// prevents probe: connection lifecycle spec §4.5, §4.6).
-	probeVersion := account.Credential.Version
+	probeVersion = account.Credential.Version
 	if account.PendingCredentialVersion > 0 {
 		probeVersion = account.PendingCredentialVersion
 	}
@@ -450,10 +612,11 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		Version:   probeVersion,
 	})
 	if err != nil {
-		// Vault dependency failure is not an authoritative Provider observation.
-		// Keep the claimed revision occupied: releasing it here would grant a second
-		// half-open attempt for the same condition revision and permit unbounded
-		// retries. Recovery/reclamation requires a separately specified owner.
+		if recoveryPermit.Owner != "" {
+			if renewErr := service.renewCooldownAfterDependencyFailure(ctx, sc, principal, account, recoveryPermit); renewErr != nil {
+				return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(renewErr))
+			}
+		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	if !validation.Valid {
@@ -476,35 +639,18 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		Scope:     command.Scope,
 	})
 	if err != nil {
-		// Persist validation evidence without releasing the claimed Health revision.
-		// A dependency failure did not produce a Provider outcome, so allowing a new
-		// owner to reclaim the same revision would create unlimited half-open probes.
-		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{
-			Principal: principal,
-			Account:   validated,
-			// Fence lifecycle and administrative controls so a concurrent disable or
-			// control change is not overwritten by this stale validation snapshot.
-			RequireLifecycle:           account.Lifecycle,
-			RequireControlsMatch:       true,
-			RequireControls:            account.Controls,
-			RequireRecoveryPermitOwner: recoveryPermit.Owner,
-			RequireRecoveryCondition:   recoveryPermit,
-		})
+		// Probe Adapter dependency failure: renew claimed cooldown + consume permit.
+		if recoveryPermit.Owner != "" {
+			_ = service.renewCooldownAfterDependencyFailure(ctx, sc, principal, validated, recoveryPermit)
+		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	if !validProbeSignal(outcome.Signal) {
 		// An unrecognized signal class is a dependency/protocol classification
 		// failure. Fail closed rather than treating it as a successful probe.
-		_, _ = service.accounts.Update(ctx, ports.AccountUpdate{
-			Principal: principal,
-			Account:   validated,
-			// Keep the same lifecycle/control fences as the dependency-failure path.
-			RequireLifecycle:           account.Lifecycle,
-			RequireControlsMatch:       true,
-			RequireControls:            account.Controls,
-			RequireRecoveryPermitOwner: recoveryPermit.Owner,
-			RequireRecoveryCondition:   recoveryPermit,
-		})
+		if recoveryPermit.Owner != "" {
+			_ = service.renewCooldownAfterDependencyFailure(ctx, sc, principal, validated, recoveryPermit)
+		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
 	}
 	if !outcome.Authenticated {
@@ -523,7 +669,9 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		evidence := validated
 		evidence.Credential.Version = probeVersion
 		if err := service.mintCapabilitySnapshot(ctx, principal, evidence); err != nil {
-			_, _ = service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: validated})
+			// Capability publication is non-authoritative for lifecycle metadata.
+			// Do not persist this stale snapshot: a concurrent disable, revoke,
+			// quarantine, or control change must remain authoritative.
 			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 		}
 	}
@@ -532,7 +680,7 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 	// before activation so sticky disable (PendingOrigin / lifecycle) and any
 	// concurrent cutover are observed at commit time rather than on the
 	// pre-admission snapshot (management contract §4.6 disable-intent-wins).
-	latest, err := service.accounts.Visible(ctx, principal, account.ID)
+	latest, err := service.loadAccount(ctx, principal, account.ID)
 	if err != nil {
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
 	}
@@ -595,18 +743,7 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 			update.RequireControls = latest.Controls
 			update.RequireEmptyPendingVersion = true
 		case outcome.Signal == ports.ProbeSignalNone && recoveryPermit.Owner != "":
-			// Settle the claimed scoped recovery permit; lifecycle/control fences
-			// prevent a concurrent disable from being resurrected.
-			activated = base.WithScopedRecovery(now, recoveryPermit)
-			update.RequireLifecycle = latest.Lifecycle
-			update.RequireControlsMatch = true
-			update.RequireControls = latest.Controls
-			update.RequireEmptyPendingVersion = true
-			update.RequireRecoveryPermitOwner = recoveryPermit.Owner
-			update.RequireRecoveryCondition = recoveryPermit
-		default:
-			// Fresh rate/quota signal: keep existing evidence, record probe time,
-			// then overlay the new cooldown below.
+			// Health resolve happens below; AccountStore only fences lifecycle.
 			activated = base
 			activated.Credential.LastProbedAt = now
 			activated.UpdatedAt = now
@@ -614,10 +751,16 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 			update.RequireControlsMatch = true
 			update.RequireControls = latest.Controls
 			update.RequireEmptyPendingVersion = true
-			if recoveryPermit.Owner != "" {
-				update.RequireRecoveryPermitOwner = recoveryPermit.Owner
-				update.RequireRecoveryCondition = recoveryPermit
-			}
+		default:
+			// Fresh rate/quota signal: AccountStore records probe time; HealthStore
+			// observes the cooldown below.
+			activated = base
+			activated.Credential.LastProbedAt = now
+			activated.UpdatedAt = now
+			update.RequireLifecycle = latest.Lifecycle
+			update.RequireControlsMatch = true
+			update.RequireControls = latest.Controls
+			update.RequireEmptyPendingVersion = true
 		}
 	default:
 		activated = base.WithProbeActivated(now)
@@ -628,52 +771,146 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 		update.RequireControls = latest.Controls
 	}
 
-	// A validated Provider rate/quota signal surfaced during an otherwise
-	// authenticated probe overlays a durable scoped cooldown. Auth was proven, so
-	// the account still activates; the cooldown is an orthogonal scoped overlay at
-	// the narrowest proven bucket (unknown → account) and never rewrites lifecycle
-	// (health/cooldown spec §6, §20 I-HEALTH-ORTHOGONAL). Credential-rejected,
-	// challenge, and ban outcomes are NOT signals here: they arrive as
-	// Authenticated=false and are already handled above (§6 rule 4).
-	if reason, ok := cooldownReasonForSignal(outcome.Signal); ok {
-		// A fresh signal means the claimed recovery did not succeed. When its
-		// evidenced scope differs, renew the claimed scope first so the consumed
-		// revision cannot be reclaimed, then overlay the new signal scope. A matching
-		// signal is renewed once by the ordinary overlay below.
-		if recoveryPermit.Owner != "" && !recoveryPermit.MatchesScope(outcome.SignalScope) {
-			retryNotBefore := defaultCooldownRetryNotBefore(activated, recoveryPermit.Scope, reason, now)
-			activated = activated.WithScopedCooldown(now, recoveryPermit.Scope, reason, retryNotBefore)
-		}
-		retryNotBefore, malformedHint := providerRetryNotBefore(
-			activated,
-			outcome.SignalScope,
-			reason,
-			outcome.RetryAfterSeconds,
-			now,
-		)
-		if malformedHint {
-			// Retain only an operator-visible safe classification. The raw Provider
-			// value is neither persisted nor logged (§7.4-§7.6).
-			_ = service.audit.Record(ctx, ports.AuditEvent{
-				Action:            ports.AuditProviderHintMalformed,
-				TenantID:          principal.TenantID,
-				ClientAPIKeyID:    principal.ClientAPIKeyID,
-				ProviderAccountID: activated.ID,
-				RequestID:         sc.requestID,
-				Outcome:           "malformed_provider_hint",
-			})
-		}
-		activated = activated.WithScopedCooldown(now, outcome.SignalScope, reason, retryNotBefore)
+	// Order: required audit -> logical HealthStore mutation -> AccountStore.
+	// Never commit health after AccountStore mutation.
+	var healthResult ports.AccountHealth
+	healthResult.Health = latest.Health
+	healthResult.RecoveryPermit = latest.RecoveryPermit
+
+	// First-connect / enable activation records healthy evidence when this request
+	// is promoting into an activated lifecycle (or sticky-disabled with probe success).
+	needsActivation := !update.PatchLastProbedAt && recoveryPermit.Owner == "" &&
+		outcome.Signal == ports.ProbeSignalNone &&
+		(latest.Lifecycle == domain.LifecyclePendingProbe || latest.Lifecycle == domain.LifecyclePendingValidation ||
+			latest.Lifecycle == domain.LifecycleDraft || latest.Lifecycle == domain.LifecycleReauthRequired)
+	// Also activate when a rate/quota signal arrives on first connect: healthy base
+	// then scoped cooldown overlay (auth proven, cooldown orthogonal).
+	if !update.PatchLastProbedAt && recoveryPermit.Owner == "" &&
+		(latest.Lifecycle == domain.LifecyclePendingProbe || latest.Lifecycle == domain.LifecyclePendingValidation ||
+			latest.Lifecycle == domain.LifecycleDraft || latest.Lifecycle == domain.LifecycleReauthRequired) {
+		needsActivation = true
+	}
+	// HealthStore derives exact transitions under lock and invokes audit before
+	// append. Application never invents planned audit payloads.
+	healthAudit := service.healthAudit(principal, latest.ID, latest.AuthMode, sc.requestID)
+
+	// probeVersion is the credential version this request proved (pending
+	// replacement or current). Activation/cooldown evidence must fence to it —
+	// never a pre-cutover stale current version.
+	activationVersion := probeVersion
+	if activationVersion <= 0 {
+		activationVersion = latest.Credential.Version
 	}
 
-	update.Account = activated
+	if needsActivation {
+		tr, err := service.health.RecordActivation(ctx, ports.ActivationHealth{
+			Principal: principal, AccountID: latest.ID, CredentialVersion: activationVersion,
+			ObservedAt: now, Audit: healthAudit,
+		})
+		if err != nil {
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		}
+		healthResult = tr.Result
+		latest.Health = tr.Result.Health
+	}
+
+	// DEVIATION (recovery success only): ResolveRecovery is the one product
+	// gate-relaxing health mutation on an already-active account. Clearing a
+	// cooling_down condition before a failed AccountStore lifecycle/metadata CAS
+	// would make the account more routable while the fence failed.
+	//
+	// Therefore ONLY this path does AccountStore metadata/fence first, then
+	// HealthStore resolve. Failure before resolve stays conservative (cooling
+	// remains). This must NOT be generalized to blocking transitions
+	// (ObserveCooldown, RecordHardFailure, epoch reset, enable reset, activation
+	// while non-active): those stay health-first because partial health progress
+	// either adds a block or cannot authorize product routing alone.
+	resolveAfterAccount := outcome.Signal == ports.ProbeSignalNone && recoveryPermit.Owner != "" && latest.Lifecycle == domain.LifecycleActive
+
+	if reason, ok := cooldownReasonForSignal(outcome.Signal); ok {
+		retryNotBefore, malformedHint := providerRetryNotBefore(latest, outcome.SignalScope, reason, outcome.RetryAfterSeconds, now)
+		if malformedHint {
+			_ = service.audit.Record(ctx, ports.AuditEvent{
+				Action: ports.AuditProviderHintMalformed, TenantID: principal.TenantID,
+				ClientAPIKeyID: principal.ClientAPIKeyID, ProviderAccountID: latest.ID,
+				RequestID: sc.requestID, Outcome: "malformed_provider_hint",
+			})
+		}
+		obs := ports.CooldownObservation{
+			Principal: principal, AccountID: latest.ID, Scope: outcome.SignalScope,
+			Reason: reason, CredentialVersion: activationVersion,
+			ObservedAt: now, RetryNotBefore: retryNotBefore,
+			SourceClass: domain.HealthSourceUpstreamAttempt, ConsumePermit: recoveryPermit,
+			Audit: healthAudit,
+		}
+		if recoveryPermit.Owner != "" && !recoveryPermit.MatchesScope(outcome.SignalScope) {
+			// Claimed scope renews with EXISTING reason and ITS own timer/source.
+			claimedReason := conditionReasonAtScope(latest, recoveryPermit.Scope)
+			if claimedReason == "" {
+				claimedReason = reason
+			}
+			obs.ClaimedScopeReason = claimedReason
+			obs.ClaimedScopeRetryNotBefore = defaultCooldownRetryNotBefore(latest, recoveryPermit.Scope, claimedReason, now)
+			obs.ClaimedScopeSourceClass = domain.HealthSourceRecoveryProbe
+		}
+		tr, err := service.health.ObserveCooldown(ctx, obs)
+		if err != nil {
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		}
+		healthResult = tr.Result
+	} else if latest.Lifecycle != domain.LifecycleActive && recoveryPermit.Owner != "" {
+		// Request-owned cleanup only: fence to the permit this probe claimed.
+		if _, err := service.health.ClearPermit(ctx, ports.PermitClear{
+			Principal: principal, AccountID: latest.ID,
+			ExpectedPermit: recoveryPermit, Audit: healthAudit,
+		}); err != nil {
+			// Conflict means a newer/different permit won — preserve it and fail closed.
+			if errors.Is(err, ports.ErrAccountUpdateConflict) {
+				return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewRecoveryPermitOccupied())
+			}
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		}
+		healthResult.RecoveryPermit = domain.RecoveryPermit{}
+	}
+
+	// AccountStore lifecycle/metadata.
+	if update.PatchLastProbedAt {
+		update.Account = domain.ProviderAccount{ID: latest.ID}
+	} else {
+		lifecycleAccount := activated
+		if lifecycleAccount.ID == "" {
+			lifecycleAccount = latest
+			lifecycleAccount.Credential.LastProbedAt = now
+			lifecycleAccount.UpdatedAt = now
+		}
+		lifecycleAccount.Health = domain.HealthSummary{}
+		lifecycleAccount.RecoveryPermit = domain.RecoveryPermit{}
+		update.Account = lifecycleAccount
+	}
 	persisted, err := service.accounts.Update(ctx, update)
 	if err != nil {
-		if errors.Is(err, ports.ErrAccountUpdateConflict) {
-			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
-		}
+		// Health-first paths (blocking/non-routable): fail closed without relaxing
+		// lifecycle. Recovery resolve is deferred past this write (see DEVIATION
+		// above): AccountStore failure here means resolve never ran, so cooling stays.
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
+
+	if resolveAfterAccount {
+		// Account fence already durable. If resolve fails, lifecycle metadata may
+		// have advanced (e.g. last_probed_at) but the cooling condition remains —
+		// still fail-closed / not more routable than pre-attempt cooling.
+		tr, err := service.health.ResolveRecovery(ctx, ports.RecoveryResolution{
+			Principal: principal, AccountID: latest.ID, Permit: recoveryPermit, ObservedAt: now, Audit: healthAudit,
+		})
+		if err != nil {
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		}
+		healthResult = tr.Result
+	}
+	persisted.Health = healthResult.Health
+	persisted.RecoveryPermit = healthResult.RecoveryPermit
+	persisted = projectAccountHealth(persisted)
+
 	if priorVersion > 0 {
 		// Cutover is already public (credential.version advanced, origin lifecycle
 		// restored). A revoke failure leaves decryptable prior material longer than
@@ -693,54 +930,139 @@ func (service *ProviderAccountService) ProbeProviderAccount(ctx context.Context,
 // change is observed and preserved rather than overwritten by the stale probe
 // snapshot.
 func (service *ProviderAccountService) probeRejected(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, account domain.ProviderAccount, recoveryPermit domain.RecoveryPermit) (ProviderAccountResult, error) {
-	latest, err := service.accounts.Visible(ctx, principal, account.ID)
+	latest, err := service.loadAccount(ctx, principal, account.ID)
 	if err != nil {
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
 	}
-	rejected := latest.WithCredentialRejected(domain.NewTimestamp(sc.start))
-	// A concurrent management disable/revoke must win over a stale rejected probe;
-	// preserve the management lifecycle while still recording the rejection outcome
-	// in the health summary.
+	now := domain.NewTimestamp(sc.start)
+	healthResult := ports.AccountHealth{Health: latest.Health, RecoveryPermit: latest.RecoveryPermit}
+	if !credentialRejectedAtVersion(latest.Health, latest.Credential.Version) {
+		// Audit under HealthStore lock before persist -> AccountStore lifecycle.
+		tr, healthErr := service.health.RecordHardFailure(ctx, ports.HardFailureObservation{
+			Principal: principal, AccountID: latest.ID, CredentialVersion: latest.Credential.Version,
+			ObservedAt: now, ConsumePermit: recoveryPermit,
+			Audit: service.healthAudit(principal, latest.ID, latest.AuthMode, sc.requestID),
+		})
+		if healthErr != nil {
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(healthErr))
+		}
+		healthResult = tr.Result
+	}
+	rejected := latest.WithCredentialRejected(now)
 	if latest.Lifecycle == domain.LifecycleDisabled || latest.Lifecycle == domain.LifecycleRevoked {
 		rejected.Lifecycle = latest.Lifecycle
 	}
-	update := ports.AccountUpdate{
-		Principal: principal,
-		Account:   rejected,
-		// Fence lifecycle and controls so a concurrent disable/control mutation
-		// wins over this stale credential-rejected snapshot.
-		RequireLifecycle:     latest.Lifecycle,
-		RequireControlsMatch: true,
-		RequireControls:      latest.Controls,
-	}
-	if recoveryPermit.Owner != "" {
-		update.RequireRecoveryPermitOwner = recoveryPermit.Owner
-		update.RequireRecoveryCondition = recoveryPermit
-	}
-	persisted, err := service.accounts.Update(ctx, update)
+	lifecycle := rejected
+	lifecycle.Health = domain.HealthSummary{}
+	lifecycle.RecoveryPermit = domain.RecoveryPermit{}
+	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
+		Principal: principal, Account: lifecycle,
+		RequireLifecycle: latest.Lifecycle, RequireControlsMatch: true, RequireControls: latest.Controls,
+	})
 	if err != nil {
-		if errors.Is(err, ports.ErrAccountUpdateConflict) {
-			return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
-		}
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
+	persisted.Health = healthResult.Health
+	persisted.RecoveryPermit = domain.RecoveryPermit{}
+	persisted = projectAccountHealth(persisted)
 	service.observeSuccess(ctx, sc, ports.AuditProviderAccountProbed, principal, persisted.ID, 200)
 	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
 }
 
+// renewCooldownAfterDependencyFailure uses the logical HealthStore renewal with
+// recovery-probe provenance. No AccountStore lifecycle rewrite.
+func (service *ProviderAccountService) renewCooldownAfterDependencyFailure(
+	ctx context.Context,
+	sc spineContext,
+	principal domain.SecurityPrincipal,
+	account domain.ProviderAccount,
+	permit domain.RecoveryPermit,
+) error {
+	now := domain.NewTimestamp(sc.start)
+	reason := conditionReasonAtScope(account, permit.Scope)
+	if reason == "" {
+		reason = domain.HealthReasonProviderRateLimited
+	}
+	// Timing from progressive backoff policy for the claimed revision.
+	retryNotBefore := defaultCooldownRetryNotBefore(account, permit.Scope, reason, now)
+	_, err := service.health.RenewAfterDependencyFailure(ctx, ports.DependencyFailureRenewal{
+		Principal: principal, AccountID: account.ID, Permit: permit,
+		ObservedAt: now, RetryNotBefore: retryNotBefore,
+		Audit: service.healthAudit(principal, account.ID, account.AuthMode, sc.requestID),
+	})
+	return err
+}
+
+func conditionReasonAtScope(account domain.ProviderAccount, scope domain.HealthScope) domain.HealthReason {
+	for _, condition := range account.Health.Conditions {
+		if condition.Scope == scope || (condition.Scope.Kind == scope.Kind &&
+			condition.Scope.Operation == scope.Operation &&
+			condition.Scope.ModelSlug == scope.ModelSlug) {
+			return condition.Reason
+		}
+	}
+	return ""
+}
+
 func (service *ProviderAccountService) pendingProbeRejected(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, account domain.ProviderAccount) (ProviderAccountResult, error) {
-	pendingVersion := account.PendingCredentialVersion
-	// Persist the fence first so a concurrent reauth cannot re-Put under a version
-	// the product already considers failed. Vault revoke is then best-effort and
-	// idempotent cleanup of ciphertext that is no longer advertised as pending.
-	rejected := account.WithPendingCredentialRejected(domain.NewTimestamp(sc.start)).WithOAuthJourneyCleared(domain.NewTimestamp(sc.start))
-	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{Principal: principal, Account: rejected, RequirePendingVersion: pendingVersion})
+	latest, err := service.loadAccount(ctx, principal, account.ID)
 	if err != nil {
+		return ProviderAccountResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
+	}
+	pendingVersion := latest.PendingCredentialVersion
+	if pendingVersion == 0 || (account.PendingCredentialVersion > 0 && account.PendingCredentialVersion != pendingVersion) {
+		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewDependencyUnavailable())
+	}
+	now := domain.NewTimestamp(sc.start)
+	// Health first (required audit): pending-only hard fence drops evidence fenced
+	// to the failed pending version and clears the permit, without demoting origin
+	// usability scopes. AccountStore then restores origin lifecycle. First-connect
+	// rejections use probeRejected (full hard failure) instead.
+	healthResult := ports.AccountHealth{Health: latest.Health, RecoveryPermit: latest.RecoveryPermit}
+	if !credentialRejectedAtVersion(latest.Health, pendingVersion) {
+		tr, healthErr := service.health.RecordHardFailure(ctx, ports.HardFailureObservation{
+			Principal: principal, AccountID: latest.ID, CredentialVersion: pendingVersion,
+			ObservedAt: now, PendingOnly: true,
+			Audit: service.healthAudit(principal, latest.ID, latest.AuthMode, sc.requestID),
+		})
+		if healthErr != nil {
+			return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(healthErr))
+		}
+		healthResult = tr.Result
+	}
+	rejected := latest.WithPendingCredentialRejected(now).WithOAuthJourneyCleared(now)
+	lifecycle := rejected
+	lifecycle.Health = domain.HealthSummary{}
+	lifecycle.RecoveryPermit = domain.RecoveryPermit{}
+	persisted, err := service.accounts.Update(ctx, ports.AccountUpdate{
+		Principal: principal, Account: lifecycle, RequirePendingVersion: pendingVersion,
+		RequireLifecycle: latest.Lifecycle, RequireControlsMatch: true, RequireControls: latest.Controls,
+	})
+	if err != nil {
+		// Health already conservatively dropped pending-version evidence only —
+		// origin conditions remain; lifecycle is not relaxed (still pending until
+		// retry). Fail closed without inventing active/usable state.
 		return ProviderAccountResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
-	_ = service.vault.Revoke(ctx, ports.CredentialValidation{Principal: principal, AccountID: account.ID, AuthMode: account.AuthMode, Version: pendingVersion})
+	persisted.Health = healthResult.Health
+	persisted.RecoveryPermit = domain.RecoveryPermit{}
+	// Origin version is current after rollback: summary ignores historical pending
+	// hard evidence while conditions still list it.
+	persisted = projectAccountHealth(persisted)
+	_ = service.vault.Revoke(ctx, ports.CredentialValidation{Principal: principal, AccountID: latest.ID, AuthMode: latest.AuthMode, Version: pendingVersion})
 	service.observeSuccess(ctx, sc, ports.AuditProviderAccountProbed, principal, persisted.ID, 200)
 	return ProviderAccountResult{Account: persisted, RequestID: sc.requestID}, nil
+}
+
+func credentialRejectedAtVersion(health domain.HealthSummary, version int) bool {
+	for _, condition := range health.Conditions {
+		if condition.CredentialVersion == version &&
+			condition.State == domain.HealthExpired &&
+			condition.Reason == domain.HealthReasonCredentialRejected {
+			return true
+		}
+	}
+	return false
 }
 
 // submissionGate applies the shared connection usability gates for a direct
@@ -806,6 +1128,20 @@ func (service *ProviderAccountService) probeGate(account domain.ProviderAccount)
 	// (version zero) cannot be probed.
 	if account.Credential.Version == 0 {
 		return domain.NewAccountNotUsable(domain.RemediationSubmitCredential), false
+	}
+	// Current-version hard health is a hard stop even when AccountStore lifecycle
+	// is still pending_probe (partial hard-rejection: health expired, lifecycle
+	// write failed). Retry must not reach Vault/Adapter.
+	for _, condition := range account.Health.Conditions {
+		if condition.CredentialVersion != account.Credential.Version {
+			continue
+		}
+		switch condition.State {
+		case domain.HealthExpired:
+			return domain.NewAccountNotUsable(domain.RemediationReauthenticate), false
+		case domain.HealthChallenged, domain.HealthBlocked:
+			return domain.NewAccountNotUsable(domain.RemediationContactOperator), false
+		}
 	}
 	return domain.CanonicalError{}, true
 }

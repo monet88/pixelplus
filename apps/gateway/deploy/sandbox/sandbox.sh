@@ -61,19 +61,22 @@ cmd_start() {
   #   --cap-drop ALL            drop every Linux capability
   #   --security-opt no-new-privileges  block privilege escalation
   #   --tmpfs /tmp              single narrow, non-exec, size-bounded writable dir
+  #   --volume named state      durable /var/lib/pixelplus (survives restart)
   #   --pids-limit/--memory/--cpus  bounded resources
-  # No --privileged, no --network host, no -v bind mount, no docker socket.
+  # No --privileged, no --network host, no host-path bind mount, no docker socket.
+  docker volume create pixelplus-gateway-state >/dev/null 2>&1 || true
   docker run -d \
     --name "${NAME}" \
     --publish "${HOST_ADDR}:${HOST_PORT}:${CONTAINER_PORT}" \
     --env PIXELPLUS_GATEWAY_ADDR="0.0.0.0:${CONTAINER_PORT}" \
     --env PIXELPLUS_GATEWAY_STARTUP_TIMEOUT="10s" \
     --env PIXELPLUS_GATEWAY_SHUTDOWN_TIMEOUT="10s" \
-    --env PROVIDER_ACCOUNT_STORE_PATH="/tmp/provider-accounts.json" \
+    --env PROVIDER_ACCOUNT_STORE_PATH="/var/lib/pixelplus/provider-accounts.json" \
     --user "65532:65532" \
     --read-only \
     --cap-drop ALL \
     --security-opt no-new-privileges \
+    --volume pixelplus-gateway-state:/var/lib/pixelplus \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
     --pids-limit 128 \
     --memory 256m \

@@ -83,7 +83,7 @@ func TestSubmitCredentialAcceptedLandsPendingValidation(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_submit", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_submit", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -109,14 +109,26 @@ func TestSubmitCredentialAcceptedLandsPendingValidation(t *testing.T) {
 	if health["summary_state"] != "unknown" {
 		t.Fatalf("health.summary_state = %v, want unknown", health["summary_state"])
 	}
+	// Credential epoch must fence health to the newly stored version (not draft v0).
+	conditions, _ := health["conditions"].([]any)
+	if len(conditions) == 0 {
+		t.Fatalf("health.conditions empty after submit epoch reset")
+	}
+	cond0, _ := conditions[0].(map[string]any)
+	if reason, _ := cond0["reason"].(string); reason != "initial_unprobed" {
+		t.Fatalf("condition reason = %v, want initial_unprobed", cond0["reason"])
+	}
+	if version, _ := cond0["credential_version"].(float64); version != 1 {
+		t.Fatalf("condition credential_version = %v, want 1 after epoch", cond0["credential_version"])
+	}
 
 	// The material was forwarded to the Vault exactly once under the account's
 	// own Tenant/account/Auth Mode/version binding, and the account persisted.
 	if calls := harness.vault.putCalls.Load(); calls != 1 {
 		t.Fatalf("vault.Put ran %d times, want 1", calls)
 	}
-	if calls := harness.accounts.updateCalls.Load(); calls != 1 {
-		t.Fatalf("account.Update ran %d times, want 1", calls)
+	if calls := harness.accounts.updateCalls.Load(); calls != 2 {
+		t.Fatalf("account.Update ran %d times, want 2 (reserve + lifecycle commit)", calls)
 	}
 	intake := harness.vault.intake()
 	if intake.Principal.TenantID != "tenant_a" {
@@ -148,7 +160,7 @@ func TestSubmitCredentialWrongClassRejectedBeforeVault(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_wrongclass", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_wrongclass", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -183,7 +195,7 @@ func TestSubmitCredentialProhibitedModeUnavailable(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_prohibited", domain.AuthModeGrokWebSSO))
+		h.seedAccount("tenant_a", usableDraft("pa_prohibited", domain.AuthModeGrokWebSSO))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -214,7 +226,7 @@ func TestSubmitCredentialGatedWithoutAckRejected(t *testing.T) {
 	harness := newSpineHarness(t, func(h *spineHarness) {
 		account := usableDraft("pa_noack", domain.AuthModeChatGPTCodexOAuth)
 		account.RiskAcknowledged = false
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -245,7 +257,7 @@ func TestSubmitCredentialRequiresManageScope(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_scope", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_scope", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -272,7 +284,7 @@ func TestSubmitCredentialRequiresIdempotencyKey(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_noidem", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_noidem", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -302,8 +314,8 @@ func TestSubmitCredentialNonEnumerationIsIndistinguishable(t *testing.T) {
 	deleted := usableDraft("pa_deleted", domain.AuthModeChatGPTCodexOAuth)
 	deleted.Lifecycle = domain.LifecycleDeleted
 	seed := func(h *spineHarness) {
-		h.accounts.seed("tenant_b", foreign)
-		h.accounts.seed("tenant_a", deleted)
+		h.seedAccount("tenant_b", foreign)
+		h.seedAccount("tenant_a", deleted)
 	}
 
 	cases := []struct {
@@ -355,7 +367,7 @@ func TestProbeValidationFailurePreventsProbe(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_valfail", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_valfail", domain.AuthModeChatGPTCodexOAuth))
 		h.vault.validResult.Valid = false
 	})
 
@@ -372,6 +384,21 @@ func TestProbeValidationFailurePreventsProbe(t *testing.T) {
 	if account["lifecycle_state"] != "reauth_required" {
 		t.Fatalf("lifecycle_state = %v, want reauth_required", account["lifecycle_state"])
 	}
+	health, _ := account["health"].(map[string]any)
+	if health["summary_state"] != "expired" {
+		t.Fatalf("health.summary_state = %v, want expired after hard rejection", health["summary_state"])
+	}
+	conds, _ := health["conditions"].([]any)
+	if len(conds) == 0 {
+		t.Fatal("health.conditions empty after first-connect validation rejection")
+	}
+	c0, _ := conds[0].(map[string]any)
+	if c0["reason"] != "credential_rejected" {
+		t.Fatalf("reason = %v, want credential_rejected", c0["reason"])
+	}
+	if version, _ := c0["credential_version"].(float64); version != 1 {
+		t.Fatalf("rejected credential_version = %v, want 1", c0["credential_version"])
+	}
 	if calls := harness.vault.validCalls.Load(); calls != 1 {
 		t.Fatalf("vault.Validate ran %d times, want 1", calls)
 	}
@@ -386,7 +413,7 @@ func TestProbeAuthFailureNeverActivates(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_probefail", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_probefail", domain.AuthModeChatGPTCodexOAuth))
 		h.probe.outcome.Authenticated = false
 	})
 
@@ -415,7 +442,7 @@ func TestProbeSuccessActivatesAccount(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_active", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_active", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -471,7 +498,7 @@ func TestDirectReauthenticationCutsOverPendingVersion(t *testing.T) {
 			"request_orphaned",
 		)
 		account = account.WithRecoveryPermitClaimed(decision.Permit)
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 	response, payload := harness.do(t, requestSpec{
 		method: http.MethodPost,
@@ -482,16 +509,24 @@ func TestDirectReauthenticationCutsOverPendingVersion(t *testing.T) {
 	if response.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202 (body=%s)", response.StatusCode, payload)
 	}
-	stored, err := harness.accounts.Visible(t.Context(), managePrincipal(), "pa_reauth_direct")
-	if err != nil {
-		t.Fatalf("visible staged account: %v", err)
-	}
+	stored := harness.storedAccount(t, managePrincipal(), "pa_reauth_direct")
 	if stored.RecoveryPermit.Owner != "" {
 		t.Fatalf("recovery permit owner = %q, want cleared by reauthentication epoch", stored.RecoveryPermit.Owner)
 	}
 	staged := decodeAccount(t, payload)
 	if staged["lifecycle_state"] != string(domain.LifecyclePendingValidation) || staged["credential"].(map[string]any)["version"] != float64(1) {
 		t.Fatalf("staged account exposed wrong current version/lifecycle: %s", payload)
+	}
+	// Epoch preserve keeps origin v1 cooldown; permit must be empty.
+	var preservedCooling bool
+	for _, c := range stored.Health.Conditions {
+		if c.Scope.Operation == string(domain.CapabilityOpImageGeneration) &&
+			c.State == domain.HealthCoolingDown && c.CredentialVersion == 1 {
+			preservedCooling = true
+		}
+	}
+	if !preservedCooling {
+		t.Fatalf("reauth epoch lost origin v1 cooldown; conditions=%+v", stored.Health.Conditions)
 	}
 	response, payload = harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_direct/probe", bearer: tenantAKey})
 	if response.StatusCode != http.StatusOK {
@@ -500,6 +535,37 @@ func TestDirectReauthenticationCutsOverPendingVersion(t *testing.T) {
 	activated := decodeAccount(t, payload)
 	if activated["lifecycle_state"] != string(domain.LifecycleActive) || activated["credential"].(map[string]any)["version"] != float64(2) {
 		t.Fatalf("cutover account = %s", payload)
+	}
+	// Activation health must fence to the proved pending version (v2), not stale v1.
+	actHealth, _ := activated["health"].(map[string]any)
+	actConds, _ := actHealth["conditions"].([]any)
+	foundV2Healthy := false
+	foundV1Cooling := false
+	for _, raw := range actConds {
+		c, _ := raw.(map[string]any)
+		version, _ := c["credential_version"].(float64)
+		if c["reason"] == "probe_succeeded" {
+			if version == 2 {
+				foundV2Healthy = true
+			} else {
+				t.Fatalf("probe_succeeded credential_version = %v, want 2", c["credential_version"])
+			}
+		}
+		if version == 1 && c["state"] == "cooling_down" {
+			foundV1Cooling = true
+		}
+	}
+	if !foundV2Healthy {
+		t.Fatalf("want probe_succeeded at credential_version 2; health=%v", actHealth)
+	}
+	// Effective summary uses only current v2 conditions — historical v1 cooling
+	// must not dominate summary_state after successful cutover.
+	if actHealth["summary_state"] != "healthy" {
+		t.Fatalf("summary_state = %v, want healthy (v2 only; v1 history must not dominate)", actHealth["summary_state"])
+	}
+	if !foundV1Cooling {
+		// Origin cooldown may still be present as historical evidence.
+		t.Logf("note: v1 cooling not retained after cutover; conditions=%v", actHealth)
 	}
 	if !harness.vault.wasRevoked("pa_reauth_direct", 1) {
 		t.Fatal("prior credential version was not revoked")
@@ -513,7 +579,7 @@ func TestDisabledReauthenticationStaysDisabledAfterCutover(t *testing.T) {
 		account.Lifecycle = domain.LifecycleDisabled
 		account.Credential.Version = 1
 		account.Credential.LastAllocatedVersion = 1
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 	response, _ := harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_disabled/reauthentication", bearer: tenantAKey, idemKey: "idem-reauth-disabled", body: submitBody(domain.CredentialClassOAuthTokenImport)})
 	if response.StatusCode != http.StatusAccepted {
@@ -539,7 +605,7 @@ func TestDisabledReauthenticationSecondKeyBlockedWhilePending(t *testing.T) {
 		account.Lifecycle = domain.LifecycleDisabled
 		account.Credential.Version = 1
 		account.Credential.LastAllocatedVersion = 1
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 	response, payload := harness.do(t, requestSpec{
 		method: http.MethodPost,
@@ -592,8 +658,8 @@ func TestReauthenticationNonEnumerationIsIndistinguishable(t *testing.T) {
 	deleted.Credential.Version = 1
 	deleted.Credential.LastAllocatedVersion = 1
 	seed := func(h *spineHarness) {
-		h.accounts.seed("tenant_b", foreign)
-		h.accounts.seed("tenant_a", deleted)
+		h.seedAccount("tenant_b", foreign)
+		h.seedAccount("tenant_a", deleted)
 	}
 
 	cases := []struct {
@@ -651,7 +717,7 @@ func TestProbeRejectedWhileReplacementMarkerHeld(t *testing.T) {
 		account.PendingCredentialVersion = 2
 		account.PendingOrigin = domain.LifecycleActive
 		account.ActiveOAuthAuthorizationID = "oauth_auth_inflight_reauth"
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 	response, payload := harness.do(t, requestSpec{
 		method: http.MethodPost,
@@ -688,7 +754,7 @@ func TestStalePendingPromotionFenceConflicts(t *testing.T) {
 		account.Lifecycle = domain.LifecycleActive
 		account.Credential.Version = 1
 		account.Credential.LastAllocatedVersion = 1
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 	})
 	response, payload := harness.do(t, requestSpec{
 		method: http.MethodPost,
@@ -743,7 +809,7 @@ func TestFailedReauthenticationConsumesVersionAndRestoresOrigin(t *testing.T) {
 		account.Lifecycle = domain.LifecycleActive
 		account.Credential.Version = 1
 		account.Credential.LastAllocatedVersion = 1
-		h.accounts.seed("tenant_a", account)
+		h.seedAccount("tenant_a", account)
 		h.vault.validResult.Valid = false
 	})
 	response, payload := harness.do(t, requestSpec{method: http.MethodPost, path: "/v1/provider-accounts/pa_reauth_failed/reauthentication", bearer: tenantAKey, idemKey: "idem-reauth-failed", body: submitBody(domain.CredentialClassOAuthTokenImport)})
@@ -785,7 +851,7 @@ func TestProbeOnDraftRejectedBeforeAdapter(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_draftprobe", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_draftprobe", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -812,7 +878,7 @@ func TestProbeRequiresManageScope(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", probeableAccount("pa_probescope", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", probeableAccount("pa_probescope", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	response, payload := harness.do(t, requestSpec{
@@ -835,7 +901,7 @@ func TestCredentialMaterialAbsentFromProjections(t *testing.T) {
 	t.Parallel()
 
 	harness := newSpineHarness(t, func(h *spineHarness) {
-		h.accounts.seed("tenant_a", usableDraft("pa_redact", domain.AuthModeChatGPTCodexOAuth))
+		h.seedAccount("tenant_a", usableDraft("pa_redact", domain.AuthModeChatGPTCodexOAuth))
 	})
 
 	_, submitPayload := harness.do(t, requestSpec{

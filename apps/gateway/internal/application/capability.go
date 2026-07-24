@@ -58,7 +58,7 @@ func (service *ProviderAccountService) GetCapabilitySnapshot(ctx context.Context
 	}
 
 	// Same-Tenant ownership before any capability disclosure.
-	account, err := service.accounts.Visible(ctx, principal, query.AccountID)
+	account, err := service.loadAccount(ctx, principal, query.AccountID)
 	if err != nil {
 		return CapabilitySnapshotResult{}, service.fail(ctx, sc, service.visibilityCanonical(err))
 	}
@@ -78,12 +78,24 @@ func (service *ProviderAccountService) GetCapabilitySnapshot(ctx context.Context
 	}
 
 	// Management read recomputes freshness and then applies both account-wide
-	// usability and operation-scoped Health gates. It remains inspectable, but a
-	// matching cooldown must not advertise authorization that /v1/models omits.
+	// usability, operation-scoped Health, and the same CircuitStore gates that
+	// /v1/models uses so offerable never advertises pairs product listing hides.
 	snapshot = snapshot.WithDerivedFreshness(sc.start).WithAccountOfferGate(service.accountAllowsOffers(account))
 	if service.accountAllowsOffers(account) {
 		for operation, fact := range snapshot.Operations {
 			if accountHealthBlocksOperation(account, operation) {
+				fact.Offerable = false
+				snapshot.Operations[operation] = fact
+				continue
+			}
+			surface := fact.ProbeSurface
+			circuit, err := service.circuits.SurfaceOpen(ctx, ports.CircuitSurface{
+				Provider:  account.Provider,
+				AuthMode:  account.AuthMode,
+				Surface:   surface,
+				Operation: operation,
+			})
+			if err != nil || circuit.Open {
 				fact.Offerable = false
 				snapshot.Operations[operation] = fact
 			}
@@ -128,10 +140,15 @@ func (service *ProviderAccountService) ListModels(ctx context.Context, query Lis
 
 	usable := make(map[domain.ProviderAccountID]domain.ProviderAccount, len(accounts))
 	for _, account := range accounts {
-		if !service.accountAllowsOffers(account) {
+		// Compose HealthStore; missing health fails closed (skip from offers).
+		composed, err := service.loadAccount(ctx, principal, account.ID)
+		if err != nil {
 			continue
 		}
-		usable[account.ID] = account
+		if !service.accountAllowsOffers(composed) {
+			continue
+		}
+		usable[account.ID] = composed
 	}
 
 	offers := make([]domain.ModelOffer, 0)
@@ -238,6 +255,9 @@ func (service *ProviderAccountService) accountAllowsOffers(account domain.Provid
 
 func accountHasNonRoutableAccountHealth(account domain.ProviderAccount) bool {
 	for _, condition := range account.Health.Conditions {
+		if condition.CredentialVersion != account.Credential.Version {
+			continue
+		}
 		if condition.Scope.Kind != domain.HealthScopeAccount {
 			continue
 		}
@@ -254,6 +274,9 @@ func accountHasNonRoutableAccountHealth(account domain.ProviderAccount) bool {
 // do cover the fact.
 func accountHealthBlocksOperation(account domain.ProviderAccount, operation domain.CapabilityOperation) bool {
 	for _, condition := range account.Health.Conditions {
+		if condition.CredentialVersion != account.Credential.Version {
+			continue
+		}
 		if !isNonRoutableHealthState(condition.State) {
 			continue
 		}
@@ -275,6 +298,9 @@ func accountHealthBlocksOperation(account domain.ProviderAccount, operation doma
 // an account-wide block (§3.8, I-HEALTH-SCOPED).
 func accountHealthBlocksPair(account domain.ProviderAccount, operation domain.CapabilityOperation, modelSlug string) bool {
 	for _, condition := range account.Health.Conditions {
+		if condition.CredentialVersion != account.Credential.Version {
+			continue
+		}
 		if !isNonRoutableHealthState(condition.State) {
 			continue
 		}

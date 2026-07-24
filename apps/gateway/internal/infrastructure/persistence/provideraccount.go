@@ -2,8 +2,11 @@
 package persistence
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -148,33 +151,39 @@ func applyAccountUpdate(existing domain.ProviderAccount, update ports.AccountUpd
 	if update.RequireEmptyPendingVersion && existing.PendingCredentialVersion != 0 {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
-	if update.RequireEmptyRecoveryPermit && existing.RecoveryPermit.Owner != "" {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
-	if update.RequireRecoveryPermitOwner != "" && existing.RecoveryPermit.Owner != update.RequireRecoveryPermitOwner {
-		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
-	}
 	if update.RequireLifecycle != "" && existing.Lifecycle != update.RequireLifecycle {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
 	if update.RequireControlsMatch && existing.Controls != update.RequireControls {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
-	if required := update.RequireRecoveryCondition; required.Owner != "" && !accountHasRecoveryCondition(existing, required) {
+	if update.RequireLastAllocatedVersionMatch && existing.Credential.LastAllocatedVersion != update.RequireLastAllocatedVersion {
 		return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
 	}
 
-	if update.PatchLastProbedAt || update.PatchClearRecoveryPermit {
-		if update.PatchLastProbedAt {
-			existing.Credential.LastProbedAt = update.LastProbedAt
-			existing.UpdatedAt = update.LastProbedAt
-		}
-		if update.PatchClearRecoveryPermit {
-			existing.RecoveryPermit = domain.RecoveryPermit{}
-		}
+	if update.PatchLastProbedAt {
+		existing.Credential.LastProbedAt = update.LastProbedAt
+		existing.UpdatedAt = update.LastProbedAt
+		// AccountStore never carries health authority.
+		existing.Health = domain.HealthSummary{}
+		existing.RecoveryPermit = domain.RecoveryPermit{}
 		return existing, nil
 	}
-	return update.Account, nil
+	if update.PatchLastAllocatedVersion {
+		if update.LastAllocatedVersion <= existing.Credential.LastAllocatedVersion ||
+			update.LastAllocatedVersion <= existing.Credential.Version {
+			return domain.ProviderAccount{}, ports.ErrAccountUpdateConflict
+		}
+		existing.Credential.LastAllocatedVersion = update.LastAllocatedVersion
+		existing.Health = domain.HealthSummary{}
+		existing.RecoveryPermit = domain.RecoveryPermit{}
+		return existing, nil
+	}
+	// Lifecycle/metadata only: strip any embedded health from the write payload.
+	next := update.Account
+	next.Health = domain.HealthSummary{}
+	next.RecoveryPermit = domain.RecoveryPermit{}
+	return next, nil
 }
 
 // MemoryAccountStore is the production foundation Provider Account store. It
@@ -199,6 +208,7 @@ func (*MemoryAccountStore) Restore(context.Context) error {
 }
 
 // Create persists a new draft for the owning Tenant derived from the principal.
+// Health and recovery permits are never retained on AccountStore rows.
 func (store *MemoryAccountStore) Create(_ context.Context, creation ports.AccountCreation) (domain.ProviderAccount, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -209,8 +219,11 @@ func (store *MemoryAccountStore) Create(_ context.Context, creation ports.Accoun
 		accounts = make(map[domain.ProviderAccountID]domain.ProviderAccount)
 		store.byTenant[tenant] = accounts
 	}
-	accounts[creation.Account.ID] = creation.Account
-	return creation.Account, nil
+	safe := creation.Account
+	safe.Health = domain.HealthSummary{}
+	safe.RecoveryPermit = domain.RecoveryPermit{}
+	accounts[creation.Account.ID] = safe
+	return safe, nil
 }
 
 // Update persists a mutated account for the owning Tenant. It rejects an
@@ -236,20 +249,6 @@ func (store *MemoryAccountStore) Update(_ context.Context, update ports.AccountU
 	}
 	accounts[update.Account.ID] = result
 	return result, nil
-}
-
-func accountHasRecoveryCondition(account domain.ProviderAccount, required domain.RecoveryPermit) bool {
-	if account.Credential.Version != required.CredentialVersion {
-		return false
-	}
-	for _, condition := range account.Health.Conditions {
-		if condition.Scope == required.Scope &&
-			condition.ConditionRevision == required.ConditionRevision &&
-			condition.CredentialVersion == required.CredentialVersion {
-			return true
-		}
-	}
-	return false
 }
 
 // Visible returns the owning-Tenant account or the single non-enumerating
@@ -286,50 +285,75 @@ func (store *MemoryAccountStore) List(_ context.Context, principal domain.Securi
 }
 
 // FileAccountStore is a durable foundation Provider Account store that persists
-// same-Tenant account rows to a local JSON file. It satisfies the startup
-// recovery contract by loading persisted cooldowns and recovery permits in
-// Restore before composition reports readiness.
+// same-Tenant account rows to an append-only ledger under exclusive lock.
+// Health conditions and recovery permits are owned by HealthStore, not this store.
 type FileAccountStore struct {
-	mu       sync.Mutex
-	path     string
-	byTenant map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
+	mu             sync.Mutex
+	path           string
+	lock           string
+	legacySnapshot bool
+	byTenant       map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
 }
 
 // NewFileAccountStore builds a file-backed foundation account store.
 func NewFileAccountStore(path string) *FileAccountStore {
 	return &FileAccountStore{
 		path:     path,
+		lock:     path + ".lock",
 		byTenant: make(map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount),
 	}
 }
 
-// Restore loads persisted account rows from the configured file. A missing file
-// is treated as an empty store; a corrupted file fails closed.
+func (store *FileAccountStore) acquireLock() (func(), error) {
+	dir := filepath.Dir(store.lock)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return nil, err
+		}
+	}
+	file, err := os.OpenFile(store.lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("%w: account store exclusive lock held", ports.ErrDependencyUnavailable)
+		}
+		return nil, err
+	}
+	_, _ = file.WriteString("pixelplus-account-lock\n")
+	if err := file.Close(); err != nil {
+		_ = os.Remove(store.lock)
+		return nil, err
+	}
+	return func() { _ = os.Remove(store.lock) }, nil
+}
+
+// Restore loads persisted account rows from the append-only ledger. A missing
+// file is empty state; null, corrupt, or invalid rows fail closed so readiness
+// cannot open over untrusted durability (health/cooldown spec §7.1-§7.2).
+// Restore acquires the same O_EXCL exclusive lock as Read/writes so startup
+// cannot observe a partial append under concurrent writers.
 func (store *FileAccountStore) Restore(_ context.Context) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-
-	data, err := os.ReadFile(store.path)
+	unlock, err := store.acquireLock()
 	if err != nil {
-		if os.IsNotExist(err) {
-			store.byTenant = make(map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount)
-			return nil
-		}
 		return err
 	}
-	var loaded map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		return err
-	}
-	store.byTenant = loaded
-	return nil
+	defer unlock()
+	return store.reloadLocked()
 }
 
 // Create persists a new draft for the owning Tenant derived from the principal.
 func (store *FileAccountStore) Create(ctx context.Context, creation ports.AccountCreation) (domain.ProviderAccount, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-
+	unlock, err := store.acquireLock()
+	if err != nil {
+		return domain.ProviderAccount{}, err
+	}
+	defer unlock()
+	if err := store.reloadLocked(); err != nil {
+		return domain.ProviderAccount{}, err
+	}
 	return store.createLocked(ctx, creation)
 }
 
@@ -340,15 +364,19 @@ func (store *FileAccountStore) createLocked(_ context.Context, creation ports.Ac
 		accounts = make(map[domain.ProviderAccountID]domain.ProviderAccount)
 		store.byTenant[tenant] = accounts
 	}
-	accounts[creation.Account.ID] = creation.Account
-	if err := store.saveLocked(); err != nil {
+	// Persist lifecycle/metadata only; HealthStore owns conditions and permits.
+	safe := creation.Account
+	safe.Health = domain.HealthSummary{}
+	safe.RecoveryPermit = domain.RecoveryPermit{}
+	accounts[creation.Account.ID] = safe
+	if err := store.appendAccountLocked(tenant, safe); err != nil {
 		delete(accounts, creation.Account.ID)
 		if len(accounts) == 0 {
 			delete(store.byTenant, tenant)
 		}
 		return domain.ProviderAccount{}, err
 	}
-	return creation.Account, nil
+	return safe, nil
 }
 
 // Update persists a mutated account for the owning Tenant. It rejects an
@@ -358,6 +386,14 @@ func (store *FileAccountStore) createLocked(_ context.Context, creation ports.Ac
 func (store *FileAccountStore) Update(_ context.Context, update ports.AccountUpdate) (domain.ProviderAccount, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	unlock, err := store.acquireLock()
+	if err != nil {
+		return domain.ProviderAccount{}, err
+	}
+	defer unlock()
+	if err := store.reloadLocked(); err != nil {
+		return domain.ProviderAccount{}, err
+	}
 
 	accounts, ok := store.byTenant[update.Principal.TenantID]
 	if !ok {
@@ -372,18 +408,26 @@ func (store *FileAccountStore) Update(_ context.Context, update ports.AccountUpd
 		return domain.ProviderAccount{}, err
 	}
 	accounts[update.Account.ID] = result
-	if err := store.saveLocked(); err != nil {
+	if err := store.appendAccountLocked(update.Principal.TenantID, result); err != nil {
 		accounts[update.Account.ID] = existing
 		return domain.ProviderAccount{}, err
 	}
 	return result, nil
 }
 
-// Visible returns the owning-Tenant account or the single non-enumerating
-// visibility failure for foreign, unknown, and deleted identifiers.
+// Visible returns the owning-Tenant account. Under exclusive lock + reload so
+// another process's append is visible and partial writes are not observed.
 func (store *FileAccountStore) Visible(_ context.Context, principal domain.SecurityPrincipal, id domain.ProviderAccountID) (domain.ProviderAccount, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	unlock, err := store.acquireLock()
+	if err != nil {
+		return domain.ProviderAccount{}, err
+	}
+	defer unlock()
+	if err := store.reloadLocked(); err != nil {
+		return domain.ProviderAccount{}, err
+	}
 
 	accounts, ok := store.byTenant[principal.TenantID]
 	if !ok {
@@ -396,10 +440,19 @@ func (store *FileAccountStore) Visible(_ context.Context, principal domain.Secur
 	return account, nil
 }
 
-// List returns only the authenticated Tenant's non-deleted accounts.
+// List returns only the authenticated Tenant's non-deleted accounts under
+// exclusive lock + reload for cross-process freshness.
 func (store *FileAccountStore) List(_ context.Context, principal domain.SecurityPrincipal) ([]domain.ProviderAccount, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	unlock, err := store.acquireLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := store.reloadLocked(); err != nil {
+		return nil, err
+	}
 
 	accounts := store.byTenant[principal.TenantID]
 	result := make([]domain.ProviderAccount, 0, len(accounts))
@@ -412,22 +465,319 @@ func (store *FileAccountStore) List(_ context.Context, principal domain.Security
 	return result, nil
 }
 
-func (store *FileAccountStore) saveLocked() error {
+// accountLedgerEntry is one append-only durable account projection. Health and
+// recovery permits are owned by HealthStore; AccountStore rows carry lifecycle
+// and credential metadata only for the logical port split (ADR 0009).
+type accountLedgerEntry struct {
+	TenantID domain.TenantID        `json:"tenant_id"`
+	Account  domain.ProviderAccount `json:"account"`
+}
+
+func (store *FileAccountStore) reloadLocked() error {
+	data, err := os.ReadFile(store.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			store.legacySnapshot = false
+			store.byTenant = make(map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount)
+			return nil
+		}
+		return err
+	}
+	if len(data) == 0 {
+		store.legacySnapshot = false
+		store.byTenant = make(map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount)
+		return nil
+	}
+	// Reject top-level JSON null so Restore fails closed instead of leaving a
+	// nil map that panics on later Create/Update.
+	trimmed := string(data)
+	if trimmed == "null" || trimmed == "null\n" {
+		return errors.New("account ledger: null root")
+	}
+
+	// Prefer append-only JSONL (Windows-safe repeated writes). Fall back to the
+	// legacy single JSON object snapshot only when the whole file is a tenant map
+	// (no per-line tenant_id ledger entries).
+	if !looksLikeAccountJSONL(data) {
+		var loaded map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount
+		if err := json.Unmarshal(data, &loaded); err != nil {
+			return err
+		}
+		if loaded == nil {
+			return errors.New("account ledger: null root object")
+		}
+		if err := validateAccountTree(loaded); err != nil {
+			return err
+		}
+		// Strip health authority from legacy snapshots.
+		for tenant, accounts := range loaded {
+			for id, account := range accounts {
+				account.Health = domain.HealthSummary{}
+				account.RecoveryPermit = domain.RecoveryPermit{}
+				accounts[id] = account
+			}
+			loaded[tenant] = accounts
+		}
+		store.byTenant = loaded
+		store.legacySnapshot = true
+		return nil
+	}
+
+	next := make(map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount)
+	offset := 0
+	lineNo := 0
+	for offset < len(data) {
+		lineNo++
+		end := offset
+		for end < len(data) && data[end] != '\n' {
+			end++
+		}
+		line := data[offset:end]
+		if end < len(data) {
+			end++
+		}
+		offset = end
+		if len(line) == 0 {
+			continue
+		}
+		if string(line) == "null" {
+			return fmt.Errorf("account ledger line %d: null record", lineNo)
+		}
+		var entry accountLedgerEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return fmt.Errorf("account ledger line %d: %w", lineNo, err)
+		}
+		if err := validateAccountRow(entry.TenantID, entry.Account); err != nil {
+			return fmt.Errorf("account ledger line %d: %w", lineNo, err)
+		}
+		accounts, ok := next[entry.TenantID]
+		if !ok {
+			accounts = make(map[domain.ProviderAccountID]domain.ProviderAccount)
+			next[entry.TenantID] = accounts
+		}
+		// AccountStore no longer owns health authority; strip embedded health so
+		// a legacy row cannot resurrect HealthStore state on restore.
+		entry.Account.Health = domain.HealthSummary{}
+		entry.Account.RecoveryPermit = domain.RecoveryPermit{}
+		accounts[entry.Account.ID] = entry.Account
+	}
+	store.byTenant = next
+	store.legacySnapshot = false
+	return nil
+}
+
+// looksLikeAccountJSONL reports whether data is the append-only ledger format
+// (lines of accountLedgerEntry) rather than a legacy whole-map snapshot.
+func looksLikeAccountJSONL(data []byte) bool {
+	// First non-empty line with a tenant_id field is the JSONL shape.
+	offset := 0
+	for offset < len(data) {
+		end := offset
+		for end < len(data) && data[end] != '\n' {
+			end++
+		}
+		line := data[offset:end]
+		if end < len(data) {
+			end++
+		}
+		offset = end
+		if len(line) == 0 {
+			continue
+		}
+		var probe struct {
+			TenantID string           `json:"tenant_id"`
+			Account  *json.RawMessage `json:"account"`
+		}
+		if err := json.Unmarshal(line, &probe); err != nil {
+			return false
+		}
+		return probe.TenantID != "" && probe.Account != nil
+	}
+	return false
+}
+
+func (store *FileAccountStore) appendAccountLocked(tenant domain.TenantID, account domain.ProviderAccount) error {
 	dir := filepath.Dir(store.path)
-	if dir != "" {
+	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return err
 		}
 	}
-	temp := store.path + ".tmp"
-	data, err := json.Marshal(store.byTenant)
+	// A legacy whole-map snapshot must be rewritten before the first append.
+	// Otherwise the ledger entry is concatenated to the legacy JSON document and
+	// the next Restore fails closed on two adjacent top-level values.
+	if store.legacySnapshot {
+		return store.rewriteLedgerLocked()
+	}
+	// Append-only JSONL under process mutex. Unlike rename-over-destination this
+	// is Windows-safe for repeated writes (no replace of an open destination).
+	// Tradeoff: the ledger grows with each mutation; compaction is deferred.
+	safe := account
+	safe.Health = domain.HealthSummary{}
+	safe.RecoveryPermit = domain.RecoveryPermit{}
+	entry := accountLedgerEntry{TenantID: tenant, Account: safe}
+	data, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(temp, data, 0o640); err != nil {
+	file, err := os.OpenFile(store.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	if err != nil {
 		return err
 	}
-	return os.Rename(temp, store.path)
+	defer file.Close()
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return file.Sync()
+}
+
+func (store *FileAccountStore) rewriteLedgerLocked() error {
+	var data bytes.Buffer
+	for tenant, accounts := range store.byTenant {
+		for _, account := range accounts {
+			safe := account
+			safe.Health = domain.HealthSummary{}
+			safe.RecoveryPermit = domain.RecoveryPermit{}
+			encoded, err := json.Marshal(accountLedgerEntry{TenantID: tenant, Account: safe})
+			if err != nil {
+				return err
+			}
+			data.Write(encoded)
+			data.WriteByte('\n')
+		}
+	}
+	file, err := os.OpenFile(store.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data.Bytes()); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	store.legacySnapshot = false
+	return nil
+}
+
+func validateAccountTree(tree map[domain.TenantID]map[domain.ProviderAccountID]domain.ProviderAccount) error {
+	if tree == nil {
+		return errors.New("account ledger: nil tenant map")
+	}
+	for tenant, accounts := range tree {
+		if tenant == "" {
+			return errors.New("account ledger: empty tenant id")
+		}
+		if accounts == nil {
+			return fmt.Errorf("account ledger: nil account map for tenant %q", tenant)
+		}
+		for id, account := range accounts {
+			if err := validateAccountRow(tenant, account); err != nil {
+				return err
+			}
+			if account.ID != id {
+				return fmt.Errorf("account ledger: id mismatch %q != %q", account.ID, id)
+			}
+		}
+	}
+	return nil
+}
+
+func validateAccountRow(tenant domain.TenantID, account domain.ProviderAccount) error {
+	if tenant == "" {
+		return errors.New("missing tenant_id")
+	}
+	if account.ID == "" {
+		return errors.New("missing account id")
+	}
+	if !account.Provider.Valid() {
+		return errors.New("invalid provider")
+	}
+	if !account.AuthMode.Valid() {
+		return errors.New("invalid auth_mode")
+	}
+	switch account.Lifecycle {
+	case domain.LifecycleDraft, domain.LifecyclePendingValidation, domain.LifecyclePendingProbe,
+		domain.LifecycleActive, domain.LifecycleDisabled, domain.LifecycleReauthRequired,
+		domain.LifecycleRevoked, domain.LifecycleDeleted:
+	default:
+		return fmt.Errorf("invalid lifecycle %q", account.Lifecycle)
+	}
+	switch account.Controls.Drain {
+	case domain.DrainOff, domain.DrainDraining, "":
+		// Empty drain is treated as off for legacy rows that pre-date explicit controls.
+		if account.Controls.Drain == "" {
+			// Documented backward compatibility: missing drain maps to off.
+		}
+	default:
+		return fmt.Errorf("invalid drain control %q", account.Controls.Drain)
+	}
+	switch account.Controls.Quarantine {
+	case domain.QuarantineOff, domain.QuarantineQuarantined, "":
+	default:
+		return fmt.Errorf("invalid quarantine control %q", account.Controls.Quarantine)
+	}
+	if account.Credential.Version < 0 || account.Credential.LastAllocatedVersion < 0 {
+		return errors.New("negative credential version")
+	}
+	if account.Credential.LastAllocatedVersion < account.Credential.Version {
+		return errors.New("last_allocated_version must be >= credential version")
+	}
+	if account.PendingCredentialVersion < 0 {
+		return errors.New("negative pending credential version")
+	}
+	if account.PendingCredentialVersion > 0 {
+		// Pending is strictly newer than the current usable version (when one exists)
+		// and never invents a version beyond LastAllocatedVersion.
+		if account.Credential.Version != 0 && account.PendingCredentialVersion <= account.Credential.Version {
+			return errors.New("pending credential version must exceed current version")
+		}
+		if account.PendingCredentialVersion > account.Credential.LastAllocatedVersion {
+			return errors.New("pending credential version exceeds last allocated")
+		}
+		switch account.PendingOrigin {
+		case domain.LifecycleDraft, domain.LifecycleActive, domain.LifecycleDisabled, domain.LifecycleRevoked,
+			domain.LifecyclePendingValidation, domain.LifecyclePendingProbe, domain.LifecycleReauthRequired:
+		case "":
+			return errors.New("pending origin required when pending credential version is set")
+		default:
+			return fmt.Errorf("invalid pending origin lifecycle %q", account.PendingOrigin)
+		}
+	} else if account.PendingOrigin != "" {
+		return errors.New("pending origin allowed only when pending credential version exists")
+	}
+	// ActiveOAuth marker must not pair with a settled non-pending lifecycle without
+	// a journey — empty is always OK; non-empty requires a restorable in-flight state.
+	if account.ActiveOAuthAuthorizationID != "" {
+		switch account.Lifecycle {
+		case domain.LifecycleDraft, domain.LifecyclePendingValidation, domain.LifecyclePendingProbe,
+			domain.LifecycleDisabled, domain.LifecycleReauthRequired, domain.LifecycleActive:
+		default:
+			return fmt.Errorf("active oauth marker inconsistent with lifecycle %q", account.Lifecycle)
+		}
+	}
+	if account.CreatedAt.IsZero() {
+		return errors.New("created_at required")
+	}
+	if account.UpdatedAt.IsZero() {
+		return errors.New("updated_at required")
+	}
+	if account.UpdatedAt.Time().Before(account.CreatedAt.Time()) {
+		return errors.New("updated_at before created_at")
+	}
+	if !account.Credential.LastValidatedAt.IsZero() && account.Credential.LastValidatedAt.Time().Before(account.CreatedAt.Time()) {
+		return errors.New("last_validated_at before created_at")
+	}
+	if !account.Credential.LastProbedAt.IsZero() && account.Credential.LastProbedAt.Time().Before(account.CreatedAt.Time()) {
+		return errors.New("last_probed_at before created_at")
+	}
+	// Credential class is derived from AuthMode when set via lifecycle; no free-form class on the row.
+	return nil
 }
 
 // UnavailableAccountStore is installed after startup restoration fails. It
