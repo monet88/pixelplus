@@ -35,6 +35,7 @@ go -C apps/gateway test -race ./internal/... -count=1 -timeout=300s
 git diff --check
 node scripts/validate-public-api-contract.mjs
 node scripts/test-public-api-contract-validator.mjs
+git diff --exit-code dd1079efcb28c362eeb9dab40329d9afc697fb1f...HEAD -- package-lock.json
 ```
 
 ## Acceptance Evidence
@@ -50,6 +51,7 @@ node scripts/test-public-api-contract-validator.mjs
 - `git diff --check` PASS
 - `node scripts/validate-public-api-contract.mjs` PASS
 - `node scripts/test-public-api-contract-validator.mjs` PASS
+- `git diff --exit-code dd1079efcb28c362eeb9dab40329d9afc697fb1f...HEAD -- package-lock.json` PASS
 - GitNexus: new FileRoutingPolicyStore symbols UNKNOWN (index lag); composition.New HIGH (full suite required)
 - Follow-up commits after 049b786/678d2bc/2da8446: allowlist; cross-mode scoped to fallback_enabled (red then green); health/drain/quarantine/open-circuit public proofs; experimental fail-closed; circuit dep 503; shared ValidateRoutingPolicyShape
 - Post-7ce7f86 P2 (Standards):
