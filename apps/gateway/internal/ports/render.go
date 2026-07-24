@@ -348,6 +348,17 @@ type RenderAdapter interface {
 	Render(context.Context, RenderCommand, PromptInjection, InputAssetInjection, RenderCaptureSink) (domain.RenderOutcome, error)
 }
 
+// RenderDigester produces opaque, keyed digests for create-time fingerprint and
+// optional prompt binding. The key never leaves the digester implementation
+// (composition/confidential infrastructure). Application receives only hex digests.
+// Unkeyed SHA-256 of the prompt MUST NOT equal these digests (dictionary oracle ban).
+type RenderDigester interface {
+	// DigestPrompt returns a keyed HMAC digest of prompt material.
+	DigestPrompt(prompt string) string
+	// CreateFingerprint binds operation, model, prompt, and asset ids under the key.
+	CreateFingerprint(operation domain.RenderOperation, model, prompt string, inputs []domain.AssetID, mask domain.AssetID) domain.Fingerprint
+}
+
 // RenderAuditAction names a Render Job product/security audit event.
 type RenderAuditAction string
 

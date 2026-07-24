@@ -24,7 +24,7 @@ func TestStaleFenceRejectsTransitionAndPlacement(t *testing.T) {
 		"key_a",
 		domain.RenderOpImageGeneration,
 		"m",
-		domain.DigestPrompt("p"),
+		"opaque-digest",
 		nil,
 		"",
 		"pa_1",
@@ -113,7 +113,7 @@ func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
 		"key_a",
 		domain.RenderOpImageGeneration,
 		"m",
-		domain.DigestPrompt("p"),
+		"opaque-digest",
 		nil,
 		"",
 		"pa_1",
@@ -215,7 +215,7 @@ func TestPostManifestRecoveryClaimIsRecoveryOnly(t *testing.T) {
 	now := domain.NewTimestamp(base)
 	job := domain.NewQueuedRenderJob(
 		"job_manifest_rec", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
-		domain.DigestPrompt("p"), nil, "", "pa_1", 1, "fp", "idem", now,
+		"opaque-digest", nil, "", "pa_1", 1, "fp", "idem", now,
 	)
 	if _, err := store.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: job}); err != nil {
 		t.Fatalf("Create: %v", err)

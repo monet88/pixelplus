@@ -118,6 +118,7 @@ func mustRenderService(t *testing.T, admission ports.AdmissionStore, jobs ports.
 		Vault:        noopVault{},
 		Prompts:      prompts,
 		Authorized:   noopAuthorized{},
+		Digester:     noopDigester{},
 		Queue:        noopQueue{},
 		Audit:        noopRenderAudit{},
 		Telemetry:    noopTelemetry{},
@@ -231,6 +232,13 @@ type noopAuthorized struct{}
 
 func (noopAuthorized) Render(context.Context, ports.AuthorizedRenderRequest) (domain.RenderOutcome, error) {
 	return domain.RenderOutcome{}, ports.ErrRenderAdapterUnavailable
+}
+
+type noopDigester struct{}
+
+func (noopDigester) DigestPrompt(string) string { return "d" }
+func (noopDigester) CreateFingerprint(domain.RenderOperation, string, string, []domain.AssetID, domain.AssetID) domain.Fingerprint {
+	return "fp"
 }
 
 type noopQueue struct{}

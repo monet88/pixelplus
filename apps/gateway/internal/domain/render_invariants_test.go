@@ -1,12 +1,9 @@
 package domain_test
 
 import (
-	"encoding/hex"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
-	"unicode"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 )
@@ -26,7 +23,8 @@ func TestRenderJobDoesNotStorePromptPlaintext(t *testing.T) {
 
 	now := domain.NewTimestamp(time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC))
 	prompt := "super secret prompt text that must never land on the job row"
-	digest := domain.DigestPrompt(prompt)
+	// Opaque digests are produced by ports.RenderDigester (keyed); domain only stores the result.
+	digest := "keyed-opaque-digest-not-raw-sha256-of-prompt---------------"
 	job := domain.NewQueuedRenderJob(
 		"job_1",
 		"tenant_a",
@@ -38,7 +36,7 @@ func TestRenderJobDoesNotStorePromptPlaintext(t *testing.T) {
 		"",
 		"pa_1",
 		1,
-		domain.NewCreateRenderJobFingerprint(domain.RenderOpImageGeneration, "gpt-image-1", prompt, nil, ""),
+		domain.Fingerprint("keyed-opaque-fingerprint-not-raw-concat-----------"),
 		"idem-1",
 		now,
 	)
@@ -120,48 +118,5 @@ func TestProviderRenderOutcomeClassesAreClosedSet(t *testing.T) {
 		if class == rogue {
 			t.Fatalf("authorized set must not include storage_cap_later (got %q)", class)
 		}
-	}
-	d := domain.DigestPrompt("x")
-	if _, err := hex.DecodeString(d); err != nil || len(d) != 64 {
-		t.Fatalf("DigestPrompt must return 32-byte hex digest, got %q", d)
-	}
-}
-
-func TestCreateRenderJobFingerprintIsStableDigestNotRawConcat(t *testing.T) {
-	t.Parallel()
-
-	prompt := "a red circle"
-	fp := domain.NewCreateRenderJobFingerprint(domain.RenderOpImageGeneration, "gpt-image-1", prompt, nil, "")
-	raw := string(fp)
-
-	// Must not embed raw prompt.
-	if strings.Contains(raw, prompt) {
-		t.Fatalf("fingerprint embeds raw prompt: %q", raw)
-	}
-	// Must not look like field concatenation (record separators / operation labels).
-	if strings.Contains(raw, "create_render_job") || strings.Contains(raw, "\x1f") {
-		t.Fatalf("fingerprint looks like raw concatenated material, not a digest: %q", raw)
-	}
-	// Must be hex digest (sha-256 = 64 lowercase hex chars).
-	if len(raw) != 64 {
-		t.Fatalf("fingerprint length = %d, want 64 hex chars", len(raw))
-	}
-	for _, r := range raw {
-		if !unicode.Is(unicode.ASCII_Hex_Digit, r) || (r >= 'A' && r <= 'F') {
-			// allow only lowercase hex
-			if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
-				t.Fatalf("fingerprint is not lowercase hex: %q", raw)
-			}
-		}
-	}
-	// Stability: same inputs → same fingerprint.
-	fp2 := domain.NewCreateRenderJobFingerprint(domain.RenderOpImageGeneration, "gpt-image-1", prompt, nil, "")
-	if fp != fp2 {
-		t.Fatal("fingerprint not stable across identical inputs")
-	}
-	// Distinct inputs → distinct fingerprints.
-	fp3 := domain.NewCreateRenderJobFingerprint(domain.RenderOpImageGeneration, "gpt-image-1", "different", nil, "")
-	if fp == fp3 {
-		t.Fatal("distinct prompts produced identical fingerprints")
 	}
 }

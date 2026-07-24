@@ -116,6 +116,7 @@ type RenderService struct {
 	vault        ports.CredentialVault
 	prompts      ports.RenderPromptStore
 	authorized   ports.AuthorizedRender
+	digester     ports.RenderDigester
 	queue        ports.JobRuntime
 	audit        ports.RenderAuditRecorder
 	telemetry    ports.TelemetryRecorder
@@ -146,6 +147,8 @@ type RenderDependencies struct {
 	// Authorized is the protected render boundary (Vault + confidential + Adapter).
 	// Application never hands prompt/credential plaintext to an ordinary Adapter.
 	Authorized ports.AuthorizedRender
+	// Digester produces keyed fingerprints/prompt digests; never unkeyed SHA-256.
+	Digester   ports.RenderDigester
 	Queue      ports.JobRuntime
 	Audit      ports.RenderAuditRecorder
 	Telemetry  ports.TelemetryRecorder
@@ -183,6 +186,8 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		return nil, errors.New("application: render prompt store is required")
 	case dependencies.Authorized == nil:
 		return nil, errors.New("application: authorized render port is required")
+	case dependencies.Digester == nil:
+		return nil, errors.New("application: render digester is required")
 	case dependencies.Queue == nil:
 		return nil, errors.New("application: job runtime is required")
 	case dependencies.Audit == nil:
@@ -212,6 +217,7 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		vault:        dependencies.Vault,
 		prompts:      dependencies.Prompts,
 		authorized:   dependencies.Authorized,
+		digester:     dependencies.Digester,
 		queue:        dependencies.Queue,
 		audit:        dependencies.Audit,
 		telemetry:    dependencies.Telemetry,
@@ -342,7 +348,7 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		}
 	}
 
-	fingerprint := domain.NewCreateRenderJobFingerprint(command.operation, command.model, command.prompt, command.inputs, command.mask)
+	fingerprint := service.digester.CreateFingerprint(command.operation, command.model, command.prompt, command.inputs, command.mask)
 	identity := domain.ReplayIdentity{
 		Scope: domain.ReplayScope{
 			TenantID:       principal.TenantID,
@@ -430,7 +436,7 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	now := domain.NewTimestamp(sc.start)
 	// Job metadata stores only a non-secret digest; plaintext goes to the
 	// confidential port and is never retained on the durable job row (ADR 0009).
-	promptDigest := domain.DigestPrompt(command.prompt)
+	promptDigest := service.digester.DigestPrompt(command.prompt)
 	job := domain.NewQueuedRenderJob(
 		jobID,
 		principal.TenantID,

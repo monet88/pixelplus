@@ -389,44 +389,9 @@ func NewQueuedRenderJob(
 	}
 }
 
-// DigestPrompt returns the non-secret SHA-256 hex digest of prompt material.
-// The digest is safe to store on job metadata; the plaintext is not.
-func DigestPrompt(prompt string) string {
-	sum := sha256.Sum256([]byte(prompt))
-	return hex.EncodeToString(sum[:])
-}
-
-// NewCreateRenderJobFingerprint builds a stable SHA-256 hex fingerprint over
-// the create inputs that determine the durable side effect. The return value is
-// always a 64-char lowercase hex digest — never raw concatenated field material
-// and never prompt plaintext (#20 section 5.2, ADR 0009).
-func NewCreateRenderJobFingerprint(operation RenderOperation, model, prompt string, inputs []AssetID, mask AssetID) Fingerprint {
-	const separator = "\x1f"
-	h := sha256.New()
-	_, _ = h.Write([]byte("create_render_job"))
-	_, _ = h.Write([]byte(separator))
-	_, _ = h.Write([]byte(operation))
-	_, _ = h.Write([]byte(separator))
-	_, _ = h.Write([]byte(model))
-	_, _ = h.Write([]byte(separator))
-	_, _ = h.Write([]byte(prompt))
-	_, _ = h.Write([]byte(separator))
-	_, _ = h.Write([]byte(joinAssetIDs(inputs)))
-	_, _ = h.Write([]byte(separator))
-	_, _ = h.Write([]byte(mask))
-	return Fingerprint(hex.EncodeToString(h.Sum(nil)))
-}
-
-func joinAssetIDs(ids []AssetID) string {
-	if len(ids) == 0 {
-		return ""
-	}
-	out := string(ids[0])
-	for i := 1; i < len(ids); i++ {
-		out += "," + string(ids[i])
-	}
-	return out
-}
+// PromptDigest and create fingerprints are produced by ports.RenderDigester
+// (keyed HMAC) in infrastructure. Domain no longer exposes unkeyed SHA-256 of
+// prompt material — that would be a dictionary/correlation oracle (#54 P1-9).
 
 // NewOutputEntryID builds a stable entry id from job and position.
 func NewOutputEntryID(jobID Identifier, position int) OutputEntryID {

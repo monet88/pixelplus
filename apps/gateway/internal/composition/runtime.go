@@ -114,6 +114,13 @@ type Dependencies struct {
 	RenderStaging    ports.RenderStagingStore
 	AuthorizedRender ports.AuthorizedRender
 	RenderAudit      ports.RenderAuditRecorder
+	// RenderDigester produces keyed create fingerprints. Production without an
+	// injected digester (or fixture AllowInMemory key) fails readiness closed.
+	RenderDigester ports.RenderDigester
+	// RenderDigestKey is optional raw key material for composing an HMAC digester
+	// when RenderDigester is nil. Never logged. Empty in production without inject
+	// keeps readiness closed (no restart-unstable auto key).
+	RenderDigestKey []byte
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -234,13 +241,18 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	// must be restored before Ready. Production without explicit durable render
 	// ports or controlled in-memory mode keeps readiness closed so /readyz does
 	// not advertise execution readiness against unavailable stores.
-	renderDurabilityReady := config.AllowInMemoryRenderJobs ||
+	// Keyed digester is also required: production without inject fails closed
+	// rather than minting a restart-unstable key (#54 P1-9).
+	renderDigestReady := dependencies.RenderDigester != nil ||
+		len(dependencies.RenderDigestKey) > 0 ||
+		config.AllowInMemoryRenderJobs
+	renderDurabilityReady := (config.AllowInMemoryRenderJobs ||
 		(dependencies.RenderJobs != nil &&
 			dependencies.RenderReplay != nil &&
 			dependencies.RenderPrompts != nil &&
-			dependencies.RenderStaging != nil)
+			dependencies.RenderStaging != nil)) && renderDigestReady
 	if !renderDurabilityReady {
-		logger.Error("render job durability not configured; readiness stays closed")
+		logger.Error("render job durability or digester key not configured; readiness stays closed")
 	}
 	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil && jobRestoreErr == nil && renderDurabilityReady)
 
@@ -508,6 +520,24 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 			authorized = vaultpkg.NewFailClosedAuthorizedRender()
 		}
 	}
+	digester := dependencies.RenderDigester
+	if digester == nil {
+		key := dependencies.RenderDigestKey
+		if len(key) == 0 && config.AllowInMemoryRenderJobs {
+			// Fixture-only deterministic key; never used as production default.
+			key = []byte(vaultpkg.FixtureRenderDigestKey)
+		}
+		if len(key) > 0 {
+			if d, err := vaultpkg.NewHMACRenderDigester(key); err == nil {
+				digester = d
+			}
+		}
+	}
+	if digester == nil {
+		// Production without injected digester/key: fail-closed digester so the
+		// process can start with Ready=false without minting a restart-unstable key.
+		digester = vaultpkg.FailClosedRenderDigester{}
+	}
 	audit := dependencies.RenderAudit
 	if audit == nil {
 		audit = observability.NewSlogRenderAuditRecorder(dependencies.Logger)
@@ -537,6 +567,7 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 		Vault:        vault,
 		Prompts:      prompts,
 		Authorized:   authorized,
+		Digester:     digester,
 		Queue:        dependencies.Runtime,
 		Audit:        audit,
 		Telemetry:    telemetry,

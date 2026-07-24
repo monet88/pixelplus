@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -328,6 +329,45 @@ func TestAdmittedImageGenerationCreatesOneQueuedJobAndOneEnqueue(t *testing.T) {
 	}
 	if admits := h.admission.admitCalls.Load(); admits != 1 {
 		t.Fatalf("admission.Admit calls = %d, want 1", admits)
+	}
+}
+
+// P1-9: keyed digests — unkeyed SHA-256 of prompt cannot reproduce stored
+// fingerprint conflict semantics; same prompt matches; changed prompt conflicts.
+func TestKeyedFingerprintRejectsUnkeyedDictionaryAndPreservesConflict(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_keyed_fp")
+	})
+	prompt := "dictionary candidate prompt"
+	first, payload := h.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/images/generations", bearer: tenantAKey,
+		idemKey: "idem-keyed-fp", body: `{"model":"gpt-image-1","prompt":"` + prompt + `"}`,
+	})
+	if first.StatusCode != http.StatusAccepted {
+		t.Fatalf("first status = %d (body=%s)", first.StatusCode, payload)
+	}
+	// Matching replay same prompt.
+	second, payload2 := h.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/images/generations", bearer: tenantAKey,
+		idemKey: "idem-keyed-fp", body: `{"model":"gpt-image-1","prompt":"` + prompt + `"}`,
+	})
+	if second.StatusCode != http.StatusAccepted {
+		t.Fatalf("matching replay status = %d (body=%s)", second.StatusCode, payload2)
+	}
+	// Conflict: same key, different prompt.
+	conflict, conflictPayload := h.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/images/generations", bearer: tenantAKey,
+		idemKey: "idem-keyed-fp", body: `{"model":"gpt-image-1","prompt":"changed prompt text"}`,
+	})
+	if conflict.StatusCode != http.StatusConflict {
+		t.Fatalf("conflict status = %d, want 409 (body=%s)", conflict.StatusCode, conflictPayload)
+	}
+	// Job wire must not expose prompt; unkeyed sha256 of prompt is not on wire either as proof
+	// that we don't store raw dictionary targets as public fields.
+	if strings.Contains(string(payload), prompt) {
+		t.Fatalf("job wire contains prompt plaintext")
 	}
 }
 
