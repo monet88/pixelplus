@@ -262,9 +262,9 @@ type PayloadSendBoundary interface {
 
 // AuthorizedRenderRequest is the application-facing request for one upstream
 // render. It carries only safe identities so the authorized port can resolve
-// Vault credential, confidential prompt, and staging capture internally.
-// Application never supplies or receives prompt/credential/output plaintext.
-// SendBoundary, when non-nil, is marked only immediately before Adapter entry.
+// Vault credential, confidential prompt, input/mask Asset bytes, and staging
+// capture internally. Application never supplies or receives prompt/credential/
+// Asset/output plaintext. SendBoundary is marked only immediately before Adapter entry.
 type AuthorizedRenderRequest struct {
 	Principal    domain.SecurityPrincipal
 	JobRef       domain.JobRef
@@ -274,6 +274,10 @@ type AuthorizedRenderRequest struct {
 	Invocation   domain.RenderInvocation
 	Capture      RenderCapturePlan
 	SendBoundary PayloadSendBoundary
+	// InputAssetIDs and MaskAssetID are same-Tenant identities only; bytes are
+	// resolved inside AuthorizedRender via AssetContentStore (ADR 0009).
+	InputAssetIDs []domain.AssetID
+	MaskAssetID   domain.AssetID
 }
 
 // AuthorizedRender is the protected execution boundary for one render attempt.
@@ -300,6 +304,21 @@ type PromptInjection interface {
 	Use(func(plaintext string) error) error
 }
 
+// InputAssetMaterial is one input or mask image presented to the Adapter only
+// inside Use. Callers must not retain Data after Use returns.
+type InputAssetMaterial struct {
+	AssetID     domain.AssetID
+	ContentType string
+	Data        []byte
+}
+
+// InputAssetInjection grants the Adapter a single-call, Use-scoped view of
+// same-Tenant input/mask Asset bytes resolved only inside AuthorizedRender.
+// Generation may pass an empty injection (no inputs).
+type InputAssetInjection interface {
+	Use(func(inputs []InputAssetMaterial, mask *InputAssetMaterial) error) error
+}
+
 // RenderCaptureSink receives Provider output bytes only inside the authorized
 // infrastructure boundary. Accept stages bytes and records safe entry metadata;
 // application never sees the byte slices.
@@ -308,10 +327,11 @@ type RenderCaptureSink interface {
 }
 
 // RenderAdapter runs one controlled generation/edit/inpaint attempt after the
-// authorized boundary has resolved secrets. Prompt is injected via
-// PromptInjection; output bytes go only to RenderCaptureSink.
+// authorized boundary has resolved secrets. Prompt and input/mask Asset bytes
+// are injected via protected Use-scoped values; output bytes go only to
+// RenderCaptureSink. RenderCommand never carries content bytes.
 type RenderAdapter interface {
-	Render(context.Context, RenderCommand, PromptInjection, RenderCaptureSink) (domain.RenderOutcome, error)
+	Render(context.Context, RenderCommand, PromptInjection, InputAssetInjection, RenderCaptureSink) (domain.RenderOutcome, error)
 }
 
 // RenderAuditAction names a Render Job product/security audit event.

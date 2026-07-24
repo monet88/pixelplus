@@ -142,19 +142,24 @@ func (s *stagingCaptureSink) manifest() domain.ResultManifest {
 // Limitation (honest): CredentialVault currently supports only Validate/Put/Revoke —
 // credential plaintext is not injected into the Adapter. When Vault.Render(SecretMaterial)
 // lands it must inject credentials inside the Vault without returning them to application.
+// Input/mask Asset bytes are fetched here and injected into the Adapter without
+// returning content to application.
 type AuthorizedRenderService struct {
 	prompts ports.RenderPromptStore
 	vault   ports.CredentialVault
 	adapter ports.RenderAdapter
 	staging ports.RenderStagingStore
+	content ports.AssetContentStore
 }
 
 // NewAuthorizedRenderService wires the authorized render boundary.
+// content may be nil only for generation-only fixtures that never resolve inputs.
 func NewAuthorizedRenderService(
 	prompts ports.RenderPromptStore,
 	vault ports.CredentialVault,
 	adapter ports.RenderAdapter,
 	staging ports.RenderStagingStore,
+	content ports.AssetContentStore,
 ) *AuthorizedRenderService {
 	if vault == nil {
 		vault = NewFailClosedCredentialVault()
@@ -164,11 +169,13 @@ func NewAuthorizedRenderService(
 		vault:   vault,
 		adapter: adapter,
 		staging: staging,
+		content: content,
 	}
 }
 
-// Render resolves Vault Validate + prompt Use, invokes the Adapter with a
-// capture sink that stages bytes, and returns only safe manifest metadata.
+// Render resolves Vault Validate + prompt Use + input/mask Asset bytes, invokes
+// the Adapter with a capture sink that stages bytes, and returns only safe
+// manifest metadata. Asset/prompt bytes never cross into application.
 func (service *AuthorizedRenderService) Render(ctx context.Context, request ports.AuthorizedRenderRequest) (domain.RenderOutcome, error) {
 	if service.prompts == nil || service.adapter == nil || service.staging == nil {
 		return domain.RenderOutcome{}, ports.ErrRenderAdapterUnavailable
@@ -185,6 +192,12 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 	// Valid=false is a usability reject, not only a dependency error (#15/#46).
 	if !validation.Valid {
 		return domain.RenderOutcome{}, ports.ErrCredentialAbsent
+	}
+
+	// Resolve input/mask Asset bytes inside the protected boundary only.
+	assetInjection, err := service.loadInputAssets(ctx, request)
+	if err != nil {
+		return domain.RenderOutcome{}, err
 	}
 
 	plan := request.Capture
@@ -223,7 +236,7 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 			AuthMode:   request.AuthMode,
 			Version:    request.Version,
 			Invocation: request.Invocation,
-		}, injection, sink)
+		}, injection, assetInjection, sink)
 		return renderErr
 	})
 	if err != nil {
@@ -237,6 +250,59 @@ func (service *AuthorizedRenderService) Render(ctx context.Context, request port
 		}
 	}
 	return outcome, nil
+}
+
+type inputAssetInjection struct {
+	inputs []ports.InputAssetMaterial
+	mask   *ports.InputAssetMaterial
+}
+
+func (i inputAssetInjection) Use(fn func(inputs []ports.InputAssetMaterial, mask *ports.InputAssetMaterial) error) error {
+	if fn == nil {
+		return ports.ErrRenderAdapterUnavailable
+	}
+	return fn(i.inputs, i.mask)
+}
+
+func (service *AuthorizedRenderService) loadInputAssets(ctx context.Context, request ports.AuthorizedRenderRequest) (ports.InputAssetInjection, error) {
+	if len(request.InputAssetIDs) == 0 && request.MaskAssetID == "" {
+		return inputAssetInjection{}, nil
+	}
+	if service.content == nil {
+		return nil, ports.ErrDependencyUnavailable
+	}
+	inputs := make([]ports.InputAssetMaterial, 0, len(request.InputAssetIDs))
+	for _, id := range request.InputAssetIDs {
+		if id == "" {
+			continue
+		}
+		content, err := service.content.Fetch(ctx, request.Principal, id)
+		if err != nil {
+			return nil, err
+		}
+		// Copy so Adapter cannot observe shared backing store slices.
+		data := append([]byte(nil), content.Data...)
+		inputs = append(inputs, ports.InputAssetMaterial{
+			AssetID:     id,
+			ContentType: content.ContentType,
+			Data:        data,
+		})
+	}
+	var mask *ports.InputAssetMaterial
+	if request.MaskAssetID != "" {
+		content, err := service.content.Fetch(ctx, request.Principal, request.MaskAssetID)
+		if err != nil {
+			return nil, err
+		}
+		data := append([]byte(nil), content.Data...)
+		m := ports.InputAssetMaterial{
+			AssetID:     request.MaskAssetID,
+			ContentType: content.ContentType,
+			Data:        data,
+		}
+		mask = &m
+	}
+	return inputAssetInjection{inputs: inputs, mask: mask}, nil
 }
 
 // FailClosedAuthorizedRender fails every render closed.

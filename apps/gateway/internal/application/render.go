@@ -826,7 +826,9 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			AttemptID:  attempt.ID,
 			ManifestID: manifestID,
 		},
-		SendBoundary: sendBoundary,
+		SendBoundary:  sendBoundary,
+		InputAssetIDs: append([]domain.AssetID(nil), job.InputAssetIDs...),
+		MaskAssetID:   job.MaskAssetID,
 	})
 
 	if renderErr != nil {

@@ -249,6 +249,17 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		return nil, err
 	}
 
+	// Share one Asset metadata/content pair across AssetService and RenderService
+	// so upload→edit/inpaint sees the same same-Tenant Assets (ADR 0009 single
+	// composition root). Creating independent Memory stores per service would
+	// make Visible/Fetch miss committed uploads.
+	if dependencies.AssetMetadata == nil {
+		dependencies.AssetMetadata = persistence.NewMemoryAssetMetadataStore(dependencies.Clock)
+	}
+	if dependencies.AssetContent == nil {
+		dependencies.AssetContent = persistence.NewMemoryAssetContentStore()
+	}
+
 	assetService, err := newAssetService(dependencies)
 	if err != nil {
 		return nil, err
@@ -490,7 +501,9 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 			adapter = vaultpkg.NewFailClosedRenderAdapter()
 		}
 		if prompts != nil && adapter != nil && staging != nil {
-			authorized = vaultpkg.NewAuthorizedRenderService(prompts, vault, adapter, staging)
+			// content is required so edit/inpaint can inject same-Tenant Asset
+			// bytes inside the authorized boundary without application seeing them.
+			authorized = vaultpkg.NewAuthorizedRenderService(prompts, vault, adapter, staging, content)
 		} else {
 			authorized = vaultpkg.NewFailClosedAuthorizedRender()
 		}

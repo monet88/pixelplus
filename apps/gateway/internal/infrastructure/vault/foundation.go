@@ -69,9 +69,9 @@ func NewFailClosedRenderAdapter() *FailClosedRenderAdapter {
 }
 
 // Render fails closed because no Provider render surface is configured.
-// PromptInjection and capture sink are ignored; credential/output plaintext is
+// Injections and capture sink are ignored; credential/output plaintext is
 // never available here.
-func (*FailClosedRenderAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (*FailClosedRenderAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.InputAssetInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	return domain.RenderOutcome{}, ports.ErrRenderAdapterUnavailable
 }
 

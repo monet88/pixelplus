@@ -31,7 +31,7 @@ type capturePromptAdapter struct {
 	seen atomic.Value
 }
 
-func (a *capturePromptAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (a *capturePromptAdapter) Render(_ context.Context, _ ports.RenderCommand, prompt ports.PromptInjection, _ ports.InputAssetInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	if prompt != nil {
 		_ = prompt.Use(func(p string) error {
 			a.seen.Store(p)
@@ -75,8 +75,86 @@ type markThenFailAdapter struct {
 	fail error
 }
 
-func (a *markThenFailAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (a *markThenFailAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.InputAssetInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	return domain.RenderOutcome{}, a.fail
+}
+
+type stubContentStore struct {
+	byID map[domain.AssetID]ports.AssetContent
+}
+
+func (s *stubContentStore) Put(context.Context, domain.AssetID, []byte) error { return nil }
+func (s *stubContentStore) Fetch(_ context.Context, _ domain.SecurityPrincipal, id domain.AssetID) (ports.AssetContent, error) {
+	if s == nil || s.byID == nil {
+		return ports.AssetContent{}, ports.ErrAssetNotVisible
+	}
+	c, ok := s.byID[id]
+	if !ok {
+		return ports.AssetContent{}, ports.ErrAssetNotVisible
+	}
+	return c, nil
+}
+
+type captureAssetAdapter struct {
+	input atomic.Value
+	mask  atomic.Value
+}
+
+func (a *captureAssetAdapter) Render(_ context.Context, _ ports.RenderCommand, _ ports.PromptInjection, assets ports.InputAssetInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+	if assets != nil {
+		_ = assets.Use(func(inputs []ports.InputAssetMaterial, mask *ports.InputAssetMaterial) error {
+			if len(inputs) > 0 {
+				a.input.Store(append([]byte(nil), inputs[0].Data...))
+			}
+			if mask != nil {
+				a.mask.Store(append([]byte(nil), mask.Data...))
+			}
+			return nil
+		})
+	}
+	if sink != nil {
+		_ = sink.Accept(0, domain.ContentTypePNG, []byte{0x89, 0x50, 0x4e, 0x47})
+	}
+	return domain.RenderOutcome{Class: domain.RenderOutcomeSuccess, Commit: domain.CommitCommitted}, nil
+}
+
+func TestAuthorizedRenderInjectsInputAndMaskAssetBytes(t *testing.T) {
+	t.Parallel()
+
+	prompts := vaultpkg.NewMemoryRenderPromptStore()
+	_ = prompts.Put(context.Background(), ports.RenderPromptIntake{
+		TenantID: "tenant_a", JobID: "job_edit", Material: "edit-me",
+	})
+	content := &stubContentStore{byID: map[domain.AssetID]ports.AssetContent{
+		"asset_in":  {ContentType: domain.ContentTypePNG, Data: []byte("INPUT-BYTES")},
+		"asset_msk": {ContentType: domain.ContentTypePNG, Data: []byte("MASK-BYTES")},
+	}}
+	adapter := &captureAssetAdapter{}
+	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, &stubStaging{}, content)
+	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
+		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
+		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_edit"},
+		AccountID: "pa_1",
+		Version:   1,
+		Invocation: domain.RenderInvocation{
+			TenantID: "tenant_a", JobID: "job_edit", AttemptID: "att_1",
+			Operation: domain.RenderOpInpaint, Model: "m",
+		},
+		Capture: ports.RenderCapturePlan{
+			TenantID: "tenant_a", JobID: "job_edit", AttemptID: "att_1", ManifestID: "man_1",
+		},
+		InputAssetIDs: []domain.AssetID{"asset_in"},
+		MaskAssetID:   "asset_msk",
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if string(adapter.input.Load().([]byte)) != "INPUT-BYTES" {
+		t.Fatalf("input bytes = %v, want INPUT-BYTES", adapter.input.Load())
+	}
+	if string(adapter.mask.Load().([]byte)) != "MASK-BYTES" {
+		t.Fatalf("mask bytes = %v, want MASK-BYTES", adapter.mask.Load())
+	}
 }
 
 func TestPayloadSendBoundaryOnlyAtAdapterEntry(t *testing.T) {
@@ -86,7 +164,7 @@ func TestPayloadSendBoundaryOnlyAtAdapterEntry(t *testing.T) {
 	staging := &stubStaging{}
 	boundary := &countingSendBoundary{}
 	// No prompt stored → Use fails before MarkPayloadSent.
-	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, &capturePromptAdapter{}, staging)
+	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, &capturePromptAdapter{}, staging, nil)
 	_, err := auth.Render(context.Background(), ports.AuthorizedRenderRequest{
 		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
 		JobRef:    domain.JobRef{TenantID: "tenant_a", JobID: "job_pre"},
@@ -114,7 +192,7 @@ func TestPayloadSendBoundaryOnlyAtAdapterEntry(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 	adapter := &markThenFailAdapter{fail: errors.New("adapter boom")}
-	auth = vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, staging)
+	auth = vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, staging, nil)
 	boundary2 := &countingSendBoundary{}
 	_, err = auth.Render(context.Background(), ports.AuthorizedRenderRequest{
 		Principal: domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "k"},
@@ -143,7 +221,7 @@ func TestAuthorizedRenderInjectsPromptViaUseNotCommand(t *testing.T) {
 	prompts := vaultpkg.NewMemoryRenderPromptStore()
 	staging := &stubStaging{}
 	adapter := &capturePromptAdapter{}
-	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, staging)
+	auth := vaultpkg.NewAuthorizedRenderService(prompts, alwaysValidVault{}, adapter, staging, nil)
 
 	if err := prompts.Put(context.Background(), ports.RenderPromptIntake{
 		TenantID: "tenant_a",

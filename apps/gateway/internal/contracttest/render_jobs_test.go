@@ -1,9 +1,13 @@
 package contracttest_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -133,8 +137,8 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 }
 
 // countingRenderAdapter is a controlled Provider render surface. It records the
-// exact prompt plaintext injected via PromptInjection for ADR 0009 proof and
-// the AuthMode surface passed into the Adapter.
+// exact prompt plaintext and input/mask Asset bytes injected via protected
+// Use-scoped values for ADR 0009 proof, plus AuthMode on RenderCommand.
 type countingRenderAdapter struct {
 	harness *renderHarness
 	outcome domain.RenderOutcome
@@ -145,14 +149,28 @@ type countingRenderAdapter struct {
 	entered chan struct{}
 	// lastAuthMode is the AuthMode on the last RenderCommand (safe surface).
 	lastAuthMode atomic.Value // domain.AuthMode
+	// lastInput/lastMask capture Asset bytes seen inside InputAssetInjection.Use.
+	lastInput atomic.Value // []byte
+	lastMask  atomic.Value // []byte
 }
 
-func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, assets ports.InputAssetInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	adapter.harness.renderCalls.Add(1)
 	adapter.lastAuthMode.Store(cmd.AuthMode)
 	if prompt != nil {
 		_ = prompt.Use(func(plaintext string) error {
 			adapter.harness.lastPrompt.Store(plaintext)
+			return nil
+		})
+	}
+	if assets != nil {
+		_ = assets.Use(func(inputs []ports.InputAssetMaterial, mask *ports.InputAssetMaterial) error {
+			if len(inputs) > 0 {
+				adapter.lastInput.Store(append([]byte(nil), inputs[0].Data...))
+			}
+			if mask != nil {
+				adapter.lastMask.Store(append([]byte(nil), mask.Data...))
+			}
 			return nil
 		})
 	}
@@ -739,6 +757,121 @@ func TestUnknownCommitAfterPayloadNeverRerenders(t *testing.T) {
 	}
 	if failed["commit_status"] != "unknown" {
 		t.Fatalf("commit_status = %v, want unknown", failed["commit_status"])
+	}
+}
+
+// uploadInputAsset creates one same-Tenant input Asset via public multipart HTTP
+// so edit/inpaint proofs never seed content through private store calls.
+func (h *renderHarness) uploadInputAsset(t *testing.T, idemKey string, content []byte) string {
+	t.Helper()
+	buffer := &bytes.Buffer{}
+	writer := multipart.NewWriter(buffer)
+	if err := writer.WriteField("kind", "input"); err != nil {
+		t.Fatalf("kind field: %v", err)
+	}
+	header := textproto.MIMEHeader{}
+	header.Set("Content-Disposition", `form-data; name="file"; filename="input.png"`)
+	header.Set("Content-Type", domain.ContentTypePNG)
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		t.Fatalf("CreatePart: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, h.fixture.URL()+"/v1/assets", buffer)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tenantAKey)
+	req.Header.Set("Idempotency-Key", idemKey)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := h.fixture.Client().Do(req)
+	if err != nil {
+		t.Fatalf("Do upload: %v", err)
+	}
+	payload, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		t.Fatalf("upload status = %d (body=%s)", resp.StatusCode, payload)
+	}
+	var asset map[string]any
+	if err := json.Unmarshal(payload, &asset); err != nil {
+		t.Fatalf("decode asset: %v body=%s", err, payload)
+	}
+	id, _ := asset["asset_id"].(string)
+	if id == "" {
+		// Some wires use id
+		id, _ = asset["id"].(string)
+	}
+	if id == "" {
+		t.Fatalf("missing asset id: %s", payload)
+	}
+	return id
+}
+
+// P1-1: edit deliver same-Tenant input Asset bytes to Adapter inside authorized
+// boundary; public create + Worker proof; no bytes on job wire.
+func TestEditDeliversInputAssetBytesToAdapterNotOnWire(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_edit_bytes")
+	})
+
+	// Distinct valid PNG payload so Adapter observation is not the fixture default alone.
+	inputBytes := fixtureMinimalPNG()
+	assetID := h.uploadInputAsset(t, "idem-upload-edit-input", inputBytes)
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/edits",
+		bearer:  tenantAKey,
+		idemKey: "idem-edit-bytes",
+		body:    `{"model":"gpt-image-1","prompt":"make blue","input_asset_id":"` + assetID + `"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("edit create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	if _, has := job["prompt"]; has {
+		t.Fatalf("job wire must not expose prompt: %v", job)
+	}
+	jobID, _ := job["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("missing job_id: %v", job)
+	}
+	// Wire must not carry asset bytes (PNG signature must not appear in JSON body).
+	if bytes.Contains(payload, []byte{0x89, 0x50, 0x4e, 0x47}) {
+		t.Fatalf("job wire leaked PNG bytes: %s", payload)
+	}
+
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{
+		TenantID: "tenant_a",
+		JobID:    domain.Identifier(jobID),
+	}); err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls = %d, want 1", calls)
+	}
+	got, _ := h.adapter.lastInput.Load().([]byte)
+	if !bytes.Equal(got, inputBytes) {
+		t.Fatalf("adapter input bytes mismatch (got %d bytes, want %d)", len(got), len(inputBytes))
+	}
+	// Queue redelivery must not re-render.
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{
+		TenantID: "tenant_a",
+		JobID:    domain.Identifier(jobID),
+	}); err != nil {
+		t.Fatalf("redelivery: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render after redelivery = %d, want 1", calls)
 	}
 }
 
