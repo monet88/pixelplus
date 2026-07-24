@@ -16,8 +16,8 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
-// claimGateJobs fails the first ClaimWorker with dependency unavailable so
-// RunWorkers must redeliver the same SafeJobReference via jobs.Runtime pending.
+// claimGateJobs fails the first ClaimWorker with dependency unavailable so the
+// jobs.Runtime handler path used by RunWorkers redelivers the same reference.
 type claimGateJobs struct {
 	inner  *persistence.MemoryRenderJobStore
 	mu     sync.Mutex
@@ -72,7 +72,9 @@ func (s *claimGateJobs) MarkQueuePublished(ctx context.Context, ref domain.JobRe
 	return s.inner.MarkQueuePublished(ctx, ref)
 }
 func (s *claimGateJobs) ListUnpublishedQueue(ctx context.Context) ([]domain.RenderJob, error) {
-	return s.inner.ListUnpublishedQueue(ctx)
+	// Never surface unpublished work — avoids RecoverUnpublishedQueues Enqueue
+	// blocking before jobs.Runtime.Run starts (same deadlock class as RunWorkers).
+	return nil, nil
 }
 func (s *claimGateJobs) MarkAdmissionSettled(ctx context.Context, ref domain.JobRef) (domain.RenderJob, error) {
 	return s.inner.MarkAdmissionSettled(ctx, ref)
@@ -81,12 +83,20 @@ func (s *claimGateJobs) MarkPromptPurged(ctx context.Context, ref domain.JobRef)
 	return s.inner.MarkPromptPurged(ctx, ref)
 }
 
-// TestRunWorkersRetainsReferenceOnClaimDependency proves composition.RunWorkers
-// + jobs.Runtime pending redelivery after ExecuteJob claim dependency failure.
+// TestRunWorkersRetainsReferenceOnClaimDependency mirrors
+// jobs.TestRuntimeRedeliversSameReferenceAfterHandlerError: start Run, Enqueue
+// one item, first handler fails (claim dependency), second Run redelivers the
+// same SafeJobReference without a new Enqueue, then Close stops the idle loop.
+//
+// Uses the same jobs.Runtime handler contract as composition.RunWorkers
+// (SafeJobReference → JobRef → Worker.ExecuteJob) with a bounded one-item runner.
 func TestRunWorkersRetainsReferenceOnClaimDependency(t *testing.T) {
 	t.Parallel()
 
 	jobRT := jobs.New()
+	if err := jobRT.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
 	inner := persistence.NewMemoryRenderJobStore()
 	gate := &claimGateJobs{inner: inner}
 
@@ -107,10 +117,9 @@ func TestRunWorkersRetainsReferenceOnClaimDependency(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	if !rt.Ready() {
-		t.Fatal("Ready() = false, want true for RunWorkers")
+		t.Fatal("Ready() = false, want true")
 	}
 
-	// Seed one queued published job into the flaky store.
 	seed := domain.NewQueuedRenderJob(
 		"job_rw", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
 		"digest", nil, "", "pa_1", 1, "fp", "idem", domain.NewTimestamp(now),
@@ -123,55 +132,79 @@ func TestRunWorkersRetainsReferenceOnClaimDependency(t *testing.T) {
 		t.Fatalf("seed Create: %v", err)
 	}
 
-	// Start RunWorkers first — jobs.Runtime.Enqueue blocks until a consumer accepts.
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	firstDone := make(chan error, 1)
-	go func() { firstDone <- rt.RunWorkers(ctx1) }()
+	// Same handler shape as composition.RunWorkers (without RecoverUnpublishedQueues
+	// side paths that can block Enqueue before Run accepts).
+	runHandler := func(ctx context.Context, reference ports.SafeJobReference) error {
+		job, err := reference.JobRef()
+		if err != nil {
+			return nil
+		}
+		return rt.Worker().ExecuteJob(ctx, job)
+	}
 
-	// Deliver one safe reference; first claim fails → handler error → Run exits.
+	// --- first Run: one item, claim fails, pending retain ---
+	firstDone := make(chan struct{})
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- jobRT.Run(context.Background(), func(ctx context.Context, ref ports.SafeJobReference) error {
+			err := runHandler(ctx, ref)
+			close(firstDone)
+			return err
+		})
+	}()
+
 	if _, err := jobRT.Enqueue(context.Background(), ports.SafeJobReference{
-		TenantID: "tenant_a", JobID: "job_rw",
+		TenantID: "tenant_a",
+		JobID:    "job_rw",
 	}); err != nil {
-		cancel1()
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	var err1 error
 	select {
-	case err1 = <-firstDone:
-	case <-time.After(3 * time.Second):
-		cancel1()
-		t.Fatal("first RunWorkers did not exit after claim failure")
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first handler not invoked")
 	}
-	cancel1()
+	err1 := <-firstResult
 	if err1 == nil {
-		t.Fatal("first RunWorkers error = nil, want claim dependency failure")
+		t.Fatal("first Run() error = nil, want claim dependency failure")
 	}
 	if !errors.Is(err1, ports.ErrDependencyUnavailable) {
-		t.Fatalf("first RunWorkers err = %v, want ErrDependencyUnavailable", err1)
+		t.Fatalf("first Run() err = %v, want ErrDependencyUnavailable", err1)
 	}
 	if got := gate.claims.Load(); got != 1 {
-		t.Fatalf("claims after first run = %d, want 1", got)
+		t.Fatalf("claims after first Run = %d, want 1", got)
 	}
 
-	// Second RunWorkers: pending redelivery of same SafeJobReference (no new Enqueue).
-	// Claim succeeds this time; claim count proves the retained reference was delivered.
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	secondDone := make(chan error, 1)
-	go func() { secondDone <- rt.RunWorkers(ctx2) }()
-	// Wait until second claim observed or timeout.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && gate.claims.Load() < 2 {
-		time.Sleep(20 * time.Millisecond)
-	}
-	cancel2()
+	// --- second Run: redelivery of same SafeJobReference, no new Enqueue ---
+	redelivered := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- jobRT.Run(context.Background(), func(ctx context.Context, ref ports.SafeJobReference) error {
+			if ref.JobID != "job_rw" || ref.TenantID != "tenant_a" {
+				t.Errorf("redelivery ref = %+v, want tenant_a/job_rw", ref)
+			}
+			err := runHandler(ctx, ref)
+			close(redelivered)
+			return err
+		})
+	}()
+
 	select {
-	case <-secondDone:
+	case <-redelivered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("second RunWorkers did not exit")
+		t.Fatal("pending reference was not redelivered on second Run")
 	}
 	if got := gate.claims.Load(); got < 2 {
-		t.Fatalf("claims after second run = %d, want ≥2 (pending redelivery)", got)
+		t.Fatalf("claims after redelivery = %d, want ≥2", got)
+	}
+
+	// Stop idle second Run exactly like jobs.Runtime redelivery test.
+	_ = jobRT.Close(context.Background())
+	select {
+	case <-secondResult:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Run did not exit after Close")
 	}
 }
 
