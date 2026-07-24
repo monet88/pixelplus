@@ -105,7 +105,11 @@ func NewFixture(options Options) (*Fixture, error) {
 	if options.Clock != nil {
 		clock = options.Clock
 	}
-	runtime, err := composition.New(composition.Config{}, composition.Dependencies{
+	runtime, err := composition.New(composition.Config{
+		// Controlled fixtures only: process-local job store is not production
+		// durable state. Production composition leaves this false and fails closed.
+		AllowInMemoryRenderJobs: true,
+	}, composition.Dependencies{
 		Runtime: jobs,
 		Clock:   clock,
 		IDs:     &controlledIDs{},

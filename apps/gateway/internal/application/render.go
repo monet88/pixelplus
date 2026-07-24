@@ -605,10 +605,10 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	claim, err := service.jobs.ClaimWorker(ctx, ref, ports.WorkerLease{WorkerID: workerID})
+	claim, err := service.jobs.ClaimWorker(ctx, ref, ports.WorkerLease{WorkerID: workerID, Now: service.nowTS()})
 	if err != nil {
 		// Concurrent claimant / terminal / cancel — discard without Provider work.
-		if errors.Is(err, domain.ErrJobNotClaimable) || errors.Is(err, ports.ErrRenderJobNotVisible) {
+		if errors.Is(err, domain.ErrJobNotClaimable) || errors.Is(err, ports.ErrRenderJobNotVisible) || errors.Is(err, ports.ErrDependencyUnavailable) {
 			return nil
 		}
 		return err
@@ -621,7 +621,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return nil
 	}
 
-	// Hard same-Tenant account lease for the entire execution.
+	// Job→account continuity binding for this execution (not exclusive account mutex).
 	if err := service.jobs.BindAccountLease(ctx, ref, fence, job.ProviderAccountID); err != nil {
 		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
 			JobRef:       ref,
@@ -631,6 +631,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			FailureClass: domain.ErrCodeAccountNotUsable,
 			CommitStatus: domain.CommitNotStarted,
 			ClearLease:   true,
+			Now:          service.nowTS(),
 		})
 		return nil
 	}
@@ -654,19 +655,21 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			To:           domain.JobCanceled,
 			CommitStatus: domain.CommitNotStarted,
 			ClearLease:   true,
+			Now:          service.nowTS(),
 		})
 		return nil
 	}
 
 	// Attempt ledger before payload.
+	now := service.nowTS()
 	attempt := domain.UpstreamAttempt{
 		ID:                domain.NewAttemptID(job.JobID, 1),
 		ProviderAccountID: job.ProviderAccountID,
 		CredentialVersion: job.CredentialVersion,
 		CommitStatus:      domain.CommitNotStarted,
 		Sequence:          1,
-		CreatedAt:         domain.NewTimestamp(service.clock.Now()),
-		UpdatedAt:         domain.NewTimestamp(service.clock.Now()),
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 	if _, err := service.jobs.ObserveAttempt(ctx, ports.AttemptObservation{
 		JobRef:       ref,
@@ -677,8 +680,9 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		Progress: domain.JobProgress{
 			Source:    domain.ProgressEstimated,
 			Value:     10,
-			UpdatedAt: domain.NewTimestamp(service.clock.Now()),
+			UpdatedAt: now,
 		},
+		Now: now,
 	}); err != nil {
 		if errors.Is(err, domain.ErrStaleFence) {
 			return nil
@@ -687,15 +691,17 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 
 	// Mark not_committed immediately before payload send boundary.
+	now = service.nowTS()
 	attempt.CommitStatus = domain.CommitNotCommitted
 	attempt.PayloadSent = false
-	attempt.UpdatedAt = domain.NewTimestamp(service.clock.Now())
+	attempt.UpdatedAt = now
 	if _, err := service.jobs.ObserveAttempt(ctx, ports.AttemptObservation{
 		JobRef:       ref,
 		FencingToken: fence,
 		Attempt:      attempt,
 		Phase:        domain.PhaseUpstream,
 		CommitStatus: domain.CommitNotCommitted,
+		Now:          now,
 	}); err != nil {
 		if errors.Is(err, domain.ErrStaleFence) {
 			return nil
@@ -733,12 +739,14 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			commit = domain.CommitUnknown
 		}
 		attempt.CommitStatus = commit
+		now = service.nowTS()
 		_, _ = service.jobs.ObserveAttempt(ctx, ports.AttemptObservation{
 			JobRef:       ref,
 			FencingToken: fence,
 			Attempt:      attempt,
 			Phase:        domain.PhaseUpstream,
 			CommitStatus: commit,
+			Now:          now,
 		})
 		_, _ = service.jobs.Transition(ctx, ports.FencedTransition{
 			JobRef:       ref,
@@ -748,6 +756,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			FailureClass: domain.ErrCodeDependencyUnavailable,
 			CommitStatus: commit,
 			ClearLease:   true,
+			Now:          now,
 		})
 		return nil
 	}
@@ -764,6 +773,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			FailureClass: domain.ErrCodeInternal,
 			CommitStatus: domain.CommitNotCommitted,
 			ClearLease:   true,
+			Now:          service.nowTS(),
 		})
 		return nil
 	case domain.RenderOutcomeUnknown:
@@ -776,6 +786,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			FailureClass: domain.ErrCodeInternal,
 			CommitStatus: domain.CommitUnknown,
 			ClearLease:   true,
+			Now:          service.nowTS(),
 		})
 		return nil
 	case domain.RenderOutcomeSuccess, domain.RenderOutcomeCommitted:
@@ -790,6 +801,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			FailureClass: domain.ErrCodeInternal,
 			CommitStatus: domain.CommitUnknown,
 			ClearLease:   true,
+			Now:          service.nowTS(),
 		})
 		return nil
 	}
@@ -808,6 +820,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			To:           domain.JobCanceled,
 			CommitStatus: domain.CommitCommitted,
 			ClearLease:   true,
+			Now:          service.nowTS(),
 		})
 		return nil
 	}
@@ -824,6 +837,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			FailureClass: domain.ErrCodeInternal,
 			CommitStatus: domain.CommitCommitted,
 			ClearLease:   true,
+			Now:          service.nowTS(),
 		})
 		return nil
 	}
@@ -861,6 +875,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		FencingToken: fence,
 		Manifest:     manifest,
 		Phase:        domain.PhasePlacingOutput,
+		Now:          service.nowTS(),
 	}); err != nil {
 		if errors.Is(err, domain.ErrStaleFence) {
 			return nil
@@ -868,7 +883,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		return err
 	}
 
-	// Place each output Asset by stable placement key before completed.
+	// Application owns Asset Reserve/Commit/Put; job store only records the result.
 	// Storage-cap is a placement/delivery outcome, not a Provider render class.
 	jobAfter, err := service.jobs.Load(ctx, ref)
 	if err != nil {
@@ -885,6 +900,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 					EntryID:             entry.ID,
 					DeliveryStateForced: domain.OutputPending,
 					FailureClass:        string(domain.ErrCodeStorageCapExceeded),
+					Now:                 service.nowTS(),
 				})
 				continue
 			}
@@ -896,11 +912,13 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 				FailureClass: domain.ErrCodeInternal,
 				CommitStatus: domain.CommitCommitted,
 				ClearLease:   true,
+				Now:          service.nowTS(),
 			})
 			return nil
 		}
 	}
 
+	completeAt := service.nowTS()
 	_, err = service.jobs.Transition(ctx, ports.FencedTransition{
 		JobRef:       ref,
 		FencingToken: fence,
@@ -909,14 +927,19 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		Progress: domain.JobProgress{
 			Source:    domain.ProgressEstimated,
 			Value:     100,
-			UpdatedAt: domain.NewTimestamp(service.clock.Now()),
+			UpdatedAt: completeAt,
 		},
 		ClearLease: true,
+		Now:        completeAt,
 	})
 	if err != nil && !errors.Is(err, domain.ErrStaleFence) {
 		return err
 	}
 	return nil
+}
+
+func (service *RenderService) nowTS() domain.Timestamp {
+	return domain.NewTimestamp(service.clock.Now())
 }
 
 // staged holds process-local staged output bytes for placement/retry in the
@@ -999,7 +1022,7 @@ func (service *RenderService) placeOutputBytes(
 		FencingToken: fence,
 		EntryID:      entry.ID,
 		Asset:        asset,
-		Content:      data,
+		Now:          service.nowTS(),
 	})
 	return err
 }
@@ -1018,6 +1041,7 @@ func (service *RenderService) placeFromManifest(
 			FencingToken: fence,
 			EntryID:      entry.ID,
 			Asset:        domain.Asset{ID: entry.AssetID, ContentType: entry.ContentType, ByteSize: entry.ByteSize, Checksum: entry.Checksum},
+			Now:          service.nowTS(),
 		})
 		if err != nil {
 			return ports.PlacementResult{}, service.dependencyCanonical(err)
@@ -1033,6 +1057,7 @@ func (service *RenderService) placeFromManifest(
 			EntryID:             entry.ID,
 			DeliveryStateForced: domain.OutputFailed,
 			FailureClass:        string(domain.ErrCodeInternal),
+			Now:                 service.nowTS(),
 		})
 		if err != nil {
 			return ports.PlacementResult{}, service.dependencyCanonical(err)
@@ -1047,6 +1072,7 @@ func (service *RenderService) placeFromManifest(
 				EntryID:             entry.ID,
 				DeliveryStateForced: domain.OutputPending,
 				FailureClass:        string(domain.ErrCodeStorageCapExceeded),
+				Now:                 service.nowTS(),
 			})
 			if placeErr != nil {
 				return ports.PlacementResult{}, service.dependencyCanonical(placeErr)

@@ -31,6 +31,11 @@ type Config struct {
 	// state. Either this or an explicit Accounts port is required so production
 	// never silently loses cooldowns and recovery permits across restarts.
 	ProviderAccountStorePath string
+	// AllowInMemoryRenderJobs permits the process-local MemoryRenderJobStore
+	// when RenderJobs is nil. Production must leave this false so a missing
+	// durable job store fails closed (UnavailableRenderJobStore). Contract
+	// fixtures set true for controlled in-process proofs only.
+	AllowInMemoryRenderJobs bool
 }
 
 // Dependencies contains the controlled foundation ports owned by this slice.
@@ -235,7 +240,7 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	renderService, err := newRenderService(dependencies)
+	renderService, err := newRenderService(config, dependencies)
 	if err != nil {
 		return nil, err
 	}
@@ -390,9 +395,8 @@ func newAssetService(dependencies Dependencies) (*application.AssetService, erro
 }
 
 // newRenderService wires the Render Job spine and JobExecutor. Nil ports fall
-// back to foundation implementations so production composition is fail-closed
-// by default (no Provider render surface until injected).
-func newRenderService(dependencies Dependencies) (*application.RenderService, error) {
+// back to fail-closed foundations so production composition is safe by default.
+func newRenderService(config Config, dependencies Dependencies) (*application.RenderService, error) {
 	principal := dependencies.Principal
 	if principal == nil {
 		principal = persistence.NewFailClosedPrincipalStore()
@@ -407,7 +411,13 @@ func newRenderService(dependencies Dependencies) (*application.RenderService, er
 	}
 	jobs := dependencies.RenderJobs
 	if jobs == nil {
-		jobs = persistence.NewMemoryRenderJobStore()
+		// Production default: fail closed. Process-local memory is not restart-
+		// durable and must not silently stand in for a foundation ledger.
+		if config.AllowInMemoryRenderJobs {
+			jobs = persistence.NewMemoryRenderJobStore()
+		} else {
+			jobs = persistence.NewUnavailableRenderJobStore()
+		}
 	}
 	accounts := dependencies.Accounts
 	if accounts == nil {

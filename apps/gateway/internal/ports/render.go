@@ -14,9 +14,6 @@ var (
 	ErrRenderJobNotVisible = errors.New("render job not visible")
 	// ErrRenderJobConflict reports a lost CAS/fence on a job mutation.
 	ErrRenderJobConflict = errors.New("render job mutation conflict")
-	// ErrAccountLeaseUnavailable reports that the hard render_job account lease
-	// could not be acquired or is held by another job.
-	ErrAccountLeaseUnavailable = errors.New("provider account render lease unavailable")
 	// ErrRenderAdapterUnavailable fails closed when no controlled Provider
 	// render surface is configured.
 	ErrRenderAdapterUnavailable = errors.New("render adapter unavailable")
@@ -32,8 +29,10 @@ type RenderJobCreation struct {
 }
 
 // WorkerLease is the identity a worker presents when claiming a job.
+// Now is the injected observation instant for claim timestamps (required).
 type WorkerLease struct {
 	WorkerID domain.Identifier
+	Now      domain.Timestamp
 }
 
 // WorkerClaim is the fenced ownership grant returned by an atomic claim.
@@ -51,6 +50,8 @@ type AttemptObservation struct {
 	Phase        domain.ExecutionPhase
 	CommitStatus domain.CommitStatus
 	Progress     domain.JobProgress
+	// Now advances job.UpdatedAt when non-zero.
+	Now domain.Timestamp
 }
 
 // FencedTransition mutates lifecycle under the current fencing token.
@@ -65,29 +66,37 @@ type FencedTransition struct {
 	CommitStatus domain.CommitStatus
 	// RequireStates, when non-empty, requires current lifecycle ∈ set.
 	RequireStates []domain.JobLifecycleState
-	// ClearLease releases the worker lease on terminal transitions.
+	// ClearLease releases the worker fence on terminal transitions.
 	ClearLease bool
+	// Now is required for terminal transitions (TerminalAt / UpdatedAt).
+	Now domain.Timestamp
 }
 
-// ManifestCapture durably freezes the immutable result manifest under the fence.
+// ManifestCapture freezes the immutable result manifest under the fence.
+// Application captures Provider result first; the store only records metadata.
 type ManifestCapture struct {
 	JobRef       domain.JobRef
 	FencingToken domain.FencingToken
 	Manifest     domain.ResultManifest
 	Phase        domain.ExecutionPhase
+	Now          domain.Timestamp
 }
 
-// PlacementRequest places one output entry by stable placement key.
+// PlacementRequest records an already-committed Asset placement on the job.
+// Application/output worker owns AssetMetadataStore.Reserve/Commit and
+// AssetContentStore.Put; this request only carries the resulting Asset identity
+// for fenced, idempotent job metadata update by placement key.
 type PlacementRequest struct {
 	JobRef       domain.JobRef
 	FencingToken domain.FencingToken
 	EntryID      domain.OutputEntryID
-	Asset        domain.Asset
-	// Content bytes for the output Asset; empty when resuming an existing placement.
-	Content []byte
-	// DeliveryStateForced, when non-empty, sets delivery without placing (e.g. storage cap).
+	// Asset is the already-committed same-Tenant output Asset projection.
+	Asset domain.Asset
+	// DeliveryStateForced, when non-empty, records delivery failure without an Asset
+	// (e.g. storage_cap_exceeded after Asset reserve failed).
 	DeliveryStateForced domain.OutputDeliveryState
 	FailureClass        string
+	Now                 domain.Timestamp
 }
 
 // PlacementResult is the idempotent placement outcome.
@@ -122,12 +131,13 @@ type RenderJobStore interface {
 	PlaceOutput(context.Context, PlacementRequest) (PlacementResult, error)
 	// Cancel applies client or worker cancellation rules atomically.
 	Cancel(context.Context, CancelMutation) (domain.RenderJob, error)
-	// BindAccountLease records the hard same-Tenant account lease for the job.
+	// BindAccountLease records the job→account continuity binding for this job.
+	// It is not an exclusive account-wide mutex (#11 §5.2).
 	BindAccountLease(context.Context, domain.JobRef, domain.FencingToken, domain.ProviderAccountID) error
-	// AccountLeaseHolder returns the job currently holding a render_job lease
-	// on the account, if any.
+	// AccountLeaseHolder reports a non-terminal job bound to the account for
+	// diagnostics; multiple jobs may share an account.
 	AccountLeaseHolder(context.Context, domain.TenantID, domain.ProviderAccountID) (domain.Identifier, bool, error)
-	// ReleaseAccountLease clears the hard lease after terminal settlement.
+	// ReleaseAccountLease clears the worker fence hold for the job.
 	ReleaseAccountLease(context.Context, domain.JobRef, domain.FencingToken) error
 }
 

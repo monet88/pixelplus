@@ -8,28 +8,34 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
-// MemoryRenderJobStore is the production foundation Render Job store. It owns
-// durable job/attempt/manifest state, atomic worker claim with fencing, hard
-// Provider Account lease binding, and idempotent output placement by stable
-// placement key (#14 §§5-8, ADR 0009).
+// MemoryRenderJobStore is a process-local, controlled Render Job store for
+// fixtures and in-process proofs. It is NOT a durable production foundation:
+// process restart loses state, so production composition must not default to
+// this store (use UnavailableRenderJobStore or a future file-backed ledger).
+//
+// Responsibilities (#14 §§5-8):
+//   - fenced worker claim and lifecycle CAS
+//   - attempt/manifest metadata
+//   - job→account continuity binding (not an exclusive account mutex)
+//   - recording placement results already committed via Asset ports by the
+//     application/output worker (this store never Reserve/Commit/Put Assets)
 type MemoryRenderJobStore struct {
 	mu sync.Mutex
 	// byTenant[tenant][jobID] -> job
 	byTenant map[domain.TenantID]map[domain.Identifier]domain.RenderJob
-	// accountLeases[tenant][accountID] -> jobID holding render_job lease
-	accountLeases map[domain.TenantID]map[domain.ProviderAccountID]domain.Identifier
-	// placements[placementKey] -> asset id (idempotent placement)
-	placements map[string]domain.AssetID
-	// nextFence is the global monotonic fencing source for this process.
+	// placementRecord[placementKey] -> asset id already recorded after application
+	// Asset placement succeeded. Idempotent re-record only; not Asset storage.
+	placementRecord map[string]domain.AssetID
+	// nextFence is the process-local monotonic fencing source.
 	nextFence domain.FencingToken
 }
 
-// NewMemoryRenderJobStore builds an empty foundation job store.
+// NewMemoryRenderJobStore builds an empty process-local job store for controlled
+// fixtures. Do not wire this as the silent production default.
 func NewMemoryRenderJobStore() *MemoryRenderJobStore {
 	return &MemoryRenderJobStore{
-		byTenant:      make(map[domain.TenantID]map[domain.Identifier]domain.RenderJob),
-		accountLeases: make(map[domain.TenantID]map[domain.ProviderAccountID]domain.Identifier),
-		placements:    make(map[string]domain.AssetID),
+		byTenant:        make(map[domain.TenantID]map[domain.Identifier]domain.RenderJob),
+		placementRecord: make(map[string]domain.AssetID),
 	}
 }
 
@@ -42,7 +48,7 @@ func (store *MemoryRenderJobStore) tenantJobs(tenant domain.TenantID) map[domain
 	return jobs
 }
 
-// Create persists one queued job for the owning Tenant.
+// Create records one queued job for the owning Tenant (process-local).
 func (store *MemoryRenderJobStore) Create(_ context.Context, creation ports.RenderJobCreation) (domain.RenderJob, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -90,6 +96,7 @@ func (store *MemoryRenderJobStore) Load(_ context.Context, ref domain.JobRef) (d
 }
 
 // ClaimWorker atomically claims a queued (or recoverable running) job.
+// lease.Now advances UpdatedAt and progress timestamps.
 func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.JobRef, lease ports.WorkerLease) (ports.WorkerClaim, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -108,12 +115,18 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 	case domain.JobQueued:
 		// take claim
 	case domain.JobRunning:
-		// Recoverable only when not_started and lease not held (worker loss before payload).
+		// Recoverable only when not_started and worker lease not held.
 		if job.LeaseHeld || job.CommitStatus != domain.CommitNotStarted {
 			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 		}
 	default:
 		return ports.WorkerClaim{}, domain.ErrJobNotClaimable
+	}
+
+	now := lease.Now
+	if now.IsZero() {
+		// Fail closed on missing clock injection rather than inventing wall time.
+		return ports.WorkerClaim{}, ports.ErrDependencyUnavailable
 	}
 
 	store.nextFence++
@@ -123,10 +136,11 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 	job.WorkerID = lease.WorkerID
 	job.LeaseHeld = true
 	job.StateRevision++
+	job.UpdatedAt = now
 	job.Progress = domain.JobProgress{
 		Source:    domain.ProgressEstimated,
 		Value:     0,
-		UpdatedAt: job.UpdatedAt,
+		UpdatedAt: now,
 	}
 	store.saveLocked(job)
 	return ports.WorkerClaim{Job: cloneJob(job), FencingToken: job.WorkerFencingToken}, nil
@@ -156,6 +170,9 @@ func (store *MemoryRenderJobStore) ObserveAttempt(_ context.Context, observation
 	}
 	if observation.Progress.Source.Valid() {
 		job.Progress = observation.Progress
+	}
+	if !observation.Now.IsZero() {
+		job.UpdatedAt = observation.Now
 	}
 	job.StateRevision++
 	store.saveLocked(job)
@@ -206,12 +223,20 @@ func (store *MemoryRenderJobStore) Transition(_ context.Context, transition port
 		job.CommitStatus = transition.CommitStatus
 	}
 	if transition.ClearLease || transition.To.Terminal() {
+		// Worker fence release only; account continuity binding is job-scoped
+		// metadata (ProviderAccountID), not an exclusive account mutex.
 		job.LeaseHeld = false
-		store.clearAccountLeaseLocked(job)
 	}
-	if transition.To.Terminal() {
-		job.TerminalAt = job.UpdatedAt
-		job.ExecutionPhase = ""
+	now := transition.Now
+	if !now.IsZero() {
+		job.UpdatedAt = now
+		if transition.To.Terminal() {
+			job.TerminalAt = now
+			job.ExecutionPhase = ""
+		}
+	} else if transition.To.Terminal() {
+		// Missing Now on terminal transition is a dependency/contract defect.
+		return domain.RenderJob{}, ports.ErrDependencyUnavailable
 	}
 	job.StateRevision++
 	store.saveLocked(job)
@@ -231,7 +256,6 @@ func (store *MemoryRenderJobStore) CaptureManifest(_ context.Context, capture po
 		return domain.RenderJob{}, err
 	}
 	if job.Manifest.ID != "" {
-		// Idempotent: same manifest identity is a no-op success.
 		if job.Manifest.ID != capture.Manifest.ID {
 			return domain.RenderJob{}, ports.ErrRenderJobConflict
 		}
@@ -247,12 +271,17 @@ func (store *MemoryRenderJobStore) CaptureManifest(_ context.Context, capture po
 	} else {
 		job.ExecutionPhase = domain.PhasePlacingOutput
 	}
+	if !capture.Now.IsZero() {
+		job.UpdatedAt = capture.Now
+	}
 	job.StateRevision++
 	store.saveLocked(job)
 	return cloneJob(job), nil
 }
 
-// PlaceOutput idempotently places one output entry by stable placement key.
+// PlaceOutput records an already-committed Asset placement on the job entry.
+// It does NOT call AssetMetadataStore or AssetContentStore — application owns
+// Reserve/Commit/Put, then records the result here under fence + placement key.
 func (store *MemoryRenderJobStore) PlaceOutput(_ context.Context, request ports.PlacementRequest) (ports.PlacementResult, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -261,8 +290,6 @@ func (store *MemoryRenderJobStore) PlaceOutput(_ context.Context, request ports.
 	if err != nil {
 		return ports.PlacementResult{}, err
 	}
-	// Placement may run with fence during worker execution, or fence 0 during
-	// output-only retry after completed (no worker lease).
 	if request.FencingToken != 0 {
 		if err := store.requireFence(job, request.FencingToken); err != nil {
 			return ports.PlacementResult{}, err
@@ -288,6 +315,10 @@ func (store *MemoryRenderJobStore) PlaceOutput(_ context.Context, request ports.
 		return ports.PlacementResult{}, ports.ErrRenderJobNotVisible
 	}
 
+	if !request.Now.IsZero() {
+		job.UpdatedAt = request.Now
+	}
+
 	if request.DeliveryStateForced != "" {
 		job.OutputEntries[entryIndex].DeliveryState = request.DeliveryStateForced
 		job.OutputEntries[entryIndex].PlacementFailureClass = request.FailureClass
@@ -296,7 +327,8 @@ func (store *MemoryRenderJobStore) PlaceOutput(_ context.Context, request ports.
 		return ports.PlacementResult{Job: cloneJob(job), Entry: job.OutputEntries[entryIndex], Created: false}, nil
 	}
 
-	if existingAsset, ok := store.placements[key]; ok {
+	// Idempotent re-record of a placement already recorded for this key.
+	if existingAsset, ok := store.placementRecord[key]; ok {
 		job.OutputEntries[entryIndex].AssetID = existingAsset
 		job.OutputEntries[entryIndex].DeliveryState = domain.OutputAvailable
 		job.OutputEntries[entryIndex].PlacementFailureClass = ""
@@ -310,7 +342,11 @@ func (store *MemoryRenderJobStore) PlaceOutput(_ context.Context, request ports.
 		return ports.PlacementResult{Job: cloneJob(job), Entry: job.OutputEntries[entryIndex], Created: false}, nil
 	}
 
-	store.placements[key] = request.Asset.ID
+	// First record after application Asset ports committed the object.
+	if request.Asset.ID == "" {
+		return ports.PlacementResult{}, ports.ErrRenderJobConflict
+	}
+	store.placementRecord[key] = request.Asset.ID
 	job.OutputEntries[entryIndex].AssetID = request.Asset.ID
 	job.OutputEntries[entryIndex].DeliveryState = domain.OutputAvailable
 	job.OutputEntries[entryIndex].ContentType = request.Asset.ContentType
@@ -353,7 +389,6 @@ func (store *MemoryRenderJobStore) Cancel(_ context.Context, mutation ports.Canc
 		job.ExecutionPhase = ""
 		job.StateRevision++
 		job.LeaseHeld = false
-		store.clearAccountLeaseLocked(job)
 		store.saveLocked(job)
 		return cloneJob(job), nil
 	case domain.JobRunning:
@@ -365,14 +400,15 @@ func (store *MemoryRenderJobStore) Cancel(_ context.Context, mutation ports.Canc
 		store.saveLocked(job)
 		return cloneJob(job), nil
 	case domain.JobCancelRequested, domain.JobCanceled, domain.JobFailed, domain.JobCompleted:
-		// Idempotent no-op.
 		return cloneJob(job), nil
 	default:
 		return domain.RenderJob{}, ports.ErrRenderJobConflict
 	}
 }
 
-// BindAccountLease records the hard same-Tenant render_job lease.
+// BindAccountLease records the job→account hard continuity binding for this
+// job's execution. It is NOT an exclusive account-wide mutex: multiple jobs may
+// bind the same account subject to admission/concurrency (#11 §5.2).
 func (store *MemoryRenderJobStore) BindAccountLease(_ context.Context, ref domain.JobRef, token domain.FencingToken, accountID domain.ProviderAccountID) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -384,36 +420,39 @@ func (store *MemoryRenderJobStore) BindAccountLease(_ context.Context, ref domai
 	if err := store.requireFence(job, token); err != nil {
 		return err
 	}
-	tenant := domain.TenantID(ref.TenantID)
-	leases, ok := store.accountLeases[tenant]
-	if !ok {
-		leases = make(map[domain.ProviderAccountID]domain.Identifier)
-		store.accountLeases[tenant] = leases
+	// Continuity: bind or reaffirm the job's selected account. Never reject
+	// because another job uses the same account.
+	if job.ProviderAccountID != "" && job.ProviderAccountID != accountID {
+		// Silent account hop mid-job is forbidden; fail the bind.
+		return ports.ErrRenderJobConflict
 	}
-	if holder, taken := leases[accountID]; taken && holder != ref.JobID {
-		return ports.ErrAccountLeaseUnavailable
-	}
-	leases[accountID] = ref.JobID
 	job.ProviderAccountID = accountID
-	job.LeaseHeld = true
 	store.saveLocked(job)
 	return nil
 }
 
-// AccountLeaseHolder returns the job holding a render_job lease, if any.
+// AccountLeaseHolder reports whether this job has a continuity binding to the
+// account (job-scoped). It does not mean exclusive ownership of the account.
 func (store *MemoryRenderJobStore) AccountLeaseHolder(_ context.Context, tenant domain.TenantID, accountID domain.ProviderAccountID) (domain.Identifier, bool, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	leases, ok := store.accountLeases[tenant]
+	jobs, ok := store.byTenant[tenant]
 	if !ok {
 		return "", false, nil
 	}
-	holder, ok := leases[accountID]
-	return holder, ok, nil
+	// Return any non-terminal job currently bound to the account for diagnostics.
+	// Multiple may exist; this is not an exclusion oracle.
+	for id, job := range jobs {
+		if job.ProviderAccountID == accountID && !job.Lifecycle.Terminal() {
+			return id, true, nil
+		}
+	}
+	return "", false, nil
 }
 
-// ReleaseAccountLease clears the hard lease after terminal settlement.
+// ReleaseAccountLease clears the worker fence hold for the job. Account
+// continuity (ProviderAccountID) remains for audit; exclusivity is never held.
 func (store *MemoryRenderJobStore) ReleaseAccountLease(_ context.Context, ref domain.JobRef, token domain.FencingToken) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -428,7 +467,6 @@ func (store *MemoryRenderJobStore) ReleaseAccountLease(_ context.Context, ref do
 		}
 	}
 	job.LeaseHeld = false
-	store.clearAccountLeaseLocked(job)
 	store.saveLocked(job)
 	return nil
 }
@@ -456,16 +494,6 @@ func (store *MemoryRenderJobStore) requireFence(job domain.RenderJob, token doma
 	return nil
 }
 
-func (store *MemoryRenderJobStore) clearAccountLeaseLocked(job domain.RenderJob) {
-	leases, ok := store.accountLeases[job.TenantID]
-	if !ok {
-		return
-	}
-	if holder, taken := leases[job.ProviderAccountID]; taken && holder == job.JobID {
-		delete(leases, job.ProviderAccountID)
-	}
-}
-
 func cloneJob(job domain.RenderJob) domain.RenderJob {
 	out := job
 	if job.InputAssetIDs != nil {
@@ -491,7 +519,56 @@ func cloneManifest(manifest domain.ResultManifest) domain.ResultManifest {
 	return out
 }
 
-// MemoryRenderReplayStore is the foundation create-idempotency store for image jobs.
+// UnavailableRenderJobStore is the production fail-closed substitute when no
+// durable Render Job store is configured. Every operation returns
+// ErrDependencyUnavailable so product traffic cannot treat an empty process-
+// local map as durable job state (review finding #6).
+type UnavailableRenderJobStore struct{}
+
+// NewUnavailableRenderJobStore builds the fail-closed job store.
+func NewUnavailableRenderJobStore() *UnavailableRenderJobStore {
+	return &UnavailableRenderJobStore{}
+}
+
+func (*UnavailableRenderJobStore) Create(context.Context, ports.RenderJobCreation) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) Visible(context.Context, domain.SecurityPrincipal, domain.Identifier) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) Load(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) ClaimWorker(context.Context, domain.JobRef, ports.WorkerLease) (ports.WorkerClaim, error) {
+	return ports.WorkerClaim{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) ObserveAttempt(context.Context, ports.AttemptObservation) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) Transition(context.Context, ports.FencedTransition) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) CaptureManifest(context.Context, ports.ManifestCapture) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) PlaceOutput(context.Context, ports.PlacementRequest) (ports.PlacementResult, error) {
+	return ports.PlacementResult{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) Cancel(context.Context, ports.CancelMutation) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) BindAccountLease(context.Context, domain.JobRef, domain.FencingToken, domain.ProviderAccountID) error {
+	return ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) AccountLeaseHolder(context.Context, domain.TenantID, domain.ProviderAccountID) (domain.Identifier, bool, error) {
+	return "", false, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) ReleaseAccountLease(context.Context, domain.JobRef, domain.FencingToken) error {
+	return ports.ErrDependencyUnavailable
+}
+
+// MemoryRenderReplayStore is the process-local create-idempotency store for
+// image jobs (controlled/in-process; not restart-durable).
 type MemoryRenderReplayStore struct {
 	mu      sync.Mutex
 	records map[domain.ReplayScope]*renderReplayRecord
@@ -503,7 +580,7 @@ type renderReplayRecord struct {
 	job         domain.RenderJob
 }
 
-// NewMemoryRenderReplayStore builds an empty foundation render replay store.
+// NewMemoryRenderReplayStore builds an empty process-local render replay store.
 func NewMemoryRenderReplayStore() *MemoryRenderReplayStore {
 	return &MemoryRenderReplayStore{records: make(map[domain.ReplayScope]*renderReplayRecord)}
 }
@@ -560,5 +637,6 @@ func (store *MemoryRenderReplayStore) Abandon(_ context.Context, identity domain
 
 var (
 	_ ports.RenderJobStore    = (*MemoryRenderJobStore)(nil)
+	_ ports.RenderJobStore    = (*UnavailableRenderJobStore)(nil)
 	_ ports.RenderReplayStore = (*MemoryRenderReplayStore)(nil)
 )
