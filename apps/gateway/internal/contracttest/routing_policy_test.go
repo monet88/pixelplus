@@ -924,7 +924,9 @@ func mapsEqual(a, b map[string]any) bool {
 }
 
 // AC: selection_order ∪ fallback_chain multi-mode requires fallback_auth_modes
-// to enumerate every distinct mode (invalid_request when incomplete).
+// to enumerate every distinct mode when fallback is enabled (invalid_request
+// when incomplete). Authority: §8.1 "fallback_auth_modes when cross-mode
+// fallback intended"; NF-XMODE.
 func TestRoutingPolicyCrossModeRequiresDeclaredModes(t *testing.T) {
 	t.Parallel()
 
@@ -978,6 +980,51 @@ func TestRoutingPolicyCrossModeRequiresDeclaredModes(t *testing.T) {
 	})
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("complete cross-mode status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+}
+
+// AC (normative correction): multi-mode selection_order with fallback_enabled=false
+// and empty fallback_chain/fallback_auth_modes MUST succeed. fallback_auth_modes
+// is required only for cross-mode *fallback* (§8.1 "when cross-mode fallback
+// intended"; shape already requires empty modes when fallback is off).
+// On 2da8446 this is red: validation required modes whenever |modeSet|>1.
+func TestRoutingPolicyMultiModeSelectionFallbackOffSucceeds(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		seedEligibleAccount(h, "tenant_a", "pa_sel_a", domain.AuthModeChatGPTCodexOAuth)
+		seedEligibleAccount(h, "tenant_a", "pa_sel_b", domain.AuthModeGrokXAIOAuth)
+	})
+	before := harness.routing.mutationsCount()
+
+	body := `{
+		"candidate_accounts": ["pa_sel_a", "pa_sel_b"],
+		"selection_order": ["pa_sel_a", "pa_sel_b"],
+		"fallback_enabled": false,
+		"fallback_chain": [],
+		"fallback_auth_modes": [],
+		"affinity": {"enabled": false},
+		"lease_policy": {"enabled": false, "eligible_units": []}
+	}`
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   body,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("multi-mode selection with fallback off status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	got := decodeRoutingPolicy(t, payload)
+	if got["fallback_enabled"] != false {
+		t.Fatalf("fallback_enabled = %v, want false", got["fallback_enabled"])
+	}
+	order, _ := got["selection_order"].([]any)
+	if len(order) != 2 {
+		t.Fatalf("selection_order = %v, want two accounts", order)
+	}
+	if harness.routing.mutationsCount() != before+1 {
+		t.Fatalf("mutations = %d, want %d", harness.routing.mutationsCount(), before+1)
 	}
 }
 
@@ -1133,5 +1180,142 @@ func TestRoutingPolicyCircuitDependencyUnavailable(t *testing.T) {
 	}
 	if decodeError(t, payload)["code"] != "dependency_unavailable" {
 		t.Fatalf("code = %v, want dependency_unavailable", decodeError(t, payload)["code"])
+	}
+}
+
+// Characterization / acceptance proofs for mandatory candidate rejection classes
+// (C2/C5 / administrative controls / open circuit). Public Runtime.Handler only.
+
+// AC: account-scoped non-routable Health (cooling_down) rejects candidate with
+// account_not_usable + wait_provider_cooldown (NewProviderCooldownBlocked).
+func TestRoutingPolicyRejectsScopedHealthBlock(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		account := activeProbedAccount("pa_health_block", domain.AuthModeChatGPTCodexOAuth)
+		account.Health = domain.HealthSummary{
+			SummaryState: domain.HealthCoolingDown,
+			Conditions: []domain.HealthCondition{{
+				Scope:             domain.HealthScope{Kind: domain.HealthScopeAccount},
+				State:             domain.HealthCoolingDown,
+				Reason:            domain.HealthReasonProviderRateLimited,
+				CredentialVersion: account.Credential.Version,
+				Remediation:       domain.RemediationWaitProviderCooldown,
+				SourceClass:       domain.HealthSourceUpstreamAttempt,
+			}},
+		}
+		h.seedAccount("tenant_a", account)
+		h.capabilities.seed("tenant_a", sampleObservationSnapshot("pa_health_block", domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+	})
+	before := harness.routing.mutationsCount()
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   validPolicyBody("pa_health_block"),
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	errBody := decodeError(t, payload)
+	if errBody["code"] != "account_not_usable" {
+		t.Fatalf("code = %v, want account_not_usable", errBody["code"])
+	}
+	if errBody["remediation"] != "wait_provider_cooldown" {
+		t.Fatalf("remediation = %v, want wait_provider_cooldown", errBody["remediation"])
+	}
+	if harness.routing.mutationsCount() != before {
+		t.Fatalf("store mutated on health reject")
+	}
+}
+
+// AC: hard administrative controls (drain / quarantine) reject with
+// account_not_usable / account_remediation and zero mutation.
+func TestRoutingPolicyRejectsDrainAndQuarantine(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		mut  func(*domain.ProviderAccount)
+	}{
+		{
+			name: "drain",
+			mut: func(a *domain.ProviderAccount) {
+				a.Controls.Drain = domain.DrainDraining
+			},
+		},
+		{
+			name: "quarantine",
+			mut: func(a *domain.ProviderAccount) {
+				a.Controls.Quarantine = domain.QuarantineQuarantined
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			id := "pa_ctrl_" + tc.name
+			harness := newSpineHarness(t, func(h *spineHarness) {
+				account := activeProbedAccount(id, domain.AuthModeChatGPTCodexOAuth)
+				tc.mut(&account)
+				h.seedAccount("tenant_a", account)
+				h.capabilities.seed("tenant_a", sampleObservationSnapshot(domain.ProviderAccountID(id), domain.AuthModeChatGPTCodexOAuth, 1, spineFixtureTime))
+			})
+			before := harness.routing.mutationsCount()
+			response, payload := harness.do(t, requestSpec{
+				method: http.MethodPut,
+				path:   "/v1/routing-policy",
+				bearer: tenantAKey,
+				body:   validPolicyBody(id),
+			})
+			if response.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+			}
+			errBody := decodeError(t, payload)
+			if errBody["code"] != "account_not_usable" {
+				t.Fatalf("code = %v, want account_not_usable", errBody["code"])
+			}
+			if errBody["remediation"] != "account_remediation" {
+				t.Fatalf("remediation = %v, want account_remediation", errBody["remediation"])
+			}
+			if harness.routing.mutationsCount() != before {
+				t.Fatalf("store mutated on %s reject", tc.name)
+			}
+		})
+	}
+}
+
+// AC: open Provider Surface Circuit omits all offerable pairs → candidate is
+// capability_unsupported (distinct from circuit dependency 503).
+func TestRoutingPolicyRejectsOpenCircuit(t *testing.T) {
+	t.Parallel()
+
+	harness := newSpineHarness(t, func(h *spineHarness) {
+		seedEligibleAccount(h, "tenant_a", "pa_circ_open", domain.AuthModeChatGPTCodexOAuth)
+		// Open circuit on the live-probe surface used by sampleObservationSnapshot
+		// so every offerable pair is omitted (capability_unsupported).
+		h.circuits.set(ports.CircuitSurface{
+			Provider: domain.ProviderChatGPT,
+			AuthMode: domain.AuthModeChatGPTCodexOAuth,
+			Surface:  "/backend-api/models",
+		}, ports.CircuitState{Open: true})
+	})
+	before := harness.routing.mutationsCount()
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPut,
+		path:   "/v1/routing-policy",
+		bearer: tenantAKey,
+		body:   validPolicyBody("pa_circ_open"),
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	errBody := decodeError(t, payload)
+	if errBody["code"] != "capability_unsupported" {
+		t.Fatalf("code = %v, want capability_unsupported (open circuit omits all pairs)", errBody["code"])
+	}
+	if harness.routing.mutationsCount() != before {
+		t.Fatalf("store mutated on open-circuit reject")
 	}
 }

@@ -194,26 +194,32 @@ func (service *ProviderAccountService) validatePolicyCandidates(ctx context.Cont
 		modesByAccount[id] = account.AuthMode
 	}
 
-	// Cross-auth-mode: modes from selection_order + fallback_chain. If more than
-	// one distinct mode appears, fallback_auth_modes must list every mode.
-	modeSet := make(map[domain.AuthMode]struct{})
-	for _, id := range policy.SelectionOrder {
-		modeSet[modesByAccount[id]] = struct{}{}
-	}
-	for _, id := range policy.FallbackChain {
-		modeSet[modesByAccount[id]] = struct{}{}
-	}
-	if len(modeSet) > 1 {
-		allowed := make(map[domain.AuthMode]struct{}, len(policy.FallbackAuthModes))
-		for _, mode := range policy.FallbackAuthModes {
-			allowed[mode] = struct{}{}
+	// Cross-auth-mode fallback declaration (§8.1 "fallback_auth_modes when
+	// cross-mode fallback intended"; NF-XMODE). Only when fallback is enabled:
+	// modes from selection_order ∪ fallback_chain with more than one distinct
+	// mode require fallback_auth_modes to enumerate every mode. Multi-mode
+	// selection_order alone with fallback_enabled=false is allowed (shape
+	// already forces empty fallback_auth_modes when fallback is off).
+	if policy.FallbackEnabled {
+		modeSet := make(map[domain.AuthMode]struct{})
+		for _, id := range policy.SelectionOrder {
+			modeSet[modesByAccount[id]] = struct{}{}
 		}
-		for mode := range modeSet {
-			if _, ok := allowed[mode]; !ok {
-				return domain.NewInvalidRequest(), false
+		for _, id := range policy.FallbackChain {
+			modeSet[modesByAccount[id]] = struct{}{}
+		}
+		if len(modeSet) > 1 {
+			allowed := make(map[domain.AuthMode]struct{}, len(policy.FallbackAuthModes))
+			for _, mode := range policy.FallbackAuthModes {
+				allowed[mode] = struct{}{}
 			}
-			if mode.Prohibited() || mode.Experimental() {
-				return domain.NewAuthModeUnavailable(), false
+			for mode := range modeSet {
+				if _, ok := allowed[mode]; !ok {
+					return domain.NewInvalidRequest(), false
+				}
+				if mode.Prohibited() || mode.Experimental() {
+					return domain.NewAuthModeUnavailable(), false
+				}
 			}
 		}
 	}

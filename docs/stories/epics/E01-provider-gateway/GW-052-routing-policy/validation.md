@@ -10,7 +10,7 @@ stores. No private handler/use-case tests as primary evidence.
 
 | Layer | Cases |
 | --- | --- |
-| Integration (contract) | Prior proofs + cross-mode selection∪fallback modes; allowlist 403 vs foreign 404; active+unknown health reject; experimental fail-closed; circuit SurfaceOpen → 503; /models unwidened |
+| Integration (contract) | Prior proofs + cross-mode only when fallback_enabled; multi-mode selection with fallback off succeeds; allowlist 403 vs foreign 404; active+unknown health; experimental fail-closed; circuit dependency 503; open circuit → capability_unsupported; scoped health cooling_down → wait_provider_cooldown; drain/quarantine → account_remediation; /models unwidened |
 | Composition/HTTP | Corrupt/lock-occupied/semantically invalid routing companion → readiness false; GET/PUT 503 `dependency_unavailable`; no durable mutation |
 | Persistence | File restore rejects null/invalid rows; append-only Replace ×2 + restart latest-row wins; second Tenant intact |
 | Models regression | Existing Models contract tests still pass |
@@ -51,4 +51,4 @@ node scripts/test-public-api-contract-validator.mjs
 - `node scripts/validate-public-api-contract.mjs` PASS
 - `node scripts/test-public-api-contract-validator.mjs` PASS
 - GitNexus: new FileRoutingPolicyStore symbols UNKNOWN (index lag); composition.New HIGH (full suite required)
-- Follow-up commits after 049b786/678d2bc: allowlist tri-state; cross-mode selection∪chain; active+unknown health; experimental fail-closed; circuit→503; shared domain validation; Replace pre-append validate
+- Follow-up commits after 049b786/678d2bc/2da8446: allowlist; cross-mode scoped to fallback_enabled (red then green); health/drain/quarantine/open-circuit public proofs; experimental fail-closed; circuit dep 503; shared ValidateRoutingPolicyShape
