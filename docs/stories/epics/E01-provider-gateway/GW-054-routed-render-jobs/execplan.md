@@ -76,4 +76,3 @@ Pause for human confirmation if:
 - Provider-specific behavior lacks a fail-closed controlled-port representation.
 - Validation would need to weaken Tenant isolation, fencing, commit certainty,
   output capture, or no-duplicate-render requirements.
-

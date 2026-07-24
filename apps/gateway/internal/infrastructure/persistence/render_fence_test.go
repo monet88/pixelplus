@@ -205,6 +205,52 @@ func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
 	}
 }
 
+// cancel_requested with expired lease is reclaimable recovery-only; active lease blocks.
+func TestCancelRequestedExpiredLeaseIsRecoveryOnlyClaimable(t *testing.T) {
+	t.Parallel()
+
+	store := persistence.NewMemoryRenderJobStore()
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	base := time.Date(2026, 7, 24, 19, 0, 0, 0, time.UTC)
+	now := domain.NewTimestamp(base)
+	job := domain.NewQueuedRenderJob(
+		"job_cr_claim", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		"opaque-digest", nil, "", "pa_1", 1, "fp", "idem", now,
+	)
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: job}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "w1", Now: now, ExpiresAt: domain.NewTimestamp(base.Add(time.Minute)),
+	}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := store.Cancel(context.Background(), ports.CancelMutation{
+		Principal: principal, JobID: job.JobID, RequestedBy: "key_a", Now: now,
+	}); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	// Active lease still blocks.
+	if _, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "w2", Now: domain.NewTimestamp(base.Add(30 * time.Second)),
+	}); !errors.Is(err, domain.ErrJobNotClaimable) {
+		t.Fatalf("active cancel_requested claim = %v, want not claimable", err)
+	}
+	// Expired lease → recovery-only reclaim; lifecycle stays cancel_requested.
+	rec, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "w3", Now: domain.NewTimestamp(base.Add(2 * time.Minute)),
+	})
+	if err != nil {
+		t.Fatalf("expired reclaim: %v", err)
+	}
+	if !rec.RecoveryOnly {
+		t.Fatal("want RecoveryOnly=true")
+	}
+	if rec.Job.Lifecycle != domain.JobCancelRequested {
+		t.Fatalf("lifecycle = %v, want cancel_requested", rec.Job.Lifecycle)
+	}
+}
+
 // CaptureManifest requires lifecycle running; cancel_requested wins (no capture).
 func TestCaptureManifestRejectsCancelRequested(t *testing.T) {
 	t.Parallel()

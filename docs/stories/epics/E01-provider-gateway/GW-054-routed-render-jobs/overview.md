@@ -45,4 +45,3 @@ replacement render.
 - Changing the stable OpenAPI contract or the accepted Render Job state machine.
 - Implementing chat execution, new Auth Modes, or cross-surface Provider fallback.
 - Allowing output retry to recreate a Render Job or rerun generation/edit/inpaint.
-

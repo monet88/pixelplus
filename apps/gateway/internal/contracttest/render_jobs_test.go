@@ -717,6 +717,38 @@ func (s *flakyClaimJobStore) RenewWorkerLease(_ context.Context, ref domain.JobR
 	s.jobs[s.key(ref)] = job
 	return job, nil
 }
+func (s *flakyClaimJobStore) MarkClaimedAudited(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.jobs[s.key(ref)]
+	job.ClaimedAudited = true
+	s.jobs[s.key(ref)] = job
+	return job, nil
+}
+func (s *flakyClaimJobStore) MarkOutputPlacedAudited(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.jobs[s.key(ref)]
+	job.OutputPlacedAudited = true
+	s.jobs[s.key(ref)] = job
+	return job, nil
+}
+func (s *flakyClaimJobStore) MarkTerminalAudited(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.jobs[s.key(ref)]
+	job.TerminalAudited = true
+	s.jobs[s.key(ref)] = job
+	return job, nil
+}
+func (s *flakyClaimJobStore) MarkStagingPurgePending(_ context.Context, ref domain.JobRef, pending bool) (domain.RenderJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.jobs[s.key(ref)]
+	job.StagingPurgePending = pending
+	s.jobs[s.key(ref)] = job
+	return job, nil
+}
 func (s *flakyClaimJobStore) MarkPromptPurged(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

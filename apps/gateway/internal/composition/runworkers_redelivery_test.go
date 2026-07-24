@@ -85,6 +85,18 @@ func (s *claimGateJobs) MarkPromptPurged(ctx context.Context, ref domain.JobRef)
 func (s *claimGateJobs) RenewWorkerLease(ctx context.Context, ref domain.JobRef, token domain.FencingToken, lease ports.WorkerLease) (domain.RenderJob, error) {
 	return s.inner.RenewWorkerLease(ctx, ref, token, lease)
 }
+func (s *claimGateJobs) MarkClaimedAudited(ctx context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	return s.inner.MarkClaimedAudited(ctx, ref)
+}
+func (s *claimGateJobs) MarkOutputPlacedAudited(ctx context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	return s.inner.MarkOutputPlacedAudited(ctx, ref)
+}
+func (s *claimGateJobs) MarkTerminalAudited(ctx context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	return s.inner.MarkTerminalAudited(ctx, ref)
+}
+func (s *claimGateJobs) MarkStagingPurgePending(ctx context.Context, ref domain.JobRef, pending bool) (domain.RenderJob, error) {
+	return s.inner.MarkStagingPurgePending(ctx, ref, pending)
+}
 
 // TestRunWorkersRetainsReferenceOnClaimDependency mirrors
 // jobs.TestRuntimeRedeliversSameReferenceAfterHandlerError: start Run, Enqueue

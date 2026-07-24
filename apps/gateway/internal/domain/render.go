@@ -288,9 +288,21 @@ type RenderJob struct {
 	// this job. Terminal visibility may precede purge; redelivery retries purge
 	// without Provider render when this remains false (ADR 0009).
 	PromptPurged bool
-	CreatedAt    Timestamp
-	UpdatedAt    Timestamp
-	TerminalAt   Timestamp
+	// ClaimedAudited is true after the worker claimed audit was successfully
+	// recorded. Terminal/redelivery paths retry until marked (no Provider re-render).
+	ClaimedAudited bool
+	// OutputPlacedAudited is true after the output-placed audit was recorded for
+	// durable placement. Placement may succeed before audit; redelivery retries.
+	OutputPlacedAudited bool
+	// TerminalAudited is true after completed/failed/canceled audit was recorded.
+	// Transition may succeed before audit; redelivery retries without re-render.
+	TerminalAudited bool
+	// StagingPurgePending is true when placement committed but staging Delete has
+	// not yet succeeded. Redelivery retries purge only (stable Asset placement).
+	StagingPurgePending bool
+	CreatedAt           Timestamp
+	UpdatedAt           Timestamp
+	TerminalAt          Timestamp
 }
 
 // JobRef returns the durable ownership identity shared with workers.

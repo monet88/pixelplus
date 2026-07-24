@@ -89,4 +89,3 @@ surfaces are the Go HTTP server and worker process.
    manifest and output Asset placement to be durable before completion.
 4. Let the Adapter retry full renders. Rejected because the Render Job execution
    layer is the sole retry owner.
-

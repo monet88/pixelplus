@@ -152,6 +152,16 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 				return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 			}
 		}
+	case domain.JobCancelRequested:
+		// Crash recovery: cancel CAS won then worker died before terminalization.
+		// Active live fence still blocks other claimants; expired/released lease
+		// is reclaimable recovery-only (never Provider) so terminal + cleanup run.
+		if leaseActive {
+			return ports.WorkerClaim{}, domain.ErrJobNotClaimable
+		}
+		// Same worker redelivery with active fence handled above only for running;
+		// cancel_requested with active same-worker lease still blocks (leaseActive).
+		recoveryOnly = true
 	default:
 		return ports.WorkerClaim{}, domain.ErrJobNotClaimable
 	}
@@ -163,7 +173,11 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 	}
 
 	store.nextFence++
-	job.Lifecycle = domain.JobRunning
+	// cancel_requested recovery keeps cancel_requested so recover path terminalizes
+	// without re-entering Provider preflight as a fresh running execution.
+	if job.Lifecycle != domain.JobCancelRequested {
+		job.Lifecycle = domain.JobRunning
+	}
 	if !recoveryOnly {
 		job.ExecutionPhase = domain.PhasePreflight
 	}
@@ -200,6 +214,74 @@ func leaseExpired(job domain.RenderJob, now domain.Timestamp) bool {
 		return false
 	}
 	return !now.Time().Before(job.LeaseExpiresAt.Time())
+}
+
+// MarkClaimedAudited records durable fulfillment of the claimed audit obligation.
+func (store *MemoryRenderJobStore) MarkClaimedAudited(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	job, err := store.loadLocked(ref)
+	if err != nil {
+		return domain.RenderJob{}, err
+	}
+	if job.ClaimedAudited {
+		return cloneJob(job), nil
+	}
+	job.ClaimedAudited = true
+	job.StateRevision++
+	store.saveLocked(job)
+	return cloneJob(job), nil
+}
+
+// MarkOutputPlacedAudited records durable fulfillment of the output-placed audit.
+func (store *MemoryRenderJobStore) MarkOutputPlacedAudited(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	job, err := store.loadLocked(ref)
+	if err != nil {
+		return domain.RenderJob{}, err
+	}
+	if job.OutputPlacedAudited {
+		return cloneJob(job), nil
+	}
+	job.OutputPlacedAudited = true
+	job.StateRevision++
+	store.saveLocked(job)
+	return cloneJob(job), nil
+}
+
+// MarkTerminalAudited records durable fulfillment of the terminal lifecycle audit.
+func (store *MemoryRenderJobStore) MarkTerminalAudited(_ context.Context, ref domain.JobRef) (domain.RenderJob, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	job, err := store.loadLocked(ref)
+	if err != nil {
+		return domain.RenderJob{}, err
+	}
+	if job.TerminalAudited {
+		return cloneJob(job), nil
+	}
+	job.TerminalAudited = true
+	job.StateRevision++
+	store.saveLocked(job)
+	return cloneJob(job), nil
+}
+
+// MarkStagingPurgePending sets or clears the staging Delete debt after placement.
+func (store *MemoryRenderJobStore) MarkStagingPurgePending(_ context.Context, ref domain.JobRef, pending bool) (domain.RenderJob, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	job, err := store.loadLocked(ref)
+	if err != nil {
+		return domain.RenderJob{}, err
+	}
+	if job.StagingPurgePending == pending {
+		return cloneJob(job), nil
+	}
+	job.StagingPurgePending = pending
+	job.StateRevision++
+	store.saveLocked(job)
+	return cloneJob(job), nil
 }
 
 // RenewWorkerLease extends the active fence lifetime and records HeartbeatAt.
@@ -766,6 +848,18 @@ func (*UnavailableRenderJobStore) MarkPromptPurged(context.Context, domain.JobRe
 	return domain.RenderJob{}, ports.ErrDependencyUnavailable
 }
 func (*UnavailableRenderJobStore) RenewWorkerLease(context.Context, domain.JobRef, domain.FencingToken, ports.WorkerLease) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) MarkClaimedAudited(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) MarkOutputPlacedAudited(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) MarkTerminalAudited(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	return domain.RenderJob{}, ports.ErrDependencyUnavailable
+}
+func (*UnavailableRenderJobStore) MarkStagingPurgePending(context.Context, domain.JobRef, bool) (domain.RenderJob, error) {
 	return domain.RenderJob{}, ports.ErrDependencyUnavailable
 }
 

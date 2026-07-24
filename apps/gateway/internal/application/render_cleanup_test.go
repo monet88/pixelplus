@@ -431,3 +431,19 @@ func (s *cleanupJobStore) MarkPromptPurged(context.Context, domain.JobRef) (doma
 func (s *cleanupJobStore) RenewWorkerLease(context.Context, domain.JobRef, domain.FencingToken, ports.WorkerLease) (domain.RenderJob, error) {
 	return s.job, nil
 }
+func (s *cleanupJobStore) MarkClaimedAudited(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	s.job.ClaimedAudited = true
+	return s.job, nil
+}
+func (s *cleanupJobStore) MarkOutputPlacedAudited(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	s.job.OutputPlacedAudited = true
+	return s.job, nil
+}
+func (s *cleanupJobStore) MarkTerminalAudited(context.Context, domain.JobRef) (domain.RenderJob, error) {
+	s.job.TerminalAudited = true
+	return s.job, nil
+}
+func (s *cleanupJobStore) MarkStagingPurgePending(_ context.Context, _ domain.JobRef, pending bool) (domain.RenderJob, error) {
+	s.job.StagingPurgePending = pending
+	return s.job, nil
+}

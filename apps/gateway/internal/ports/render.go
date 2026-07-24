@@ -159,6 +159,18 @@ type RenderJobStore interface {
 	// MarkPromptPurged records that confidential prompt material was deleted.
 	// Idempotent when already purged.
 	MarkPromptPurged(context.Context, domain.JobRef) (domain.RenderJob, error)
+	// MarkClaimedAudited records that the claimed audit obligation was fulfilled.
+	// Idempotent when already marked.
+	MarkClaimedAudited(context.Context, domain.JobRef) (domain.RenderJob, error)
+	// MarkOutputPlacedAudited records that the output-placed audit was fulfilled.
+	// Idempotent when already marked.
+	MarkOutputPlacedAudited(context.Context, domain.JobRef) (domain.RenderJob, error)
+	// MarkTerminalAudited records that the terminal lifecycle audit was fulfilled.
+	// Idempotent when already marked.
+	MarkTerminalAudited(context.Context, domain.JobRef) (domain.RenderJob, error)
+	// MarkStagingPurgePending records that staging still needs Delete after
+	// durable placement. ClearStagingPurgePending clears the obligation.
+	MarkStagingPurgePending(context.Context, domain.JobRef, bool) (domain.RenderJob, error)
 	// RenewWorkerLease extends LeaseExpiresAt and HeartbeatAt under the current
 	// fence for a long-running healthy worker. Stale fence / wrong worker fails.
 	RenewWorkerLease(context.Context, domain.JobRef, domain.FencingToken, WorkerLease) (domain.RenderJob, error)
@@ -278,6 +290,13 @@ type RenderCapturePlan struct {
 	JobID      domain.Identifier
 	AttemptID  domain.AttemptID
 	ManifestID domain.ResultManifestID
+	// StagingExpiresAt bounds staging retention (storage-cap / placement retry).
+	// Zero means the vault capture sink applies DefaultStagingRetention from Now
+	// when Now is set; both zero leaves ExpiresAt unset (tests that omit clocks).
+	StagingExpiresAt domain.Timestamp
+	// Now is the injected observation instant for default expiry computation.
+	// Must not use wall-clock inside vault; application supplies clock.Now.
+	Now domain.Timestamp
 }
 
 // PayloadSendBoundary records the durable fact that Provider payload

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -123,6 +124,9 @@ type RenderService struct {
 	requestLog   ports.RequestLogRecorder
 	clock        ports.Clock
 	ids          ports.IDGenerator
+	// leaseTTL / heartbeatInterval bound worker fence renewals (tests inject short).
+	leaseTTL          time.Duration
+	heartbeatInterval time.Duration
 }
 
 // RenderDependencies bundles the controlled ports this slice owns.
@@ -155,6 +159,11 @@ type RenderDependencies struct {
 	RequestLog ports.RequestLogRecorder
 	Clock      ports.Clock
 	IDs        ports.IDGenerator
+	// WorkerLeaseTTL bounds fence lifetime (zero → foundation 2m).
+	WorkerLeaseTTL time.Duration
+	// HeartbeatInterval is how often RenewWorkerLease runs during Adapter
+	// (zero → leaseTTL/3). Tests inject short intervals for deterministic cancel.
+	HeartbeatInterval time.Duration
 }
 
 // NewRenderService validates and wires the Render Job spine dependencies.
@@ -201,29 +210,42 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 	case dependencies.IDs == nil:
 		return nil, errors.New("application: ID generator is required")
 	}
+	leaseTTL := dependencies.WorkerLeaseTTL
+	if leaseTTL <= 0 {
+		leaseTTL = defaultWorkerLeaseTTL
+	}
+	hb := dependencies.HeartbeatInterval
+	if hb <= 0 {
+		hb = leaseTTL / 3
+		if hb < time.Second {
+			hb = time.Second
+		}
+	}
 	return &RenderService{
-		principal:    dependencies.Principal,
-		admission:    dependencies.Admission,
-		replay:       dependencies.Replay,
-		jobs:         dependencies.Jobs,
-		accounts:     dependencies.Accounts,
-		health:       dependencies.Health,
-		capabilities: dependencies.Capabilities,
-		circuits:     dependencies.Circuits,
-		routing:      dependencies.Routing,
-		assets:       dependencies.Assets,
-		content:      dependencies.Content,
-		staging:      dependencies.Staging,
-		vault:        dependencies.Vault,
-		prompts:      dependencies.Prompts,
-		authorized:   dependencies.Authorized,
-		digester:     dependencies.Digester,
-		queue:        dependencies.Queue,
-		audit:        dependencies.Audit,
-		telemetry:    dependencies.Telemetry,
-		requestLog:   dependencies.RequestLog,
-		clock:        dependencies.Clock,
-		ids:          dependencies.IDs,
+		principal:         dependencies.Principal,
+		admission:         dependencies.Admission,
+		replay:            dependencies.Replay,
+		jobs:              dependencies.Jobs,
+		accounts:          dependencies.Accounts,
+		health:            dependencies.Health,
+		capabilities:      dependencies.Capabilities,
+		circuits:          dependencies.Circuits,
+		routing:           dependencies.Routing,
+		assets:            dependencies.Assets,
+		content:           dependencies.Content,
+		staging:           dependencies.Staging,
+		vault:             dependencies.Vault,
+		prompts:           dependencies.Prompts,
+		authorized:        dependencies.Authorized,
+		digester:          dependencies.Digester,
+		queue:             dependencies.Queue,
+		audit:             dependencies.Audit,
+		telemetry:         dependencies.Telemetry,
+		requestLog:        dependencies.RequestLog,
+		clock:             dependencies.Clock,
+		ids:               dependencies.IDs,
+		leaseTTL:          leaseTTL,
+		heartbeatInterval: hb,
 	}, nil
 }
 
@@ -372,10 +394,16 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	case ports.ReplayTerminal:
 		// Matching replay: load *current* job from the store by TerminalJob.JobRef
 		// so worker-completed state is not a stale queued snapshot (P1-6).
+		// Load errors fail closed — never return a stale replay snapshot.
 		job := decision.TerminalJob
-		if current, loadErr := service.jobs.Load(ctx, job.JobRef()); loadErr == nil {
-			job = current
+		current, loadErr := service.jobs.Load(ctx, job.JobRef())
+		if loadErr != nil {
+			if errors.Is(loadErr, ports.ErrRenderJobNotVisible) {
+				return RenderJobResult{}, service.fail(ctx, sc, domain.NewResourceNotFound())
+			}
+			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(loadErr))
 		}
+		job = current
 		// If queue publication never succeeded, recover by re-enqueueing without
 		// creating a replacement (#14 §3.3).
 		if !job.QueuePublished {
@@ -558,10 +586,10 @@ func (service *RenderService) fencedTerminal(ctx context.Context, tenant domain.
 	return service.jobs.Transition(ctx, transition)
 }
 
-// finishTerminalCleanup purges confidential prompt and settles create occupancy
-// independently. Job lifecycle may already be terminal; cleanup debt remains
-// durable and retriable. Prompt failure must not block admission settlement
-// (occupancy leak). Returns errors.Join of remaining debts.
+// finishTerminalCleanup purges confidential prompt, settles create occupancy,
+// drains staging purge debt, and fulfills owed worker audits. Job lifecycle may
+// already be terminal; debts remain durable and retriable without Provider work.
+// Prompt failure must not block admission settlement (occupancy leak).
 func (service *RenderService) finishTerminalCleanup(ctx context.Context, job domain.RenderJob) error {
 	if !job.Lifecycle.Terminal() {
 		return nil
@@ -591,7 +619,86 @@ func (service *RenderService) finishTerminalCleanup(ctx context.Context, job dom
 	if settleErr := service.releaseJobAdmission(ctx, current); settleErr != nil {
 		errs = append(errs, settleErr)
 	}
+	// Staging purge debt after durable placement (independent of audits).
+	if current.StagingPurgePending {
+		if purgeErr := service.retryStagingPurge(ctx, current); purgeErr != nil {
+			errs = append(errs, purgeErr)
+		} else if reloaded, loadErr := service.jobs.Load(ctx, current.JobRef()); loadErr == nil {
+			current = reloaded
+		}
+	}
+	// Owed audits after durable side effects (claimed / output-placed / terminal).
+	if auditErr := service.fulfillAuditObligations(ctx, current); auditErr != nil {
+		errs = append(errs, auditErr)
+	}
 	return errors.Join(errs...)
+}
+
+// fulfillAuditObligations records claimed/output-placed/terminal audits that are
+// still owed and marks them durable. Idempotent after markers; never re-renders.
+func (service *RenderService) fulfillAuditObligations(ctx context.Context, job domain.RenderJob) error {
+	current, err := service.jobs.Load(ctx, job.JobRef())
+	if err != nil {
+		return err
+	}
+	// Claimed audit: owed once a worker fence existed (WorkerID set) until marked.
+	if !current.ClaimedAudited && current.WorkerID != "" {
+		if err := service.recordJobAudit(ctx, ports.AuditRenderJobClaimed, current, "success"); err != nil {
+			return err
+		}
+		marked, markErr := service.jobs.MarkClaimedAudited(ctx, current.JobRef())
+		if markErr != nil {
+			return markErr
+		}
+		current = marked
+	}
+	// Output-placed: owed when at least one entry is available until marked.
+	if !current.OutputPlacedAudited && hasAvailableOutput(current) {
+		if err := service.recordJobAudit(ctx, ports.AuditRenderOutputPlaced, current, "success"); err != nil {
+			return err
+		}
+		marked, markErr := service.jobs.MarkOutputPlacedAudited(ctx, current.JobRef())
+		if markErr != nil {
+			return markErr
+		}
+		current = marked
+	}
+	// Terminal lifecycle audit.
+	if !current.TerminalAudited && current.Lifecycle.Terminal() {
+		if err := service.recordJobAudit(ctx, terminalAuditAction(current.Lifecycle), current, "success"); err != nil {
+			return err
+		}
+		if _, markErr := service.jobs.MarkTerminalAudited(ctx, current.JobRef()); markErr != nil {
+			return markErr
+		}
+	}
+	return nil
+}
+
+func hasAvailableOutput(job domain.RenderJob) bool {
+	for _, entry := range job.OutputEntries {
+		if entry.DeliveryState == domain.OutputAvailable && entry.AssetID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (service *RenderService) retryStagingPurge(ctx context.Context, job domain.RenderJob) error {
+	for _, entry := range job.OutputEntries {
+		if entry.DeliveryState != domain.OutputAvailable || entry.Checksum == "" {
+			continue
+		}
+		identity := ports.StagingIdentity{
+			TenantID: job.TenantID, JobID: job.JobID, ManifestID: job.Manifest.ID,
+			EntryID: entry.ID, Checksum: entry.Checksum,
+		}
+		if err := service.staging.Delete(ctx, identity); err != nil {
+			return err
+		}
+	}
+	_, err := service.jobs.MarkStagingPurgePending(ctx, job.JobRef(), false)
+	return err
 }
 
 // admissionSettlementKey is the stable idempotency key for create-time occupancy.
@@ -795,15 +902,17 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	claim, err := service.jobs.ClaimWorker(ctx, ref, ports.WorkerLease{
 		WorkerID:  workerID,
 		Now:       now,
-		ExpiresAt: domain.NewTimestamp(now.Time().Add(2 * time.Minute)),
+		ExpiresAt: domain.NewTimestamp(now.Time().Add(service.leaseTTL)),
 	})
 	if err != nil {
-		// Terminal jobs may still owe cleanup (prompt purge / admission settle).
+		// Terminal jobs may still owe cleanup (prompt purge / admission settle / audits).
 		// Redelivery retries cleanup only — never Provider render.
 		if errors.Is(err, domain.ErrJobNotClaimable) || errors.Is(err, ports.ErrRenderJobNotVisible) {
 			if existing, loadErr := service.jobs.Load(ctx, ref); loadErr == nil && existing.Lifecycle.Terminal() {
 				return service.finishTerminalCleanup(ctx, existing)
 			}
+			// Non-terminal not claimable (e.g. active cancel_requested lease): do not ACK
+			// forever — return nil only when another live worker still holds the fence.
 			return nil
 		}
 		// Durable store dependency failures must redeliver (do not ACK/discard).
@@ -812,21 +921,26 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	job := claim.Job
 	fence := claim.FencingToken
 
-	// Claimed audit after durable fence grant (P1-B). Failure redelivers; no Provider yet.
-	if err := service.recordJobAudit(ctx, ports.AuditRenderJobClaimed, job, "success"); err != nil {
-		return err
-	}
-
-	// Queued cancel may have won; re-load and exit without Provider.
-	if job.Lifecycle == domain.JobCancelRequested || job.Lifecycle.Terminal() {
-		if job.Lifecycle.Terminal() {
-			return service.finishTerminalCleanup(ctx, job)
+	// Claimed audit obligation after durable fence grant (marker for redelivery).
+	if !job.ClaimedAudited {
+		if err := service.recordJobAudit(ctx, ports.AuditRenderJobClaimed, job, "success"); err != nil {
+			return err
 		}
-		return nil
+		marked, markErr := service.jobs.MarkClaimedAudited(ctx, ref)
+		if markErr != nil {
+			return markErr
+		}
+		job = marked
 	}
 
-	// Post-payload / post-manifest recovery: drain or finalize without Adapter.
-	if claim.RecoveryOnly {
+	// Terminal: cleanup + owed audits only.
+	if job.Lifecycle.Terminal() {
+		return service.finishTerminalCleanup(ctx, job)
+	}
+
+	// cancel_requested (including recovery reclaim after worker death): terminalize
+	// without Provider. RecoveryOnly reclaim keeps cancel_requested lifecycle.
+	if job.Lifecycle == domain.JobCancelRequested || claim.RecoveryOnly {
 		return service.recoverAttemptWithoutRender(ctx, ref, job, fence)
 	}
 
@@ -933,10 +1047,11 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		fence:   fence,
 		attempt: &attempt,
 	}
-	// Heartbeat during long Adapter calls so lease expiry does not steal the fence.
-	stopHB := service.startLeaseHeartbeat(ctx, ref, fence, workerID)
-	defer stopHB()
-	outcome, renderErr := service.authorized.Render(ctx, ports.AuthorizedRenderRequest{
+	// Heartbeat during long Adapter calls; first RenewWorkerLease failure cancels
+	// the Adapter context and blocks capture/placement under a lost fence.
+	renderCtx, stopHB := service.startLeaseHeartbeat(ctx, ref, fence, workerID)
+	captureNow := service.nowTS()
+	outcome, renderErr := service.authorized.Render(renderCtx, ports.AuthorizedRenderRequest{
 		Principal: principal,
 		JobRef:    ref,
 		AccountID: job.ProviderAccountID,
@@ -956,11 +1071,39 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			JobID:      job.JobID,
 			AttemptID:  attempt.ID,
 			ManifestID: manifestID,
+			Now:        captureNow,
 		},
 		SendBoundary:  sendBoundary,
 		InputAssetIDs: append([]domain.AssetID(nil), job.InputAssetIDs...),
 		MaskAssetID:   job.MaskAssetID,
 	})
+	hbErr := stopHB()
+
+	// Heartbeat loss: never capture/place/complete under a lost fence.
+	if hbErr != nil {
+		commit := domain.CommitNotStarted
+		if attempt.PayloadSent {
+			commit = domain.CommitUnknown
+		}
+		attempt.CommitStatus = commit
+		now = service.nowTS()
+		if err := service.persistAttempt(ctx, ports.AttemptObservation{
+			JobRef: ref, FencingToken: fence, Attempt: attempt,
+			Phase: domain.PhaseUpstream, CommitStatus: commit, Now: now,
+		}); err != nil && !errors.Is(err, domain.ErrStaleFence) {
+			return errors.Join(hbErr, err)
+		}
+		if attempt.PayloadSent {
+			// Durable uncertainty: fail terminal so redelivery is recovery-only.
+			_ = service.persistTerminal(ctx, job, ports.FencedTransition{
+				JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+				FailureStage: domain.StageRecovery, FailureClass: domain.ErrCodeDependencyUnavailable,
+				CommitStatus: commit, ClearLease: true, Now: now,
+			})
+			return hbErr
+		}
+		return hbErr
+	}
 
 	if renderErr != nil {
 		// Classification depends on whether the send boundary was crossed.
@@ -1174,6 +1317,14 @@ func (service *RenderService) recoverAttemptWithoutRender(
 						CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
 					})
 				}
+				if errors.Is(placeErr, ports.ErrStagingExpired) {
+					// Delivery already marked expired; fail closed, zero re-render.
+					return service.persistTerminal(ctx, job, ports.FencedTransition{
+						JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+						FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeDependencyUnavailable,
+						CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
+					})
+				}
 				// Staging missing after committed capture: fail closed, no re-render.
 				return service.persistTerminal(ctx, job, ports.FencedTransition{
 					JobRef: ref, FencingToken: fence, To: domain.JobFailed,
@@ -1250,10 +1401,8 @@ func (service *RenderService) persistAttempt(ctx context.Context, observation po
 
 // persistTerminal applies a terminal transition; only ErrStaleFence is discarded.
 // Other durable mutation errors return so redelivery can recover without a second render.
-// After terminal write, cleanup debt (prompt purge + admission settle) must succeed
-// or return so redelivery retries cleanup without Provider render. Terminal lifecycle
-// audits (completed/failed/canceled) surface Record errors so redelivery retries
-// audit without Provider re-render (Standards P1-B).
+// After terminal write, cleanup + audit obligations are finishTerminalCleanup
+// (markers make audits retriable without Provider re-render).
 func (service *RenderService) persistTerminal(ctx context.Context, job domain.RenderJob, transition ports.FencedTransition) error {
 	terminal, err := service.fencedTerminal(ctx, job.TenantID, transition)
 	if err != nil {
@@ -1265,10 +1414,7 @@ func (service *RenderService) persistTerminal(ctx context.Context, job domain.Re
 	if !terminal.Lifecycle.Terminal() {
 		return nil
 	}
-	if err := service.finishTerminalCleanup(ctx, terminal); err != nil {
-		return err
-	}
-	return service.recordJobAudit(ctx, terminalAuditAction(terminal.Lifecycle), terminal, "success")
+	return service.finishTerminalCleanup(ctx, terminal)
 }
 
 func terminalAuditAction(state domain.JobLifecycleState) ports.RenderAuditAction {
@@ -1443,6 +1589,10 @@ func (service *RenderService) placeEntryFromStaging(
 	fence domain.FencingToken,
 ) error {
 	identity := service.stagingIdentity(job, entry)
+	// Resume path: placement already durable, only purge/audit debt remains.
+	if entry.DeliveryState == domain.OutputAvailable && entry.AssetID != "" {
+		return service.afterPlacementSettled(ctx, job, identity)
+	}
 	var placeErr error
 	err := service.staging.Use(ctx, ports.StagingAccess{
 		Principal: principal,
@@ -1453,8 +1603,22 @@ func (service *RenderService) placeEntryFromStaging(
 		return placeErr
 	})
 	if err != nil {
+		if errors.Is(err, ports.ErrStagingExpired) {
+			// Persist delivery expired (no Asset); zero re-render on output retry.
+			_, placeOutErr := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
+				JobRef:              job.JobRef(),
+				FencingToken:        fence,
+				EntryID:             entry.ID,
+				DeliveryStateForced: domain.OutputExpired,
+				FailureClass:        string(domain.ErrCodeDependencyUnavailable),
+				Now:                 service.nowTS(),
+			})
+			if placeOutErr != nil {
+				return placeOutErr
+			}
+			return ports.ErrStagingExpired
+		}
 		if errors.Is(err, ports.ErrStagingNotFound) ||
-			errors.Is(err, ports.ErrStagingExpired) ||
 			errors.Is(err, ports.ErrDependencyUnavailable) {
 			return err
 		}
@@ -1463,45 +1627,97 @@ func (service *RenderService) placeEntryFromStaging(
 	if placeErr != nil {
 		return placeErr
 	}
-	// Purge staging after successful placement (P1-7).
-	_ = service.staging.Delete(ctx, identity)
-	// Output placed audit after durable placement (P1-B).
-	return service.recordJobAudit(ctx, ports.AuditRenderOutputPlaced, job, "success")
+	return service.afterPlacementSettled(ctx, job, identity)
+}
+
+// afterPlacementSettled records purge debt, audits output-placed once, then Deletes
+// staging. Failures are durable obligations for redelivery (no re-render).
+func (service *RenderService) afterPlacementSettled(
+	ctx context.Context,
+	job domain.RenderJob,
+	identity ports.StagingIdentity,
+) error {
+	if _, err := service.jobs.MarkStagingPurgePending(ctx, job.JobRef(), true); err != nil {
+		return err
+	}
+	// Reload for audit markers after placement.
+	current, err := service.jobs.Load(ctx, job.JobRef())
+	if err != nil {
+		return err
+	}
+	if !current.OutputPlacedAudited {
+		if err := service.recordJobAudit(ctx, ports.AuditRenderOutputPlaced, current, "success"); err != nil {
+			return err
+		}
+		if _, err := service.jobs.MarkOutputPlacedAudited(ctx, current.JobRef()); err != nil {
+			return err
+		}
+	}
+	if err := service.staging.Delete(ctx, identity); err != nil {
+		return err
+	}
+	if _, err := service.jobs.MarkStagingPurgePending(ctx, job.JobRef(), false); err != nil {
+		return err
+	}
+	return nil
 }
 
 // startLeaseHeartbeat renews the worker fence while Adapter is in-flight.
-// Interval is leaseTTL/3 (foundation default TTL 2m → ~40s). Stop via returned cancel.
+// Returns a child context canceled on first RenewWorkerLease failure, and a
+// stop func that is idempotent, waits for the goroutine, and returns that error.
 func (service *RenderService) startLeaseHeartbeat(
-	ctx context.Context,
+	parent context.Context,
 	ref domain.JobRef,
 	fence domain.FencingToken,
 	workerID domain.Identifier,
-) func() {
+) (context.Context, func() error) {
+	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
-	interval := defaultWorkerLeaseTTL / 3
-	if interval < time.Second {
+	var (
+		failMu sync.Mutex
+		fail   error
+		once   sync.Once
+	)
+	interval := service.heartbeatInterval
+	if interval <= 0 {
 		interval = time.Second
 	}
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-done:
-				return
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				now := service.nowTS()
-				_, _ = service.jobs.RenewWorkerLease(ctx, ref, fence, ports.WorkerLease{
+				if _, err := service.jobs.RenewWorkerLease(ctx, ref, fence, ports.WorkerLease{
 					WorkerID:  workerID,
 					Now:       now,
-					ExpiresAt: domain.NewTimestamp(now.Time().Add(defaultWorkerLeaseTTL)),
-				})
+					ExpiresAt: domain.NewTimestamp(now.Time().Add(service.leaseTTL)),
+				}); err != nil {
+					failMu.Lock()
+					if fail == nil {
+						fail = err
+					}
+					failMu.Unlock()
+					cancel()
+					return
+				}
 			}
 		}
 	}()
-	return func() { close(done) }
+	stop := func() error {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+		failMu.Lock()
+		defer failMu.Unlock()
+		return fail
+	}
+	return ctx, stop
 }
 
 // defaultWorkerLeaseTTL mirrors the foundation store bound for heartbeat renewals.

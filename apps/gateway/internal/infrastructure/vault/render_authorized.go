@@ -3,10 +3,16 @@ package vault
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
+
+// defaultStagingRetention bounds staged Provider bytes for placement-only
+// recovery when the capture plan omits StagingExpiresAt but supplies Now.
+// Mirrors persistence.DefaultStagingRetention; vault must not import persistence.
+const defaultStagingRetention = 24 * time.Hour
 
 // MemoryRenderPromptStore is a process-local controlled confidential prompt
 // store for fixtures. It is NOT the production default (use
@@ -103,6 +109,12 @@ func (s *stagingCaptureSink) Accept(position int, contentType string, data []byt
 	}
 	checksum := domain.StagingChecksum(data)
 	entryID := domain.NewOutputEntryID(s.plan.JobID, position)
+	expiresAt := s.plan.StagingExpiresAt
+	if expiresAt.IsZero() && !s.plan.Now.IsZero() {
+		// Bounded retention for placement-only recovery after storage-cap (#14 §8).
+		// Application injects Now; vault never uses wall-clock.
+		expiresAt = domain.NewTimestamp(s.plan.Now.Time().Add(defaultStagingRetention))
+	}
 	if err := s.staging.Put(s.ctx, ports.StagingPut{
 		Identity: ports.StagingIdentity{
 			TenantID:   s.plan.TenantID,
@@ -113,6 +125,7 @@ func (s *stagingCaptureSink) Accept(position int, contentType string, data []byt
 		},
 		ContentType: contentType,
 		Data:        data,
+		ExpiresAt:   expiresAt,
 	}); err != nil {
 		return err
 	}
