@@ -627,7 +627,7 @@ func (service *RenderService) GetRenderJob(ctx context.Context, query GetRenderJ
 }
 
 // CancelRenderJob cancels a same-Tenant job without Provider work when queued.
-func (service *RenderService) CancelRenderJob(ctx context.Context, command CancelRenderJobCommand) (RenderJobResult, error) {
+func (service *RenderService) CancelRenderJob(ctx context.Context, command CancelRenderJobCommand) (result RenderJobResult, err error) {
 	sc := spineContext{operation: operationCancelRenderJob, requestID: service.resolveRequestID(command.RequestID), start: service.clock.Now()}
 
 	principal, canonical, ok := service.authenticate(ctx, ports.PresentedClientAPIKey{Material: command.PresentedKeyMaterial})
@@ -644,41 +644,48 @@ func (service *RenderService) CancelRenderJob(ctx context.Context, command Cance
 	}
 
 	// Ownership before admission.
-	if _, err := service.jobs.Visible(ctx, principal, command.JobID); err != nil {
-		return RenderJobResult{}, service.fail(ctx, sc, service.jobVisibilityCanonical(err))
+	if _, visErr := service.jobs.Visible(ctx, principal, command.JobID); visErr != nil {
+		return RenderJobResult{}, service.fail(ctx, sc, service.jobVisibilityCanonical(visErr))
 	}
 
 	reservation, canonical, ok := service.admit(ctx, principal, operationCancelRenderJob)
 	if !ok {
 		return RenderJobResult{}, service.fail(ctx, sc, canonical)
 	}
-	defer func() { _ = service.release(ctx, reservation) }()
 
-	job, err := service.jobs.Cancel(ctx, ports.CancelMutation{
+	job, cancelErr := service.jobs.Cancel(ctx, ports.CancelMutation{
 		Principal:   principal,
 		JobID:       command.JobID,
 		RequestedBy: principal.ClientAPIKeyID,
 		Now:         domain.NewTimestamp(sc.start),
 	})
-	if err != nil {
-		return RenderJobResult{}, service.fail(ctx, sc, service.jobVisibilityCanonical(err))
+	if cancelErr != nil {
+		// Still settle request-scoped admission; surface release failure if any.
+		if relErr := service.release(ctx, reservation); relErr != nil {
+			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(relErr))
+		}
+		return RenderJobResult{}, service.fail(ctx, sc, service.jobVisibilityCanonical(cancelErr))
 	}
 
-	// Terminal cancel: purge + admission settle are durable and retriable.
-	// Outcome is already terminal for client visibility even if cleanup errors.
+	// Terminal cancel: purge + job admission settle are durable and retriable.
 	if job.Lifecycle.Terminal() {
-		if err := service.finishTerminalCleanup(ctx, job); err != nil {
-			// Surface dependency so operator/redelivery can finish cleanup debt.
-			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
+		if cleanErr := service.finishTerminalCleanup(ctx, job); cleanErr != nil {
+			if relErr := service.release(ctx, reservation); relErr != nil {
+				return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(errors.Join(cleanErr, relErr)))
+			}
+			return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(cleanErr))
 		}
-		// Reload after cleanup markers for honest projection.
 		if refreshed, loadErr := service.jobs.Visible(ctx, principal, job.JobID); loadErr == nil {
 			job = refreshed
 		}
 	}
 
-	action := ports.AuditRenderJobCanceled
-	service.observeSuccess(ctx, sc, action, principal, job, 200)
+	// Request-scoped admission release before success audit (never silent).
+	if relErr := service.release(ctx, reservation); relErr != nil {
+		return RenderJobResult{}, service.fail(ctx, sc, service.dependencyCanonical(relErr))
+	}
+
+	service.observeSuccess(ctx, sc, ports.AuditRenderJobCanceled, principal, job, 200)
 	return RenderJobResult{Job: job, RequestID: sc.requestID}, nil
 }
 
@@ -733,19 +740,26 @@ func (service *RenderService) RetryRenderJobOutput(ctx context.Context, command 
 	if !ok {
 		return OutputDeliveryResult{}, service.fail(ctx, sc, canonical)
 	}
-	defer func() { _ = service.release(ctx, reservation) }()
 
 	// Already available: idempotent return, zero render/placement side effect.
 	if entry.DeliveryState == domain.OutputAvailable && entry.AssetID != "" {
+		if relErr := service.release(ctx, reservation); relErr != nil {
+			return OutputDeliveryResult{}, service.fail(ctx, sc, service.dependencyCanonical(relErr))
+		}
 		service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, job, 202)
 		return OutputDeliveryResult{Job: job, Entry: entry, RequestID: sc.requestID}, nil
 	}
 
 	// Placement-only recovery from immutable manifest staging checksum/content.
-	// Controlled path: re-place from staged checksum identity without render.
 	result, placeErr := service.placeFromManifest(ctx, principal, job, entry, 0)
 	if placeErr.Code != "" {
+		if relErr := service.release(ctx, reservation); relErr != nil {
+			return OutputDeliveryResult{}, service.fail(ctx, sc, service.dependencyCanonical(relErr))
+		}
 		return OutputDeliveryResult{}, service.fail(ctx, sc, placeErr)
+	}
+	if relErr := service.release(ctx, reservation); relErr != nil {
+		return OutputDeliveryResult{}, service.fail(ctx, sc, service.dependencyCanonical(relErr))
 	}
 	service.observeSuccess(ctx, sc, ports.AuditRenderOutputRetry, principal, result.Job, 202)
 	return OutputDeliveryResult{Job: result.Job, Entry: result.Entry, RequestID: sc.requestID}, nil

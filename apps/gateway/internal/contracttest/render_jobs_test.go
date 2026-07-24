@@ -32,6 +32,7 @@ type renderHarness struct {
 	enqueueError     error
 	allowInMemory    *bool
 	digester         ports.RenderDigester
+	digestKey        []byte
 	renderJobs       ports.RenderJobStore
 }
 
@@ -136,6 +137,9 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	}
 	if h.digester != nil {
 		opts.RenderDigester = h.digester
+	}
+	if len(h.digestKey) > 0 {
+		opts.RenderDigestKey = h.digestKey
 	}
 	if h.renderJobs != nil {
 		opts.RenderJobs = h.renderJobs
@@ -357,30 +361,25 @@ func (failClosedDigester) CreateFingerprint(domain.RenderOperation, string, stri
 	return "", ports.ErrRenderDigesterUnavailable
 }
 
-// P1-10: missing digester/key blocks product create (503) with zero side effects,
-// not only /readyz.
+// P1-10: unusable digester keeps /readyz 503 and blocks create with zero side effects.
 func TestMissingDigesterBlocksCreateWithZeroSideEffects(t *testing.T) {
 	t.Parallel()
 
-	allow := false
+	// AllowInMemory fixtures would install a fixture key unless digester is injected.
+	// Inject fail-closed digester so readiness reflects unusable product digester.
+	allow := true
 	h := newRenderHarness(t, func(h *renderHarness) {
 		seedRoutableImageAccount(h, "pa_no_digest")
 		h.allowInMemory = &allow
 		h.digester = failClosedDigester{}
 	})
 
-	// /readyz must stay closed without durable digester key.
-	readyResp, _ := h.do(t, requestSpec{method: http.MethodGet, path: "/readyz", bearer: tenantAKey})
-	if readyResp.StatusCode != http.StatusServiceUnavailable && readyResp.StatusCode != http.StatusOK {
-		// When AllowInMemory=false and digester fail-closed, readiness should be false
-		// unless other gates open it. Composition requires digester ready OR allow in-memory.
-		// With fail-closed digester injected, renderDigestReady is true (digester non-nil)
-		// but AllowInMemory false without durable stores → Ready false.
-	}
-	// Explicit Ready check via Runtime.
 	if h.fixture.Runtime().Ready() {
-		// If Ready is true because digester is non-nil, create must still 503.
-		// Product path is the hard requirement.
+		t.Fatal("Runtime.Ready() = true, want false with FailClosed digester")
+	}
+	readyResp, _ := h.do(t, requestSpec{method: http.MethodGet, path: "/readyz", bearer: tenantAKey})
+	if readyResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET /readyz status = %d, want 503", readyResp.StatusCode)
 	}
 
 	admitsBefore := h.admission.admitCalls.Load()
@@ -403,6 +402,107 @@ func TestMissingDigesterBlocksCreateWithZeroSideEffects(t *testing.T) {
 	}
 	if n := len(h.fixture.EnqueuedReferences()); n != 0 {
 		t.Fatalf("enqueue count = %d, want 0", n)
+	}
+}
+
+// Short digest key (<32 bytes) keeps readiness closed and create 503.
+// Non-empty short key is not replaced by the fixture auto key.
+func TestShortDigestKeyKeepsReadinessAndCreateClosed(t *testing.T) {
+	t.Parallel()
+
+	allow := true
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_short_key")
+		h.allowInMemory = &allow
+		h.digestKey = []byte("short") // <32 bytes → FailClosed digester
+	})
+
+	if h.fixture.Runtime().Ready() {
+		t.Fatal("Runtime.Ready() = true, want false with short digest key")
+	}
+	readyResp, _ := h.do(t, requestSpec{method: http.MethodGet, path: "/readyz", bearer: tenantAKey})
+	if readyResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET /readyz status = %d, want 503", readyResp.StatusCode)
+	}
+	create, payload := h.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/images/generations", bearer: tenantAKey,
+		idemKey: "idem-short-key", body: `{"model":"gpt-image-1","prompt":"blocked"}`,
+	})
+	if create.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("create status = %d, want 503 (body=%s)", create.StatusCode, payload)
+	}
+	if n := len(h.fixture.EnqueuedReferences()); n != 0 {
+		t.Fatalf("enqueue count = %d, want 0", n)
+	}
+}
+
+// Cancel admission Reconcile failure surfaces as 503; no silent release.
+func TestCancelSurfacesAdmissionReleaseFailure(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_cancel_rel")
+	})
+	create, payload := h.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/images/generations", bearer: tenantAKey,
+		idemKey: "idem-cancel-rel", body: `{"model":"gpt-image-1","prompt":"cancel me"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+
+	h.admission.settleErr = ports.ErrDependencyUnavailable
+	cancel, cancelPayload := h.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/render-jobs/" + jobID + "/cancel", bearer: tenantAKey,
+	})
+	if cancel.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("cancel status = %d, want 503 (body=%s)", cancel.StatusCode, cancelPayload)
+	}
+}
+
+// Output retry admission Reconcile failure surfaces as 503 after successful place path.
+func TestOutputRetrySurfacesAdmissionReleaseFailure(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_retry_rel")
+	})
+	create, payload := h.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/images/generations", bearer: tenantAKey,
+		idemKey: "idem-retry-rel", body: `{"model":"gpt-image-1","prompt":"retry me"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d", create.StatusCode)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+	_ = h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{
+		TenantID: "tenant_a", JobID: domain.Identifier(jobID),
+	})
+	get, getPayload := h.do(t, requestSpec{
+		method: http.MethodGet, path: "/v1/render-jobs/" + jobID, bearer: tenantAKey,
+	})
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d", get.StatusCode)
+	}
+	var completed map[string]any
+	_ = json.Unmarshal(getPayload, &completed)
+	entries, _ := completed["output_entries"].([]any)
+	entry, _ := entries[0].(map[string]any)
+	entryID, _ := entry["output_entry_id"].(string)
+
+	h.admission.settleErr = ports.ErrDependencyUnavailable
+	retry, retryPayload := h.do(t, requestSpec{
+		method: http.MethodPost,
+		path:   "/v1/render-jobs/" + jobID + "/outputs/" + entryID + "/retry",
+		bearer: tenantAKey,
+	})
+	if retry.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("retry status = %d, want 503 (body=%s)", retry.StatusCode, retryPayload)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/application"
+	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/observability"
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/persistence"
 	vaultpkg "github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/vault"
@@ -237,22 +238,23 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if jobRestoreErr != nil {
 		logger.Error("gateway startup recovery failed; readiness stays closed", "error", jobRestoreErr)
 	}
+	// Resolve digester before readiness: only a usable digester (probe mint
+	// succeeds) counts as ready. Injected FailClosed or short keys keep Ready
+	// closed even when the digester pointer is non-nil (#54 pre-review follow-up).
+	digester, digesterUsable := resolveRenderDigester(config, dependencies)
+	dependencies.RenderDigester = digester
+
 	// ADR 0009: replay/job recovery (and render confidential/staging durability)
 	// must be restored before Ready. Production without explicit durable render
 	// ports or controlled in-memory mode keeps readiness closed so /readyz does
 	// not advertise execution readiness against unavailable stores.
-	// Keyed digester is also required: production without inject fails closed
-	// rather than minting a restart-unstable key (#54 P1-9).
-	renderDigestReady := dependencies.RenderDigester != nil ||
-		len(dependencies.RenderDigestKey) > 0 ||
-		config.AllowInMemoryRenderJobs
 	renderDurabilityReady := (config.AllowInMemoryRenderJobs ||
 		(dependencies.RenderJobs != nil &&
 			dependencies.RenderReplay != nil &&
 			dependencies.RenderPrompts != nil &&
-			dependencies.RenderStaging != nil)) && renderDigestReady
+			dependencies.RenderStaging != nil)) && digesterUsable
 	if !renderDurabilityReady {
-		logger.Error("render job durability or digester key not configured; readiness stays closed")
+		logger.Error("render job durability or usable digester not configured; readiness stays closed")
 	}
 	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil && jobRestoreErr == nil && renderDurabilityReady)
 
@@ -520,23 +522,10 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 			authorized = vaultpkg.NewFailClosedAuthorizedRender()
 		}
 	}
+	// Digester was resolved in New for readiness; rebuild if missing (defensive).
 	digester := dependencies.RenderDigester
 	if digester == nil {
-		key := dependencies.RenderDigestKey
-		if len(key) == 0 && config.AllowInMemoryRenderJobs {
-			// Fixture-only deterministic key; never used as production default.
-			key = []byte(vaultpkg.FixtureRenderDigestKey)
-		}
-		if len(key) > 0 {
-			if d, err := vaultpkg.NewHMACRenderDigester(key); err == nil {
-				digester = d
-			}
-		}
-	}
-	if digester == nil {
-		// Production without injected digester/key: fail-closed digester so the
-		// process can start with Ready=false without minting a restart-unstable key.
-		digester = vaultpkg.FailClosedRenderDigester{}
+		digester, _ = resolveRenderDigester(config, dependencies)
 	}
 	audit := dependencies.RenderAudit
 	if audit == nil {
@@ -575,6 +564,36 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 		Clock:        dependencies.Clock,
 		IDs:          dependencies.IDs,
 	})
+}
+
+// resolveRenderDigester builds the digester used for product create fingerprints
+// and reports whether it can actually mint digests. Short keys and FailClosed
+// implementations are not usable for readiness.
+func resolveRenderDigester(config Config, dependencies Dependencies) (ports.RenderDigester, bool) {
+	if dependencies.RenderDigester != nil {
+		return dependencies.RenderDigester, renderDigesterUsable(dependencies.RenderDigester)
+	}
+	key := dependencies.RenderDigestKey
+	if len(key) == 0 && config.AllowInMemoryRenderJobs {
+		// Fixture-only deterministic key; never used as production default.
+		key = []byte(vaultpkg.FixtureRenderDigestKey)
+	}
+	if len(key) >= vaultpkg.MinRenderDigestKeyBytes {
+		if d, err := vaultpkg.NewHMACRenderDigester(key); err == nil {
+			return d, true
+		}
+	}
+	// Empty/weak/missing key: process may start, product digests fail closed.
+	return vaultpkg.FailClosedRenderDigester{}, false
+}
+
+// renderDigesterUsable probes whether the digester can mint a durable fingerprint.
+func renderDigesterUsable(d ports.RenderDigester) bool {
+	if d == nil {
+		return false
+	}
+	_, err := d.CreateFingerprint(domain.RenderOpImageGeneration, "ready-probe", "ready-probe", nil, "")
+	return err == nil
 }
 
 // Handler returns the real composed HTTP surface.
