@@ -1471,13 +1471,21 @@ func TestUnknownCommitAfterPayloadNeverRerenders(t *testing.T) {
 // so edit/inpaint proofs never seed content through private store calls.
 func (h *renderHarness) uploadInputAsset(t *testing.T, idemKey string, content []byte) string {
 	t.Helper()
+	return h.uploadAsset(t, idemKey, "input", content)
+}
+
+// uploadAsset creates one same-Tenant Asset of the given kind via public
+// multipart HTTP so edit/inpaint/mask proofs never seed content through
+// private store calls.
+func (h *renderHarness) uploadAsset(t *testing.T, idemKey, kind string, content []byte) string {
+	t.Helper()
 	buffer := &bytes.Buffer{}
 	writer := multipart.NewWriter(buffer)
-	if err := writer.WriteField("kind", "input"); err != nil {
+	if err := writer.WriteField("kind", kind); err != nil {
 		t.Fatalf("kind field: %v", err)
 	}
 	header := textproto.MIMEHeader{}
-	header.Set("Content-Disposition", `form-data; name="file"; filename="input.png"`)
+	header.Set("Content-Disposition", `form-data; name="file"; filename="`+kind+`.png"`)
 	header.Set("Content-Type", domain.ContentTypePNG)
 	part, err := writer.CreatePart(header)
 	if err != nil {
@@ -1604,6 +1612,73 @@ func TestInpaintNeverDowngradesToEdit(t *testing.T) {
 	}
 	if len(h.fixture.EnqueuedReferences()) != 0 {
 		t.Fatalf("enqueue on invalid inpaint = %d, want 0", len(h.fixture.EnqueuedReferences()))
+	}
+}
+
+// Issue #55: a mask whose pixel dimensions differ from its target input is
+// rejected before enqueue/Provider work with the distinct canonical outcome.
+func TestInpaintMaskDimensionMismatchRejectsBeforeUpstream(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_inpaint_mismatch")
+	})
+
+	inputID := h.uploadAsset(t, "idem-upload-mismatch-input", "input", pngBytes(t, 64, 64))
+	maskID := h.uploadAsset(t, "idem-upload-mismatch-mask", "mask", pngBytes(t, 32, 32))
+
+	response, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/inpaints",
+		bearer:  tenantAKey,
+		idemKey: "idem-inpaint-mismatch",
+		body:    `{"model":"gpt-image-1","prompt":"fill","input_asset_id":"` + inputID + `","mask_asset_id":"` + maskID + `"}`,
+	})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", response.StatusCode, payload)
+	}
+	var errBody map[string]any
+	_ = json.Unmarshal(payload, &errBody)
+	if errBody["code"] != "mask_dimension_mismatch" {
+		t.Fatalf("code = %v, want mask_dimension_mismatch", errBody["code"])
+	}
+	if len(h.fixture.EnqueuedReferences()) != 0 {
+		t.Fatalf("enqueue on mask dimension mismatch = %d, want 0", len(h.fixture.EnqueuedReferences()))
+	}
+	if h.renderCalls.Load() != 0 {
+		t.Fatalf("render calls = %d, want 0", h.renderCalls.Load())
+	}
+}
+
+// Issue #55: referencing a non-mask-kind Asset as mask_asset_id is rejected as
+// invalid_mask, distinct from a generic invalid_request.
+func TestInpaintMaskWrongKindRejectsAsInvalidMask(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_inpaint_wrongkind")
+	})
+
+	inputID := h.uploadAsset(t, "idem-upload-wrongkind-input", "input", pngBytes(t, 48, 48))
+	notAMask := h.uploadAsset(t, "idem-upload-wrongkind-notmask", "input", pngBytes(t, 48, 48))
+
+	response, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/inpaints",
+		bearer:  tenantAKey,
+		idemKey: "idem-inpaint-wrongkind",
+		body:    `{"model":"gpt-image-1","prompt":"fill","input_asset_id":"` + inputID + `","mask_asset_id":"` + notAMask + `"}`,
+	})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", response.StatusCode, payload)
+	}
+	var errBody map[string]any
+	_ = json.Unmarshal(payload, &errBody)
+	if errBody["code"] != "invalid_mask" {
+		t.Fatalf("code = %v, want invalid_mask", errBody["code"])
+	}
+	if len(h.fixture.EnqueuedReferences()) != 0 {
+		t.Fatalf("enqueue on wrong mask kind = %d, want 0", len(h.fixture.EnqueuedReferences()))
 	}
 }
 

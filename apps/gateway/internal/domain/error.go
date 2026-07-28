@@ -265,6 +265,11 @@ const (
 	ErrCodeInvalidImage       ErrorCode = "invalid_image"
 	ErrCodeInvalidDimensions  ErrorCode = "invalid_dimensions"
 	ErrCodeStorageCapExceeded ErrorCode = "storage_cap_exceeded"
+	// ErrCodeInvalidMask and ErrCodeMaskDimensionMismatch are the distinct
+	// masked-operation validation outcomes (#13 section 4.3): an invalid mask
+	// role/encoding versus a mask whose dimensions do not match its input.
+	ErrCodeInvalidMask           ErrorCode = "invalid_mask"
+	ErrCodeMaskDimensionMismatch ErrorCode = "mask_dimension_mismatch"
 )
 
 // Error satisfies the error interface so a CanonicalError can flow through Go
@@ -602,6 +607,33 @@ func NewInvalidImage() CanonicalError {
 func NewInvalidDimensions() CanonicalError {
 	return CanonicalError{
 		Code:         ErrCodeInvalidDimensions,
+		Category:     CategoryValidation,
+		StatusClass:  StatusInvalidRequest,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationFixRequest,
+		FailureStage: StageAsset,
+	}
+}
+
+// NewInvalidMask builds the canonical outcome for a mask reference whose role
+// or encoding cannot be interpreted as a region selector for a masked
+// operation (#13 section 4.3).
+func NewInvalidMask() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeInvalidMask,
+		Category:     CategoryValidation,
+		StatusClass:  StatusInvalidRequest,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationFixRequest,
+		FailureStage: StageAsset,
+	}
+}
+
+// NewMaskDimensionMismatch builds the canonical outcome for a mask whose pixel
+// dimensions do not match its target input image (#13 section 4.3).
+func NewMaskDimensionMismatch() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeMaskDimensionMismatch,
 		Category:     CategoryValidation,
 		StatusClass:  StatusInvalidRequest,
 		Retryability: RetryNotRetryable,

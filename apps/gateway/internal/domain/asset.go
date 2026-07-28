@@ -89,6 +89,12 @@ var (
 	ErrInvalidImage = errors.New("asset content is not a decodable image of the declared type")
 	// ErrInvalidDimensions reports pixel dimensions outside the canonical bounds.
 	ErrInvalidDimensions = errors.New("asset pixel dimensions are out of bounds")
+	// ErrInvalidMask reports a mask reference whose role/kind cannot be
+	// interpreted as a region selector for a masked operation (#13 section 4.3).
+	ErrInvalidMask = errors.New("mask asset role or encoding is invalid")
+	// ErrMaskDimensionMismatch reports a mask whose pixel dimensions do not
+	// match its target input image (#13 section 4.3).
+	ErrMaskDimensionMismatch = errors.New("mask asset dimensions do not match the input asset")
 )
 
 // ImageFacts is the canonical decoded description of an uploaded image. It is a
@@ -200,6 +206,21 @@ func InspectImageContent(declaredContentType string, data []byte) (ImageFacts, e
 		return ImageFacts{}, ErrInvalidDimensions
 	}
 	return ImageFacts{ContentType: actual, Width: width, Height: height}, nil
+}
+
+// ValidateMaskRelationship checks that mask is a valid region selector for
+// input on a masked image operation (#13 section 4.3). Callers must already
+// have resolved both Assets as same-Tenant visible before calling this; it
+// performs no I/O and never re-decodes content (dimensions are already
+// recorded on the Asset at upload time).
+func ValidateMaskRelationship(input, mask Asset) error {
+	if mask.Kind != AssetKindMask {
+		return ErrInvalidMask
+	}
+	if input.Width != mask.Width || input.Height != mask.Height {
+		return ErrMaskDimensionMismatch
+	}
+	return nil
 }
 
 // sniffImageType returns the canonical media type implied by the magic bytes,

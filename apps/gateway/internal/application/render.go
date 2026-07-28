@@ -380,6 +380,7 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	}
 
 	// Same-Tenant Asset visibility for inputs/mask before routing/Provider work.
+	var resolvedInputs []domain.Asset
 	for _, assetID := range command.inputs {
 		if assetID == "" {
 			continue
@@ -391,6 +392,7 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		if asset.Kind != domain.AssetKindInput {
 			return RenderJobResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 		}
+		resolvedInputs = append(resolvedInputs, asset)
 	}
 	if command.mask != "" {
 		mask, err := service.assets.Visible(ctx, principal, command.mask)
@@ -398,7 +400,14 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 			return RenderJobResult{}, service.fail(ctx, sc, service.assetVisibilityCanonical(err))
 		}
 		if mask.Kind != domain.AssetKindMask {
-			return RenderJobResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
+			return RenderJobResult{}, service.fail(ctx, sc, domain.NewInvalidMask())
+		}
+		// Relationship check (#13 section 4.3): mask must be dimensionally
+		// compatible with its target input before routing/Provider work.
+		if len(resolvedInputs) > 0 {
+			if err := domain.ValidateMaskRelationship(resolvedInputs[0], mask); err != nil {
+				return RenderJobResult{}, service.fail(ctx, sc, maskRelationshipCanonical(err))
+			}
 		}
 	}
 
@@ -1538,6 +1547,7 @@ func (service *RenderService) preflightExecute(
 		return domain.ProviderAccount{}, domain.ErrCodeAccountNotUsable, false
 	}
 	// Input Assets (and mask) must remain same-Tenant visible and correct kind.
+	var resolvedInputs []domain.Asset
 	for _, assetID := range job.InputAssetIDs {
 		if assetID == "" {
 			continue
@@ -1549,6 +1559,7 @@ func (service *RenderService) preflightExecute(
 		if asset.Kind != domain.AssetKindInput {
 			return domain.ProviderAccount{}, domain.ErrCodeInvalidRequest, false
 		}
+		resolvedInputs = append(resolvedInputs, asset)
 	}
 	if job.MaskAssetID != "" {
 		mask, err := service.assets.Visible(ctx, principal, job.MaskAssetID)
@@ -1556,7 +1567,16 @@ func (service *RenderService) preflightExecute(
 			return domain.ProviderAccount{}, domain.ErrCodeResourceNotFound, false
 		}
 		if mask.Kind != domain.AssetKindMask {
-			return domain.ProviderAccount{}, domain.ErrCodeInvalidRequest, false
+			return domain.ProviderAccount{}, domain.ErrCodeInvalidMask, false
+		}
+		// Relationship re-check (#13 section 4.3): worker re-gates before payload.
+		if len(resolvedInputs) > 0 {
+			if relErr := domain.ValidateMaskRelationship(resolvedInputs[0], mask); relErr != nil {
+				if errors.Is(relErr, domain.ErrMaskDimensionMismatch) {
+					return domain.ProviderAccount{}, domain.ErrCodeMaskDimensionMismatch, false
+				}
+				return domain.ProviderAccount{}, domain.ErrCodeInvalidMask, false
+			}
 		}
 	}
 	validation, err := service.vault.Validate(ctx, ports.CredentialValidation{
@@ -1626,7 +1646,8 @@ func preflightFailureStage(class domain.ErrorCode) domain.FailureStage {
 	switch class {
 	case domain.ErrCodeCapabilityUnsupported, domain.ErrCodeCapabilityUnverified, domain.ErrCodeSnapshotStale:
 		return domain.StageCapability
-	case domain.ErrCodeResourceNotFound, domain.ErrCodeInvalidRequest:
+	case domain.ErrCodeResourceNotFound, domain.ErrCodeInvalidRequest,
+		domain.ErrCodeInvalidMask, domain.ErrCodeMaskDimensionMismatch:
 		return domain.StageAsset
 	case domain.ErrCodeDependencyUnavailable:
 		return domain.StageDependency
@@ -2194,6 +2215,16 @@ func (service *RenderService) assetVisibilityCanonical(err error) domain.Canonic
 		return domain.NewResourceNotFound()
 	}
 	return service.dependencyCanonical(err)
+}
+
+// maskRelationshipCanonical maps a mask/input relationship validation failure
+// to its distinct canonical outcome (#13 section 4.3): a dimension mismatch is
+// never relabeled as the generic invalid_mask role/encoding failure.
+func maskRelationshipCanonical(err error) domain.CanonicalError {
+	if errors.Is(err, domain.ErrMaskDimensionMismatch) {
+		return domain.NewMaskDimensionMismatch()
+	}
+	return domain.NewInvalidMask()
 }
 
 func (service *RenderService) dependencyCanonical(err error) domain.CanonicalError {
