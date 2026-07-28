@@ -179,6 +179,29 @@ func (store *assetFakeMetadataStore) Delete(_ context.Context, principal domain.
 	return nil
 }
 
+// overwriteAssetDimensions rewrites the recorded pixel dimensions of a committed
+// Asset for the given Tenant. Production Assets are immutable; this test-only
+// seam models a controlled divergence (e.g. a mask that no longer matches its
+// input) so the worker preflight re-check can be proven on an already-created
+// job. It returns an error when the Asset is not present.
+func (store *assetFakeMetadataStore) overwriteAssetDimensions(tenant domain.TenantID, id domain.AssetID, width, height int) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	state, ok := store.byTenant[tenant]
+	if !ok {
+		return ports.ErrAssetNotVisible
+	}
+	asset, ok := state.assets[id]
+	if !ok {
+		return ports.ErrAssetNotVisible
+	}
+	asset.Width = width
+	asset.Height = height
+	state.assets[id] = asset
+	return nil
+}
+
 // assetFakeContentStore keeps immutable bytes keyed by Asset id. Fetch is the
 // second gate behind the metadata authority, so a foreign/unknown/expired id
 // never reaches it; an id with no stored bytes still returns the non-enumerating
