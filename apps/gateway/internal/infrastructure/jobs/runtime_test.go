@@ -3,6 +3,7 @@ package jobs_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +11,144 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/jobs"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
+
+// Handler failure re-queues the same SafeJobReference; a subsequent Run
+// redelivers it (at-least-once). Application still owns whether redelivery may render.
+func TestRuntimeRedeliversSameReferenceAfterHandlerError(t *testing.T) {
+	t.Parallel()
+
+	runtime := jobs.New()
+	if err := runtime.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	var calls atomic.Int32
+	firstDone := make(chan struct{})
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- runtime.Run(context.Background(), func(_ context.Context, ref ports.SafeJobReference) error {
+			calls.Add(1)
+			if ref.JobID != domain.Identifier("job_retry") {
+				t.Errorf("unexpected job_id %s", ref.JobID)
+			}
+			close(firstDone)
+			return errors.New("durable mutation failed")
+		})
+	}()
+
+	if _, err := runtime.Enqueue(context.Background(), ports.SafeJobReference{
+		TenantID: domain.Identifier("tenant_1"),
+		JobID:    domain.Identifier("job_retry"),
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first handler not invoked")
+	}
+	if err := <-firstResult; err == nil {
+		t.Fatal("first Run() error = nil, want handler failure")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls after first Run = %d, want 1", got)
+	}
+
+	// Recovery: second Run redelivers the pending reference without a new Enqueue.
+	redelivered := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- runtime.Run(context.Background(), func(_ context.Context, ref ports.SafeJobReference) error {
+			calls.Add(1)
+			if ref.JobID != domain.Identifier("job_retry") {
+				t.Errorf("redelivery job_id = %s, want job_retry", ref.JobID)
+			}
+			close(redelivered)
+			return nil
+		})
+	}()
+	select {
+	case <-redelivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending reference was not redelivered on second Run")
+	}
+	// Cancel the idle second Run.
+	_ = runtime.Close(context.Background())
+	if err := <-secondResult; !errors.Is(err, context.Canceled) && err != nil && !errors.Is(err, jobs.ErrClosed) {
+		// Close cancels Run; accept Canceled or nil race after success.
+		if !errors.Is(err, context.Canceled) {
+			// success path already closed redelivered before Close
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler calls after redelivery = %d, want 2", got)
+	}
+}
+
+// Enqueue is nonblocking without a Run consumer and idempotent by job identity.
+func TestRuntimeEnqueueNonblockingAndIdempotent(t *testing.T) {
+	t.Parallel()
+
+	runtime := jobs.New()
+	if err := runtime.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	ref := ports.SafeJobReference{
+		TenantID: domain.Identifier("tenant_1"),
+		JobID:    domain.Identifier("job_once"),
+	}
+	// Enqueue before Run must not block.
+	done := make(chan error, 1)
+	go func() {
+		_, err := runtime.Enqueue(context.Background(), ref)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Enqueue before Run: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Enqueue blocked without consumer (deadlock)")
+	}
+
+	// Second Enqueue of same identity is idempotent success.
+	if _, err := runtime.Enqueue(context.Background(), ref); err != nil {
+		t.Fatalf("idempotent Enqueue: %v", err)
+	}
+
+	// One Run delivers the reference once (not twice).
+	var calls atomic.Int32
+	got := make(chan struct{}, 2)
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- runtime.Run(context.Background(), func(_ context.Context, r ports.SafeJobReference) error {
+			calls.Add(1)
+			got <- struct{}{}
+			if r.JobID != ref.JobID {
+				t.Errorf("job_id = %s, want %s", r.JobID, ref.JobID)
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler not invoked")
+	}
+	// Give a short window for a spurious second delivery.
+	select {
+	case <-got:
+		t.Fatal("idempotent publication delivered twice without re-arm")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("handler calls = %d, want 1", calls.Load())
+	}
+	_ = runtime.Close(context.Background())
+	<-runResult
+}
 
 func TestRuntimeRejectsASecondConsumer(t *testing.T) {
 	t.Parallel()

@@ -147,3 +147,35 @@ func (recorder *SlogAssetAuditRecorder) Record(_ context.Context, event ports.As
 }
 
 var _ ports.AssetAuditRecorder = (*SlogAssetAuditRecorder)(nil)
+
+// SlogRenderAuditRecorder emits the secret-free Render Job product/security
+// audit projection. It never logs prompt, image bytes, credentials, or
+// temporary Provider URLs (#14 §9).
+type SlogRenderAuditRecorder struct {
+	logger *slog.Logger
+}
+
+// NewSlogRenderAuditRecorder builds a Render Job audit recorder.
+func NewSlogRenderAuditRecorder(logger *slog.Logger) *SlogRenderAuditRecorder {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &SlogRenderAuditRecorder{logger: logger}
+}
+
+// Record writes one safe Render Job audit event.
+func (recorder *SlogRenderAuditRecorder) Record(_ context.Context, event ports.RenderAuditEvent) error {
+	recorder.logger.Info("gateway.audit",
+		"action", string(event.Action),
+		"tenant_id", string(event.TenantID),
+		"client_api_key_id", string(event.ClientAPIKeyID),
+		"job_id", string(event.JobID),
+		"provider_account_id", string(event.AccountID),
+		"request_id", string(event.RequestID),
+		"outcome", event.Outcome,
+		"lifecycle", string(event.Lifecycle),
+	)
+	return nil
+}
+
+var _ ports.RenderAuditRecorder = (*SlogRenderAuditRecorder)(nil)

@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 
+	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
@@ -55,7 +56,27 @@ func (*FailClosedProbeAdapter) Probe(context.Context, ports.ProbeCommand) (ports
 	return ports.ProbeOutcome{}, ports.ErrDependencyUnavailable
 }
 
+// FailClosedRenderAdapter is the production foundation Render Adapter. No real
+// Provider render surface is wired yet, so every render fails closed with
+// ErrRenderAdapterUnavailable rather than inventing a generation result. This
+// keeps composition safe by default until a controlled or production adapter is
+// injected (#14, ADR 0009, I-FAIL-CLOSED-SENSITIVE).
+type FailClosedRenderAdapter struct{}
+
+// NewFailClosedRenderAdapter builds the fail-closed foundation Render Adapter.
+func NewFailClosedRenderAdapter() *FailClosedRenderAdapter {
+	return &FailClosedRenderAdapter{}
+}
+
+// Render fails closed because no Provider render surface is configured.
+// Injections and capture sink are ignored; credential/output plaintext is
+// never available here.
+func (*FailClosedRenderAdapter) Render(context.Context, ports.RenderCommand, ports.PromptInjection, ports.InputAssetInjection, ports.CredentialInjection, ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+	return domain.RenderOutcome{}, ports.ErrRenderAdapterUnavailable
+}
+
 var (
 	_ ports.CredentialVault = (*FailClosedCredentialVault)(nil)
 	_ ports.ProbeAdapter    = (*FailClosedProbeAdapter)(nil)
+	_ ports.RenderAdapter   = (*FailClosedRenderAdapter)(nil)
 )

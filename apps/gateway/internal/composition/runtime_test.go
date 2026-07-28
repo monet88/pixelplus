@@ -103,9 +103,11 @@ func TestRuntimeCloseRetriesOwnedResourceAfterTimeout(t *testing.T) {
 	}
 }
 
-func TestRunWorkersDoesNotPropagateHandlerErrors(t *testing.T) {
+func TestRunWorkersPropagatesDurableExecutionErrors(t *testing.T) {
 	t.Parallel()
 
+	// Empty ref is discarded (nil). Valid ref hits ExecuteJob; failing ID
+	// generator surfaces a durable error that must reach JobRuntime.
 	jobs := &deliveringJobRuntime{
 		references: []ports.SafeJobReference{
 			{},
@@ -113,14 +115,19 @@ func TestRunWorkersDoesNotPropagateHandlerErrors(t *testing.T) {
 		},
 		delivered: make(chan struct{}),
 	}
-	runtime, err := composition.New(composition.Config{}, composition.Dependencies{
+	runtime, err := composition.New(composition.Config{
+		AllowInMemoryRenderJobs: true,
+	}, composition.Dependencies{
 		Runtime:  jobs,
 		Clock:    inertClock{},
-		IDs:      inertIDs{},
+		IDs:      failWorkerIDs{},
 		Accounts: persistence.NewMemoryAccountStore(),
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
+	}
+	if !runtime.Ready() {
+		t.Fatal("Ready() = false, want true for RunWorkers proof")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -135,20 +142,37 @@ func TestRunWorkersDoesNotPropagateHandlerErrors(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("job references were not delivered")
 	}
-	cancel()
 
-	if err := <-workerResult; !errors.Is(err, context.Canceled) {
-		t.Fatalf("RunWorkers() error = %v, want context.Canceled", err)
+	err = <-workerResult
+	if err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("RunWorkers() error = %v, want durable execution error", err)
 	}
-	if results := jobs.handlerResults(); len(results) != 2 {
+	if !errors.Is(err, errWorkerIDFailed) {
+		t.Fatalf("RunWorkers() error = %v, want %v", err, errWorkerIDFailed)
+	}
+	results := jobs.handlerResults()
+	if len(results) != 2 {
 		t.Fatalf("handler invocations = %d, want 2", len(results))
-	} else {
-		for index, result := range results {
-			if result != nil {
-				t.Fatalf("handler result[%d] = %v, want nil (errors must not reach the runtime loop)", index, result)
-			}
-		}
 	}
+	if results[0] != nil {
+		t.Fatalf("handler result[0] (invalid ref) = %v, want nil discard", results[0])
+	}
+	if !errors.Is(results[1], errWorkerIDFailed) {
+		t.Fatalf("handler result[1] = %v, want propagated %v", results[1], errWorkerIDFailed)
+	}
+	cancel()
+}
+
+// failWorkerIDs fails only worker id allocation so ExecuteJob returns a durable error.
+type failWorkerIDs struct{}
+
+var errWorkerIDFailed = errors.New("worker id allocation failed")
+
+func (failWorkerIDs) New(kind domain.IdentifierKind) (domain.Identifier, error) {
+	if kind == domain.IdentifierKindWorker {
+		return "", errWorkerIDFailed
+	}
+	return domain.Identifier("test"), nil
 }
 
 type deliveringJobRuntime struct {
@@ -168,13 +192,20 @@ func (*deliveringJobRuntime) Enqueue(_ context.Context, reference ports.SafeJobR
 }
 
 func (runtime *deliveringJobRuntime) Run(ctx context.Context, handler ports.JobHandler) error {
+	var firstErr error
 	for _, reference := range runtime.references {
 		result := handler(ctx, reference)
 		runtime.mu.Lock()
 		runtime.results = append(runtime.results, result)
 		runtime.mu.Unlock()
+		if result != nil && firstErr == nil {
+			firstErr = result
+		}
 	}
 	close(runtime.delivered)
+	if firstErr != nil {
+		return firstErr
+	}
 	<-ctx.Done()
 	return ctx.Err()
 }

@@ -18,6 +18,11 @@ const (
 	// The generated value is prefixed with `oauth_` so it matches the frozen
 	// Public API authorization_id pattern.
 	IdentifierKindOAuth IdentifierKind = "oauth"
+	// IdentifierKindWorker namespaces worker process identities used for
+	// Render Job fencing leases (#14 §5.1).
+	IdentifierKindWorker IdentifierKind = "worker"
+	// IdentifierKindAttempt namespaces upstream attempt identities.
+	IdentifierKindAttempt IdentifierKind = "attempt"
 )
 
 // Identifier is a server-owned opaque identifier.

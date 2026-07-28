@@ -38,23 +38,47 @@ func (*FailClosedPrincipalStore) Authenticate(context.Context, ports.PresentedCl
 // no-op. Real per-(Tenant, Client API Key) limit windows arrive with a later
 // admission ticket; this foundation never fails open on unavailable state
 // because there is no external limit state to lose.
-type AlwaysAdmitStore struct{}
+//
+// When SettlementKey is set, Reconcile is logically idempotent: the second
+// settle for the same key is a no-op even across redelivery after a successful
+// first settle (#8 §7.4 / #54 terminal cleanup).
+type AlwaysAdmitStore struct {
+	mu      sync.Mutex
+	settled map[string]struct{}
+}
 
 // NewAlwaysAdmitStore builds the foundation admission store.
 func NewAlwaysAdmitStore() *AlwaysAdmitStore {
-	return &AlwaysAdmitStore{}
+	return &AlwaysAdmitStore{settled: make(map[string]struct{})}
 }
 
 // Admit accepts the request and returns a reservation bound to the operation.
 func (*AlwaysAdmitStore) Admit(_ context.Context, request ports.AdmissionRequest) (ports.AdmissionDecision, ports.AdmissionReservation, error) {
 	return ports.AdmissionDecision{Admitted: true},
-		ports.AdmissionReservation(request),
+		ports.AdmissionReservation{Principal: request.Principal, Operation: request.Operation},
 		nil
 }
 
-// Reconcile settles a reservation. The foundation holds no durable occupancy.
-func (*AlwaysAdmitStore) Reconcile(context.Context, ports.AdmissionReservation) error {
+// Reconcile settles a reservation. Keyed settles are idempotent.
+func (store *AlwaysAdmitStore) Reconcile(_ context.Context, reservation ports.AdmissionReservation) error {
+	if reservation.SettlementKey == "" {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.settled == nil {
+		store.settled = make(map[string]struct{})
+	}
+	store.settled[reservation.SettlementKey] = struct{}{}
 	return nil
+}
+
+// LogicalSettleCount reports how many distinct SettlementKeys have been
+// settled (test/operator observation only).
+func (store *AlwaysAdmitStore) LogicalSettleCount() int {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return len(store.settled)
 }
 
 // MemoryReplayStore is the production foundation idempotency store. It performs
