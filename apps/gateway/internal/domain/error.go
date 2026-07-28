@@ -625,7 +625,7 @@ func NewInvalidMask() CanonicalError {
 		StatusClass:  StatusInvalidRequest,
 		Retryability: RetryNotRetryable,
 		Remediation:  RemediationFixRequest,
-		FailureStage: StageAsset,
+		FailureStage: StageRequestValidation,
 	}
 }
 
@@ -638,7 +638,7 @@ func NewMaskDimensionMismatch() CanonicalError {
 		StatusClass:  StatusInvalidRequest,
 		Retryability: RetryNotRetryable,
 		Remediation:  RemediationFixRequest,
-		FailureStage: StageAsset,
+		FailureStage: StageRequestValidation,
 	}
 }
 

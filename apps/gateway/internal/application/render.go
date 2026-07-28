@@ -379,7 +379,9 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		return RenderJobResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
 
-	// Same-Tenant Asset visibility for inputs/mask before routing/Provider work.
+	// Same-Tenant Asset visibility for inputs before routing/Provider work. A
+	// prior output reused as input is accepted (#13 section 4.3.2); any other
+	// role (e.g. a mask referenced as input) is invalid_mask, not invalid_request.
 	var resolvedInputs []domain.Asset
 	for _, assetID := range command.inputs {
 		if assetID == "" {
@@ -389,26 +391,10 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 		if err != nil {
 			return RenderJobResult{}, service.fail(ctx, sc, service.assetVisibilityCanonical(err))
 		}
-		if asset.Kind != domain.AssetKindInput {
-			return RenderJobResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
-		}
-		resolvedInputs = append(resolvedInputs, asset)
-	}
-	if command.mask != "" {
-		mask, err := service.assets.Visible(ctx, principal, command.mask)
-		if err != nil {
-			return RenderJobResult{}, service.fail(ctx, sc, service.assetVisibilityCanonical(err))
-		}
-		if mask.Kind != domain.AssetKindMask {
+		if asset.Kind != domain.AssetKindInput && asset.Kind != domain.AssetKindOutput {
 			return RenderJobResult{}, service.fail(ctx, sc, domain.NewInvalidMask())
 		}
-		// Relationship check (#13 section 4.3): mask must be dimensionally
-		// compatible with its target input before routing/Provider work.
-		if len(resolvedInputs) > 0 {
-			if err := domain.ValidateMaskRelationship(resolvedInputs[0], mask); err != nil {
-				return RenderJobResult{}, service.fail(ctx, sc, maskRelationshipCanonical(err))
-			}
-		}
+		resolvedInputs = append(resolvedInputs, asset)
 	}
 
 	// Keyed digester must succeed before any replay/admission/job side effect.
@@ -482,6 +468,27 @@ func (service *RenderService) create(ctx context.Context, command createRequest)
 	account, canonical, ok := service.selectAccount(ctx, principal, command.operation, command.model, sc.start)
 	if !ok {
 		return RenderJobResult{}, service.failAfterRollback(ctx, sc, canonical, reservation, identity)
+	}
+
+	// Mask relationship validation runs AFTER routing so capability precedence
+	// holds: an account whose snapshot classifies the operation unsupported is
+	// rejected as capability_unsupported inside selectAccount before any mask
+	// shape cost is spent (#13 section 4.3.5, I-CAP-REJECT-BEFORE-UPSTREAM). The
+	// mask must resolve same-Tenant, be kind mask, and be dimensionally
+	// compatible with its target input (#13 section 4.3.1-4.3.3).
+	if command.mask != "" {
+		mask, err := service.assets.Visible(ctx, principal, command.mask)
+		if err != nil {
+			return RenderJobResult{}, service.failAfterRollback(ctx, sc, service.assetVisibilityCanonical(err), reservation, identity)
+		}
+		if mask.Kind != domain.AssetKindMask {
+			return RenderJobResult{}, service.failAfterRollback(ctx, sc, domain.NewInvalidMask(), reservation, identity)
+		}
+		if len(resolvedInputs) > 0 {
+			if err := domain.ValidateMaskRelationship(resolvedInputs[0], mask); err != nil {
+				return RenderJobResult{}, service.failAfterRollback(ctx, sc, maskRelationshipCanonical(err), reservation, identity)
+			}
+		}
 	}
 
 	// Vault presence gate: credential version must be authorized before enqueue.
@@ -1556,8 +1563,8 @@ func (service *RenderService) preflightExecute(
 		if err != nil {
 			return domain.ProviderAccount{}, domain.ErrCodeResourceNotFound, false
 		}
-		if asset.Kind != domain.AssetKindInput {
-			return domain.ProviderAccount{}, domain.ErrCodeInvalidRequest, false
+		if asset.Kind != domain.AssetKindInput && asset.Kind != domain.AssetKindOutput {
+			return domain.ProviderAccount{}, domain.ErrCodeInvalidMask, false
 		}
 		resolvedInputs = append(resolvedInputs, asset)
 	}
@@ -1646,8 +1653,9 @@ func preflightFailureStage(class domain.ErrorCode) domain.FailureStage {
 	switch class {
 	case domain.ErrCodeCapabilityUnsupported, domain.ErrCodeCapabilityUnverified, domain.ErrCodeSnapshotStale:
 		return domain.StageCapability
-	case domain.ErrCodeResourceNotFound, domain.ErrCodeInvalidRequest,
-		domain.ErrCodeInvalidMask, domain.ErrCodeMaskDimensionMismatch:
+	case domain.ErrCodeInvalidMask, domain.ErrCodeMaskDimensionMismatch:
+		return domain.StageRequestValidation
+	case domain.ErrCodeResourceNotFound, domain.ErrCodeInvalidRequest:
 		return domain.StageAsset
 	case domain.ErrCodeDependencyUnavailable:
 		return domain.StageDependency

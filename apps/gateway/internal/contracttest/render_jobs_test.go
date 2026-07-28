@@ -34,6 +34,7 @@ type renderHarness struct {
 	digester         ports.RenderDigester
 	digestKey        []byte
 	renderJobs       ports.RenderJobStore
+	assetMetadata    *assetFakeMetadataStore
 }
 
 func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarness {
@@ -143,6 +144,9 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	}
 	if h.renderJobs != nil {
 		opts.RenderJobs = h.renderJobs
+	}
+	if h.assetMetadata != nil {
+		opts.AssetMetadata = h.assetMetadata
 	}
 	fixture, err := contracttest.NewFixture(opts)
 	if err != nil {
@@ -1679,6 +1683,79 @@ func TestInpaintMaskWrongKindRejectsAsInvalidMask(t *testing.T) {
 	}
 	if len(h.fixture.EnqueuedReferences()) != 0 {
 		t.Fatalf("enqueue on wrong mask kind = %d, want 0", len(h.fixture.EnqueuedReferences()))
+	}
+}
+
+// Issue #55: the worker re-gates the mask/input relationship before any payload.
+// A job admitted with a compatible mask whose target Asset later becomes
+// dimensionally incompatible must fail closed at request_validation with the
+// distinct mask_dimension_mismatch class, commit not started, and zero render.
+func TestInpaintMaskMismatchRejectedByWorkerBeforePayload(t *testing.T) {
+	t.Parallel()
+
+	store := newAssetFakeMetadataStore(&mutableTestClock{now: spineFixtureTime}, defaultAssetCapBytes, defaultAssetCapCount)
+	h := newRenderHarness(t, func(h *renderHarness) {
+		h.assetMetadata = store
+		seedRoutableImageAccount(h, "pa_inpaint_worker_mismatch")
+	})
+
+	// Create passes: input and mask agree at 64x64 so create-path validation
+	// admits the job and enqueues exactly one reference.
+	inputID := h.uploadAsset(t, "idem-upload-worker-input", "input", pngBytes(t, 64, 64))
+	maskID := h.uploadAsset(t, "idem-upload-worker-mask", "mask", pngBytes(t, 64, 64))
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/inpaints",
+		bearer:  tenantAKey,
+		idemKey: "idem-inpaint-worker-mismatch",
+		body:    `{"model":"gpt-image-1","prompt":"fill","input_asset_id":"` + inputID + `","mask_asset_id":"` + maskID + `"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d, want 202 (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	_ = json.Unmarshal(payload, &job)
+	jobID := job["job_id"].(string)
+
+	// Mutate the mask out of dimensional agreement after admission but before the
+	// worker runs, so only the worker re-check can catch it.
+	if err := store.overwriteAssetDimensions("tenant_a", domain.AssetID(maskID), 32, 32); err != nil {
+		t.Fatalf("overwriteAssetDimensions: %v", err)
+	}
+
+	ref := domain.JobRef{TenantID: "tenant_a", JobID: domain.Identifier(jobID)}
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), ref); err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != 0 {
+		t.Fatalf("render calls = %d, want 0 (no payload on preflight reject)", calls)
+	}
+
+	get, getPayload := h.do(t, requestSpec{
+		method: http.MethodGet,
+		path:   "/v1/render-jobs/" + jobID,
+		bearer: tenantAKey,
+	})
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d, want 200 (body=%s)", get.StatusCode, getPayload)
+	}
+	var failed map[string]any
+	if err := json.Unmarshal(getPayload, &failed); err != nil {
+		t.Fatalf("decode failed job: %v", err)
+	}
+	if failed["lifecycle_state"] != "failed" {
+		t.Fatalf("lifecycle_state = %v, want failed (body=%s)", failed["lifecycle_state"], getPayload)
+	}
+	if failed["failure_class"] != "mask_dimension_mismatch" {
+		t.Fatalf("failure_class = %v, want mask_dimension_mismatch", failed["failure_class"])
+	}
+	if failed["failure_stage"] != "request_validation" {
+		t.Fatalf("failure_stage = %v, want request_validation", failed["failure_stage"])
+	}
+	// commit_status is omitted from the wire when not started, proving no payload.
+	if _, has := failed["commit_status"]; has {
+		t.Fatalf("commit_status present = %v, want omitted (not_started)", failed["commit_status"])
 	}
 }
 
