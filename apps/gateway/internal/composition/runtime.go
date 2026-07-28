@@ -204,6 +204,19 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	}
 	dependencies.Routing = routing
 
+	// Render Job / replay durability (#56). Companion ledgers beside the
+	// account path, mirroring Health/Routing. AllowInMemoryRenderJobs fixtures
+	// and explicit injects are untouched — this only fills the gap when a path
+	// is configured and no dependency was supplied.
+	if config.ProviderAccountStorePath != "" {
+		if dependencies.RenderJobs == nil {
+			dependencies.RenderJobs = persistence.NewFileRenderJobStore(config.ProviderAccountStorePath + ".render-jobs.ledger")
+		}
+		if dependencies.RenderReplay == nil {
+			dependencies.RenderReplay = persistence.NewFileRenderReplayStore(config.ProviderAccountStorePath + ".render-replay.ledger")
+		}
+	}
+
 	runtime := &Runtime{
 		worker: application.NewFoundationJobExecutor(),
 		jobs:   dependencies.Runtime,

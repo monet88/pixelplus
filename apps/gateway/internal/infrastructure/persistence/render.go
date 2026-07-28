@@ -756,6 +756,30 @@ func (store *MemoryRenderJobStore) saveLocked(job domain.RenderJob) {
 	store.tenantJobs(job.TenantID)[job.JobID] = job
 }
 
+// seedJob installs one job row directly (durable-restore replay only, not a
+// product mutation path). It backfills placementRecord from any OutputEntry
+// already carrying an AssetID so placement idempotency survives restart
+// without a second ledger stream, and advances nextFence past the job's
+// WorkerFencingToken so a resumed claim never reuses or undercuts a token
+// issued before restart. Callers must hold store.mu.
+func (store *MemoryRenderJobStore) seedJob(job domain.RenderJob) {
+	store.saveLocked(cloneJob(job))
+	for _, entry := range job.OutputEntries {
+		if entry.AssetID == "" {
+			continue
+		}
+		key := domain.PlacementKey{
+			TenantID:      job.TenantID,
+			JobID:         job.JobID,
+			OutputEntryID: entry.ID,
+		}.String()
+		store.placementRecord[key] = entry.AssetID
+	}
+	if job.WorkerFencingToken >= store.nextFence {
+		store.nextFence = job.WorkerFencingToken + 1
+	}
+}
+
 func (store *MemoryRenderJobStore) requireFence(job domain.RenderJob, token domain.FencingToken) error {
 	if !job.LeaseHeld || job.WorkerFencingToken != token {
 		return domain.ErrStaleFence
@@ -923,6 +947,29 @@ func (store *MemoryRenderReplayStore) Complete(_ context.Context, identity domai
 	return nil
 }
 
+// seedRecord installs one replay record directly (durable-restore replay
+// only, not a product mutation path). Callers must hold store.mu.
+func (store *MemoryRenderReplayStore) seedRecord(scope domain.ReplayScope, fingerprint domain.Fingerprint, terminal bool, job domain.RenderJob) {
+	store.records[scope] = &renderReplayRecord{
+		fingerprint: fingerprint,
+		terminal:    terminal,
+		job:         cloneJob(job),
+	}
+}
+
+// removeRecord deletes a replay record directly, mirroring Abandon's exact
+// no-steal ownership check for durable-restore tombstone replay: a missing
+// record, a terminal record, or a record whose fingerprint no longer matches
+// the abandoning identity (someone else's claim) is left untouched. Callers
+// must hold store.mu.
+func (store *MemoryRenderReplayStore) removeRecord(scope domain.ReplayScope, fingerprint domain.Fingerprint) {
+	record, ok := store.records[scope]
+	if !ok || record.terminal || record.fingerprint != fingerprint {
+		return
+	}
+	delete(store.records, scope)
+}
+
 // Abandon clears an in-progress claim still owned by this request.
 func (store *MemoryRenderReplayStore) Abandon(_ context.Context, identity domain.ReplayIdentity) error {
 	store.mu.Lock()
@@ -937,6 +984,22 @@ func (store *MemoryRenderReplayStore) Abandon(_ context.Context, identity domain
 	}
 	delete(store.records, identity.Scope)
 	return nil
+}
+
+// ownsPendingRecord reports whether identity currently owns a non-terminal
+// record for its scope — i.e. whether a following Abandon call will actually
+// remove state rather than silently no-op (missing, terminal, or a
+// fingerprint mismatch belonging to another owner). Durable-restore callers
+// use this before Abandon to decide whether a tombstone row is owed.
+func (store *MemoryRenderReplayStore) ownsPendingRecord(identity domain.ReplayIdentity) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	record, ok := store.records[identity.Scope]
+	if !ok {
+		return false
+	}
+	return !record.terminal && record.fingerprint == identity.Fingerprint
 }
 
 var (

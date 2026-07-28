@@ -98,6 +98,63 @@ func TestStaleFenceRejectsTransitionAndPlacement(t *testing.T) {
 	}
 }
 
+// Stale fence cannot bind the job→account continuity lease after a newer
+// claim; the correct current fence still succeeds (#56 AC2 coverage).
+func TestStaleFenceRejectsBindAccountLease(t *testing.T) {
+	t.Parallel()
+
+	store := persistence.NewMemoryRenderJobStore()
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	now := domain.NewTimestamp(time.Date(2026, 7, 24, 13, 0, 0, 0, time.UTC))
+	job := domain.NewQueuedRenderJob(
+		"job_bind_fence",
+		"tenant_a",
+		"key_a",
+		domain.RenderOpImageGeneration,
+		"m",
+		"opaque-digest",
+		nil,
+		"",
+		"pa_1",
+		1,
+		"fp",
+		"idem",
+		now,
+	)
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: job}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	claim, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID: "worker_1",
+		Now:      domain.NewTimestamp(now.Time().Add(time.Second)),
+	})
+	if err != nil {
+		t.Fatalf("ClaimWorker: %v", err)
+	}
+
+	// Stale fence (wrong token) must not bind the account continuity lease.
+	if err := store.BindAccountLease(context.Background(), job.JobRef(), claim.FencingToken+99, "pa_1"); !errors.Is(err, domain.ErrStaleFence) {
+		t.Fatalf("stale BindAccountLease error = %v, want ErrStaleFence", err)
+	}
+	unbound, err := store.Load(context.Background(), job.JobRef())
+	if err != nil {
+		t.Fatalf("Load after stale bind: %v", err)
+	}
+	if unbound.ProviderAccountID != "pa_1" {
+		// ProviderAccountID is already pa_1 from NewQueuedRenderJob; the stale
+		// bind attempt must not have reached the mutation path at all — proven
+		// by the returned error rather than a value change here. The value
+		// assertion still guards against silent success on a different account.
+		t.Fatalf("ProviderAccountID after stale bind = %q, want pa_1", unbound.ProviderAccountID)
+	}
+
+	// Correct current fence still succeeds.
+	if err := store.BindAccountLease(context.Background(), job.JobRef(), claim.FencingToken, "pa_1"); err != nil {
+		t.Fatalf("BindAccountLease with current fence: %v", err)
+	}
+}
+
 // Lease expiry allows reclaim when not_started and PayloadSent=false (crash
 // before Adapter entry). After durable PayloadSent, reclaim never re-renders.
 func TestLeaseExpiryRecoveryDoesNotRerenderAfterPayloadSent(t *testing.T) {
