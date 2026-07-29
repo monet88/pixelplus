@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -105,7 +106,12 @@ func (s *auditJobStore) MarkQueuePublished(context.Context, domain.JobRef) (doma
 	return s.job, nil
 }
 func (s *auditJobStore) ListQueueRecoveryCandidates(context.Context) ([]domain.RenderJob, error) {
-	return nil, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.job.JobID == "" || s.job.Lifecycle.Terminal() {
+		return nil, nil
+	}
+	return []domain.RenderJob{s.job}, nil
 }
 func (s *auditJobStore) MarkAdmissionSettled(context.Context, domain.JobRef) (domain.RenderJob, error) {
 	s.mu.Lock()
@@ -178,6 +184,83 @@ func minimalReviewService(t *testing.T, jobs ports.RenderJobStore, audit ports.R
 		t.Fatalf("NewRenderService: %v", err)
 	}
 	return svc
+}
+
+type reconciliationReplay struct {
+	decision  ports.RenderReplayDecision
+	claims    []domain.ReplayIdentity
+	completed []ports.RenderReplayResult
+}
+
+func (r *reconciliationReplay) Claim(_ context.Context, identity domain.ReplayIdentity) (ports.RenderReplayDecision, error) {
+	r.claims = append(r.claims, identity)
+	return r.decision, nil
+}
+func (r *reconciliationReplay) Complete(_ context.Context, _ domain.ReplayIdentity, result ports.RenderReplayResult) error {
+	r.completed = append(r.completed, result)
+	return nil
+}
+func (*reconciliationReplay) Abandon(context.Context, domain.ReplayIdentity) error { return nil }
+
+func newReconciliationService(t *testing.T, jobs ports.RenderJobStore, replay ports.RenderReplayStore) *application.RenderService {
+	t.Helper()
+	now := time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)
+	svc, err := application.NewRenderService(application.RenderDependencies{
+		Principal: noopPrincipal{}, Admission: &keyedAdmissionStore{settled: map[string]struct{}{}},
+		Replay: replay, Jobs: jobs, Accounts: noopAccounts{}, Capabilities: noopCapabilities{},
+		Routing: noopRouting{}, Assets: noopAssets{}, Content: noopContent{}, Staging: noopStaging{},
+		Vault: noopVault{}, Prompts: &cleanupPromptStore{}, Authorized: noopAuthorized{}, Digester: noopDigester{},
+		Queue: noopQueue{}, Audit: &failOnceAudit{}, Telemetry: noopTelemetry{}, RequestLog: noopRequestLog{},
+		Clock: fixedClock{now: now}, IDs: fixedIDs{},
+	})
+	if err != nil {
+		t.Fatalf("NewRenderService: %v", err)
+	}
+	return svc
+}
+
+func TestReconcileReplayTerminalsCompletesExistingDurableJob(t *testing.T) {
+	t.Parallel()
+
+	now := domain.NewTimestamp(time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC))
+	job := domain.NewQueuedRenderJob(
+		"job_reconcile", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m", "digest",
+		nil, "", "pa_1", 1, "fp_reconcile", "idem_reconcile", now,
+	)
+	jobs := &auditJobStore{job: job}
+	replay := &reconciliationReplay{decision: ports.RenderReplayDecision{Outcome: ports.ReplayInProgress}}
+	svc := newReconciliationService(t, jobs, replay)
+
+	if err := svc.ReconcileReplayTerminals(context.Background()); err != nil {
+		t.Fatalf("ReconcileReplayTerminals: %v", err)
+	}
+	if len(replay.claims) != 1 || replay.claims[0].Fingerprint != job.RequestFingerprint {
+		t.Fatalf("claims = %+v, want one matching fingerprint", replay.claims)
+	}
+	if len(replay.completed) != 1 || replay.completed[0].Job.JobID != job.JobID {
+		t.Fatalf("completed = %+v, want existing durable job", replay.completed)
+	}
+}
+
+func TestReconcileReplayTerminalsFailsClosedOnConflict(t *testing.T) {
+	t.Parallel()
+
+	now := domain.NewTimestamp(time.Date(2026, 8, 3, 1, 0, 0, 0, time.UTC))
+	job := domain.NewQueuedRenderJob(
+		"job_conflict", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m", "digest",
+		nil, "", "pa_1", 1, "fp_conflict", "idem_conflict", now,
+	)
+	jobs := &auditJobStore{job: job}
+	replay := &reconciliationReplay{decision: ports.RenderReplayDecision{Outcome: ports.ReplayConflict}}
+	svc := newReconciliationService(t, jobs, replay)
+
+	err := svc.ReconcileReplayTerminals(context.Background())
+	if !errors.Is(err, ports.ErrDependencyUnavailable) {
+		t.Fatalf("ReconcileReplayTerminals conflict = %v, want ErrDependencyUnavailable", err)
+	}
+	if len(replay.completed) != 0 {
+		t.Fatalf("completed on conflict = %+v, want none", replay.completed)
+	}
 }
 
 func TestTerminalAuditFailureRetriedExactlyOnce(t *testing.T) {
