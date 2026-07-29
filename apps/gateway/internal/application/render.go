@@ -1344,7 +1344,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
 				if _, err := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
 					JobRef: ref, FencingToken: fence, EntryID: entry.ID,
-					DeliveryStateForced: domain.OutputFailed,
+					DeliveryStateForced: domain.OutputPending,
 					FailureClass:        string(domain.ErrCodeStorageCapExceeded),
 					Now:                 service.nowTS(),
 				}); err != nil {
@@ -1353,11 +1353,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 					}
 					return err
 				}
-				return service.persistTerminal(ctx, job, ports.FencedTransition{
-					JobRef: ref, FencingToken: fence, To: domain.JobFailed,
-					FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeStorageCapExceeded,
-					CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
-				})
+				continue
 			}
 			if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 				JobRef: ref, FencingToken: fence, To: domain.JobFailed,
@@ -1444,12 +1440,8 @@ func (service *RenderService) recoverAttemptWithoutRender(
 					continue
 				}
 				if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
-					// Issue #54 acceptance: placement not durable → do not complete.
-					return service.persistTerminal(ctx, job, ports.FencedTransition{
-						JobRef: ref, FencingToken: fence, To: domain.JobFailed,
-						FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeStorageCapExceeded,
-						CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
-					})
+					// Preserve the captured result; output delivery remains pending and retriable.
+					continue
 				}
 				if errors.Is(placeErr, ports.ErrStagingExpired) {
 					// Delivery already marked expired; fail closed, zero re-render.

@@ -1010,6 +1010,58 @@ func TestForeignRenderJobIsNonEnumerating404(t *testing.T) {
 	}
 }
 
+// Foreign cancel and output retry have the same non-enumerating behavior as job reads.
+func TestForeignRenderJobCancelAndOutputRetryAreNonEnumerating404(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_render_foreign_mutations")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-gen-foreign-mutations",
+		body:    `{"model":"gpt-image-1","prompt":"tenant a only"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d, want 202 (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	if err := json.Unmarshal(payload, &job); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	jobID, _ := job["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("job_id missing: %s", payload)
+	}
+	admits := h.admission.admitCalls.Load()
+
+	for _, request := range []requestSpec{
+		{method: http.MethodPost, path: "/v1/render-jobs/" + jobID + "/cancel", bearer: tenantBKey},
+		{method: http.MethodPost, path: "/v1/render-jobs/" + jobID + "/outputs/output_0/retry", bearer: tenantBKey},
+	} {
+		response, responsePayload := h.do(t, request)
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("foreign %s status = %d, want 404 (body=%s)", request.path, response.StatusCode, responsePayload)
+		}
+		errBody := decodeError(t, responsePayload)
+		if errBody["code"] != "resource_not_found" {
+			t.Fatalf("foreign %s code = %v, want resource_not_found", request.path, errBody["code"])
+		}
+		if _, hasRef := errBody["resource_reference"]; hasRef {
+			t.Fatalf("foreign %s must not carry resource_reference: %v", request.path, errBody)
+		}
+	}
+	if got := h.admission.admitCalls.Load(); got != admits {
+		t.Fatalf("admission after foreign mutations = %d, want %d", got, admits)
+	}
+	if calls := h.renderCalls.Load(); calls != 0 {
+		t.Fatalf("render calls after foreign mutations = %d, want 0", calls)
+	}
+}
+
 // Spec: HTTP create → nonblocking queue → Runtime.RunWorkers → GET completed
 // with manifest/Asset. Proves controlledJobRuntime delivers to JobExecutor,
 // no deadlock on enqueue-before-consumer, and no replacement publication.
@@ -1254,31 +1306,124 @@ func TestWorkerCompletesJobWithManifestAndOutputAsset(t *testing.T) {
 		t.Fatalf("asset_id missing on available entry: %v", entry)
 	}
 
-	// Output retry returns 202 OutputRetryResponse (not 200 full job) and does not re-render.
-	retry, retryPayload := h.do(t, requestSpec{
-		method: http.MethodPost,
-		path:   "/v1/render-jobs/" + jobID + "/outputs/" + entry["output_entry_id"].(string) + "/retry",
-		bearer: tenantAKey,
-	})
-	if retry.StatusCode != http.StatusAccepted {
-		t.Fatalf("retry status = %d, want 202 (body=%s)", retry.StatusCode, retryPayload)
-	}
-	var retryBody map[string]any
-	if err := json.Unmarshal(retryPayload, &retryBody); err != nil {
-		t.Fatalf("decode retry: %v", err)
-	}
-	if retryBody["re_render"] != false {
-		t.Fatalf("re_render = %v, want false", retryBody["re_render"])
-	}
-	if retryBody["output_entry_id"] != entry["output_entry_id"] {
-		t.Fatalf("output_entry_id = %v, want %v", retryBody["output_entry_id"], entry["output_entry_id"])
-	}
-	// Must not be a full RenderJob body (no lifecycle_state).
-	if _, has := retryBody["lifecycle_state"]; has {
-		t.Fatalf("OutputRetryResponse must not embed full RenderJob: %s", retryPayload)
+	// Repeated output retry returns the same entry and never creates another render admission.
+	for retryCount := 0; retryCount < 2; retryCount++ {
+		retry, retryPayload := h.do(t, requestSpec{
+			method: http.MethodPost,
+			path:   "/v1/render-jobs/" + jobID + "/outputs/" + entry["output_entry_id"].(string) + "/retry",
+			bearer: tenantAKey,
+		})
+		if retry.StatusCode != http.StatusAccepted {
+			t.Fatalf("retry %d status = %d, want 202 (body=%s)", retryCount+1, retry.StatusCode, retryPayload)
+		}
+		var retryBody map[string]any
+		if err := json.Unmarshal(retryPayload, &retryBody); err != nil {
+			t.Fatalf("decode retry %d: %v", retryCount+1, err)
+		}
+		if retryBody["re_render"] != false {
+			t.Fatalf("retry %d re_render = %v, want false", retryCount+1, retryBody["re_render"])
+		}
+		if retryBody["output_entry_id"] != entry["output_entry_id"] {
+			t.Fatalf("retry %d output_entry_id = %v, want %v", retryCount+1, retryBody["output_entry_id"], entry["output_entry_id"])
+		}
+		// Must not be a full RenderJob body (no lifecycle_state).
+		if _, has := retryBody["lifecycle_state"]; has {
+			t.Fatalf("OutputRetryResponse must not embed full RenderJob: %s", retryPayload)
+		}
 	}
 	if calls := h.renderCalls.Load(); calls != 1 {
-		t.Fatalf("render calls after output retry = %d, want 1", calls)
+		t.Fatalf("render calls after output retries = %d, want 1", calls)
+	}
+	if got := h.admission.OperationCount(domain.OperationToken("create_image_generation")); got != 1 {
+		t.Fatalf("image-generation admissions = %d, want 1", got)
+	}
+	if got := h.admission.OperationCount(domain.OperationToken("retry_render_job_output")); got != 2 {
+		t.Fatalf("output-retry admissions = %d, want 2", got)
+	}
+}
+
+// Output delivery retry places a pending manifest entry once after storage recovers.
+func TestOutputRetryPlacesPendingManifestWithoutRenderingAgain(t *testing.T) {
+	t.Parallel()
+
+	assets := newAssetFakeMetadataStore(&mutableTestClock{now: spineFixtureTime}, 1, defaultAssetCapCount)
+	h := newRenderHarness(t, func(h *renderHarness) {
+		h.assetMetadata = assets
+		seedRoutableImageAccount(h, "pa_retry_pending")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-retry-pending",
+		body:    `{"model":"gpt-image-1","prompt":"deliver later"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d, want 202 (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	if err := json.Unmarshal(payload, &job); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	jobID, _ := job["job_id"].(string)
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{TenantID: "tenant_a", JobID: domain.Identifier(jobID)}); err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls after storage-cap placement failure = %d, want 1", calls)
+	}
+
+	get, getPayload := h.do(t, requestSpec{method: http.MethodGet, path: "/v1/render-jobs/" + jobID, bearer: tenantAKey})
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d, want 200 (body=%s)", get.StatusCode, getPayload)
+	}
+	var completed map[string]any
+	if err := json.Unmarshal(getPayload, &completed); err != nil {
+		t.Fatalf("decode completed: %v", err)
+	}
+	if completed["lifecycle_state"] != "completed" {
+		t.Fatalf("lifecycle_state = %v, want completed", completed["lifecycle_state"])
+	}
+	entries, _ := completed["output_entries"].([]any)
+	entry, _ := entries[0].(map[string]any)
+	if entry["delivery_state"] != "pending" {
+		t.Fatalf("delivery_state = %v, want pending", entry["delivery_state"])
+	}
+	entryID, _ := entry["output_entry_id"].(string)
+
+	assets.capBytes = defaultAssetCapBytes
+	var assetID string
+	for retryCount := 0; retryCount < 2; retryCount++ {
+		retry, retryPayload := h.do(t, requestSpec{
+			method: http.MethodPost,
+			path:   "/v1/render-jobs/" + jobID + "/outputs/" + entryID + "/retry",
+			bearer: tenantAKey,
+		})
+		if retry.StatusCode != http.StatusAccepted {
+			t.Fatalf("retry %d status = %d, want 202 (body=%s)", retryCount+1, retry.StatusCode, retryPayload)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(retryPayload, &result); err != nil {
+			t.Fatalf("decode retry %d: %v", retryCount+1, err)
+		}
+		if result["delivery_state"] != "available" || result["asset_id"] == "" || result["re_render"] != false {
+			t.Fatalf("retry %d result = %v, want available placed output without re-render", retryCount+1, result)
+		}
+		if retryCount == 0 {
+			assetID, _ = result["asset_id"].(string)
+		} else if result["asset_id"] != assetID {
+			t.Fatalf("retry %d asset_id = %v, want stable %q", retryCount+1, result["asset_id"], assetID)
+		}
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls after pending output retries = %d, want 1", calls)
+	}
+	if got := h.admission.OperationCount(domain.OperationToken("create_image_generation")); got != 1 {
+		t.Fatalf("image-generation admissions = %d, want 1", got)
+	}
+	if got := h.admission.OperationCount(domain.OperationToken("retry_render_job_output")); got != 2 {
+		t.Fatalf("output-retry admissions = %d, want 2", got)
 	}
 }
 
