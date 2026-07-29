@@ -310,6 +310,85 @@ func (job RenderJob) JobRef() JobRef {
 	return JobRef{TenantID: Identifier(job.TenantID), JobID: job.JobID}
 }
 
+// ValidateDurable checks the cross-field invariants a restored durable job row
+// must satisfy before it re-enters the worker claim path. Valid JSON can still
+// encode an impossible state; the most dangerous is a queued job that already
+// carries Provider work (payload sent, committed/unknown attempt, or a captured
+// manifest). ClaimWorker treats a queued job as a fresh full claim — never
+// recovery-only — so restoring such a row would authorize a *second* Provider
+// generation after a crash (#56 Spec P1-2 / #14 §6.4, ADR 0009). This does not
+// re-derive product state; it only fails closed on contradictions the state
+// machine can never produce.
+func (job RenderJob) ValidateDurable() error {
+	if job.TenantID == "" || job.JobID == "" {
+		return fmt.Errorf("%w: missing tenant or job id", ErrInvalidDurableJob)
+	}
+	if !job.Lifecycle.Valid() {
+		return fmt.Errorf("%w: lifecycle %q", ErrInvalidDurableJob, job.Lifecycle)
+	}
+	if !job.CommitStatus.Valid() {
+		return fmt.Errorf("%w: commit status %q", ErrInvalidDurableJob, job.CommitStatus)
+	}
+	if job.Attempt.ID != "" {
+		if !job.Attempt.CommitStatus.Valid() {
+			return fmt.Errorf("%w: attempt commit status %q", ErrInvalidDurableJob, job.Attempt.CommitStatus)
+		}
+		if job.Attempt.CommitStatus != job.CommitStatus {
+			return fmt.Errorf(
+				"%w: job commit status %q differs from attempt %q",
+				ErrInvalidDurableJob,
+				job.CommitStatus,
+				job.Attempt.CommitStatus,
+			)
+		}
+	} else if job.Attempt.PayloadSent || job.Attempt.ResponseCaptured {
+		return fmt.Errorf("%w: attempt progress without attempt identity", ErrInvalidDurableJob)
+	}
+	if job.Attempt.ResponseCaptured && job.Attempt.CommitStatus == CommitNotStarted {
+		return fmt.Errorf("%w: response captured with not_started commit", ErrInvalidDurableJob)
+	}
+	if job.Manifest.ID != "" {
+		if job.Attempt.ID == "" || job.Manifest.AttemptID != job.Attempt.ID {
+			return fmt.Errorf("%w: manifest is not bound to current attempt", ErrInvalidDurableJob)
+		}
+	}
+	// A held worker lease implies a fenced worker identity, terminal or not.
+	if job.LeaseHeld && (job.WorkerID == "" || job.WorkerFencingToken <= 0) {
+		return fmt.Errorf("%w: held lease without worker/fence", ErrInvalidDurableJob)
+	}
+	if job.Lifecycle.Terminal() {
+		// Terminal transitions clear the fence and stamp TerminalAt (Transition).
+		if job.LeaseHeld {
+			return fmt.Errorf("%w: terminal job still holds worker lease", ErrInvalidDurableJob)
+		}
+		if job.TerminalAt.IsZero() {
+			return fmt.Errorf("%w: terminal job missing terminal timestamp", ErrInvalidDurableJob)
+		}
+		return nil
+	}
+	// Non-terminal jobs always carry a valid execution phase (terminal clears it).
+	if !job.ExecutionPhase.Valid() {
+		return fmt.Errorf("%w: non-terminal execution phase %q", ErrInvalidDurableJob, job.ExecutionPhase)
+	}
+	if job.Lifecycle == JobQueued {
+		// Queued means never claimed for execution: no worker, no attempt progress.
+		// Any Provider-work marker here is the re-render vector this guard closes.
+		if job.LeaseHeld || job.WorkerID != "" {
+			return fmt.Errorf("%w: queued job carries a worker lease", ErrInvalidDurableJob)
+		}
+		if job.CommitStatus != CommitNotStarted {
+			return fmt.Errorf("%w: queued job commit status %q, want not_started", ErrInvalidDurableJob, job.CommitStatus)
+		}
+		if job.Attempt.PayloadSent {
+			return fmt.Errorf("%w: queued job has payload_sent", ErrInvalidDurableJob)
+		}
+		if job.Manifest.ID != "" {
+			return fmt.Errorf("%w: queued job already has a captured manifest", ErrInvalidDurableJob)
+		}
+	}
+	return nil
+}
+
 // PlacementKey is the stable output placement identity (#14 §8.3).
 type PlacementKey struct {
 	TenantID      TenantID
@@ -330,6 +409,12 @@ var ErrStaleFence = errors.New("stale render job fencing token")
 
 // ErrJobNotClaimable reports that claim lost the atomic condition.
 var ErrJobNotClaimable = errors.New("render job is not claimable")
+
+// ErrInvalidDurableJob reports a restored durable job row that decodes as valid
+// JSON but encodes an impossible cross-field state (e.g. a queued job that
+// already sent a Provider payload). Restore must fail closed on such a row
+// rather than seed it into the worker claim path (#56 Spec P1-2, ADR 0009).
+var ErrInvalidDurableJob = errors.New("invalid durable render job state")
 
 // CanTransition reports whether from→to is an allowed lifecycle edge (§4.2).
 //

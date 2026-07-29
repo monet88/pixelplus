@@ -125,16 +125,33 @@ func TestStaleFenceRejectsBindAccountLease(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	claim, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
-		WorkerID: "worker_1",
-		Now:      domain.NewTimestamp(now.Time().Add(time.Second)),
+	claim1, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID:  "worker_1",
+		Now:       domain.NewTimestamp(now.Time().Add(time.Second)),
+		ExpiresAt: domain.NewTimestamp(now.Time().Add(2 * time.Second)),
 	})
 	if err != nil {
-		t.Fatalf("ClaimWorker: %v", err)
+		t.Fatalf("ClaimWorker1: %v", err)
+	}
+	claim2, err := store.ClaimWorker(context.Background(), job.JobRef(), ports.WorkerLease{
+		WorkerID:  "worker_2",
+		Now:       domain.NewTimestamp(now.Time().Add(3 * time.Second)),
+		ExpiresAt: domain.NewTimestamp(now.Time().Add(5 * time.Second)),
+	})
+	if err != nil {
+		t.Fatalf("ClaimWorker2 after expiry: %v", err)
+	}
+	if claim2.FencingToken <= claim1.FencingToken {
+		t.Fatalf("second fencing token = %d, want > %d", claim2.FencingToken, claim1.FencingToken)
 	}
 
-	// Stale fence (wrong token) must not bind the account continuity lease.
-	if err := store.BindAccountLease(context.Background(), job.JobRef(), claim.FencingToken+99, "pa_1"); !errors.Is(err, domain.ErrStaleFence) {
+	// The first worker's genuinely superseded token must not bind a different
+	// account or advance the state revision.
+	baseline, err := store.Load(context.Background(), job.JobRef())
+	if err != nil {
+		t.Fatalf("Load baseline after reclaim: %v", err)
+	}
+	if err := store.BindAccountLease(context.Background(), job.JobRef(), claim1.FencingToken, "pa_2"); !errors.Is(err, domain.ErrStaleFence) {
 		t.Fatalf("stale BindAccountLease error = %v, want ErrStaleFence", err)
 	}
 	unbound, err := store.Load(context.Background(), job.JobRef())
@@ -142,15 +159,14 @@ func TestStaleFenceRejectsBindAccountLease(t *testing.T) {
 		t.Fatalf("Load after stale bind: %v", err)
 	}
 	if unbound.ProviderAccountID != "pa_1" {
-		// ProviderAccountID is already pa_1 from NewQueuedRenderJob; the stale
-		// bind attempt must not have reached the mutation path at all — proven
-		// by the returned error rather than a value change here. The value
-		// assertion still guards against silent success on a different account.
-		t.Fatalf("ProviderAccountID after stale bind = %q, want pa_1", unbound.ProviderAccountID)
+		t.Fatalf("ProviderAccountID after stale bind to pa_2 = %q, want pa_1 (no mutation)", unbound.ProviderAccountID)
+	}
+	if unbound.StateRevision != baseline.StateRevision {
+		t.Fatalf("StateRevision after stale bind = %d, want %d (no mutation)", unbound.StateRevision, baseline.StateRevision)
 	}
 
 	// Correct current fence still succeeds.
-	if err := store.BindAccountLease(context.Background(), job.JobRef(), claim.FencingToken, "pa_1"); err != nil {
+	if err := store.BindAccountLease(context.Background(), job.JobRef(), claim2.FencingToken, "pa_1"); err != nil {
 		t.Fatalf("BindAccountLease with current fence: %v", err)
 	}
 }

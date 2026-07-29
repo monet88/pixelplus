@@ -3,6 +3,7 @@ package composition_test
 import (
 	"context"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,21 +15,166 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
-// TestFileRenderStoresSurviveRealRestartWithoutDuplicateProviderWork proves
-// #56 AC5 (durable restart) against a genuine process boundary: process A and
-// process B share ONLY a file path — never a Go object — unlike
-// TestPublishedJobRecoversIntoFreshRuntimeWithoutClientRetry (queue_recovery_test.go),
-// which shares one in-memory store instance across two composition.New calls.
-//
-// Process A drives one job through claim → attempt → manifest → placement →
-// completed and completes one matching-replay terminal record, then dies.
-// Process B opens fresh FileRenderJobStore/FileRenderReplayStore instances at
-// the same paths, recovers via composition.New, and must observe: (1) the
-// durable job/lease/attempt/manifest/output state, (2) a redelivered
-// ExecuteJob on the completed job triggers terminal cleanup only — zero
-// Provider Adapter calls (no duplicate render), and (3) a matching
-// idempotency-key replay still resolves to the same terminal job.
-func TestFileRenderStoresSurviveRealRestartWithoutDuplicateProviderWork(t *testing.T) {
+// TestFileRenderStoresReconcileReplayCrashWindow proves the exact crash between
+// Jobs.Create and Replay.Complete: process A leaves a durable queued job plus an
+// in-progress replay claim; fresh process B must terminalize that replay during
+// startup before queue recovery, preserving the same job id without client-side
+// re-creation.
+func TestFileRenderStoresReconcileReplayCrashWindow(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	jobPath := filepath.Join(dir, "render-jobs.ledger")
+	replayPath := filepath.Join(dir, "render-replay.ledger")
+	base := time.Date(2026, 7, 26, 8, 0, 0, 0, time.UTC)
+	digester, err := vaultpkg.NewHMACRenderDigester([]byte(vaultpkg.FixtureRenderDigestKey))
+	if err != nil {
+		t.Fatalf("digester: %v", err)
+	}
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	identity := domain.ReplayIdentity{
+		Scope:       domain.ReplayScope{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Key: "idem-crash-window"},
+		Fingerprint: "fp_crash_window",
+	}
+
+	jobsA := persistence.NewFileRenderJobStore(jobPath)
+	replayA := persistence.NewFileRenderReplayStore(replayPath)
+	if err := jobsA.Restore(context.Background()); err != nil {
+		t.Fatalf("A jobs Restore: %v", err)
+	}
+	if err := replayA.Restore(context.Background()); err != nil {
+		t.Fatalf("A replay Restore: %v", err)
+	}
+	if decision, err := replayA.Claim(context.Background(), identity); err != nil || decision.Outcome != ports.ReplayClaimed {
+		t.Fatalf("A replay Claim = %+v, %v; want ReplayClaimed", decision, err)
+	}
+	job := domain.NewQueuedRenderJob(
+		"job_crash_window", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m", "digest",
+		nil, "", "pa_1", 1, identity.Fingerprint, identity.Scope.Key, domain.NewTimestamp(base),
+	)
+	if _, err := jobsA.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: job}); err != nil {
+		t.Fatalf("A Jobs.Create: %v", err)
+	}
+	// Crash here: deliberately no Replay.Complete.
+
+	jobsB := persistence.NewFileRenderJobStore(jobPath)
+	replayB := persistence.NewFileRenderReplayStore(replayPath)
+	compB, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true}, composition.Dependencies{
+		Runtime: jobs.New(), Clock: clockNow{t: base}, IDs: &rwSeqIDs{},
+		RenderJobs: jobsB, RenderReplay: replayB, RenderDigester: digester,
+	})
+	if err != nil {
+		t.Fatalf("B New: %v", err)
+	}
+	if !compB.Ready() {
+		t.Fatal("B Ready() = false after replay reconciliation")
+	}
+	decision, err := replayB.Claim(context.Background(), identity)
+	if err != nil {
+		t.Fatalf("B replay Claim: %v", err)
+	}
+	if decision.Outcome != ports.ReplayTerminal || decision.TerminalJob.JobID != job.JobID {
+		t.Fatalf("B replay decision = %+v, want terminal job_crash_window", decision)
+	}
+	_ = compB.Close(context.Background())
+}
+
+// crashAfterPayloadAuthorized simulates abrupt process death immediately after
+// the protected send boundary durably records PayloadSent=true. Panicking is
+// intentional: returning an error would let ExecuteJob terminalize the attempt,
+// which is not the crash window this restart test must preserve.
+type crashAfterPayloadAuthorized struct {
+	calls atomic.Int32
+}
+
+func (a *crashAfterPayloadAuthorized) Render(ctx context.Context, request ports.AuthorizedRenderRequest) (domain.RenderOutcome, error) {
+	a.calls.Add(1)
+	if request.SendBoundary == nil {
+		panic("missing payload send boundary")
+	}
+	if err := request.SendBoundary.MarkPayloadSent(ctx); err != nil {
+		panic(err)
+	}
+	panic("simulated process crash after payload send")
+}
+
+type restartAccountStore struct {
+	account domain.ProviderAccount
+}
+
+func (s restartAccountStore) Create(context.Context, ports.AccountCreation) (domain.ProviderAccount, error) {
+	return domain.ProviderAccount{}, ports.ErrDependencyUnavailable
+}
+func (s restartAccountStore) Visible(context.Context, domain.SecurityPrincipal, domain.ProviderAccountID) (domain.ProviderAccount, error) {
+	return s.account, nil
+}
+func (s restartAccountStore) List(context.Context, domain.SecurityPrincipal) ([]domain.ProviderAccount, error) {
+	return []domain.ProviderAccount{s.account}, nil
+}
+func (s restartAccountStore) Update(context.Context, ports.AccountUpdate) (domain.ProviderAccount, error) {
+	return domain.ProviderAccount{}, ports.ErrDependencyUnavailable
+}
+func (s restartAccountStore) Restore(context.Context) error { return nil }
+
+type restartCapabilityStore struct {
+	now time.Time
+}
+
+func (s restartCapabilityStore) Get(context.Context, domain.SecurityPrincipal, domain.ProviderAccountID) (domain.CapabilitySnapshot, error) {
+	return domain.NewLiveProbeSnapshot(
+		"pa_1",
+		domain.AuthModeChatGPTCodexOAuth,
+		1,
+		domain.NewTimestamp(s.now),
+		map[domain.CapabilityOperation]domain.CapabilityFact{
+			domain.CapabilityOpImageGeneration: {
+				Status:        domain.CapabilityVerified,
+				EvidenceClass: domain.EvidenceLiveProbe,
+				ProbeSurface:  "/images/generations",
+			},
+		},
+		nil,
+		"/images/generations",
+	), nil
+}
+func (restartCapabilityStore) List(context.Context, domain.SecurityPrincipal) ([]domain.CapabilitySnapshot, error) {
+	return nil, nil
+}
+func (restartCapabilityStore) Put(context.Context, domain.SecurityPrincipal, domain.CapabilitySnapshot) error {
+	return nil
+}
+
+type restartValidVault struct{}
+
+func (restartValidVault) Put(context.Context, ports.CredentialIntake) error { return nil }
+func (restartValidVault) Validate(context.Context, ports.CredentialValidation) (ports.CredentialValidationResult, error) {
+	return ports.CredentialValidationResult{Valid: true}, nil
+}
+func (restartValidVault) Revoke(context.Context, ports.CredentialValidation) error { return nil }
+
+func usableRestartAccount() domain.ProviderAccount {
+	return domain.ProviderAccount{
+		ID:         "pa_1",
+		Provider:   domain.ProviderChatGPT,
+		AuthMode:   domain.AuthModeChatGPTCodexOAuth,
+		Lifecycle:  domain.LifecycleActive,
+		Credential: domain.CredentialMetadata{Version: 1},
+		Health: domain.HealthSummary{
+			SummaryState: domain.HealthHealthy,
+		},
+		Controls: domain.AdministrativeControls{
+			AuthModeExecutionEnabled: true,
+		},
+		RiskAcknowledged: true,
+	}
+}
+
+// TestFileRenderStoresRecoverPostPayloadCrashWithoutDuplicateProviderWork proves
+// #56 AC5 against a durable restart boundary. Process A crosses the protected
+// payload-send boundary and dies while the durable job is still running. Fresh
+// process B reclaims the expired lease in RecoveryOnly mode and fails the
+// uncertain attempt closed without entering the Provider Adapter a second time.
+func TestFileRenderStoresRecoverPostPayloadCrashWithoutDuplicateProviderWork(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -44,17 +190,31 @@ func TestFileRenderStoresSurviveRealRestartWithoutDuplicateProviderWork(t *testi
 	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
 	const fingerprint domain.Fingerprint = "fp_restart_durable"
 	const idemKey = "idem-restart-durable"
+	seed := domain.NewQueuedRenderJob(
+		"job_restart_durable", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
+		"digest", nil, "", "pa_1", 1, fingerprint, idemKey, domain.NewTimestamp(base),
+	)
+	ref := seed.JobRef()
+	identity := domain.ReplayIdentity{
+		Scope:       domain.ReplayScope{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Key: idemKey},
+		Fingerprint: fingerprint,
+	}
 
-	// --- Process A: fresh File-backed stores at the ledger paths ---
+	// --- Process A: real worker crosses MarkPayloadSent, then dies abruptly. ---
 	jobStoreA := persistence.NewFileRenderJobStore(jobLedgerPath)
 	replayStoreA := persistence.NewFileRenderReplayStore(replayLedgerPath)
+	crashAdapter := &crashAfterPayloadAuthorized{}
 	compA, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true}, composition.Dependencies{
-		Runtime:        jobs.New(),
-		Clock:          clockNow{t: base},
-		IDs:            &rwSeqIDs{},
-		RenderJobs:     jobStoreA,
-		RenderReplay:   replayStoreA,
-		RenderDigester: digester,
+		Runtime:          jobs.New(),
+		Clock:            clockNow{t: base},
+		IDs:              &rwSeqIDs{},
+		RenderJobs:       jobStoreA,
+		RenderReplay:     replayStoreA,
+		RenderDigester:   digester,
+		Accounts:         restartAccountStore{account: usableRestartAccount()},
+		Capabilities:     restartCapabilityStore{now: base},
+		Vault:            restartValidVault{},
+		AuthorizedRender: crashAdapter,
 	})
 	if err != nil {
 		t.Fatalf("A New: %v", err)
@@ -62,103 +222,54 @@ func TestFileRenderStoresSurviveRealRestartWithoutDuplicateProviderWork(t *testi
 	if !compA.Ready() {
 		t.Fatal("A Ready() = false, want true")
 	}
-
-	seed := domain.NewQueuedRenderJob(
-		"job_restart_durable", "tenant_a", "key_a", domain.RenderOpImageGeneration, "m",
-		"digest", nil, "", "pa_1", 1, fingerprint, idemKey, domain.NewTimestamp(base),
-	)
-	created, err := jobStoreA.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: seed})
-	if err != nil {
-		t.Fatalf("A Create: %v", err)
-	}
-	ref := created.JobRef()
-
-	claimAt := domain.NewTimestamp(base.Add(time.Second))
-	claim, err := jobStoreA.ClaimWorker(context.Background(), ref, ports.WorkerLease{
-		WorkerID: "worker_a", Now: claimAt, ExpiresAt: domain.NewTimestamp(base.Add(2 * time.Minute)),
-	})
-	if err != nil {
-		t.Fatalf("A ClaimWorker: %v", err)
-	}
-
-	attemptAt := domain.NewTimestamp(base.Add(2 * time.Second))
-	attempt := domain.UpstreamAttempt{
-		ID: domain.NewAttemptID(seed.JobID, 1), ProviderAccountID: "pa_1", CredentialVersion: 1,
-		CommitStatus: domain.CommitCommitted, PayloadSent: true, ResponseCaptured: true,
-		Sequence: 1, CreatedAt: attemptAt, UpdatedAt: attemptAt,
-	}
-	if _, err := jobStoreA.ObserveAttempt(context.Background(), ports.AttemptObservation{
-		JobRef: ref, FencingToken: claim.FencingToken, Attempt: attempt,
-		Phase: domain.PhaseUpstream, CommitStatus: domain.CommitCommitted, Now: attemptAt,
-	}); err != nil {
-		t.Fatalf("A ObserveAttempt: %v", err)
-	}
-
-	entryID := domain.NewOutputEntryID(seed.JobID, 0)
-	manifestAt := domain.NewTimestamp(base.Add(3 * time.Second))
-	manifest := domain.ResultManifest{
-		ID: domain.NewResultManifestID(attempt.ID), AttemptID: attempt.ID,
-		Entries:    []domain.OutputEntry{{ID: entryID, Position: 0, DeliveryState: domain.OutputPending, Checksum: "c"}},
-		CapturedAt: manifestAt,
-	}
-	if _, err := jobStoreA.CaptureManifest(context.Background(), ports.ManifestCapture{
-		JobRef: ref, FencingToken: claim.FencingToken, Manifest: manifest,
-		Phase: domain.PhasePlacingOutput, Now: manifestAt,
-	}); err != nil {
-		t.Fatalf("A CaptureManifest: %v", err)
-	}
-
-	placeAt := domain.NewTimestamp(base.Add(4 * time.Second))
-	if _, err := jobStoreA.PlaceOutput(context.Background(), ports.PlacementRequest{
-		JobRef: ref, FencingToken: claim.FencingToken, EntryID: entryID,
-		Asset: domain.Asset{ID: "asset_restart_durable", ContentType: domain.ContentTypePNG, ByteSize: 3, Checksum: "c"},
-		Now:   placeAt,
-	}); err != nil {
-		t.Fatalf("A PlaceOutput: %v", err)
-	}
-
-	completeAt := domain.NewTimestamp(base.Add(5 * time.Second))
-	completed, err := jobStoreA.Transition(context.Background(), ports.FencedTransition{
-		JobRef: ref, FencingToken: claim.FencingToken, To: domain.JobCompleted,
-		CommitStatus: domain.CommitCommitted, ClearLease: true, Now: completeAt,
-	})
-	if err != nil {
-		t.Fatalf("A Transition completed: %v", err)
-	}
-	if completed.Lifecycle != domain.JobCompleted {
-		t.Fatalf("A completed lifecycle = %v, want completed", completed.Lifecycle)
-	}
-
-	identity := domain.ReplayIdentity{
-		Scope:       domain.ReplayScope{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Key: idemKey},
-		Fingerprint: fingerprint,
-	}
-	claimedDecision, err := replayStoreA.Claim(context.Background(), identity)
-	if err != nil {
+	if _, err := replayStoreA.Claim(context.Background(), identity); err != nil {
 		t.Fatalf("A replay Claim: %v", err)
 	}
-	if claimedDecision.Outcome != ports.ReplayClaimed {
-		t.Fatalf("A replay Claim outcome = %v, want ReplayClaimed", claimedDecision.Outcome)
-	}
-	if err := replayStoreA.Complete(context.Background(), identity, ports.RenderReplayResult{Job: completed}); err != nil {
-		t.Fatalf("A replay Complete: %v", err)
+	if _, err := jobStoreA.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: seed}); err != nil {
+		t.Fatalf("A Create: %v", err)
 	}
 
-	// Process A dies without further mutation. No Go object is shared with B.
+	executeCtx, cancelExecute := context.WithCancel(context.Background())
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Fatal("A ExecuteJob did not simulate process crash")
+			}
+			cancelExecute()
+		}()
+		_ = compA.Worker().ExecuteJob(executeCtx, ref)
+	}()
+	if calls := crashAdapter.calls.Load(); calls != 1 {
+		t.Fatalf("A Provider boundary calls = %d, want 1", calls)
+	}
+
+	crashed, err := jobStoreA.Load(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("A Load after crash: %v", err)
+	}
+	if crashed.Lifecycle != domain.JobRunning || !crashed.LeaseHeld {
+		t.Fatalf("A crash state = lifecycle %v lease %v, want running with held lease", crashed.Lifecycle, crashed.LeaseHeld)
+	}
+	if !crashed.Attempt.PayloadSent || crashed.Attempt.CommitStatus != domain.CommitNotStarted {
+		t.Fatalf("A attempt after crash = %+v, want payload sent with unresolved commit", crashed.Attempt)
+	}
+	if crashed.Manifest.ID != "" {
+		t.Fatalf("A manifest after crash = %q, want empty", crashed.Manifest.ID)
+	}
 	_ = compA.Close(context.Background())
 
-	// --- Process B: fresh store instances at the SAME paths only ---
+	// --- Process B: fresh stores, expired lease, recovery-only execution. ---
 	jobStoreB := persistence.NewFileRenderJobStore(jobLedgerPath)
 	replayStoreB := persistence.NewFileRenderReplayStore(replayLedgerPath)
-	auth := &countingAuthorized{}
+	authB := &countingAuthorized{}
 	compB, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true}, composition.Dependencies{
 		Runtime:          jobs.New(),
-		Clock:            clockNow{t: base},
+		Clock:            clockNow{t: base.Add(10 * time.Minute)},
 		IDs:              &rwSeqIDs{},
 		RenderJobs:       jobStoreB,
 		RenderReplay:     replayStoreB,
 		RenderDigester:   digester,
-		AuthorizedRender: auth,
+		AuthorizedRender: authB,
 	})
 	if err != nil {
 		t.Fatalf("B New: %v", err)
@@ -166,51 +277,30 @@ func TestFileRenderStoresSurviveRealRestartWithoutDuplicateProviderWork(t *testi
 	if !compB.Ready() {
 		t.Fatal("B Ready() = false after restart recovery; want true")
 	}
-
-	// (1) durable job/lease/attempt/manifest/output state survived the restart.
-	loaded, err := jobStoreB.Load(context.Background(), ref)
-	if err != nil {
-		t.Fatalf("B Load: %v", err)
-	}
-	if loaded.Lifecycle != domain.JobCompleted {
-		t.Fatalf("B lifecycle = %v, want completed", loaded.Lifecycle)
-	}
-	if loaded.Manifest.ID != manifest.ID {
-		t.Fatalf("B manifest id = %q, want %q", loaded.Manifest.ID, manifest.ID)
-	}
-	if loaded.Attempt.CommitStatus != domain.CommitCommitted || !loaded.Attempt.PayloadSent {
-		t.Fatalf("B attempt = %+v, want committed+payload sent", loaded.Attempt)
-	}
-	if len(loaded.OutputEntries) != 1 || loaded.OutputEntries[0].AssetID != "asset_restart_durable" {
-		t.Fatalf("B output entries = %+v, want asset_restart_durable placed", loaded.OutputEntries)
-	}
-	if loaded.OutputEntries[0].DeliveryState != domain.OutputAvailable {
-		t.Fatalf("B delivery state = %v, want available", loaded.OutputEntries[0].DeliveryState)
-	}
-	if loaded.LeaseHeld {
-		t.Fatal("B LeaseHeld = true, want false (cleared on terminal transition)")
-	}
-
-	// (2) redelivery of the completed job after restart is cleanup-only — the
-	// worker seam must not re-enter the Provider Adapter.
 	if err := compB.Worker().ExecuteJob(context.Background(), ref); err != nil {
-		t.Fatalf("B ExecuteJob redelivery: %v", err)
+		t.Fatalf("B ExecuteJob recovery: %v", err)
 	}
-	if calls := auth.calls.Load(); calls != 0 {
-		t.Fatalf("B Adapter calls after redelivery = %d, want 0 (no duplicate Provider work)", calls)
+	if calls := authB.calls.Load(); calls != 0 {
+		t.Fatalf("B Provider calls = %d, want 0 (RecoveryOnly must not re-render)", calls)
 	}
 
-	// (3) matching idempotency-key replay still resolves to the same terminal job.
+	recovered, err := jobStoreB.Load(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("B Load recovered job: %v", err)
+	}
+	if recovered.Lifecycle != domain.JobFailed || recovered.FailureStage != domain.StageRecovery {
+		t.Fatalf("B recovered state = lifecycle %v stage %v, want failed/recovery", recovered.Lifecycle, recovered.FailureStage)
+	}
+	if recovered.CommitStatus != domain.CommitUnknown || recovered.LeaseHeld {
+		t.Fatalf("B recovered commit/lease = %v/%v, want unknown/false", recovered.CommitStatus, recovered.LeaseHeld)
+	}
+
 	decision, err := replayStoreB.Claim(context.Background(), identity)
 	if err != nil {
 		t.Fatalf("B replay Claim: %v", err)
 	}
-	if decision.Outcome != ports.ReplayTerminal {
-		t.Fatalf("B replay Claim outcome = %v, want ReplayTerminal", decision.Outcome)
+	if decision.Outcome != ports.ReplayTerminal || decision.TerminalJob.JobID != seed.JobID {
+		t.Fatalf("B replay decision = %+v, want terminal owner job_restart_durable", decision)
 	}
-	if decision.TerminalJob.JobID != seed.JobID || decision.TerminalJob.Lifecycle != domain.JobCompleted {
-		t.Fatalf("B replay terminal job = %+v, want completed job_restart_durable", decision.TerminalJob)
-	}
-
 	_ = compB.Close(context.Background())
 }

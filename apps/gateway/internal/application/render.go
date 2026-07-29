@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -606,6 +607,53 @@ func (service *RenderService) ensureQueuePublished(ctx context.Context, job doma
 		return job, nil
 	}
 	return service.jobs.MarkQueuePublished(ctx, job.JobRef())
+}
+
+// ReconcileReplayTerminals repairs the crash window where a durable job was
+// created but its replay completion was not persisted. Claim first enforces the
+// no-steal fingerprint rule; only a matching missing/in-progress owner is
+// completed. A conflict fails startup closed rather than overwriting another
+// request's idempotency identity (#14 §3.3, #56 Spec P1-1).
+func (service *RenderService) ReconcileReplayTerminals(ctx context.Context) error {
+	if service == nil || service.jobs == nil || service.replay == nil {
+		return ports.ErrDependencyUnavailable
+	}
+	jobs, err := service.jobs.ListQueueRecoveryCandidates(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.IdempotencyKey == "" || job.RequestFingerprint == "" || job.ClientAPIKeyID == "" {
+			return fmt.Errorf("%w: durable render job %s lacks replay identity", ports.ErrDependencyUnavailable, job.JobID)
+		}
+		identity := domain.ReplayIdentity{
+			Scope: domain.ReplayScope{
+				TenantID:       job.TenantID,
+				ClientAPIKeyID: job.ClientAPIKeyID,
+				Key:            job.IdempotencyKey,
+			},
+			Fingerprint: job.RequestFingerprint,
+		}
+		decision, err := service.replay.Claim(ctx, identity)
+		if err != nil {
+			return err
+		}
+		switch decision.Outcome {
+		case ports.ReplayClaimed, ports.ReplayInProgress:
+			if err := service.replay.Complete(ctx, identity, ports.RenderReplayResult{Job: job}); err != nil {
+				return err
+			}
+		case ports.ReplayTerminal:
+			if decision.TerminalJob.JobRef() != job.JobRef() {
+				return fmt.Errorf("%w: replay identity for render job %s resolves to %s", ports.ErrDependencyUnavailable, job.JobID, decision.TerminalJob.JobID)
+			}
+		case ports.ReplayConflict, ports.ReplayUncertain:
+			return fmt.Errorf("%w: replay identity conflict for render job %s", ports.ErrDependencyUnavailable, job.JobID)
+		default:
+			return fmt.Errorf("%w: unknown replay outcome for render job %s", ports.ErrDependencyUnavailable, job.JobID)
+		}
+	}
+	return nil
 }
 
 // RecoverQueuePublications re-arms SafeJobReference delivery for every durable

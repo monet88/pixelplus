@@ -24,17 +24,42 @@ type renderJobLedgerEntry struct {
 }
 
 // FileRenderJobStore is a durable RenderJobStore backed by an append-only
-// JSONL ledger under an exclusive O_EXCL lock (same Windows-safe pattern as
-// FileAccountStore/FileRoutingPolicyStore). Every operation reloads a fresh
-// in-process MemoryRenderJobStore from the ledger, delegates the real
-// mutation to that already-proven implementation, and appends the resulting
-// row before returning — so all fencing/attempt/manifest/placement rules
-// stay defined in exactly one place.
+// JSONL ledger protected by an OS advisory lock. The lock anchor may remain on
+// disk; the open kernel lock/handle, not file existence, owns exclusion, so a
+// crashed process cannot wedge future restarts. Operations synchronize the
+// in-process MemoryRenderJobStore with durable rows before delegating the real
+// mutation to that already-proven implementation, then append the resulting
+// row before returning — so all fencing/attempt/manifest/placement rules stay
+// defined in exactly one place.
 type FileRenderJobStore struct {
-	mu   sync.Mutex
-	path string
-	lock string
-	mem  *MemoryRenderJobStore
+	mu     sync.Mutex
+	path   string
+	lock   string
+	mem    *MemoryRenderJobStore
+	cursor ledgerCursor
+}
+
+// ledgerCursor tracks the already-validated append-only prefix held in memory.
+// File identity detects replacement; a smaller size detects truncation. Either
+// condition forces a full rebuild before state is exposed.
+type ledgerCursor struct {
+	info   os.FileInfo
+	offset int64
+	lineNo int
+}
+
+func (cursor *ledgerCursor) reset() {
+	*cursor = ledgerCursor{}
+}
+
+func (cursor *ledgerCursor) canContinue(info os.FileInfo) bool {
+	return cursor.info != nil && info.Size() >= cursor.offset && os.SameFile(cursor.info, info)
+}
+
+func (cursor *ledgerCursor) advance(info os.FileInfo, lines int) {
+	cursor.info = info
+	cursor.offset = info.Size()
+	cursor.lineNo += lines
 }
 
 // NewFileRenderJobStore builds a file-backed durable Render Job store.
@@ -53,19 +78,10 @@ func (store *FileRenderJobStore) acquireLock() (func(), error) {
 			return nil, err
 		}
 	}
-	file, err := os.OpenFile(store.lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		if os.IsExist(err) {
-			return nil, fmt.Errorf("%w: render job store exclusive lock held", ports.ErrDependencyUnavailable)
-		}
-		return nil, err
-	}
-	_, _ = file.WriteString("pixelplus-render-job-lock\n")
-	if err := file.Close(); err != nil {
-		_ = os.Remove(store.lock)
-		return nil, err
-	}
-	return func() { _ = os.Remove(store.lock) }, nil
+	// OS advisory lock, not an O_EXCL marker file: the kernel releases it when
+	// this process dies, so an abrupt crash cannot leave a lock that blocks every
+	// future restart (#56 Standards P1-1).
+	return acquireAdvisoryLock(store.lock, "render job store exclusive lock held")
 }
 
 // Restore loads persisted job rows. A missing file is empty state; null,
@@ -82,22 +98,60 @@ func (store *FileRenderJobStore) Restore(context.Context) error {
 	return store.reloadLocked()
 }
 
+func requireCompleteJSONLRecord(file *os.File, info os.FileInfo) error {
+	if info.Size() == 0 {
+		return nil
+	}
+	var last [1]byte
+	if _, err := file.ReadAt(last[:], info.Size()-1); err != nil {
+		return err
+	}
+	if last[0] != '\n' {
+		return fmt.Errorf("%w: ledger has an incomplete final record", ports.ErrDependencyUnavailable)
+	}
+	return nil
+}
+
 func (store *FileRenderJobStore) reloadLocked() error {
 	file, err := os.Open(store.path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			store.mem = NewMemoryRenderJobStore()
+			store.cursor.reset()
 			return nil
 		}
 		return err
 	}
 	defer file.Close()
 
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if err := requireCompleteJSONLRecord(file, info); err != nil {
+		return err
+	}
+	incremental := store.cursor.canContinue(info)
+	if incremental && info.Size() == store.cursor.offset {
+		return nil
+	}
+	startOffset := int64(0)
+	baseLine := 0
 	next := NewMemoryRenderJobStore()
+	if incremental {
+		startOffset = store.cursor.offset
+		baseLine = store.cursor.lineNo
+		next = store.mem
+	}
+	if _, err := file.Seek(startOffset, 0); err != nil {
+		return err
+	}
+
+	var entries []renderJobLedgerEntry
 	scanner := bufio.NewScanner(file)
 	// Manifests/output entries can be moderately large; allow multi-MiB lines.
 	scanner.Buffer(make([]byte, 64*1024), 8<<20)
-	lineNo := 0
+	lineNo := baseLine
 	for scanner.Scan() {
 		lineNo++
 		line := scanner.Bytes()
@@ -117,18 +171,41 @@ func (store *FileRenderJobStore) reloadLocked() error {
 		if entry.Job.TenantID != entry.TenantID {
 			return fmt.Errorf("%w: render job ledger line %d: tenant mismatch", ports.ErrDependencyUnavailable, lineNo)
 		}
-		// Latest-row-wins: seedJob overwrites any prior row for this job id and
-		// advances the fencing counter past every observed WorkerFencingToken.
-		next.seedJob(entry.Job)
+		// Valid JSON can still decode an impossible cross-field state (e.g. a queued
+		// job that already sent a Provider payload). Seeding such a row would let
+		// ClaimWorker take it as a fresh full claim and authorize a second Provider
+		// generation after a crash. Fail closed so readiness never opens over an
+		// unsound durable row (#56 Spec P1-2, ADR 0009).
+		if err := entry.Job.ValidateDurable(); err != nil {
+			return fmt.Errorf("%w: render job ledger line %d: %v", ports.ErrDependencyUnavailable, lineNo, err)
+		}
+		entries = append(entries, entry)
 	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+
+	// Parse and validate the entire new suffix before touching live memory. One bad
+	// appended row therefore leaves both the prior memory state and cursor intact.
+	for _, entry := range entries {
+		next.seedJob(entry.Job)
+	}
 	store.mem = next
+	store.cursor.info = info
+	store.cursor.offset = info.Size()
+	store.cursor.lineNo = lineNo
 	return nil
 }
 
-func (store *FileRenderJobStore) appendJobLocked(job domain.RenderJob) error {
+func (store *FileRenderJobStore) appendJobLocked(job domain.RenderJob) (err error) {
+	// The Memory store mutates before append. If any durable write step fails,
+	// invalidate the cursor so the next operation rebuilds from the last durable
+	// prefix instead of treating the unpersisted in-memory mutation as committed.
+	defer func() {
+		if err != nil {
+			store.cursor.reset()
+		}
+	}()
 	dir := filepath.Dir(store.path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -148,7 +225,15 @@ func (store *FileRenderJobStore) appendJobLocked(job domain.RenderJob) error {
 	if _, err := file.Write(append(data, '\n')); err != nil {
 		return err
 	}
-	return file.Sync()
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	store.cursor.advance(info, 1)
+	return nil
 }
 
 // withReload serializes one operation under the in-process mutex and the
@@ -464,14 +549,14 @@ type renderReplayLedgerEntry struct {
 }
 
 // FileRenderReplayStore is a durable RenderReplayStore backed by an
-// append-only JSONL ledger under an exclusive O_EXCL lock, wrapping a fresh
-// MemoryRenderReplayStore per operation the same way FileRenderJobStore wraps
-// MemoryRenderJobStore.
+// append-only JSONL ledger protected by the same crash-safe OS advisory lock as
+// FileRenderJobStore and delegating replay semantics to MemoryRenderReplayStore.
 type FileRenderReplayStore struct {
-	mu   sync.Mutex
-	path string
-	lock string
-	mem  *MemoryRenderReplayStore
+	mu     sync.Mutex
+	path   string
+	lock   string
+	mem    *MemoryRenderReplayStore
+	cursor ledgerCursor
 }
 
 // NewFileRenderReplayStore builds a file-backed durable render replay store.
@@ -490,19 +575,9 @@ func (store *FileRenderReplayStore) acquireLock() (func(), error) {
 			return nil, err
 		}
 	}
-	file, err := os.OpenFile(store.lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		if os.IsExist(err) {
-			return nil, fmt.Errorf("%w: render replay store exclusive lock held", ports.ErrDependencyUnavailable)
-		}
-		return nil, err
-	}
-	_, _ = file.WriteString("pixelplus-render-replay-lock\n")
-	if err := file.Close(); err != nil {
-		_ = os.Remove(store.lock)
-		return nil, err
-	}
-	return func() { _ = os.Remove(store.lock) }, nil
+	// OS advisory lock (see FileRenderJobStore.acquireLock): released by the
+	// kernel on process death so a crash never wedges every restart (#56 P1-1).
+	return acquireAdvisoryLock(store.lock, "render replay store exclusive lock held")
 }
 
 // Restore loads persisted replay rows. A missing file is empty state; null or
@@ -523,16 +598,40 @@ func (store *FileRenderReplayStore) reloadLocked() error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			store.mem = NewMemoryRenderReplayStore()
+			store.cursor.reset()
 			return nil
 		}
 		return err
 	}
 	defer file.Close()
 
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if err := requireCompleteJSONLRecord(file, info); err != nil {
+		return err
+	}
+	incremental := store.cursor.canContinue(info)
+	if incremental && info.Size() == store.cursor.offset {
+		return nil
+	}
+	startOffset := int64(0)
+	baseLine := 0
 	next := NewMemoryRenderReplayStore()
+	if incremental {
+		startOffset = store.cursor.offset
+		baseLine = store.cursor.lineNo
+		next = store.mem
+	}
+	if _, err := file.Seek(startOffset, 0); err != nil {
+		return err
+	}
+
+	var entries []renderReplayLedgerEntry
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 8<<20)
-	lineNo := 0
+	lineNo := baseLine
 	for scanner.Scan() {
 		lineNo++
 		line := scanner.Bytes()
@@ -549,20 +648,47 @@ func (store *FileRenderReplayStore) reloadLocked() error {
 		if !entry.Scope.Valid() {
 			return fmt.Errorf("%w: render replay ledger line %d: invalid scope", ports.ErrDependencyUnavailable, lineNo)
 		}
+		if entry.Terminal && entry.Job.JobID == "" {
+			return fmt.Errorf("%w: render replay ledger line %d: terminal record missing job", ports.ErrDependencyUnavailable, lineNo)
+		}
+		// A carried replay job is an ownership capability. Bind every identity
+		// dimension before seeding it: Tenant alone is insufficient because two API
+		// keys in one Tenant must not cross-return each other's jobs.
+		if entry.Job.JobID != "" && (entry.Job.TenantID != entry.Scope.TenantID ||
+			entry.Job.ClientAPIKeyID != entry.Scope.ClientAPIKeyID ||
+			entry.Job.IdempotencyKey != entry.Scope.Key ||
+			entry.Job.RequestFingerprint != entry.Fingerprint) {
+			return fmt.Errorf("%w: render replay ledger line %d: job replay identity mismatch", ports.ErrDependencyUnavailable, lineNo)
+		}
+		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
 		if entry.Abandoned {
 			next.removeRecord(entry.Scope, entry.Fingerprint)
 			continue
 		}
 		next.seedRecord(entry.Scope, entry.Fingerprint, entry.Terminal, entry.Job)
 	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
 	store.mem = next
+	store.cursor.info = info
+	store.cursor.offset = info.Size()
+	store.cursor.lineNo = lineNo
 	return nil
 }
 
-func (store *FileRenderReplayStore) appendLocked(entry renderReplayLedgerEntry) error {
+func (store *FileRenderReplayStore) appendLocked(entry renderReplayLedgerEntry) (err error) {
+	// Replay memory is also mutated before append; rebuild from disk after any
+	// write failure so an unpersisted claim/completion/tombstone cannot leak into
+	// a later operation in this process.
+	defer func() {
+		if err != nil {
+			store.cursor.reset()
+		}
+	}()
 	dir := filepath.Dir(store.path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -581,7 +707,15 @@ func (store *FileRenderReplayStore) appendLocked(entry renderReplayLedgerEntry) 
 	if _, err := file.Write(append(data, '\n')); err != nil {
 		return err
 	}
-	return file.Sync()
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	store.cursor.advance(info, 1)
+	return nil
 }
 
 func (store *FileRenderReplayStore) withReload(fn func() error) error {

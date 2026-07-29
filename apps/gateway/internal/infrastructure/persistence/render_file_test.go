@@ -13,6 +13,171 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
+// A lock anchor left on disk by an earlier process is not ownership. Restore
+// must acquire the OS lock on that anchor and proceed normally.
+func TestFileRenderJobStoreRestoreIgnoresUnlockedLockAnchor(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-jobs.ledger")
+	if err := os.WriteFile(path+".lock", []byte("stale anchor"), 0o600); err != nil {
+		t.Fatalf("write lock anchor: %v", err)
+	}
+
+	store := NewFileRenderJobStore(path)
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore with unlocked lock anchor: %v", err)
+	}
+}
+
+// The open OS lock/handle, not the anchor file, excludes a second process. Once
+// released, the same store can acquire it immediately without deleting the file.
+func TestFileRenderJobStoreActiveAdvisoryLockExcludesAndReleaseAllowsRetry(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-jobs.ledger")
+	release, err := acquireAdvisoryLock(path+".lock", "test lock held")
+	if err != nil {
+		t.Fatalf("acquire first advisory lock: %v", err)
+	}
+
+	store := NewFileRenderJobStore(path)
+	if err := store.Restore(context.Background()); !errors.Is(err, ports.ErrDependencyUnavailable) {
+		release()
+		t.Fatalf("Restore while lock held = %v, want ErrDependencyUnavailable", err)
+	}
+	release()
+
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore after lock release: %v", err)
+	}
+	if _, err := os.Stat(path + ".lock"); err != nil {
+		t.Fatalf("lock anchor after release: %v", err)
+	}
+}
+
+// After the initial full restore, an unchanged ledger is a true no-op and an
+// append advances exactly from the prior byte offset instead of replaying history.
+func TestFileRenderJobStoreReloadTracksIncrementalTail(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-jobs.ledger")
+	now := domain.NewTimestamp(time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC))
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	store := NewFileRenderJobStore(path)
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{
+		Principal: principal,
+		Job:       seedQueuedJob("job_tail_1", now),
+	}); err != nil {
+		t.Fatalf("Create first job: %v", err)
+	}
+	firstOffset := store.cursor.offset
+	firstInfo := store.cursor.info
+	if firstOffset == 0 || store.cursor.lineNo != 1 {
+		t.Fatalf("cursor after first append = offset %d, lines %d; want nonzero, 1", firstOffset, store.cursor.lineNo)
+	}
+	if _, err := store.Visible(context.Background(), principal, "job_tail_1"); err != nil {
+		t.Fatalf("Visible on unchanged ledger: %v", err)
+	}
+	if store.cursor.offset != firstOffset || store.cursor.info != firstInfo {
+		t.Fatalf("unchanged ledger moved cursor: offset %d→%d", firstOffset, store.cursor.offset)
+	}
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{
+		Principal: principal,
+		Job:       seedQueuedJob("job_tail_2", now),
+	}); err != nil {
+		t.Fatalf("Create second job: %v", err)
+	}
+	if store.cursor.offset <= firstOffset || store.cursor.lineNo != 2 {
+		t.Fatalf("cursor after tail append = offset %d, lines %d; want >%d, 2", store.cursor.offset, store.cursor.lineNo, firstOffset)
+	}
+}
+
+// A replaced/truncated ledger cannot reuse the prior tail cursor. The store
+// rebuilds from byte zero, so removed jobs disappear instead of surviving as
+// ghost in-memory state.
+func TestFileRenderJobStoreReloadRebuildsAfterLedgerReplacement(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-jobs.ledger")
+	now := domain.NewTimestamp(time.Date(2026, 8, 2, 1, 0, 0, 0, time.UTC))
+	principal := domain.SecurityPrincipal{TenantID: "tenant_a", ClientAPIKeyID: "key_a"}
+	store := NewFileRenderJobStore(path)
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if _, err := store.Create(context.Background(), ports.RenderJobCreation{Principal: principal, Job: seedQueuedJob("job_old", now)}); err != nil {
+		t.Fatalf("Create old job: %v", err)
+	}
+
+	replacement := renderJobLedgerEntry{TenantID: "tenant_a", Job: seedQueuedJob("job_new", now)}
+	raw, err := json.Marshal(replacement)
+	if err != nil {
+		t.Fatalf("marshal replacement: %v", err)
+	}
+	tmp := path + ".replacement"
+	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatalf("replace ledger: %v", err)
+	}
+
+	if _, err := store.Visible(context.Background(), principal, "job_old"); !errors.Is(err, ports.ErrRenderJobNotVisible) {
+		t.Fatalf("old job after ledger replacement = %v, want not visible", err)
+	}
+	if _, err := store.Visible(context.Background(), principal, "job_new"); err != nil {
+		t.Fatalf("new job after ledger replacement: %v", err)
+	}
+	if store.cursor.lineNo != 1 {
+		t.Fatalf("cursor lines after rebuild = %d, want 1", store.cursor.lineNo)
+	}
+}
+
+func TestFileRenderJobStoreRestoreRejectsIncompleteFinalRecord(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-jobs.ledger")
+	now := domain.NewTimestamp(time.Date(2026, 8, 2, 1, 30, 0, 0, time.UTC))
+	raw, err := json.Marshal(renderJobLedgerEntry{TenantID: "tenant_a", Job: seedQueuedJob("job_no_newline", now)})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := NewFileRenderJobStore(path).Restore(context.Background()); !errors.Is(err, ports.ErrDependencyUnavailable) {
+		t.Fatalf("Restore() error = %v, want ErrDependencyUnavailable", err)
+	}
+}
+
+func TestFileRenderReplayStoreRestoreRejectsIncompleteFinalRecord(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-replay.ledger")
+	raw, err := json.Marshal(renderReplayLedgerEntry{
+		Scope:       domain.ReplayScope{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Key: "idem_no_newline"},
+		Fingerprint: "fp_no_newline",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := NewFileRenderReplayStore(path).Restore(context.Background()); !errors.Is(err, ports.ErrDependencyUnavailable) {
+		t.Fatalf("Restore() error = %v, want ErrDependencyUnavailable", err)
+	}
+}
+
 // Empty/missing ledger restores to usable empty state (FileAccountStore parity).
 func TestFileRenderJobStoreRestoreEmptyIsUsable(t *testing.T) {
 	t.Parallel()
@@ -61,6 +226,124 @@ func TestFileRenderJobStoreRestoreRejectsInvalidRows(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Valid JSON that contradicts the Render Job state machine must fail closed.
+// In particular, queued Provider-work markers would otherwise be claimed as a
+// fresh render after restart instead of entering recovery-only handling.
+func TestFileRenderJobStoreRestoreRejectsImpossibleDurableStates(t *testing.T) {
+	t.Parallel()
+
+	now := domain.NewTimestamp(time.Date(2026, 8, 2, 2, 0, 0, 0, time.UTC))
+	attempt := domain.UpstreamAttempt{
+		ID:                "attempt_invalid",
+		ProviderAccountID: "pa_1",
+		CredentialVersion: 1,
+		CommitStatus:      domain.CommitNotStarted,
+		Sequence:          1,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	manifest := domain.ResultManifest{
+		ID:        "manifest_invalid",
+		AttemptID: attempt.ID,
+		Entries: []domain.OutputEntry{{
+			ID: "output_invalid", Position: 0, DeliveryState: domain.OutputPending,
+		}},
+		CapturedAt: now,
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*domain.RenderJob)
+	}{
+		{name: "queued_payload_sent", mutate: func(job *domain.RenderJob) {
+			job.Attempt = attempt
+			job.Attempt.PayloadSent = true
+		}},
+		{name: "queued_committed", mutate: func(job *domain.RenderJob) {
+			job.CommitStatus = domain.CommitCommitted
+			job.Attempt = attempt
+			job.Attempt.CommitStatus = domain.CommitCommitted
+		}},
+		{name: "queued_unknown", mutate: func(job *domain.RenderJob) {
+			job.CommitStatus = domain.CommitUnknown
+			job.Attempt = attempt
+			job.Attempt.CommitStatus = domain.CommitUnknown
+		}},
+		{name: "queued_manifest", mutate: func(job *domain.RenderJob) {
+			job.Attempt = attempt
+			job.Manifest = manifest
+		}},
+		{name: "running_attempt_commit_differs_from_job", mutate: func(job *domain.RenderJob) {
+			job.Lifecycle = domain.JobRunning
+			job.Attempt = attempt
+			job.Attempt.CommitStatus = domain.CommitCommitted
+		}},
+		{name: "payload_sent_without_attempt_identity", mutate: func(job *domain.RenderJob) {
+			job.Lifecycle = domain.JobRunning
+			job.Attempt.PayloadSent = true
+		}},
+		{name: "response_captured_without_attempt_identity", mutate: func(job *domain.RenderJob) {
+			job.Lifecycle = domain.JobRunning
+			job.Attempt.ResponseCaptured = true
+		}},
+		{name: "response_captured_with_not_started_commit", mutate: func(job *domain.RenderJob) {
+			job.Lifecycle = domain.JobRunning
+			job.Attempt = attempt
+			job.Attempt.ResponseCaptured = true
+		}},
+		{name: "manifest_bound_to_different_attempt", mutate: func(job *domain.RenderJob) {
+			job.Lifecycle = domain.JobRunning
+			job.Attempt = attempt
+			job.Manifest = manifest
+			job.Manifest.AttemptID = "attempt_other"
+		}},
+		{name: "terminal_missing_timestamp", mutate: func(job *domain.RenderJob) {
+			job.Lifecycle = domain.JobFailed
+			job.ExecutionPhase = ""
+		}},
+		{name: "held_lease_missing_worker", mutate: func(job *domain.RenderJob) {
+			job.Lifecycle = domain.JobRunning
+			job.LeaseHeld = true
+			job.WorkerFencingToken = 1
+		}},
+		{name: "held_lease_missing_fence", mutate: func(job *domain.RenderJob) {
+			job.Lifecycle = domain.JobRunning
+			job.LeaseHeld = true
+			job.WorkerID = "worker_invalid"
+		}},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			job := seedQueuedJob("job_"+domain.Identifier(tc.name), now)
+			tc.mutate(&job)
+			raw, err := json.Marshal(renderJobLedgerEntry{TenantID: job.TenantID, Job: job})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			dir := t.TempDir()
+			path := filepath.Join(dir, "render-jobs.ledger")
+			if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			err = NewFileRenderJobStore(path).Restore(context.Background())
+			if !errors.Is(err, ports.ErrDependencyUnavailable) {
+				t.Fatalf("Restore() error = %v, want ErrDependencyUnavailable", err)
+			}
+		})
+	}
+}
+
+func bindJobToReplay(job domain.RenderJob, identity domain.ReplayIdentity) domain.RenderJob {
+	job.TenantID = identity.Scope.TenantID
+	job.ClientAPIKeyID = identity.Scope.ClientAPIKeyID
+	job.IdempotencyKey = identity.Scope.Key
+	job.RequestFingerprint = identity.Fingerprint
+	return job
 }
 
 func seedQueuedJob(id domain.Identifier, now domain.Timestamp) domain.RenderJob {
@@ -282,6 +565,95 @@ func TestFileRenderJobStoreRejectedMutationDoesNotAppend(t *testing.T) {
 
 // --- FileRenderReplayStore ---
 
+// Replay uses the same advisory-lock contract as jobs: a pre-existing unlocked
+// anchor is harmless, an active owner excludes, and release permits retry.
+func TestFileRenderReplayStoreAdvisoryLockLifecycle(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-replay.ledger")
+	if err := os.WriteFile(path+".lock", []byte("stale anchor"), 0o600); err != nil {
+		t.Fatalf("write lock anchor: %v", err)
+	}
+	store := NewFileRenderReplayStore(path)
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore with unlocked lock anchor: %v", err)
+	}
+
+	release, err := acquireAdvisoryLock(path+".lock", "test replay lock held")
+	if err != nil {
+		t.Fatalf("acquire replay advisory lock: %v", err)
+	}
+	if err := store.Restore(context.Background()); !errors.Is(err, ports.ErrDependencyUnavailable) {
+		release()
+		t.Fatalf("Restore while replay lock held = %v, want ErrDependencyUnavailable", err)
+	}
+	release()
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore after replay lock release: %v", err)
+	}
+}
+
+// Replay cursor advances with appended claim/completion rows and rebuilds when
+// the ledger is replaced, preserving tombstone/ownership semantics without an
+// O(n) history scan on every operation.
+func TestFileRenderReplayStoreReloadTracksTailAndReplacement(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-replay.ledger")
+	store := NewFileRenderReplayStore(path)
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	identity := domain.ReplayIdentity{
+		Scope:       domain.ReplayScope{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Key: "idem_tail"},
+		Fingerprint: "fp_tail",
+	}
+	if _, err := store.Claim(context.Background(), identity); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	claimOffset := store.cursor.offset
+	if claimOffset == 0 || store.cursor.lineNo != 1 {
+		t.Fatalf("cursor after claim = offset %d, lines %d; want nonzero, 1", claimOffset, store.cursor.lineNo)
+	}
+	if err := store.Complete(context.Background(), identity, ports.RenderReplayResult{
+		Job: bindJobToReplay(
+			seedQueuedJob("job_tail_replay", domain.NewTimestamp(time.Date(2026, 8, 2, 2, 0, 0, 0, time.UTC))),
+			identity,
+		),
+	}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if store.cursor.offset <= claimOffset || store.cursor.lineNo != 2 {
+		t.Fatalf("cursor after complete = offset %d, lines %d; want >%d, 2", store.cursor.offset, store.cursor.lineNo, claimOffset)
+	}
+
+	other := renderReplayLedgerEntry{
+		Scope:       domain.ReplayScope{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Key: "idem_replaced"},
+		Fingerprint: "fp_replaced",
+	}
+	raw, err := json.Marshal(other)
+	if err != nil {
+		t.Fatalf("marshal replacement: %v", err)
+	}
+	tmp := path + ".replacement"
+	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatalf("replace ledger: %v", err)
+	}
+
+	decision, err := store.Claim(context.Background(), identity)
+	if err != nil {
+		t.Fatalf("Claim original identity after replacement: %v", err)
+	}
+	if decision.Outcome != ports.ReplayClaimed {
+		t.Fatalf("original identity after replacement = %v, want ReplayClaimed", decision.Outcome)
+	}
+}
+
 // Empty/missing ledger restores to usable empty state.
 func TestFileRenderReplayStoreRestoreEmptyIsUsable(t *testing.T) {
 	t.Parallel()
@@ -315,6 +687,11 @@ func TestFileRenderReplayStoreRestoreRejectsInvalidRows(t *testing.T) {
 		{name: "null_record", line: "null\n"},
 		{name: "invalid_json", line: "{not json\n"},
 		{name: "invalid_scope", line: `{"scope":{},"fingerprint":"fp"}` + "\n"},
+		{name: "terminal_missing_job", line: `{"scope":{"TenantID":"tenant_a","ClientAPIKeyID":"key_a","Key":"idem"},"fingerprint":"fp","terminal":true}` + "\n"},
+		{name: "terminal_job_tenant_mismatch", line: `{"scope":{"TenantID":"tenant_a","ClientAPIKeyID":"key_a","Key":"idem"},"fingerprint":"fp","terminal":true,"job":{"TenantID":"tenant_b","JobID":"job_foreign"}}` + "\n"},
+		{name: "terminal_job_client_key_mismatch", line: `{"scope":{"TenantID":"tenant_a","ClientAPIKeyID":"key_b","Key":"idem"},"fingerprint":"fp","terminal":true,"job":{"TenantID":"tenant_a","JobID":"job_owned","ClientAPIKeyID":"key_a","IdempotencyKey":"idem","RequestFingerprint":"fp"}}` + "\n"},
+		{name: "terminal_job_idempotency_key_mismatch", line: `{"scope":{"TenantID":"tenant_a","ClientAPIKeyID":"key_a","Key":"idem_b"},"fingerprint":"fp","terminal":true,"job":{"TenantID":"tenant_a","JobID":"job_owned","ClientAPIKeyID":"key_a","IdempotencyKey":"idem_a","RequestFingerprint":"fp"}}` + "\n"},
+		{name: "terminal_job_fingerprint_mismatch", line: `{"scope":{"TenantID":"tenant_a","ClientAPIKeyID":"key_a","Key":"idem"},"fingerprint":"fp_b","terminal":true,"job":{"TenantID":"tenant_a","JobID":"job_owned","ClientAPIKeyID":"key_a","IdempotencyKey":"idem","RequestFingerprint":"fp_a"}}` + "\n"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -362,7 +739,7 @@ func TestFileRenderReplayStoreTerminalSurvivesRestart(t *testing.T) {
 	if decision.Outcome != ports.ReplayClaimed {
 		t.Fatalf("A Claim outcome = %v, want ReplayClaimed", decision.Outcome)
 	}
-	terminalJob := seedQueuedJob("job_terminal_replay", now)
+	terminalJob := bindJobToReplay(seedQueuedJob("job_terminal_replay", now), identity)
 	terminalJob.Lifecycle = domain.JobCompleted
 	if err := storeA.Complete(context.Background(), identity, ports.RenderReplayResult{Job: terminalJob}); err != nil {
 		t.Fatalf("A Complete: %v", err)
@@ -431,6 +808,117 @@ func TestFileRenderReplayStoreAbandonTombstoneSurvivesRestart(t *testing.T) {
 	}
 	if decision.Outcome != ports.ReplayClaimed {
 		t.Fatalf("B Claim outcome = %v, want ReplayClaimed (freed by tombstone)", decision.Outcome)
+	}
+}
+
+func TestMemoryRenderReplayStoreRejectsMismatchedCompletionJob(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryRenderReplayStore()
+	identity := domain.ReplayIdentity{
+		Scope: domain.ReplayScope{
+			TenantID:       "tenant_a",
+			ClientAPIKeyID: "key_a",
+			Key:            "idem_mismatched_job",
+		},
+		Fingerprint: "fp_expected",
+	}
+	if decision, err := store.Claim(context.Background(), identity); err != nil || decision.Outcome != ports.ReplayClaimed {
+		t.Fatalf("Claim = %+v, %v; want ReplayClaimed", decision, err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*domain.RenderJob)
+	}{
+		{name: "missing_job_id", mutate: func(job *domain.RenderJob) { job.JobID = "" }},
+		{name: "tenant", mutate: func(job *domain.RenderJob) { job.TenantID = "tenant_b" }},
+		{name: "client_api_key", mutate: func(job *domain.RenderJob) { job.ClientAPIKeyID = "key_b" }},
+		{name: "idempotency_key", mutate: func(job *domain.RenderJob) { job.IdempotencyKey = "idem_other" }},
+		{name: "fingerprint", mutate: func(job *domain.RenderJob) { job.RequestFingerprint = "fp_other" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			job := bindJobToReplay(seedQueuedJob("job_mismatched_"+domain.Identifier(tc.name), domain.NewTimestamp(time.Now().UTC())), identity)
+			tc.mutate(&job)
+			if err := store.Complete(context.Background(), identity, ports.RenderReplayResult{Job: job}); !errors.Is(err, ports.ErrDependencyUnavailable) {
+				t.Fatalf("Complete error = %v, want ErrDependencyUnavailable", err)
+			}
+			decision, err := store.Claim(context.Background(), identity)
+			if err != nil {
+				t.Fatalf("Claim after rejected Complete: %v", err)
+			}
+			if decision.Outcome != ports.ReplayInProgress {
+				t.Fatalf("Claim outcome = %v, want ReplayInProgress", decision.Outcome)
+			}
+		})
+	}
+}
+
+func TestMemoryRenderReplayStoreRejectsStaleCompletionAfterReclaim(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryRenderReplayStore()
+	scope := domain.ReplayScope{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Key: "idem_stale_complete"}
+	first := domain.ReplayIdentity{Scope: scope, Fingerprint: "fp_first"}
+	second := domain.ReplayIdentity{Scope: scope, Fingerprint: "fp_second"}
+	if decision, err := store.Claim(context.Background(), first); err != nil || decision.Outcome != ports.ReplayClaimed {
+		t.Fatalf("first Claim = %+v, %v; want ReplayClaimed", decision, err)
+	}
+	if err := store.Abandon(context.Background(), first); err != nil {
+		t.Fatalf("first Abandon: %v", err)
+	}
+	if decision, err := store.Claim(context.Background(), second); err != nil || decision.Outcome != ports.ReplayClaimed {
+		t.Fatalf("second Claim = %+v, %v; want ReplayClaimed", decision, err)
+	}
+	firstJob := bindJobToReplay(seedQueuedJob("job_first", domain.NewTimestamp(time.Now().UTC())), first)
+	if err := store.Complete(context.Background(), first, ports.RenderReplayResult{Job: firstJob}); !errors.Is(err, ports.ErrDependencyUnavailable) {
+		t.Fatalf("stale Complete error = %v, want ErrDependencyUnavailable", err)
+	}
+	decision, err := store.Claim(context.Background(), second)
+	if err != nil {
+		t.Fatalf("second matching Claim: %v", err)
+	}
+	if decision.Outcome != ports.ReplayInProgress {
+		t.Fatalf("second matching Claim outcome = %v, want ReplayInProgress", decision.Outcome)
+	}
+}
+
+func TestFileRenderReplayStoreRejectsStaleCompletionWithoutAppending(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "render-replay.ledger")
+	store := NewFileRenderReplayStore(path)
+	if err := store.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	scope := domain.ReplayScope{TenantID: "tenant_a", ClientAPIKeyID: "key_a", Key: "idem_file_stale_complete"}
+	first := domain.ReplayIdentity{Scope: scope, Fingerprint: "fp_first"}
+	second := domain.ReplayIdentity{Scope: scope, Fingerprint: "fp_second"}
+	if _, err := store.Claim(context.Background(), first); err != nil {
+		t.Fatalf("first Claim: %v", err)
+	}
+	if err := store.Abandon(context.Background(), first); err != nil {
+		t.Fatalf("first Abandon: %v", err)
+	}
+	if _, err := store.Claim(context.Background(), second); err != nil {
+		t.Fatalf("second Claim: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read before stale Complete: %v", err)
+	}
+	firstJob := bindJobToReplay(seedQueuedJob("job_first", domain.NewTimestamp(time.Now().UTC())), first)
+	if err := store.Complete(context.Background(), first, ports.RenderReplayResult{Job: firstJob}); !errors.Is(err, ports.ErrDependencyUnavailable) {
+		t.Fatalf("stale Complete error = %v, want ErrDependencyUnavailable", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after stale Complete: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("stale Complete appended a durable row")
 	}
 }
 
@@ -505,7 +993,7 @@ func TestFileRenderReplayStoreLedgerRemainsValidJSONLAfterOps(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := store.Complete(context.Background(), identity, ports.RenderReplayResult{
-		Job: seedQueuedJob("job_valid", domain.NewTimestamp(time.Now().UTC())),
+		Job: bindJobToReplay(seedQueuedJob("job_valid", domain.NewTimestamp(time.Now().UTC())), identity),
 	}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}

@@ -141,7 +141,7 @@ func (store *MemoryRenderJobStore) ClaimWorker(_ context.Context, ref domain.Job
 		// - Pre-payload: full claim (may render)
 		// - Post-payload / manifest present: recovery-only claim (drain/finalize,
 		//   never a second Provider generation) (#14 §6.4).
-		if job.Attempt.PayloadSent || job.CommitStatus == domain.CommitCommitted ||
+		if job.Attempt.PayloadSent || job.Attempt.ResponseCaptured || job.CommitStatus == domain.CommitCommitted ||
 			job.CommitStatus == domain.CommitUnknown || job.Manifest.ID != "" {
 			recoveryOnly = true
 		} else {
@@ -938,13 +938,26 @@ func (store *MemoryRenderReplayStore) Complete(_ context.Context, identity domai
 	defer store.mu.Unlock()
 
 	record, ok := store.records[identity.Scope]
-	if !ok {
-		record = &renderReplayRecord{fingerprint: identity.Fingerprint}
-		store.records[identity.Scope] = record
+	if !ok || record.fingerprint != identity.Fingerprint || !renderReplayJobMatchesIdentity(result.Job, identity) {
+		return ports.ErrDependencyUnavailable
+	}
+	if record.terminal {
+		if record.job.JobRef() != result.Job.JobRef() {
+			return ports.ErrDependencyUnavailable
+		}
+		return nil
 	}
 	record.terminal = true
-	record.job = result.Job
+	record.job = cloneJob(result.Job)
 	return nil
+}
+
+func renderReplayJobMatchesIdentity(job domain.RenderJob, identity domain.ReplayIdentity) bool {
+	return job.JobID != "" &&
+		job.TenantID == identity.Scope.TenantID &&
+		job.ClientAPIKeyID == identity.Scope.ClientAPIKeyID &&
+		job.IdempotencyKey == identity.Scope.Key &&
+		job.RequestFingerprint == identity.Fingerprint
 }
 
 // seedRecord installs one replay record directly (durable-restore replay

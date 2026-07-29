@@ -316,6 +316,14 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	runtime.worker = renderService
 	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service, renderService)
 
+	// Reconcile replay ownership before queue recovery. If a process died after
+	// Jobs.Create but before Replay.Complete, startup binds the existing durable
+	// job to its original idempotency identity; conflicts keep readiness closed.
+	replayReconcileErr := runtime.reconcileRenderReplays(startupContext)
+	if replayReconcileErr != nil {
+		logger.Error("render replay startup reconciliation failed; readiness stays closed", "error", replayReconcileErr)
+	}
+
 	// Pre-ready queue publication recovery (P1-C / Spec P1-3): re-arm every
 	// nonterminal SafeJobReference into the process-local runtime (including
 	// jobs already marked QueuePublished). Failure keeps Ready closed.
@@ -325,7 +333,8 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	}
 
 	runtime.ready.Store(accountRestoreErr == nil && healthRestoreErr == nil && routingRestoreErr == nil &&
-		jobRestoreErr == nil && renderRestoreErr == nil && queueRecoverErr == nil && renderDurabilityReady)
+		jobRestoreErr == nil && renderRestoreErr == nil && replayReconcileErr == nil &&
+		queueRecoverErr == nil && renderDurabilityReady)
 
 	return runtime, nil
 }
@@ -726,6 +735,21 @@ func (runtime *Runtime) RecoverQueuePublications(ctx context.Context) error {
 		return ErrNotReady
 	}
 	return runtime.recoverQueuePublications(ctx)
+}
+
+// reconcileRenderReplays is the internal pre-ready repair path for the durable
+// Jobs.Create → Replay.Complete crash window. It intentionally does not check
+// Ready because successful reconciliation is itself a readiness prerequisite.
+func (runtime *Runtime) reconcileRenderReplays(ctx context.Context) error {
+	if runtime == nil {
+		return ErrNotReady
+	}
+	if reconciler, ok := runtime.worker.(interface {
+		ReconcileReplayTerminals(context.Context) error
+	}); ok {
+		return reconciler.ReconcileReplayTerminals(ctx)
+	}
+	return nil
 }
 
 // recoverQueuePublications is the internal recovery path used before Ready and
