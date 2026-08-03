@@ -2,6 +2,7 @@ package httptransport
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -39,11 +40,26 @@ func (handler chatHandler) newRequestID() domain.Identifier {
 }
 
 // chatRequestWire mirrors the OpenAI-compatible non-streaming chat completion
-// request body. `stream` must be absent or false on this non-streaming route.
+// request body. `stream` must be absent or false on this non-streaming route
+// (JSON null is rejected, distinguishing an absent field from a present null).
+// Optional x_pixelplus routing fields (provider_account_id, allow_fallback,
+// conversation_id) are carried rather than rejected as unknown (OpenAI-compatible
+// contract §3.5). tenant_id is never accepted here.
 type chatRequestWire struct {
-	Model    string           `json:"model"`
-	Messages []chatMessageReq `json:"messages"`
-	Stream   *bool            `json:"stream"`
+	Model      string                  `json:"model"`
+	Messages   []chatMessageReq        `json:"messages"`
+	Stream     json.RawMessage         `json:"stream"`
+	Xpixelplus *chatRequestXpixelplus  `json:"x_pixelplus"`
+}
+
+// chatRequestXpixelplus is the documented optional routing extension. It never
+// accepts tenant_id (DisallowUnknownFields rejects it).
+type chatRequestXpixelplus struct {
+	ProviderAccountID string `json:"provider_account_id"`
+	AllowFallback     bool   `json:"allow_fallback"`
+	// ConversationID is the documented affinity-key hint; it is accepted and
+	// carried without changing routing behavior in the non-streaming surface.
+	ConversationID string `json:"conversation_id"`
 }
 
 type chatMessageReq struct {
@@ -60,10 +76,22 @@ func (handler chatHandler) completions(writer http.ResponseWriter, request *http
 	var wire chatRequestWire
 	malformed := decodeStrictJSON(body, &wire) != nil
 
-	// This route is strictly non-streaming. A stream=true request is invalid on
-	// the non-streaming surface (T16 owns streaming).
-	if !malformed && wire.Stream != nil && *wire.Stream {
-		malformed = true
+	// This route is strictly non-streaming (T16 owns streaming). `stream` must be
+	// absent or false; a present true, a non-boolean, or a JSON null are invalid.
+	// RawMessage keeps "stream": null distinct from an absent field so null is
+	// rejected rather than silently executed as non-streaming.
+	if !malformed && len(wire.Stream) > 0 {
+		var stream bool
+		if err := json.Unmarshal(wire.Stream, &stream); err != nil || stream {
+			malformed = true
+		}
+	}
+
+	var providerAccountID domain.ProviderAccountID
+	var allowFallback bool
+	if !malformed && wire.Xpixelplus != nil {
+		providerAccountID = domain.ProviderAccountID(wire.Xpixelplus.ProviderAccountID)
+		allowFallback = wire.Xpixelplus.AllowFallback
 	}
 
 	command := application.CreateChatCompletionCommand{
@@ -72,6 +100,8 @@ func (handler chatHandler) completions(writer http.ResponseWriter, request *http
 		IdempotencyKey:       idempotencyKey,
 		Model:                wire.Model,
 		Messages:             toDomainMessages(wire.Messages),
+		ProviderAccountID:    providerAccountID,
+		AllowFallback:        allowFallback,
 		OversizeBody:         oversize,
 		MalformedBody:        malformed,
 	}

@@ -2,10 +2,12 @@ package contracttest_test
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
+	"encoding/json"
 	"sync"
+	"testing"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/composition"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
@@ -133,31 +135,144 @@ func chatCapabilitySnapshot(accountID domain.ProviderAccountID, mode domain.Auth
 	return snapshot.WithDerivedFreshness(spineFixtureTime)
 }
 
+// fixtureChatDigestKey is the deterministic ≥32-byte fixture key mirroring the
+// production HMACChatDigester fixture key and its minimum-strength bound.
+// contracttest must not import infrastructure (ADR 0009), so the same value is
+// re-declared here rather than referenced from the vault package.
+const fixtureChatDigestKey = "pixelplus-fixture-chat-digest-key-v1"
+
+// chatFingerprintMessage is the structured, delimiter-safe message encoding used
+// by chat fingerprints so two distinct valid message arrays never collide
+// (mirror of the production HMACChatDigester payload).
+type chatFingerprintMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 // stubChatDigester is a controlled, deterministic chat digester that logs
-// "digest" to the shared spineLog and returns a stable fingerprint per input so
-// identical requests replay deterministically.
+// "digest" to the shared spineLog and returns a stable keyed fingerprint per
+// input so identical requests replay deterministically. The fingerprint is
+// HMAC-SHA256 under a fixture key — never a raw unkeyed SHA-256 of the messages
+// (dictionary/oracle ban, ports.ChatDigester) — over a structured JSON encoding
+// of operation + model + ordered messages, mirroring the production
+// HMACChatDigester so replay coverage is faithful.
 type stubChatDigester struct {
 	log *spineLog
+	key []byte
 }
 
 func newStubChatDigester(log *spineLog) *stubChatDigester {
-	return &stubChatDigester{log: log}
+	return &stubChatDigester{log: log, key: []byte(fixtureChatDigestKey)}
 }
 
 func (d *stubChatDigester) CreateFingerprint(operation domain.ChatOperation, model string, messages []domain.ChatMessage) (domain.Fingerprint, error) {
 	if d.log != nil {
 		d.log.add("digest")
 	}
-	h := sha256.New()
-	_, _ = io.WriteString(h, string(operation))
-	_, _ = h.Write([]byte{0})
-	_, _ = io.WriteString(h, model)
-	for _, m := range messages {
-		_, _ = h.Write([]byte{0})
-		_, _ = io.WriteString(h, string(m.Role))
-		_, _ = io.WriteString(h, string(m.Content))
+	if len(d.key) == 0 {
+		d.key = []byte(fixtureChatDigestKey)
 	}
-	return domain.Fingerprint("fp_" + hex.EncodeToString(h.Sum(nil))), nil
+	msgs := make([]chatFingerprintMessage, 0, len(messages))
+	for _, m := range messages {
+		msgs = append(msgs, chatFingerprintMessage{Role: string(m.Role), Content: m.Content})
+	}
+	payload, err := json.Marshal(struct {
+		V         int                     `json:"v"`
+		Operation string                  `json:"op"`
+		Model     string                  `json:"model"`
+		Messages  []chatFingerprintMessage `json:"messages"`
+	}{
+		V:         1,
+		Operation: string(operation),
+		Model:     model,
+		Messages:  msgs,
+	})
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, d.key)
+	_, _ = mac.Write([]byte("chat.create_fingerprint"))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(payload)
+	return domain.Fingerprint("fp_" + hex.EncodeToString(mac.Sum(nil))), nil
+}
+
+// AC: the fixture chat digester is keyed — its fingerprint must NEVER equal a
+// raw unkeyed SHA-256 of the same messages (dictionary/oracle ban,
+// ports.ChatDigester).
+func TestStubChatDigesterKeyedFingerprint(t *testing.T) {
+	d := newStubChatDigester(nil)
+	messages := []domain.ChatMessage{{Role: domain.ChatRoleUser, Content: "hi"}}
+
+	fp, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, messages)
+	if err != nil {
+		t.Fatalf("CreateFingerprint() error = %v", err)
+	}
+
+	raw := sha256.New()
+	for _, m := range messages {
+		_, _ = raw.Write([]byte(string(m.Role) + string(m.Content)))
+	}
+	unkeyed := "fp_" + hex.EncodeToString(raw.Sum(nil))
+	if string(fp) == unkeyed {
+		t.Fatalf("keyed fingerprint %q equals an unkeyed SHA-256 of the messages; the digester is not keyed", fp)
+	}
+}
+
+// AC: the structured encoding is delimiter-safe — two distinct valid message
+// arrays must never collide into the same fingerprint (mirror of the production
+// HMACChatDigester encoding; a naive role+content concatenation under a shared
+// delimiter would collide on [{user "ab"},{user "c"}] vs [{user "a"},{user "bc"}]).
+func TestStubChatDigesterNoMessageCollision(t *testing.T) {
+	d := newStubChatDigester(nil)
+
+	a, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, []domain.ChatMessage{
+		{Role: domain.ChatRoleUser, Content: "ab"},
+		{Role: domain.ChatRoleUser, Content: "c"},
+	})
+	if err != nil {
+		t.Fatalf("CreateFingerprint(a) error = %v", err)
+	}
+	b, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, []domain.ChatMessage{
+		{Role: domain.ChatRoleUser, Content: "a"},
+		{Role: domain.ChatRoleUser, Content: "bc"},
+	})
+	if err != nil {
+		t.Fatalf("CreateFingerprint(b) error = %v", err)
+	}
+	if a == b {
+		t.Fatalf("distinct message arrays collided into one fingerprint %q", a)
+	}
+}
+
+// stubChatAuditRecorder records the secret-free chat audit projections emitted
+// by the chat spine (audit-before-allow protected_access and terminal outcomes)
+// and logs each Record so the gate-order proof can observe audit-before-allow
+// through real composition without importing infrastructure.
+type stubChatAuditRecorder struct {
+	log    *spineLog
+	mu     sync.Mutex
+	events []ports.ChatAuditEvent
+}
+
+func newStubChatAuditRecorder(log *spineLog) *stubChatAuditRecorder {
+	return &stubChatAuditRecorder{log: log}
+}
+
+func (r *stubChatAuditRecorder) Record(_ context.Context, event ports.ChatAuditEvent) error {
+	if r.log != nil {
+		r.log.add("chat.audit")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
+	return nil
+}
+
+func (r *stubChatAuditRecorder) snapshot() []ports.ChatAuditEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]ports.ChatAuditEvent(nil), r.events...)
 }
 
 // recordingChatReplay wraps the composition-vended controlled chat replay
@@ -190,10 +305,22 @@ func (store *recordingChatReplay) Abandon(ctx context.Context, identity domain.R
 }
 
 // chatRoutingPolicy is a deterministic routing policy over the given selection
-// order with optional fallback chain.
+// order with optional fallback chain. CandidateAccounts is built from BOTH the
+// selection order and the fallback chain (deduplicated, order-preserving) so the
+// policy is a valid persisted state — a real routing store rejects a fallback
+// account that is missing from CandidateAccounts.
 func chatRoutingPolicy(selectionOrder []domain.ProviderAccountID, fallbackChain []domain.ProviderAccountID) domain.RoutingPolicy {
+	candidates := make([]domain.ProviderAccountID, 0, len(selectionOrder)+len(fallbackChain))
+	seen := make(map[domain.ProviderAccountID]struct{}, len(selectionOrder)+len(fallbackChain))
+	for _, id := range append(append([]domain.ProviderAccountID(nil), selectionOrder...), fallbackChain...) {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		candidates = append(candidates, id)
+	}
 	return domain.RoutingPolicy{
-		CandidateAccounts: selectionOrder,
+		CandidateAccounts: candidates,
 		SelectionOrder:    selectionOrder,
 		FallbackEnabled:   len(fallbackChain) > 0,
 		FallbackChain:     fallbackChain,

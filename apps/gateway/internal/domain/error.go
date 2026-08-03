@@ -44,6 +44,18 @@ const (
 	StatusCapacity   StatusClass = "capacity"
 	StatusDependency StatusClass = "dependency"
 	StatusInternal   StatusClass = "internal"
+	// Provider/upstream runtime status classes (frozen CanonicalError.status_class
+	// enum). They keep post-admission Provider rate/quota and upstream failures
+	// distinguishable from pre-admission account-policy gates.
+	StatusProviderRate        StatusClass = "provider_rate"
+	StatusProviderQuota       StatusClass = "provider_quota"
+	StatusUpstreamAuth        StatusClass = "upstream_auth"
+	StatusUpstreamChallenge   StatusClass = "upstream_challenge"
+	StatusUpstreamTimeout     StatusClass = "upstream_timeout"
+	StatusUpstreamUnavailable StatusClass = "upstream_unavailable"
+	StatusUpstreamProtocol    StatusClass = "upstream_protocol"
+	StatusUpstreamRejection   StatusClass = "upstream_rejection"
+	StatusUncertainty         StatusClass = "uncertainty"
 )
 
 // HTTPStatus maps a canonical status class to its HTTP status code. The mapping
@@ -73,6 +85,20 @@ func (class StatusClass) HTTPStatus() int {
 		return 507
 	case StatusDependency:
 		return 503
+	case StatusProviderRate, StatusProviderQuota:
+		return 429
+	case StatusUpstreamAuth:
+		return 401
+	case StatusUpstreamChallenge:
+		return 403
+	case StatusUpstreamTimeout:
+		return 504
+	case StatusUpstreamUnavailable:
+		return 503
+	case StatusUpstreamProtocol, StatusUpstreamRejection:
+		return 502
+	case StatusUncertainty:
+		return 409
 	default:
 		return 500
 	}
@@ -180,6 +206,12 @@ const (
 	StageRecovery   FailureStage = "recovery"
 	StageDependency FailureStage = "dependency"
 	StageInternal   FailureStage = "internal"
+	// Additional frozen failure stages (frozen CanonicalError.failure_stage enum).
+	// They let cancellation and post-admission provider/upstream outcomes carry
+	// the dedicated stage the canonical error contract requires.
+	StageCancellation      FailureStage = "cancellation"
+	StageCredential        FailureStage = "credential"
+	StageUpstreamExecution FailureStage = "upstream_execution"
 )
 
 // IdempotencyState is the bounded replay state. Values mirror the frozen
@@ -762,7 +794,9 @@ func NewRiskAckRequired() CanonicalError {
 }
 
 // NewExecutionCanceled builds the cancellation terminal outcome for a
-// non-streaming execution that was canceled before/while running.
+// non-streaming execution that was canceled before/while running. It emits the
+// dedicated `cancellation` failure stage so clients/telemetry/accounting see a
+// cancellation rather than a generic execution failure (canonical-errors §4.4).
 func NewExecutionCanceled() CanonicalError {
 	return CanonicalError{
 		Code:         ErrCodeExecutionCanceled,
@@ -770,7 +804,7 @@ func NewExecutionCanceled() CanonicalError {
 		StatusClass:  StatusConflict,
 		Retryability: RetryNotRetryable,
 		Remediation:  RemediationNone,
-		FailureStage: StageExecution,
+		FailureStage: StageCancellation,
 	}
 }
 
@@ -781,82 +815,90 @@ func NewExecutionPossiblyCommitted() CanonicalError {
 	return CanonicalError{
 		Code:            ErrCodeExecutionPossiblyCommitted,
 		Category:        CategoryExecution,
-		StatusClass:     StatusConflict,
+		StatusClass:     StatusUncertainty,
 		Retryability:    RetryNewRequestOnly,
 		Remediation:     RemediationSubmitNewRequest,
-		FailureStage:    StageExecution,
+		FailureStage:    StageUpstreamExecution,
 		RetryAfterClass: "new_request_only",
 	}
 }
 
-// NewSensitiveDataUnavailable builds the credential fail-closed outcome when a
-// required provider credential cannot be decrypted for a resolved same-Tenant
-// account. It never confirms credential existence to foreign callers.
+// NewSensitiveDataUnavailable builds the protected-data fail-closed outcome when
+// Vault, key service, audit-before-allow, revocation, retention, or binding state
+// cannot authorize protected data. The credential itself may be valid; the
+// protected dependency is unavailable, so it surfaces as a dependency/credential
+// outcome (never an account-policy "submit credentials" gate) and directs
+// remediation to dependency recovery rather than credential submission
+// (canonical-errors §4.6, I-CREDENTIAL-ERROR-FAIL-CLOSED).
 func NewSensitiveDataUnavailable() CanonicalError {
 	return CanonicalError{
-		Code:         ErrCodeSensitiveDataUnavailable,
-		Category:     CategoryCredential,
-		StatusClass:  StatusAccountPolicy,
-		Retryability: RetryOperatorActionRequired,
-		Remediation:  RemediationSubmitCredential,
-		FailureStage: StageExecution,
+		Code:            ErrCodeSensitiveDataUnavailable,
+		Category:        CategoryCredential,
+		StatusClass:     StatusDependency,
+		Retryability:    RetryAfter,
+		Remediation:     RemediationContactOperator,
+		FailureStage:    StageCredential,
+		RetryAfterClass: "dependency_recovery",
 	}
 }
 
-// providerRuntime serves the shared runtime tuple for provider runtime codes.
-func providerRuntime(code ErrorCode, remediation Remediation, retryability Retryability, retryClass string) CanonicalError {
+// providerRuntime serves the shared post-admission Provider/upstream runtime
+// tuple. Each code preserves its required Provider/upstream status class and
+// stage (never a pre-admission account-policy gate) and carries its own retry
+// class; rate/quota waits use provider_cooldown (canonical-errors §4.5).
+func providerRuntime(code ErrorCode, status StatusClass, stage FailureStage, remediation Remediation, retryability Retryability, retryClass string) CanonicalError {
 	return CanonicalError{
 		Code:            code,
 		Category:        CategoryExecution,
-		StatusClass:     StatusAccountPolicy,
+		StatusClass:     status,
 		Retryability:    retryability,
 		Remediation:     remediation,
-		FailureStage:    StageExecution,
+		FailureStage:    stage,
 		RetryAfterClass: retryClass,
 	}
 }
 
 // NewProviderRateLimited builds the provider runtime rate-limit outcome.
 func NewProviderRateLimited() CanonicalError {
-	return providerRuntime(ErrCodeProviderRateLimited, RemediationWaitProviderCooldown, RetryAfter, "provider_rate_limit")
+	return providerRuntime(ErrCodeProviderRateLimited, StatusProviderRate, StageUpstreamExecution, RemediationWaitProviderCooldown, RetryAfter, "provider_cooldown")
 }
 
 // NewProviderQuotaExhausted builds the provider runtime quota outcome.
 func NewProviderQuotaExhausted() CanonicalError {
-	return providerRuntime(ErrCodeProviderQuotaExhausted, RemediationWaitProviderCooldown, RetryAfter, "provider_quota_exhausted")
+	return providerRuntime(ErrCodeProviderQuotaExhausted, StatusProviderQuota, StageUpstreamExecution, RemediationWaitProviderCooldown, RetryAfter, "provider_cooldown")
 }
 
 // NewProviderAuthExpired builds the provider runtime expired-credential outcome.
 func NewProviderAuthExpired() CanonicalError {
-	return providerRuntime(ErrCodeProviderAuthExpired, RemediationReauthenticate, RetryOperatorActionRequired, "")
+	return providerRuntime(ErrCodeProviderAuthExpired, StatusUpstreamAuth, StageCredential, RemediationReauthenticate, RetryOperatorActionRequired, "")
 }
 
 // NewProviderChallenged builds the provider runtime challenge/interstitial outcome.
 func NewProviderChallenged() CanonicalError {
-	return providerRuntime(ErrCodeProviderChallenged, RemediationContactOperator, RetryOperatorActionRequired, "")
+	return providerRuntime(ErrCodeProviderChallenged, StatusUpstreamChallenge, StageUpstreamExecution, RemediationContactOperator, RetryOperatorActionRequired, "")
 }
 
 // NewProviderBanned builds the provider runtime permanent-ban outcome.
 func NewProviderBanned() CanonicalError {
-	return providerRuntime(ErrCodeProviderBanned, RemediationContactOperator, RetryNotRetryable, "")
+	return providerRuntime(ErrCodeProviderBanned, StatusUpstreamRejection, StageUpstreamExecution, RemediationContactOperator, RetryNotRetryable, "")
 }
 
 // NewProviderRejected builds the provider runtime generic-rejection outcome.
 func NewProviderRejected() CanonicalError {
-	return providerRuntime(ErrCodeProviderRejected, RemediationContactOperator, RetryNotRetryable, "")
+	return providerRuntime(ErrCodeProviderRejected, StatusUpstreamRejection, StageUpstreamExecution, RemediationContactOperator, RetryNotRetryable, "")
 }
 
 // NewUpstreamTimeout builds the provider runtime upstream-timeout outcome.
 func NewUpstreamTimeout() CanonicalError {
-	return providerRuntime(ErrCodeUpstreamTimeout, RemediationNone, RetrySafeInternal, "")
+	return providerRuntime(ErrCodeUpstreamTimeout, StatusUpstreamTimeout, StageUpstreamExecution, RemediationNone, RetrySafeInternal, "")
 }
 
 // NewUpstreamUnavailable builds the provider runtime upstream-unavailable outcome.
 func NewUpstreamUnavailable() CanonicalError {
-	return providerRuntime(ErrCodeUpstreamUnavailable, RemediationNone, RetrySafeInternal, "")
+	return providerRuntime(ErrCodeUpstreamUnavailable, StatusUpstreamUnavailable, StageUpstreamExecution, RemediationNone, RetrySafeInternal, "")
 }
 
 // NewUpstreamProtocolDrift builds the provider runtime protocol-drift outcome.
 func NewUpstreamProtocolDrift() CanonicalError {
-	return providerRuntime(ErrCodeUpstreamProtocolDrift, RemediationContactOperator, RetryOperatorActionRequired, "")
+	return providerRuntime(ErrCodeUpstreamProtocolDrift, StatusUpstreamProtocol, StageUpstreamExecution, RemediationContactOperator, RetryNotRetryable, "")
 }

@@ -9,13 +9,14 @@ import (
 
 // chatCompletionWire is the canonical, Provider-independent non-streaming
 // completion projection. It carries the assistant message, a single
-// finish_class per choice, usage, and safe x_pixelplus metadata. It NEVER leaks
+// finish_reason per choice (OpenAI-compatible), usage, and safe x_pixelplus
+// metadata (including the PixelPlus finish_class classification). It NEVER leaks
 // raw Provider payloads, Provider end-markers, credential material, or foreign
 // ids (chat lifecycle §4.2, OpenAI-compatible contract §3.4/§3.6).
 type chatCompletionWire struct {
 	ID         string          `json:"id"`
 	Object     string          `json:"object"`
-	Created    string          `json:"created"`
+	Created    int64           `json:"created"`
 	Model      string          `json:"model"`
 	Choices    []choiceWire    `json:"choices"`
 	Usage      usageWire       `json:"usage"`
@@ -23,9 +24,9 @@ type chatCompletionWire struct {
 }
 
 type choiceWire struct {
-	Index       int         `json:"index"`
-	Message     messageWire `json:"message"`
-	FinishClass string      `json:"finish_class"`
+	Index        int         `json:"index"`
+	Message      messageWire `json:"message"`
+	FinishReason string      `json:"finish_reason"`
 }
 
 type messageWire struct {
@@ -40,20 +41,29 @@ type usageWire struct {
 }
 
 // xpixelplusWire is the safe provider-independent metadata block (below the
-// openai-compatible core fields). It carries only same-Tenant safe ids.
+// openai-compatible core fields). It carries only same-Tenant safe ids plus the
+// PixelPlus finish_class classification in its documented metadata location
+// (ChatSafeMetadata), distinct from the OpenAI-compatible choices[].finish_reason.
 type xpixelplusWire struct {
 	RequestID         string `json:"request_id"`
 	ExecutionID       string `json:"execution_id"`
 	ProviderAccountID string `json:"provider_account_id"`
+	FinishClass       string `json:"finish_class"`
 }
 
 // toChatCompletionWire projects the canonical completion. It never admits the
-// user/system prompt back; only the assistant choice message is exposed.
+// user/system prompt back; only the assistant choice message is exposed. The
+// created timestamp is emitted as Unix seconds (integer), not an RFC3339 string,
+// per the published ChatCompletionResponse schema.
 func toChatCompletionWire(completion domain.ChatCompletion) chatCompletionWire {
+	var created int64
+	if !completion.Created.IsZero() {
+		created = completion.Created.Time().Unix()
+	}
 	wire := chatCompletionWire{
 		ID:      string(completion.ID),
 		Object:  completion.Object,
-		Created: timestampString(completion.Created),
+		Created: created,
 		Model:   completion.Model,
 		Choices: []choiceWire{},
 		Usage: usageWire{
@@ -74,8 +84,11 @@ func toChatCompletionWire(completion domain.ChatCompletion) chatCompletionWire {
 				Role:    string(choice.Message.Role),
 				Content: choice.Message.Content,
 			},
-			FinishClass: string(choice.FinishClass),
+			FinishReason: string(choice.FinishClass),
 		})
+	}
+	if len(completion.Choices) > 0 {
+		wire.Xpixelplus.FinishClass = string(completion.Choices[0].FinishClass)
 	}
 	return wire
 }

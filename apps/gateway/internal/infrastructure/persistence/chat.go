@@ -88,3 +88,32 @@ var (
 	_ ports.ChatReplayStore = (*MemoryChatReplayStore)(nil)
 	_ ports.Restorer        = (*MemoryChatReplayStore)(nil)
 )
+
+// UnavailableChatReplayStore is the fail-closed chat replay store used in
+// production until a durable chat replay ledger is configured (decision 0012).
+// A process-local MemoryChatReplayStore silently loses idempotency claims on
+// restart, so a client retry of the same Idempotency-Key could re-execute the
+// Adapter and double-settle. Production therefore fails closed on ChatReplayStore
+// rather than pretending a restart-losing in-memory store is authoritative.
+// Every call returns ErrDependencyUnavailable so chat requests surface
+// dependency_unavailable until a durable store is injected.
+type UnavailableChatReplayStore struct{}
+
+// NewUnavailableChatReplayStore builds the fail-closed chat replay store.
+func NewUnavailableChatReplayStore() *UnavailableChatReplayStore {
+	return &UnavailableChatReplayStore{}
+}
+
+func (*UnavailableChatReplayStore) Claim(context.Context, domain.ReplayIdentity) (ports.ChatReplayDecision, error) {
+	return ports.ChatReplayDecision{}, ports.ErrDependencyUnavailable
+}
+
+func (*UnavailableChatReplayStore) Complete(context.Context, domain.ReplayIdentity, ports.ChatReplayResult) error {
+	return ports.ErrDependencyUnavailable
+}
+
+func (*UnavailableChatReplayStore) Abandon(context.Context, domain.ReplayIdentity) error {
+	return ports.ErrDependencyUnavailable
+}
+
+var _ ports.ChatReplayStore = (*UnavailableChatReplayStore)(nil)

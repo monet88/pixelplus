@@ -10,6 +10,7 @@ import (
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/contracttest"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
+	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
 const chatModel = "gpt-4o"
@@ -36,6 +37,7 @@ type chatHarness struct {
 	adapter      *countingChatAdapter
 	replay       *recordingChatReplay
 	digester     *stubChatDigester
+	chatAudit    *stubChatAuditRecorder
 }
 
 func newChatHarness(t *testing.T, configure func(*chatHarness)) *chatHarness {
@@ -87,6 +89,7 @@ func newChatHarness(t *testing.T, configure func(*chatHarness)) *chatHarness {
 		adapter:      adapter,
 		replay:       newRecordingChatReplay(log),
 		digester:     newStubChatDigester(log),
+		chatAudit:    newStubChatAuditRecorder(log),
 	}
 	if configure != nil {
 		configure(harness)
@@ -107,6 +110,7 @@ func newChatHarness(t *testing.T, configure func(*chatHarness)) *chatHarness {
 		ChatAdapter:  harness.adapter,
 		ChatReplay:   harness.replay,
 		ChatDigester: harness.digester,
+		ChatAudit:    harness.chatAudit,
 	})
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)
@@ -245,12 +249,16 @@ func TestChatCompletionHappyPathThroughComposition(t *testing.T) {
 		t.Fatalf("choices = %#v, want one canonical choice", body["choices"])
 	}
 	choice, _ := choices[0].(map[string]any)
-	if choice["finish_class"] != string(domain.FinishStop) {
-		t.Fatalf("choices[0].finish_class = %v, want stop", choice["finish_class"])
+	if choice["finish_reason"] != string(domain.FinishStop) {
+		t.Fatalf("choices[0].finish_reason = %v, want stop", choice["finish_reason"])
 	}
 	message, _ := choice["message"].(map[string]any)
 	if message["role"] != string(domain.ChatRoleAssistant) {
 		t.Fatalf("choices[0].message.role = %v, want assistant", message["role"])
+	}
+	// The created timestamp is a canonical integer Unix-seconds value.
+	if created, ok := body["created"].(float64); !ok || created <= 0 {
+		t.Fatalf("created = %v, want a positive integer Unix-seconds timestamp", body["created"])
 	}
 	// Safe metadata block present; no raw Provider framing leaks.
 	meta, ok := body["x_pixelplus"].(map[string]any)
@@ -259,6 +267,9 @@ func TestChatCompletionHappyPathThroughComposition(t *testing.T) {
 	}
 	if meta["provider_account_id"] != "pa_chat" {
 		t.Fatalf("x_pixelplus.provider_account_id = %v, want pa_chat", meta["provider_account_id"])
+	}
+	if meta["finish_class"] != string(domain.FinishStop) {
+		t.Fatalf("x_pixelplus.finish_class = %v, want stop", meta["finish_class"])
 	}
 	if _, leaked := getString(meta, "prompt"); leaked {
 		t.Fatalf("x_pixelplus leaked the prompt")
@@ -300,14 +311,56 @@ func TestChatGateOrderBeforeAdapterExecution(t *testing.T) {
 	}
 
 	logs := harness.log.snapshot()
+	// The normative evaluation sequence: authenticate → scope/A2 digest → replay
+	// claim → admission → deterministic routing (account visible) → capability
+	// (C4) → circuit → Vault presence → audit-before-allow → Adapter → replay
+	// completion/settlement. Each gate below is asserted explicitly so a regression
+	// that drops a gate (audit-before-allow, risk, health, circuit, X2) fails this
+	// test instead of passing silently.
 	if !containsSeq(logs,
-		"authenticate", "digest", "replay.claim", "admit", "account.visible", "capability.get", "vault.validate", "adapter.run", "replay.complete",
+		"authenticate", "digest", "replay.claim", "admit", "account.visible",
+		"capability.get", "circuit.surface_open", "vault.validate", "chat.audit", "adapter.run", "replay.complete",
 	) {
 		t.Fatalf("gate order violated: %v", logs)
 	}
 	// Adapter must run after all gates, before replay completion/settlement.
 	if indexOf(logs, "adapter.run") >= indexOf(logs, "replay.complete") {
 		t.Fatalf("adapter.run must precede replay.complete: %v", logs)
+	}
+
+	// X2 reaffirmation: candidateRejection re-runs (risk → health → capability →
+	// circuit) immediately before Vault, so each protected gate is evaluated at
+	// least twice for the single primary account. Risk is pinned transitively: it
+	// is the first gate inside candidateRejection, so reaching health/capability/
+	// circuit (asserted below) proves the risk-ack gate passed.
+	if got := countEvents(logs, "capability.get"); got < 2 {
+		t.Fatalf("capability.get evaluated %d times, want >= 2 (C4 + X2)", got)
+	}
+	if got := countEvents(logs, "circuit.surface_open"); got < 2 {
+		t.Fatalf("circuit.surface_open evaluated %d times, want >= 2 (circuit + X2)", got)
+	}
+	if got := harness.health.readCalls.Load(); got < 2 {
+		t.Fatalf("health gate evaluated %d times, want >= 2 (health + X2)", got)
+	}
+
+	// audit-before-allow: the protected-access intent audit must be recorded
+	// before any credential release (AuthorizedChatService emits it synchronously
+	// immediately before the Adapter runs).
+	var sawProtectedAccess bool
+	for _, ev := range harness.chatAudit.snapshot() {
+		if ev.Action != ports.AuditChatProtectedAccess {
+			continue
+		}
+		sawProtectedAccess = true
+		if ev.Outcome != "intent" {
+			t.Fatalf("protected_access audit outcome = %q, want intent", ev.Outcome)
+		}
+		if ev.ProviderAccountID != "pa_chat" {
+			t.Fatalf("protected_access audit provider_account_id = %v, want pa_chat", ev.ProviderAccountID)
+		}
+	}
+	if !sawProtectedAccess {
+		t.Fatalf("no audit-before-allow protected_access audit recorded")
 	}
 }
 
@@ -561,12 +614,20 @@ func TestChatUnclassifiedNotCommittedIsProviderRejected(t *testing.T) {
 		response, payload := harness.do(t, requestSpec{
 			method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-unclassified-terminal", body: chatSuccessBody,
 		})
-		if response.StatusCode != http.StatusConflict {
-			t.Fatalf("attempt %d: status = %d, want 409 (body=%s)", attempt, response.StatusCode, payload)
+		if response.StatusCode != http.StatusBadGateway {
+			t.Fatalf("attempt %d: status = %d, want 502 (body=%s)", attempt, response.StatusCode, payload)
 		}
 		body := decodeError(t, payload)
 		if body["code"] != "provider_rejected" {
 			t.Fatalf("attempt %d: error code = %v, want provider_rejected", attempt, body["code"])
+		}
+		// Provider/upstream runtime errors surface as upstream_rejection (502),
+		// never the old pre-admission account_policy (409) class.
+		if body["status_class"] != "upstream_rejection" {
+			t.Fatalf("attempt %d: status_class = %v, want upstream_rejection", attempt, body["status_class"])
+		}
+		if body["category"] != "execution" {
+			t.Fatalf("attempt %d: category = %v, want execution", attempt, body["category"])
 		}
 	}
 	if calls := harness.adapter.CallCount(); calls != 2 {
@@ -678,7 +739,10 @@ func TestChatRiskAckGateRejectedBeforeAdapter(t *testing.T) {
 	}
 }
 
-// AC: health gate rejects a cooling/blocked account before Any Adapter work.
+// AC: health gate rejects a cooling/blocked account before Any Adapter work. The
+// cooling/blocked health condition must be what prevents Adapter execution — the
+// request is seeded with a fresh chat capability snapshot so it passes the
+// capability gate and reaches the health gate first.
 func TestChatHealthBlockedGateRejectedBeforeAdapter(t *testing.T) {
 	t.Parallel()
 
@@ -697,6 +761,10 @@ func TestChatHealthBlockedGateRejectedBeforeAdapter(t *testing.T) {
 				Remediation:       domain.RemediationWaitProviderCooldown,
 			}},
 		}, permit)
+		// Seed the same fresh chat capability snapshot the successful health-gate
+		// cases use so the request passes capability and is vetoed by the health
+		// condition (not by a missing capability snapshot).
+		h.capabilities.seed("tenant_a", chatCapabilitySnapshot(account.ID, account.AuthMode, account.Credential.Version, chatModel))
 		h.routing.Seed("tenant_a", chatRoutingPolicy([]domain.ProviderAccountID{account.ID}, nil))
 	})
 
@@ -705,6 +773,15 @@ func TestChatHealthBlockedGateRejectedBeforeAdapter(t *testing.T) {
 	})
 	if response.StatusCode != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	// The cooling/blocked condition is what blocks: account_not_usable with the
+	// provider cooldown remediation (not capability_unverified / snapshot error).
+	body := decodeError(t, payload)
+	if body["code"] != "account_not_usable" {
+		t.Fatalf("error code = %v, want account_not_usable (health gate)", body["code"])
+	}
+	if body["remediation"] != string(domain.RemediationWaitProviderCooldown) {
+		t.Fatalf("remediation = %v, want %s", body["remediation"], domain.RemediationWaitProviderCooldown)
 	}
 	if calls := harness.adapter.CallCount(); calls != 0 {
 		t.Fatalf("adapter calls = %d, want 0 (health gate precedes Adapter)", calls)

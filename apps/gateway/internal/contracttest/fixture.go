@@ -110,6 +110,10 @@ type Options struct {
 	ChatDigester             ports.ChatDigester
 	// ChatDigestKey injects key material when ChatDigester is nil.
 	ChatDigestKey []byte
+	// ChatAudit injects the chat spine audit recorder. A nil keeps the production
+	// Slog recorder; a controlled fake proves audit-before-allow protected-access
+	// intent and the terminal chat audit outcomes through real composition.
+	ChatAudit ports.ChatAuditRecorder
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -190,6 +194,7 @@ func NewFixture(options Options) (*Fixture, error) {
 		ChatCredentialAuthorizer: options.ChatCredentialAuthorizer,
 		ChatDigester:             options.ChatDigester,
 		ChatDigestKey:            options.ChatDigestKey,
+		ChatAudit:                options.ChatAudit,
 	})
 	if err != nil {
 		return nil, err

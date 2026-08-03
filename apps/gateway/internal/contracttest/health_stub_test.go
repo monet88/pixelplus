@@ -16,6 +16,10 @@ type stubHealthStore struct {
 	byTenant  map[domain.TenantID]map[domain.ProviderAccountID]stubHealthRow
 	initErr   error
 	initCalls atomic.Int32
+	// readCalls counts authoritative HealthStore.Read calls so contract tests can
+	// prove the health gate was evaluated during candidate selection AND again at
+	// X2 reaffirmation before any Adapter execution.
+	readCalls atomic.Int32
 	// forceClaimConflict makes ClaimRecoveryPermit return ErrAccountUpdateConflict
 	// without mutating state. Used to prove CAS-loser transport mapping while
 	// soft-gate still sees Eligible from an empty-permit snapshot.
@@ -60,6 +64,7 @@ func (s *stubHealthStore) Seed(tenant domain.TenantID, id domain.ProviderAccount
 func (s *stubHealthStore) Restore(context.Context) error { return nil }
 
 func (s *stubHealthStore) Read(_ context.Context, principal domain.SecurityPrincipal, id domain.ProviderAccountID) (ports.AccountHealth, error) {
+	s.readCalls.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.byTenant[principal.TenantID][id]

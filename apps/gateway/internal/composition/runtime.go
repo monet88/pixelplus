@@ -756,15 +756,24 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 	}
 	replay := dependencies.ChatReplay
 	if replay == nil {
-		// Process-local default: I-CHAT-NO-DUPLICATE-EXEC holds only within one
-		// process until the durable chat replay ledger lands (#88, decision
-		// 0012). A restart drops in-flight claims, so a client retry with the
-		// same Idempotency-Key could re-execute and double-settle.
-		replay = persistence.NewMemoryChatReplayStore()
+		// Process-local MemoryChatReplayStore is fixture-only: it silently loses
+		// idempotency claims on restart, so a production client retry of the same
+		// Idempotency-Key could re-execute the Adapter and double-settle (decision
+		// 0012). Fail closed unless an explicitly controlled in-memory mode is
+		// selected or a durable ChatReplayStore is injected.
+		if config.AllowInMemoryChat {
+			replay = persistence.NewMemoryChatReplayStore()
+		} else {
+			replay = persistence.NewUnavailableChatReplayStore()
+		}
 	}
 	accounts := dependencies.Accounts
 	if accounts == nil {
 		accounts = persistence.NewMemoryAccountStore()
+	}
+	health := dependencies.Health
+	if health == nil {
+		health = persistence.NewMemoryHealthStore()
 	}
 	capabilities := dependencies.Capabilities
 	if capabilities == nil {
@@ -820,6 +829,7 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 		Admission:    admission,
 		Replay:       replay,
 		Accounts:     accounts,
+		Health:       health,
 		Capabilities: capabilities,
 		Circuits:     circuits,
 		Routing:      routing,

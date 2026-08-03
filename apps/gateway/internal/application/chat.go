@@ -19,6 +19,15 @@ type CreateChatCompletionCommand struct {
 	IdempotencyKey       string
 	Model                string
 	Messages             []domain.ChatMessage
+	// ProviderAccountID is the optional same-Tenant routing pin carried from the
+	// documented x_pixelplus routing fields (OpenAI-compatible contract §3.5).
+	// A foreign/unusable pin fails closed at routing instead of being rejected as
+	// an unknown request field. Empty means no pin.
+	ProviderAccountID domain.ProviderAccountID
+	// AllowFallback is the optional client opt-in hint from x_pixelplus. It is
+	// still subject to Tenant Routing Policy and the single-owner no-commit proof;
+	// it only permits (never forces) the existing fallback walk.
+	AllowFallback bool
 	// OversizeBody / MalformedBody are observed at the transport boundary and
 	// carried as flags so the single normative A0→A1→A2 order is enforced here
 	// (a pre-authenticated oversize still fails authentication_failed).
@@ -44,6 +53,7 @@ type ChatService struct {
 	admission    ports.AdmissionStore
 	replay       ports.ChatReplayStore
 	accounts     ports.AccountStore
+	health       ports.HealthStore
 	capabilities ports.CapabilityStore
 	circuits     ports.CircuitStore
 	routing      ports.RoutingPolicyStore
@@ -63,6 +73,7 @@ type ChatDependencies struct {
 	Admission    ports.AdmissionStore
 	Replay       ports.ChatReplayStore
 	Accounts     ports.AccountStore
+	Health       ports.HealthStore
 	Capabilities ports.CapabilityStore
 	Circuits     ports.CircuitStore
 	Routing      ports.RoutingPolicyStore
@@ -87,6 +98,8 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 		return nil, errors.New("application: chat replay store is required")
 	case dependencies.Accounts == nil:
 		return nil, errors.New("application: account store is required")
+	case dependencies.Health == nil:
+		return nil, errors.New("application: health store is required")
 	case dependencies.Capabilities == nil:
 		return nil, errors.New("application: capability store is required")
 	case dependencies.Routing == nil:
@@ -113,6 +126,7 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 		admission:    dependencies.Admission,
 		replay:       dependencies.Replay,
 		accounts:     dependencies.Accounts,
+		health:       dependencies.Health,
 		capabilities: dependencies.Capabilities,
 		circuits:     dependencies.Circuits,
 		routing:      dependencies.Routing,
@@ -213,7 +227,7 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 	}
 
 	// Deterministic same-Tenant routing (P1-P4).
-	account, policy, canonical, ok := service.selectAccount(ctx, principal, domain.ChatOpCompletion, command.Model, sc.start)
+	account, policy, canonical, ok := service.selectAccount(ctx, principal, domain.ChatOpCompletion, command.Model, sc.start, command.ProviderAccountID)
 	if !ok {
 		return ChatResult{}, service.failAfterRollback(ctx, sc, canonical, reservation, identity)
 	}
@@ -280,7 +294,7 @@ func (service *ChatService) runExecution(
 	executionID domain.Identifier,
 ) (domain.ChatCompletion, domain.CanonicalError, bool) {
 	request := chatRequest{model: command.Model, messages: command.Messages}
-	attempts := service.attemptAccounts(ctx, sc, principal, primary, policy, request)
+	attempts := service.attemptAccounts(ctx, sc, principal, primary, policy, request, command.AllowFallback)
 
 	for index, account := range attempts {
 		completion, canonical, committed := service.attemptOnAccount(ctx, sc, principal, account, request, executionID)
@@ -303,6 +317,9 @@ func (service *ChatService) runExecution(
 
 // attemptAccounts is the primary account plus, when fallback is enabled and the
 // primary is not committed, exactly the viable FallbackChain ordered once.
+// allowFallback is the client x_pixelplus hint; it only permits (never forces)
+// the fallback walk and remains subject to Tenant Routing Policy and the
+// single-owner authoritative no-commit proof.
 func (service *ChatService) attemptAccounts(
 	ctx context.Context,
 	sc spineContext,
@@ -310,9 +327,10 @@ func (service *ChatService) attemptAccounts(
 	primary domain.ProviderAccount,
 	policy domain.RoutingPolicy,
 	request chatRequest,
+	allowFallback bool,
 ) []domain.ProviderAccount {
 	attempts := []domain.ProviderAccount{primary}
-	if !policy.FallbackEnabled {
+	if !policy.FallbackEnabled && !allowFallback {
 		return attempts
 	}
 	var fallback []domain.ProviderAccount
@@ -402,6 +420,24 @@ func (service *ChatService) classifyOutcome(
 ) (domain.ChatCompletion, domain.CanonicalError, bool) {
 	switch outcome.Class {
 	case domain.ChatOutcomeSuccess, domain.ChatOutcomeCommitted:
+		// A "success" without authoritative commit proof (CommitUnknown) must not
+		// be returned as committed: fail closed as possibly_committed before any
+		// replay Complete or accounting settlement, so an uncertain upstream
+		// execution is never treated as committed (decision 0012).
+		if outcome.Commit == domain.CommitUnknown {
+			return domain.ChatCompletion{}, domain.NewExecutionPossiblyCommitted(), false
+		}
+		if outcome.Commit != domain.CommitCommitted {
+			// No authoritative no-commit proof and not committed: malformed outcome.
+			return domain.ChatCompletion{}, domain.NewExecutionPossiblyCommitted(), false
+		}
+		// A committed result must carry the exact canonical choice shape (assistant
+		// message, valid finish_class). A malformed committed completion fails
+		// closed (never HTTP 200) and, because we cannot prove non-commit, never
+		// falls back or releases the replay claim.
+		if !validCommittedCompletion(outcome.Completion) {
+			return domain.ChatCompletion{}, domain.NewExecutionPossiblyCommitted(), false
+		}
 		completion := outcome.Completion
 		// Ensure the canonical safe metadata is complete and Provider-independent.
 		if completion.ID == "" {
@@ -431,6 +467,26 @@ func (service *ChatService) classifyOutcome(
 	default:
 		return domain.ChatCompletion{}, domain.NewInternalError(), false
 	}
+}
+
+// validCommittedCompletion reports whether a committed ChatOutcome carries the
+// exact canonical choice shape required to be returned as HTTP 200: at least one
+// choice, each with an assistant message and a valid finish_class. A malformed
+// committed result must fail closed rather than be presented as successful
+// (OpenAI-compatible contract §3.4/§3.6).
+func validCommittedCompletion(completion domain.ChatCompletion) bool {
+	if len(completion.Choices) == 0 {
+		return false
+	}
+	for _, choice := range completion.Choices {
+		if choice.Message.Role != domain.ChatRoleAssistant {
+			return false
+		}
+		if !choice.FinishClass.Valid() {
+			return false
+		}
+	}
+	return true
 }
 
 // notCommittedCanonical maps a safe provider failure class to its canonical
@@ -466,12 +522,15 @@ func (service *ChatService) notCommittedCanonical(class domain.ErrorCode) domain
 
 // selectAccount builds the deterministic same-Tenant candidate and returns the
 // primary account plus the policy (for fallback). P1-P4 precedence; never widens.
+// A non-empty pinned ID restricts selection to that same-Tenant candidate
+// (x_pixelplus provider_account_id); it is still vetted by Visible/allowability.
 func (service *ChatService) selectAccount(
 	ctx context.Context,
 	principal domain.SecurityPrincipal,
 	operation domain.ChatOperation,
 	model string,
 	now time.Time,
+	pinned domain.ProviderAccountID,
 ) (domain.ProviderAccount, domain.RoutingPolicy, domain.CanonicalError, bool) {
 	policy, err := service.routing.Read(ctx, principal)
 	if err != nil {
@@ -493,6 +552,11 @@ func (service *ChatService) selectAccount(
 	var candidates []domain.ProviderAccount
 	var lastCanonical domain.CanonicalError
 	for _, id := range order {
+		if pinned != "" && id != pinned {
+			// Routing pin: only the named same-Tenant candidate may serve this
+			// request. Foreign/unpinned candidates are never selected.
+			continue
+		}
 		account, err := service.accounts.Visible(ctx, principal, id)
 		if err != nil {
 			continue
@@ -534,7 +598,18 @@ func (service *ChatService) candidateRejection(
 	if account.Lifecycle != domain.LifecycleActive {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
 	}
-	if account.Health.SummaryState == domain.HealthUnknown {
+	// C2/C5 health: load the AUTHORITATIVE HealthStore snapshot (ADR 0009), never
+	// the AccountStore copy. HealthStore owns scoped conditions and recovery
+	// permits; blocked accounts must not reach credential/Adapter execution, and
+	// missing health evidence must fail closed rather than fail open.
+	health, err := service.health.Read(ctx, principal, account.ID)
+	if err != nil {
+		if errors.Is(err, ports.ErrHealthNotFound) {
+			return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+		}
+		return service.dependencyCanonical(err), false
+	}
+	if health.Health.SummaryState == domain.HealthUnknown {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
 	}
 	if account.Controls.Drain == domain.DrainDraining || account.Controls.Quarantine == domain.QuarantineQuarantined {
@@ -543,16 +618,24 @@ func (service *ChatService) candidateRejection(
 	if !account.Controls.AuthModeExecutionEnabled {
 		return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
 	}
-	// C5 health: cooling/blocked/challenged/expired on matching scopes.
-	for _, condition := range account.Health.Conditions {
+	// C5 health: cooling/blocked/challenged/expired on the matching scoped
+	// condition only. A condition scoped to a different operation or model must
+	// not block this request's account+operation+model pair (health spec §5 rule
+	// 7, I-HEALTH-SCOPED).
+	for _, condition := range health.Health.Conditions {
 		if condition.CredentialVersion != account.Credential.Version {
 			continue
 		}
+		scoped := chatHealthScopeCovers(condition.Scope, operation, model)
 		switch condition.State {
 		case domain.HealthCoolingDown:
-			return domain.NewProviderCooldownBlocked(0), false
+			if scoped {
+				return domain.NewProviderCooldownBlocked(0), false
+			}
 		case domain.HealthBlocked, domain.HealthChallenged, domain.HealthExpired:
-			return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+			if scoped {
+				return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
+			}
 		case domain.HealthUnknown:
 			if condition.Scope.Kind == domain.HealthScopeAccount {
 				return domain.NewAccountNotUsable(domain.RemediationAccountRemediation), false
@@ -619,6 +702,23 @@ func (service *ChatService) candidateRejection(
 		}
 	}
 	return domain.CanonicalError{}, true
+}
+
+// chatHealthScopeCovers reports whether a health condition's scope covers this
+// candidate account+operation+model pair (health spec §5 rule 7, I-HEALTH-SCOPED).
+// Account scope covers the account; operation scope covers only the matching
+// chat operation; model scope covers only the matching operation+model. A
+// condition scoped elsewhere must not block this request.
+func chatHealthScopeCovers(scope domain.HealthScope, operation domain.ChatOperation, model string) bool {
+	switch scope.Kind {
+	case domain.HealthScopeAccount:
+		return true
+	case domain.HealthScopeOperation:
+		return scope.Operation == string(operation.CapabilityOperation())
+	case domain.HealthScopeModel:
+		return scope.Operation == string(operation.CapabilityOperation()) && scope.ModelSlug == model
+	}
+	return false
 }
 
 // authenticate resolves presented Client API Key material to a Security

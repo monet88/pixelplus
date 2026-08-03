@@ -83,13 +83,14 @@ type ChatAdapter interface {
 	Run(context.Context, ChatCommand, CredentialInjection) (domain.ChatOutcome, error)
 }
 
-// ChatSendBoundary records the durable fact that Provider payload transmission
-// is beginning for a synchronous chat call. It is invoked only at the protected
-// send surface (immediately before ChatAdapter.Run), never before
-// preflight/authorization (mirror of render PayloadSendBoundary #14 §6.2).
-type ChatSendBoundary interface {
-	MarkPayloadSent(context.Context) error
-}
+// ChatSendBoundary is the same protected send surface as the render
+// PayloadSendBoundary: it records the durable fact that Provider payload
+// transmission is beginning for a synchronous chat call. It is invoked only at
+// the protected send surface (immediately before ChatAdapter.Run), never before
+// preflight/authorization. It is a type alias to the render boundary so a single
+// send-boundary contract and its guarantees stay consistent across chat and
+// render (render PayloadSendBoundary #14 §6.2, decision 0012).
+type ChatSendBoundary = PayloadSendBoundary
 
 // AuthorizedChatRequest is the application-facing request for one upstream
 // non-streaming chat completion. It carries only safe identities so the
