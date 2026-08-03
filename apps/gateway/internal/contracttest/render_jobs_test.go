@@ -2606,8 +2606,15 @@ func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
 	}
 	// block is never closed: cancel must release the in-flight Adapter by
 	// cancelling renderCtx (spec §7.2), not by waiting for the Provider to finish.
-	if err := <-errCh; err != nil {
-		t.Fatalf("ExecuteJob: %v", err)
+	// Bound the wait so a regression in the cancel-propagation path fails fast
+	// with a clear message instead of hanging for the full go test timeout.
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ExecuteJob: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ExecuteJob did not return after cancel: renderCtx cancel did not release the in-flight Adapter")
 	}
 
 	get, getPayload := h.do(t, requestSpec{

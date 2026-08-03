@@ -156,14 +156,17 @@ type renderJobCancelWire struct {
 
 // cancelAbortAttempted reports truthfully whether an upstream abort was
 // attempted. A queued→canceled job never called the Provider (zero attempts and
-// no payload), so it must not claim an abort was tried. Only a job that reached
-// the Adapter (attempt ledger exists / payload sent / response captured) can have
-// an abort attempted.
+// no payload), so it must not claim an abort was tried. Even when an attempt
+// ledger exists, an abort is only attempted once the Adapter/payload boundary
+// has been crossed: the attempt ID is created before Adapter entry (during
+// pre-Adapter authorization), so its mere presence does not prove in-flight
+// Provider work was halted. Only durable evidence that the payload was sent or
+// a response was captured marks a genuine abort attempt (§7.2).
 func cancelAbortAttempted(job domain.RenderJob) bool {
 	if job.Lifecycle != domain.JobCancelRequested && job.Lifecycle != domain.JobCanceled {
 		return false
 	}
-	return job.Attempt.ID != "" || job.Attempt.PayloadSent || job.Attempt.ResponseCaptured
+	return job.Attempt.PayloadSent || job.Attempt.ResponseCaptured
 }
 
 // cancelStopConfirmed reports whether a worker/Adapter actually confirmed the
