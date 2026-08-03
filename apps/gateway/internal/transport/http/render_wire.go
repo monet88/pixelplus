@@ -106,9 +106,9 @@ func toRenderJobWire(job domain.RenderJob) renderJobWire {
 		wire.Cancel = &cancelFieldsWire{
 			RequestedAt:            timestampString(job.CancelRequestedAt),
 			UpstreamAbortAttempted: job.Lifecycle == domain.JobCancelRequested || job.Lifecycle == domain.JobCanceled,
-			// Stop is confirmed only if a worker/Adapter actually confirmed it
-			// (a queued→canceled job never called the Provider). See cancelStopConfirmed.
-			UpstreamStopConfirmed: cancelStopConfirmed(job),
+			// Stop is confirmed only if a worker/Adapter actually confirmed it;
+			// cancellation is never proof upstream stopped. See cancelStopConfirmed.
+			UpstreamStopConfirmed: cancelStopConfirmed(),
 		}
 	}
 	return wire
@@ -170,14 +170,15 @@ func cancelAbortAttempted(job domain.RenderJob) bool {
 }
 
 // cancelStopConfirmed reports whether a worker/Adapter actually confirmed the
-// upstream stop, distinct from merely being canceled. A canceled job reached
-// with zero attempts (queued cancel — the Provider was never called) has nothing
-// that confirmed a stop, so the response MUST NOT claim upstream stopped here.
-// Only a canceled job that a worker drained/aborted (attempt ledger or payload
-// exists) proves stop was confirmed. Spec §7.2.3: the response MUST NOT claim
-// upstream stopped until a worker/Adapter confirms it.
-func cancelStopConfirmed(job domain.RenderJob) bool {
-	return job.Lifecycle == domain.JobCanceled && cancelAbortAttempted(job)
+// upstream stop, distinct from merely being canceled. Cancellation is NOT proof
+// that upstream stopped (spec §3.7 #6), and upstream_stop_confirmed MUST be
+// false unless stop is confirmed (§3.7, §7.2.3). Neither payload transmission
+// (only an abort attempt) nor a captured/committed response (the upstream
+// completed rather than stopped) constitutes a confirmed stop, and no durable
+// abort/drain confirmation is recorded in the domain today. So the field is
+// false unless explicit stop-confirmation evidence is captured.
+func cancelStopConfirmed() bool {
+	return false
 }
 
 func writeRenderJobCancel(writer http.ResponseWriter, statusCode int, result application.RenderJobResult) {
@@ -186,7 +187,7 @@ func writeRenderJobCancel(writer http.ResponseWriter, statusCode int, result app
 		JobID:                  string(job.JobID),
 		LifecycleState:         string(job.Lifecycle),
 		UpstreamAbortAttempted: cancelAbortAttempted(job),
-		UpstreamStopConfirmed:  cancelStopConfirmed(job),
+		UpstreamStopConfirmed:  cancelStopConfirmed(),
 		StateRevision:          job.StateRevision,
 		RequestID:              string(result.RequestID),
 	}
