@@ -64,6 +64,8 @@ type stubAdmissionStore struct {
 	admitErr       error
 	admitCalls     atomic.Int32
 	reconcileCalls atomic.Int32
+	operationMu    sync.Mutex
+	operations     []domain.OperationToken
 	// logicalSettleCount counts first-time keyed settles only.
 	logicalSettleCount atomic.Int32
 	mu                 sync.Mutex
@@ -74,6 +76,9 @@ type stubAdmissionStore struct {
 
 func (store *stubAdmissionStore) Admit(_ context.Context, request ports.AdmissionRequest) (ports.AdmissionDecision, ports.AdmissionReservation, error) {
 	store.admitCalls.Add(1)
+	store.operationMu.Lock()
+	store.operations = append(store.operations, request.Operation)
+	store.operationMu.Unlock()
 	store.log.add("admit")
 	if store.admitErr != nil {
 		return ports.AdmissionDecision{}, ports.AdmissionReservation{}, store.admitErr
@@ -105,6 +110,19 @@ func (store *stubAdmissionStore) Reconcile(_ context.Context, reservation ports.
 	store.settledKeys[reservation.SettlementKey] = struct{}{}
 	store.logicalSettleCount.Add(1)
 	return nil
+}
+
+func (store *stubAdmissionStore) OperationCount(operation domain.OperationToken) int {
+	store.operationMu.Lock()
+	defer store.operationMu.Unlock()
+
+	count := 0
+	for _, admitted := range store.operations {
+		if admitted == operation {
+			count++
+		}
+	}
+	return count
 }
 
 type stubReplayRecord struct {

@@ -171,7 +171,9 @@ func (handler renderHandler) cancel(writer http.ResponseWriter, request *http.Re
 		writeGatewayError(writer, err)
 		return
 	}
-	writeRenderJob(writer, http.StatusOK, result.Job)
+	// Stable OpenAPI: RenderJobCancelResponse (flat acknowledgement), not a
+	// full RenderJob body.
+	writeRenderJobCancel(writer, http.StatusOK, result)
 }
 
 func (handler renderHandler) retryOutput(writer http.ResponseWriter, request *http.Request) {

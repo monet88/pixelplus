@@ -106,8 +106,9 @@ func toRenderJobWire(job domain.RenderJob) renderJobWire {
 		wire.Cancel = &cancelFieldsWire{
 			RequestedAt:            timestampString(job.CancelRequestedAt),
 			UpstreamAbortAttempted: job.Lifecycle == domain.JobCancelRequested || job.Lifecycle == domain.JobCanceled,
-			// Stop is confirmed only for terminal canceled with no residual.
-			UpstreamStopConfirmed: job.Lifecycle == domain.JobCanceled,
+			// Stop is confirmed only if a worker/Adapter actually confirmed it;
+			// cancellation is never proof upstream stopped. See cancelStopConfirmed.
+			UpstreamStopConfirmed: cancelStopConfirmed(),
 		}
 	}
 	return wire
@@ -137,6 +138,58 @@ func writeOutputRetry(writer http.ResponseWriter, statusCode int, result applica
 	}
 	if result.Entry.DeliveryState == domain.OutputAvailable && result.Entry.AssetID != "" {
 		wire.AssetID = string(result.Entry.AssetID)
+	}
+	writeJSON(writer, statusCode, wire)
+}
+
+// renderJobCancelWire is the flat, truthful RenderJobCancelResponse projection
+// (OpenAPI additionalProperties:false). It is a cancel acknowledgement, not a
+// full RenderJob body.
+type renderJobCancelWire struct {
+	JobID                  string `json:"job_id"`
+	LifecycleState         string `json:"lifecycle_state"`
+	UpstreamAbortAttempted bool   `json:"upstream_abort_attempted"`
+	UpstreamStopConfirmed  bool   `json:"upstream_stop_confirmed"`
+	StateRevision          int64  `json:"state_revision"`
+	RequestID              string `json:"request_id"`
+}
+
+// cancelAbortAttempted reports truthfully whether an upstream abort was
+// attempted. A queued→canceled job never called the Provider (zero attempts and
+// no payload), so it must not claim an abort was tried. Even when an attempt
+// ledger exists, an abort is only attempted once the Adapter/payload boundary
+// has been crossed: the attempt ID is created before Adapter entry (during
+// pre-Adapter authorization), so its mere presence does not prove in-flight
+// Provider work was halted. Only durable evidence that the payload was sent or
+// a response was captured marks a genuine abort attempt (§7.2).
+func cancelAbortAttempted(job domain.RenderJob) bool {
+	if job.Lifecycle != domain.JobCancelRequested && job.Lifecycle != domain.JobCanceled {
+		return false
+	}
+	return job.Attempt.PayloadSent || job.Attempt.ResponseCaptured
+}
+
+// cancelStopConfirmed reports whether a worker/Adapter actually confirmed the
+// upstream stop, distinct from merely being canceled. Cancellation is NOT proof
+// that upstream stopped (spec §3.7 #6), and upstream_stop_confirmed MUST be
+// false unless stop is confirmed (§3.7, §7.2.3). Neither payload transmission
+// (only an abort attempt) nor a captured/committed response (the upstream
+// completed rather than stopped) constitutes a confirmed stop, and no durable
+// abort/drain confirmation is recorded in the domain today. So the field is
+// false unless explicit stop-confirmation evidence is captured.
+func cancelStopConfirmed() bool {
+	return false
+}
+
+func writeRenderJobCancel(writer http.ResponseWriter, statusCode int, result application.RenderJobResult) {
+	job := result.Job
+	wire := renderJobCancelWire{
+		JobID:                  string(job.JobID),
+		LifecycleState:         string(job.Lifecycle),
+		UpstreamAbortAttempted: cancelAbortAttempted(job),
+		UpstreamStopConfirmed:  cancelStopConfirmed(),
+		StateRevision:          job.StateRevision,
+		RequestID:              string(result.RequestID),
 	}
 	writeJSON(writer, statusCode, wire)
 }

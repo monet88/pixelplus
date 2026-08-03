@@ -1153,8 +1153,10 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		attempt: &attempt,
 	}
 	// Heartbeat during long Adapter calls; first RenewWorkerLease failure cancels
-	// the Adapter context and blocks capture/placement under a lost fence.
-	renderCtx, stopHB := service.startLeaseHeartbeat(ctx, ref, fence, workerID)
+	// the Adapter context and blocks capture/placement under a lost fence. A
+	// durable client cancel_requested/canceled also cancels renderCtx so the
+	// in-flight Provider Adapter stops (§7.2 "attempt abort or prevent payload").
+	renderCtx, stopHB, clientCanceled := service.startLeaseHeartbeat(ctx, ref, fence, workerID)
 	captureNow := service.nowTS()
 	outcome, renderErr := service.authorized.Render(renderCtx, ports.AuthorizedRenderRequest{
 		Principal: principal,
@@ -1211,6 +1213,45 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 	}
 
 	if renderErr != nil {
+		// Client cancel observed and the Adapter returned because renderCtx was
+		// cancelled before yielding a committed outcome. JobCanceled is only safe
+		// when the abort is authoritative.
+		//
+		// Pre-payload (PayloadSent=false): the Provider never received work, so
+		// there is no committed result to preserve and freeing create occupancy is
+		// safe — settle canceled + not_started (§7.2 "abort succeeds before a
+		// committed result → canceled").
+		//
+		// Post-payload: a local context.Canceled is NOT proof the Provider stopped
+		// or never committed (it may have committed and returned late, or ignored
+		// ctx entirely). Labeling that not_committed and freeing create occupancy
+		// would be an optimistic refund — forbidden by §7.3 ("no path frees
+		// capacity before upstream stops or conservative settlement completes")
+		// and AC3 ("do not refund or release accounting optimistically"). So an
+		// unproven post-payload abort settles conservatively, exactly like
+		// recoverAttemptWithoutRender for the same physical state: failed +
+		// recovery + commit unknown. It never claims canceled and never relabels
+		// uncertainty as a proven no-commit.
+		if clientCanceled() && errors.Is(renderErr, context.Canceled) {
+			if !attempt.PayloadSent {
+				now = service.nowTS()
+				if err := service.persistTerminal(ctx, job, ports.FencedTransition{
+					JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
+					CommitStatus: domain.CommitNotStarted, ClearLease: true, Now: now,
+				}); err != nil {
+					return err
+				}
+				return nil
+			}
+			if err := service.persistTerminal(ctx, job, ports.FencedTransition{
+				JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+				FailureStage: domain.StageRecovery, FailureClass: domain.ErrCodeInternal,
+				CommitStatus: domain.CommitUnknown, ClearLease: true, Now: service.nowTS(),
+			}); err != nil {
+				return err
+			}
+			return nil
+		}
 		// Classification depends on whether the send boundary was crossed.
 		// Pre-send failures stay not_started (recoverable); post-send uncertain
 		// outcomes are unknown (no re-render).
@@ -1326,9 +1367,11 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 
 	// Application owns Asset Reserve/Commit/Put via stable placement ids;
 	// job store only records the result.
-	// Issue #54 acceptance: completed only after durable output Asset placement.
-	// Storage-cap → failed (not completed+pending). Deviates from older #14 prose
-	// allowing completed with pending delivery for this ticket's acceptance.
+	// Issue #54 acceptance: the job completes on durable result capture, not on
+	// output Asset placement — a placement can legitimately stay pending (see the
+	// storage-cap handling below) without the job regressing or re-rendering.
+	// Storage-cap → job stays completed with the entry pending + storage_cap_exceeded
+	// (spec §8.2); capacity must be freed and output-retried later. Never fails the job.
 	// Post-placement cleanup debt (audit/purge/marker) must not fail the job —
 	// continue remaining entries, complete lifecycle, surface residual debt.
 	jobAfter, err := service.jobs.Load(ctx, ref)
@@ -1344,7 +1387,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 			if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
 				if _, err := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
 					JobRef: ref, FencingToken: fence, EntryID: entry.ID,
-					DeliveryStateForced: domain.OutputFailed,
+					DeliveryStateForced: domain.OutputPending,
 					FailureClass:        string(domain.ErrCodeStorageCapExceeded),
 					Now:                 service.nowTS(),
 				}); err != nil {
@@ -1353,11 +1396,7 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 					}
 					return err
 				}
-				return service.persistTerminal(ctx, job, ports.FencedTransition{
-					JobRef: ref, FencingToken: fence, To: domain.JobFailed,
-					FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeStorageCapExceeded,
-					CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
-				})
+				continue
 			}
 			if err := service.persistTerminal(ctx, job, ports.FencedTransition{
 				JobRef: ref, FencingToken: fence, To: domain.JobFailed,
@@ -1402,6 +1441,11 @@ func (service *RenderService) recoverAttemptWithoutRender(
 		// - Authoritative not_committed: may cancel (Provider never committed).
 		// - Post-payload empty/not_started or committed/unknown without abort proof:
 		//   failed + recovery + unknown/committed (never claim canceled).
+		//
+		// Consistent with the live worker (ExecuteJob cancel branch): a post-payload
+		// cancel without authoritative non-commit proof settles failed + recovery +
+		// unknown in both paths — never canceled and never an optimistic refund
+		// (§7.3 / AC3).
 		commit := current.CommitStatus
 		if !current.Attempt.PayloadSent {
 			return service.persistTerminal(ctx, job, ports.FencedTransition{
@@ -1444,12 +1488,21 @@ func (service *RenderService) recoverAttemptWithoutRender(
 					continue
 				}
 				if errors.Is(placeErr, ports.ErrStorageCapExceeded) {
-					// Issue #54 acceptance: placement not durable → do not complete.
-					return service.persistTerminal(ctx, job, ports.FencedTransition{
-						JobRef: ref, FencingToken: fence, To: domain.JobFailed,
-						FailureStage: domain.StageAsset, FailureClass: domain.ErrCodeStorageCapExceeded,
-						CommitStatus: domain.CommitCommitted, ClearLease: true, Now: service.nowTS(),
-					})
+					// Preserve the captured result: record pending delivery with the
+					// storage-cap class so the client knows to free capacity and retry
+					// (spec §8.2). Matches the live worker path below.
+					if _, err := service.jobs.PlaceOutput(ctx, ports.PlacementRequest{
+						JobRef: ref, FencingToken: fence, EntryID: entry.ID,
+						DeliveryStateForced: domain.OutputPending,
+						FailureClass:        string(domain.ErrCodeStorageCapExceeded),
+						Now:                 service.nowTS(),
+					}); err != nil {
+						if errors.Is(err, domain.ErrStaleFence) {
+							return nil
+						}
+						return err
+					}
+					continue
 				}
 				if errors.Is(placeErr, ports.ErrStagingExpired) {
 					// Delivery already marked expired; fail closed, zero re-render.
@@ -1817,21 +1870,36 @@ func (service *RenderService) afterPlacementSettled(
 	return nil
 }
 
-// startLeaseHeartbeat renews the worker fence while Adapter is in-flight.
-// Returns a child context canceled on first RenewWorkerLease failure, and a
-// stop func that is idempotent, waits for the goroutine, and returns that error.
+// startLeaseHeartbeat renews the worker fence while Adapter is in-flight and
+// watches for a client cancel so the Provider Adapter is signaled to stop.
+// Returns a child context canceled on first RenewWorkerLease failure OR when a
+// durable cancel_requested/canceled lifecycle is observed, plus:
+//   - a stop func that is idempotent, waits for the goroutine, and returns the
+//     lease-failure error (non-nil only when the goroutine exited via lease
+//     loss; a client cancel leaves it nil);
+//   - a clientCanceled func reporting whether the cancel was client-initiated
+//     (as opposed to lease loss). ExecuteJob terminalizes fenced on it; the
+//     read-only Load here only ever *signals* the cancel — it never persists.
+//
+// Lease loss and client cancel are mutually exclusive exits of the goroutine —
+// whichever poll is observed first wins; there is no priority between them
+// inside this function. The precedence that matters lives in ExecuteJob, which
+// checks the stop() lease error (hbErr) before clientCanceled(), so a lost
+// lease always settles as a fail and only a clean client cancel settles as
+// canceled.
 func (service *RenderService) startLeaseHeartbeat(
 	parent context.Context,
 	ref domain.JobRef,
 	fence domain.FencingToken,
 	workerID domain.Identifier,
-) (context.Context, func() error) {
+) (context.Context, func() error, func() bool) {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
 	var (
-		failMu sync.Mutex
-		fail   error
-		once   sync.Once
+		failMu       sync.Mutex
+		fail         error
+		clientCancel bool
+		once         sync.Once
 	)
 	interval := service.heartbeatInterval
 	if interval <= 0 {
@@ -1841,17 +1909,46 @@ func (service *RenderService) startLeaseHeartbeat(
 		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		// cancelSignal atomically flags a client-initiated cancel and cancels
+		// renderCtx so the in-flight Adapter stops. fail stays nil so ExecuteJob
+		// settles canceled instead of a lease-loss fail.
+		cancelSignal := func() {
+			failMu.Lock()
+			clientCancel = true
+			failMu.Unlock()
+			cancel()
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				now := service.nowTS()
-				if _, err := service.jobs.RenewWorkerLease(ctx, ref, fence, ports.WorkerLease{
+				// Poll durable lifecycle first: a client cancel_requested/canceled
+				// must reach the Adapter even though RenewWorkerLease now conflicts
+				// (the job is no longer Running).
+				current, err := service.jobs.Load(parent, ref)
+				if err == nil && (current.Lifecycle == domain.JobCancelRequested || current.Lifecycle == domain.JobCanceled) {
+					cancelSignal()
+					return
+				}
+				// Renew on the parent context so a cancel signal below never blocks
+				// the goroutine from exiting the select on Done.
+				if _, err := service.jobs.RenewWorkerLease(parent, ref, fence, ports.WorkerLease{
 					WorkerID:  workerID,
 					Now:       now,
 					ExpiresAt: domain.NewTimestamp(now.Time().Add(service.leaseTTL)),
 				}); err != nil {
+					// A cancel may have landed between the Load above and this
+					// renew, making the job leave Running and the renew conflict.
+					// Distinguish that client-cancel from a genuinely lost lease.
+					if errors.Is(err, ports.ErrRenderJobConflict) {
+						if latest, loadErr := service.jobs.Load(parent, ref); loadErr == nil &&
+							(latest.Lifecycle == domain.JobCancelRequested || latest.Lifecycle == domain.JobCanceled) {
+							cancelSignal()
+							return
+						}
+					}
 					failMu.Lock()
 					if fail == nil {
 						fail = err
@@ -1872,7 +1969,12 @@ func (service *RenderService) startLeaseHeartbeat(
 		defer failMu.Unlock()
 		return fail
 	}
-	return ctx, stop
+	client := func() bool {
+		failMu.Lock()
+		defer failMu.Unlock()
+		return clientCancel
+	}
+	return ctx, stop, client
 }
 
 // defaultWorkerLeaseTTL mirrors the foundation store bound for heartbeat renewals.

@@ -35,6 +35,10 @@ type renderHarness struct {
 	digestKey        []byte
 	renderJobs       ports.RenderJobStore
 	assetMetadata    *assetFakeMetadataStore
+	// workerLeaseTTL / heartbeatInterval bound worker fence renewals (short in
+	// cancel tests so the heartbeat poll observes a client cancel deterministically).
+	workerLeaseTTL    time.Duration
+	heartbeatInterval time.Duration
 }
 
 func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarness {
@@ -148,6 +152,12 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	if h.assetMetadata != nil {
 		opts.AssetMetadata = h.assetMetadata
 	}
+	if h.workerLeaseTTL > 0 {
+		opts.RenderWorkerLeaseTTL = h.workerLeaseTTL
+	}
+	if h.heartbeatInterval > 0 {
+		opts.RenderHeartbeatInterval = h.heartbeatInterval
+	}
 	fixture, err := contracttest.NewFixture(opts)
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)
@@ -177,7 +187,7 @@ type countingRenderAdapter struct {
 	lastMask  atomic.Value // []byte
 }
 
-func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, assets ports.InputAssetInjection, cred ports.CredentialInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (adapter *countingRenderAdapter) Render(ctx context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, assets ports.InputAssetInjection, cred ports.CredentialInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	adapter.harness.renderCalls.Add(1)
 	adapter.lastAuthMode.Store(cmd.AuthMode)
 	if prompt != nil {
@@ -205,7 +215,13 @@ func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.Render
 		}
 	}
 	if adapter.block != nil {
-		<-adapter.block
+		// Honor cancellation: a client cancel must release the in-flight Adapter
+		// instead of waiting for block (cancel propagates through renderCtx).
+		select {
+		case <-adapter.block:
+		case <-ctx.Done():
+			return domain.RenderOutcome{}, ctx.Err()
+		}
 	}
 	if adapter.err != nil {
 		return domain.RenderOutcome{}, adapter.err
@@ -951,6 +967,14 @@ func TestQueuedCancelIsTerminalWithoutProviderCall(t *testing.T) {
 	if canceled["lifecycle_state"] != "canceled" {
 		t.Fatalf("lifecycle_state = %v, want canceled", canceled["lifecycle_state"])
 	}
+	// Queued cancel has zero Provider calls: it must not claim an upstream abort,
+	// and nothing ran to confirm a stop (§7.2.3) — both must be false.
+	if canceled["upstream_abort_attempted"] != false {
+		t.Fatalf("upstream_abort_attempted = %v, want false (queued cancel, no Provider call)", canceled["upstream_abort_attempted"])
+	}
+	if canceled["upstream_stop_confirmed"] != false {
+		t.Fatalf("upstream_stop_confirmed = %v, want false (queued cancel, nothing ran to confirm stop)", canceled["upstream_stop_confirmed"])
+	}
 	if h.renderCalls.Load() != 0 {
 		t.Fatalf("render calls after queued cancel = %d, want 0", h.renderCalls.Load())
 	}
@@ -1007,6 +1031,58 @@ func TestForeignRenderJobIsNonEnumerating404(t *testing.T) {
 	// Ownership fails before admission on get.
 	if h.admission.admitCalls.Load() != admits {
 		t.Fatalf("admission after foreign get = %d, want %d", h.admission.admitCalls.Load(), admits)
+	}
+}
+
+// Foreign cancel and output retry have the same non-enumerating behavior as job reads.
+func TestForeignRenderJobCancelAndOutputRetryAreNonEnumerating404(t *testing.T) {
+	t.Parallel()
+
+	h := newRenderHarness(t, func(h *renderHarness) {
+		seedRoutableImageAccount(h, "pa_render_foreign_mutations")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-gen-foreign-mutations",
+		body:    `{"model":"gpt-image-1","prompt":"tenant a only"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d, want 202 (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	if err := json.Unmarshal(payload, &job); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	jobID, _ := job["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("job_id missing: %s", payload)
+	}
+	admits := h.admission.admitCalls.Load()
+
+	for _, request := range []requestSpec{
+		{method: http.MethodPost, path: "/v1/render-jobs/" + jobID + "/cancel", bearer: tenantBKey},
+		{method: http.MethodPost, path: "/v1/render-jobs/" + jobID + "/outputs/output_0/retry", bearer: tenantBKey},
+	} {
+		response, responsePayload := h.do(t, request)
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("foreign %s status = %d, want 404 (body=%s)", request.path, response.StatusCode, responsePayload)
+		}
+		errBody := decodeError(t, responsePayload)
+		if errBody["code"] != "resource_not_found" {
+			t.Fatalf("foreign %s code = %v, want resource_not_found", request.path, errBody["code"])
+		}
+		if _, hasRef := errBody["resource_reference"]; hasRef {
+			t.Fatalf("foreign %s must not carry resource_reference: %v", request.path, errBody)
+		}
+	}
+	if got := h.admission.admitCalls.Load(); got != admits {
+		t.Fatalf("admission after foreign mutations = %d, want %d", got, admits)
+	}
+	if calls := h.renderCalls.Load(); calls != 0 {
+		t.Fatalf("render calls after foreign mutations = %d, want 0", calls)
 	}
 }
 
@@ -1254,31 +1330,124 @@ func TestWorkerCompletesJobWithManifestAndOutputAsset(t *testing.T) {
 		t.Fatalf("asset_id missing on available entry: %v", entry)
 	}
 
-	// Output retry returns 202 OutputRetryResponse (not 200 full job) and does not re-render.
-	retry, retryPayload := h.do(t, requestSpec{
-		method: http.MethodPost,
-		path:   "/v1/render-jobs/" + jobID + "/outputs/" + entry["output_entry_id"].(string) + "/retry",
-		bearer: tenantAKey,
-	})
-	if retry.StatusCode != http.StatusAccepted {
-		t.Fatalf("retry status = %d, want 202 (body=%s)", retry.StatusCode, retryPayload)
-	}
-	var retryBody map[string]any
-	if err := json.Unmarshal(retryPayload, &retryBody); err != nil {
-		t.Fatalf("decode retry: %v", err)
-	}
-	if retryBody["re_render"] != false {
-		t.Fatalf("re_render = %v, want false", retryBody["re_render"])
-	}
-	if retryBody["output_entry_id"] != entry["output_entry_id"] {
-		t.Fatalf("output_entry_id = %v, want %v", retryBody["output_entry_id"], entry["output_entry_id"])
-	}
-	// Must not be a full RenderJob body (no lifecycle_state).
-	if _, has := retryBody["lifecycle_state"]; has {
-		t.Fatalf("OutputRetryResponse must not embed full RenderJob: %s", retryPayload)
+	// Repeated output retry returns the same entry and never creates another render admission.
+	for retryCount := 0; retryCount < 2; retryCount++ {
+		retry, retryPayload := h.do(t, requestSpec{
+			method: http.MethodPost,
+			path:   "/v1/render-jobs/" + jobID + "/outputs/" + entry["output_entry_id"].(string) + "/retry",
+			bearer: tenantAKey,
+		})
+		if retry.StatusCode != http.StatusAccepted {
+			t.Fatalf("retry %d status = %d, want 202 (body=%s)", retryCount+1, retry.StatusCode, retryPayload)
+		}
+		var retryBody map[string]any
+		if err := json.Unmarshal(retryPayload, &retryBody); err != nil {
+			t.Fatalf("decode retry %d: %v", retryCount+1, err)
+		}
+		if retryBody["re_render"] != false {
+			t.Fatalf("retry %d re_render = %v, want false", retryCount+1, retryBody["re_render"])
+		}
+		if retryBody["output_entry_id"] != entry["output_entry_id"] {
+			t.Fatalf("retry %d output_entry_id = %v, want %v", retryCount+1, retryBody["output_entry_id"], entry["output_entry_id"])
+		}
+		// Must not be a full RenderJob body (no lifecycle_state).
+		if _, has := retryBody["lifecycle_state"]; has {
+			t.Fatalf("OutputRetryResponse must not embed full RenderJob: %s", retryPayload)
+		}
 	}
 	if calls := h.renderCalls.Load(); calls != 1 {
-		t.Fatalf("render calls after output retry = %d, want 1", calls)
+		t.Fatalf("render calls after output retries = %d, want 1", calls)
+	}
+	if got := h.admission.OperationCount(domain.OperationToken("create_image_generation")); got != 1 {
+		t.Fatalf("image-generation admissions = %d, want 1", got)
+	}
+	if got := h.admission.OperationCount(domain.OperationToken("retry_render_job_output")); got != 2 {
+		t.Fatalf("output-retry admissions = %d, want 2", got)
+	}
+}
+
+// Output delivery retry places a pending manifest entry once after storage recovers.
+func TestOutputRetryPlacesPendingManifestWithoutRenderingAgain(t *testing.T) {
+	t.Parallel()
+
+	assets := newAssetFakeMetadataStore(&mutableTestClock{now: spineFixtureTime}, 1, defaultAssetCapCount)
+	h := newRenderHarness(t, func(h *renderHarness) {
+		h.assetMetadata = assets
+		seedRoutableImageAccount(h, "pa_retry_pending")
+	})
+
+	create, payload := h.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-retry-pending",
+		body:    `{"model":"gpt-image-1","prompt":"deliver later"}`,
+	})
+	if create.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status = %d, want 202 (body=%s)", create.StatusCode, payload)
+	}
+	var job map[string]any
+	if err := json.Unmarshal(payload, &job); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	jobID, _ := job["job_id"].(string)
+	if err := h.fixture.Runtime().Worker().ExecuteJob(t.Context(), domain.JobRef{TenantID: "tenant_a", JobID: domain.Identifier(jobID)}); err != nil {
+		t.Fatalf("ExecuteJob: %v", err)
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls after storage-cap placement failure = %d, want 1", calls)
+	}
+
+	get, getPayload := h.do(t, requestSpec{method: http.MethodGet, path: "/v1/render-jobs/" + jobID, bearer: tenantAKey})
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d, want 200 (body=%s)", get.StatusCode, getPayload)
+	}
+	var completed map[string]any
+	if err := json.Unmarshal(getPayload, &completed); err != nil {
+		t.Fatalf("decode completed: %v", err)
+	}
+	if completed["lifecycle_state"] != "completed" {
+		t.Fatalf("lifecycle_state = %v, want completed", completed["lifecycle_state"])
+	}
+	entries, _ := completed["output_entries"].([]any)
+	entry, _ := entries[0].(map[string]any)
+	if entry["delivery_state"] != "pending" {
+		t.Fatalf("delivery_state = %v, want pending", entry["delivery_state"])
+	}
+	entryID, _ := entry["output_entry_id"].(string)
+
+	assets.capBytes = defaultAssetCapBytes
+	var assetID string
+	for retryCount := 0; retryCount < 2; retryCount++ {
+		retry, retryPayload := h.do(t, requestSpec{
+			method: http.MethodPost,
+			path:   "/v1/render-jobs/" + jobID + "/outputs/" + entryID + "/retry",
+			bearer: tenantAKey,
+		})
+		if retry.StatusCode != http.StatusAccepted {
+			t.Fatalf("retry %d status = %d, want 202 (body=%s)", retryCount+1, retry.StatusCode, retryPayload)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(retryPayload, &result); err != nil {
+			t.Fatalf("decode retry %d: %v", retryCount+1, err)
+		}
+		if result["delivery_state"] != "available" || result["asset_id"] == "" || result["re_render"] != false {
+			t.Fatalf("retry %d result = %v, want available placed output without re-render", retryCount+1, result)
+		}
+		if retryCount == 0 {
+			assetID, _ = result["asset_id"].(string)
+		} else if result["asset_id"] != assetID {
+			t.Fatalf("retry %d asset_id = %v, want stable %q", retryCount+1, result["asset_id"], assetID)
+		}
+	}
+	if calls := h.renderCalls.Load(); calls != 1 {
+		t.Fatalf("render calls after pending output retries = %d, want 1", calls)
+	}
+	if got := h.admission.OperationCount(domain.OperationToken("create_image_generation")); got != 1 {
+		t.Fatalf("image-generation admissions = %d, want 1", got)
+	}
+	if got := h.admission.OperationCount(domain.OperationToken("retry_render_job_output")); got != 2 {
+		t.Fatalf("output-retry admissions = %d, want 2", got)
 	}
 }
 
@@ -2366,6 +2535,12 @@ func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
 
 	h := newRenderHarness(t, func(h *renderHarness) {
 		seedRoutableImageAccount(h, "pa_cancel_running")
+		// Short heartbeat so the lease heartbeat poll observes the client cancel
+		// and cancels the in-flight Adapter deterministically (not the 40s default).
+		// Lease TTL is generous because the fixture clock advances 1s per Now(): it
+		// must stay ahead of the ticker drift so renews never look lost.
+		h.workerLeaseTTL = 30 * time.Second
+		h.heartbeatInterval = 50 * time.Millisecond
 	})
 	block := make(chan struct{})
 	entered := make(chan struct{})
@@ -2410,13 +2585,36 @@ func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
 	}
 	var mid map[string]any
 	_ = json.Unmarshal(cancelPayload, &mid)
-	if mid["lifecycle_state"] != "cancel_requested" {
-		t.Fatalf("mid cancel lifecycle = %v, want cancel_requested (honest)", mid["lifecycle_state"])
+	midState, _ := mid["lifecycle_state"].(string)
+	// AC1 §11.1.5: cancel of a running job atomically records cancel_requested and
+	// returns that durable state — it MUST NOT report canceled before a worker /
+	// Adapter confirms stop. The flat response is built from the post-CAS snapshot
+	// (CancelRenderJob does not reload a non-terminal job), so it deterministically
+	// reads cancel_requested here; the worker can only terminalize later, after the
+	// heartbeat cancels the in-flight Adapter.
+	if midState != string(domain.JobCancelRequested) {
+		t.Fatalf("mid cancel lifecycle = %q, want %q (cancel_requested before stop confirmation)", midState, domain.JobCancelRequested)
 	}
-
-	close(block)
-	if err := <-errCh; err != nil {
-		t.Fatalf("ExecuteJob: %v", err)
+	// Truthful abort fields: the running Adapter is in-flight, so an abort WAS
+	// attempted; but it has not confirmed the stop, so upstream_stop_confirmed must
+	// be false (§7.2.3).
+	if mid["upstream_abort_attempted"] != true {
+		t.Fatalf("mid upstream_abort_attempted = %v, want true (Adapter in-flight)", mid["upstream_abort_attempted"])
+	}
+	if mid["upstream_stop_confirmed"] != false {
+		t.Fatalf("mid upstream_stop_confirmed = %v, want false (stop not yet confirmed)", mid["upstream_stop_confirmed"])
+	}
+	// block is never closed: cancel must release the in-flight Adapter by
+	// cancelling renderCtx (spec §7.2), not by waiting for the Provider to finish.
+	// Bound the wait so a regression in the cancel-propagation path fails fast
+	// with a clear message instead of hanging for the full go test timeout.
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ExecuteJob: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ExecuteJob did not return after cancel: renderCtx cancel did not release the in-flight Adapter")
 	}
 
 	get, getPayload := h.do(t, requestSpec{
@@ -2429,8 +2627,18 @@ func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
 	if get.StatusCode != http.StatusOK {
 		t.Fatalf("get status = %d (body=%s)", get.StatusCode, getPayload)
 	}
-	// After worker observes cancel_requested, terminal is canceled (not completed).
-	if final["lifecycle_state"] != "canceled" {
-		t.Fatalf("final lifecycle = %v, want canceled", final["lifecycle_state"])
+	// The in-flight Adapter was still past the payload boundary (PayloadSent=true)
+	// when it was cancelled, and returned bare context.Canceled — no authoritative
+	// non-commit proof. So the worker settles conservatively as failed + recovery +
+	// commit unknown (§7.3, AC3), never an optimistic canceled. (A pre-payload or
+	// authoritatively not-committed cancel would settle canceled instead.)
+	if final["lifecycle_state"] != "failed" {
+		t.Fatalf("final lifecycle = %v, want failed (conservative post-payload cancel)", final["lifecycle_state"])
+	}
+	if final["failure_stage"] != "recovery" {
+		t.Fatalf("final failure_stage = %v, want recovery", final["failure_stage"])
+	}
+	if final["commit_status"] != "unknown" {
+		t.Fatalf("final commit_status = %v, want unknown", final["commit_status"])
 	}
 }

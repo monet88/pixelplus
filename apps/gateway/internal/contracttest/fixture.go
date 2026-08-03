@@ -94,6 +94,12 @@ type Options struct {
 	// dependency unavailable) so contract tests prove create+publication recovery.
 	EnqueueFailTimes int
 	EnqueueError     error
+
+	// RenderWorkerLeaseTTL / RenderHeartbeatInterval bound worker fence renewals
+	// (zero → foundation defaults: 2m lease, leaseTTL/3 heartbeat). Contract tests
+	// inject short intervals for deterministic cancel/heartbeat coverage.
+	RenderWorkerLeaseTTL    time.Duration
+	RenderHeartbeatInterval time.Duration
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -158,13 +164,15 @@ func NewFixture(options Options) (*Fixture, error) {
 		Circuits: options.Circuits,
 		Routing:  options.Routing,
 
-		RenderJobs:      options.RenderJobs,
-		RenderReplay:    options.RenderReplay,
-		RenderAdapter:   options.RenderAdapter,
-		RenderStaging:   options.RenderStaging,
-		RenderAudit:     options.RenderAudit,
-		RenderDigester:  options.RenderDigester,
-		RenderDigestKey: options.RenderDigestKey,
+		RenderJobs:              options.RenderJobs,
+		RenderReplay:            options.RenderReplay,
+		RenderAdapter:           options.RenderAdapter,
+		RenderStaging:           options.RenderStaging,
+		RenderAudit:             options.RenderAudit,
+		RenderDigester:          options.RenderDigester,
+		RenderDigestKey:         options.RenderDigestKey,
+		RenderWorkerLeaseTTL:    options.RenderWorkerLeaseTTL,
+		RenderHeartbeatInterval: options.RenderHeartbeatInterval,
 	})
 	if err != nil {
 		return nil, err
