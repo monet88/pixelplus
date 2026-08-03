@@ -140,7 +140,6 @@ type RenderService struct {
 	replay       ports.RenderReplayStore
 	jobs         ports.RenderJobStore
 	accounts     ports.AccountStore
-	health       ports.HealthStore
 	capabilities ports.CapabilityStore
 	circuits     ports.CircuitStore
 	routing      ports.RoutingPolicyStore
@@ -169,7 +168,6 @@ type RenderDependencies struct {
 	Replay       ports.RenderReplayStore
 	Jobs         ports.RenderJobStore
 	Accounts     ports.AccountStore
-	Health       ports.HealthStore
 	Capabilities ports.CapabilityStore
 	Circuits     ports.CircuitStore
 	Routing      ports.RoutingPolicyStore
@@ -260,7 +258,6 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		replay:            dependencies.Replay,
 		jobs:              dependencies.Jobs,
 		accounts:          dependencies.Accounts,
-		health:            dependencies.Health,
 		capabilities:      dependencies.Capabilities,
 		circuits:          dependencies.Circuits,
 		routing:           dependencies.Routing,

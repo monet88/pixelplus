@@ -53,7 +53,7 @@ func (service *AuthorizedChatService) Chat(ctx context.Context, request ports.Au
 		TenantID:          request.Principal.TenantID,
 		ClientAPIKeyID:    request.Principal.ClientAPIKeyID,
 		ProviderAccountID: request.AccountID,
-		RequestID:         request.ExecutionID,
+		RequestID:         request.RequestID,
 		ExecutionID:       request.ExecutionID,
 		Outcome:           "intent",
 	}); err != nil {

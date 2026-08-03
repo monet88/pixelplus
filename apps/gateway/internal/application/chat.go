@@ -44,7 +44,6 @@ type ChatService struct {
 	admission    ports.AdmissionStore
 	replay       ports.ChatReplayStore
 	accounts     ports.AccountStore
-	health       ports.HealthStore
 	capabilities ports.CapabilityStore
 	circuits     ports.CircuitStore
 	routing      ports.RoutingPolicyStore
@@ -64,7 +63,6 @@ type ChatDependencies struct {
 	Admission    ports.AdmissionStore
 	Replay       ports.ChatReplayStore
 	Accounts     ports.AccountStore
-	Health       ports.HealthStore
 	Capabilities ports.CapabilityStore
 	Circuits     ports.CircuitStore
 	Routing      ports.RoutingPolicyStore
@@ -115,7 +113,6 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 		admission:    dependencies.Admission,
 		replay:       dependencies.Replay,
 		accounts:     dependencies.Accounts,
-		health:       dependencies.Health,
 		capabilities: dependencies.Capabilities,
 		circuits:     dependencies.Circuits,
 		routing:      dependencies.Routing,
@@ -378,6 +375,7 @@ func (service *ChatService) attemptOnAccount(
 		Operation:    domain.ChatOpCompletion,
 		Model:        request.model,
 		Messages:     request.messages,
+		RequestID:    sc.requestID,
 		ExecutionID:  executionID,
 		SendBoundary: noopChatSendBoundary{},
 	})
@@ -436,7 +434,11 @@ func (service *ChatService) classifyOutcome(
 }
 
 // notCommittedCanonical maps a safe provider failure class to its canonical
-// error. Unknown/empty classes are not fabricated.
+// error. The Adapter's NotCommitted outcome is authoritative no-commit proof
+// regardless of class, so an unrecognized/empty class maps to the generic
+// provider_rejected — never to possibly_committed, which would discard the
+// proof, block the single-owner fallback walk, and leak the replay claim
+// (decision 0012).
 func (service *ChatService) notCommittedCanonical(class domain.ErrorCode) domain.CanonicalError {
 	switch class {
 	case domain.ErrCodeProviderRateLimited:
@@ -458,7 +460,7 @@ func (service *ChatService) notCommittedCanonical(class domain.ErrorCode) domain
 	case domain.ErrCodeUpstreamProtocolDrift:
 		return domain.NewUpstreamProtocolDrift()
 	default:
-		return domain.NewExecutionPossiblyCommitted()
+		return domain.NewProviderRejected()
 	}
 }
 
@@ -654,9 +656,11 @@ func (service *ChatService) admit(ctx context.Context, principal domain.Security
 }
 
 // chatSettlementKey is the keyed-idempotent settlement identity for one chat
-// execution: settled exactly once against the original Tenant + Client API Key.
+// execution: settled exactly once against the original Tenant + Client API Key
+// (chat spec §6.5.5 — reconciliation remains charged to the originating
+// client_api_key_id).
 func chatSettlementKey(principal domain.SecurityPrincipal, executionID domain.Identifier) string {
-	return string(principal.TenantID) + "/" + string(executionID) + "/chat_occupancy"
+	return string(principal.TenantID) + "/" + string(principal.ClientAPIKeyID) + "/" + string(executionID) + "/chat_occupancy"
 }
 
 func (service *ChatService) abandon(ctx context.Context, identity domain.ReplayIdentity) error {

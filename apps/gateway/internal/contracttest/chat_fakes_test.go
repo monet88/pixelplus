@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/monet88/pixelplus/apps/gateway/internal/composition"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
@@ -159,72 +160,33 @@ func (d *stubChatDigester) CreateFingerprint(operation domain.ChatOperation, mod
 	return domain.Fingerprint("fp_" + hex.EncodeToString(h.Sum(nil))), nil
 }
 
-// recordingChatReplay is a controlled chat replay store that mirrors the
-// no-steal memory semantics and logs claim/complete/abandon to the spineLog so
-// tests can prove replay ordering through real composition.
+// recordingChatReplay wraps the composition-vended controlled chat replay
+// store and logs claim/complete/abandon to the spineLog so tests can prove
+// replay ordering through real composition. The no-steal state machine lives
+// in the production memory store; ADR 0009 forbids contracttest from importing
+// infrastructure directly, so the delegate comes from composition.
 type recordingChatReplay struct {
-	log     *spineLog
-	mu      sync.Mutex
-	records map[domain.ReplayScope]*chatReplayRecord
+	log   *spineLog
+	inner ports.ChatReplayStore
 }
 
 func newRecordingChatReplay(log *spineLog) *recordingChatReplay {
-	return &recordingChatReplay{log: log, records: make(map[domain.ReplayScope]*chatReplayRecord)}
+	return &recordingChatReplay{log: log, inner: composition.NewControlledChatReplayStore()}
 }
 
-type chatReplayRecord struct {
-	fingerprint domain.Fingerprint
-	terminal    bool
-	completion  domain.ChatCompletion
-}
-
-func (store *recordingChatReplay) Claim(_ context.Context, identity domain.ReplayIdentity) (ports.ChatReplayDecision, error) {
-	store.mu.Lock()
-	defer store.mu.Unlock()
+func (store *recordingChatReplay) Claim(ctx context.Context, identity domain.ReplayIdentity) (ports.ChatReplayDecision, error) {
 	store.log.add("replay.claim")
-	existing, ok := store.records[identity.Scope]
-	if !ok {
-		store.records[identity.Scope] = &chatReplayRecord{fingerprint: identity.Fingerprint}
-		return ports.ChatReplayDecision{Outcome: ports.ReplayClaimed}, nil
-	}
-	if existing.fingerprint != identity.Fingerprint {
-		return ports.ChatReplayDecision{Outcome: ports.ReplayConflict}, nil
-	}
-	if existing.terminal {
-		return ports.ChatReplayDecision{Outcome: ports.ReplayTerminal, TerminalResult: existing.completion}, nil
-	}
-	return ports.ChatReplayDecision{Outcome: ports.ReplayInProgress}, nil
+	return store.inner.Claim(ctx, identity)
 }
 
-func (store *recordingChatReplay) Complete(_ context.Context, identity domain.ReplayIdentity, result ports.ChatReplayResult) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
+func (store *recordingChatReplay) Complete(ctx context.Context, identity domain.ReplayIdentity, result ports.ChatReplayResult) error {
 	store.log.add("replay.complete")
-	record, ok := store.records[identity.Scope]
-	if !ok || record.fingerprint != identity.Fingerprint || result.Completion.ExecutionID == "" {
-		return ports.ErrDependencyUnavailable
-	}
-	if record.terminal {
-		return nil
-	}
-	record.terminal = true
-	record.completion = result.Completion
-	return nil
+	return store.inner.Complete(ctx, identity, result)
 }
 
-func (store *recordingChatReplay) Abandon(_ context.Context, identity domain.ReplayIdentity) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
+func (store *recordingChatReplay) Abandon(ctx context.Context, identity domain.ReplayIdentity) error {
 	store.log.add("replay.abandon")
-	record, ok := store.records[identity.Scope]
-	if !ok {
-		return nil
-	}
-	if record.terminal || record.fingerprint != identity.Fingerprint {
-		return nil
-	}
-	delete(store.records, identity.Scope)
-	return nil
+	return store.inner.Abandon(ctx, identity)
 }
 
 // chatRoutingPolicy is a deterministic routing policy over the given selection

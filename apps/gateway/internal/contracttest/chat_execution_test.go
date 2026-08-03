@@ -511,6 +511,69 @@ func TestChatFallbackBlockedWhenCommitUnknown(t *testing.T) {
 	}
 }
 
+// AC: an authoritative no-commit proof with an unrecognized/empty failure
+// class still counts as not-committed evidence — the single-owner fallback
+// walk continues instead of failing closed (decision 0012).
+func TestChatFallbackContinuesOnUnclassifiedNotCommitted(t *testing.T) {
+	t.Parallel()
+
+	var primary domain.ProviderAccountID = "pa_primary"
+	var fallback domain.ProviderAccountID = "pa_fallback"
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", string(primary), domain.AuthModeChatGPTCodexOAuth)
+		h.seedActive("tenant_a", string(fallback), domain.AuthModeChatGPTCodexOAuth)
+		h.routing.Seed("tenant_a", chatRoutingPolicy(
+			[]domain.ProviderAccountID{primary},
+			[]domain.ProviderAccountID{fallback},
+		))
+		h.adapter.Script(
+			notCommittedOutcome(domain.ErrorCode("")), // primary: no-commit proof, unclassified
+			chatSuccess(fallback, "", "", chatModel),  // fallback: committed
+		)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-unclassified", body: chatSuccessBody,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	accounts := harness.adapter.Accounts()
+	if len(accounts) != 2 || accounts[0] != primary || accounts[1] != fallback {
+		t.Fatalf("adapter walked %v, want primary then exactly one fallback", accounts)
+	}
+}
+
+// AC: an unclassified not-committed terminal failure surfaces the generic
+// provider_rejected (never possibly_committed) and abandons the replay claim,
+// so a later retry with the same Idempotency-Key re-executes instead of
+// sticking on a leaked in-progress claim (decision 0012).
+func TestChatUnclassifiedNotCommittedIsProviderRejected(t *testing.T) {
+	t.Parallel()
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", "pa_chat", domain.AuthModeChatGPTCodexOAuth)
+		h.adapter.Script(notCommittedOutcome(domain.ErrorCode("")))
+	})
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		response, payload := harness.do(t, requestSpec{
+			method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-unclassified-terminal", body: chatSuccessBody,
+		})
+		if response.StatusCode != http.StatusConflict {
+			t.Fatalf("attempt %d: status = %d, want 409 (body=%s)", attempt, response.StatusCode, payload)
+		}
+		body := decodeError(t, payload)
+		if body["code"] != "provider_rejected" {
+			t.Fatalf("attempt %d: error code = %v, want provider_rejected", attempt, body["code"])
+		}
+	}
+	if calls := harness.adapter.CallCount(); calls != 2 {
+		t.Fatalf("adapter calls = %d, want 2 (retry must re-claim, not stick on a leaked claim)", calls)
+	}
+}
+
 // AC: scope/admission vetoes before any routing/Adapter work.
 func TestChatScopeForbiddenBeforeAdapter(t *testing.T) {
 	t.Parallel()

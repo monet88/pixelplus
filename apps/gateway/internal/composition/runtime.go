@@ -599,10 +599,6 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 	if accounts == nil {
 		accounts = persistence.NewMemoryAccountStore()
 	}
-	health := dependencies.Health
-	if health == nil {
-		health = persistence.NewMemoryHealthStore()
-	}
 	capabilities := dependencies.Capabilities
 	if capabilities == nil {
 		capabilities = vaultpkg.NewFailClosedCapabilityStore()
@@ -687,7 +683,6 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 		Replay:            replay,
 		Jobs:              jobs,
 		Accounts:          accounts,
-		Health:            health,
 		Capabilities:      capabilities,
 		Circuits:          circuits,
 		Routing:           routing,
@@ -739,6 +734,14 @@ func renderDigesterUsable(d ports.RenderDigester) bool {
 	return err == nil
 }
 
+// NewControlledChatReplayStore exposes the process-local controlled chat
+// replay store for contract fixtures. ADR 0009 forbids contracttest from
+// importing infrastructure directly, so observation fakes wrap this
+// composition-vended store instead of duplicating its state machine.
+func NewControlledChatReplayStore() ports.ChatReplayStore {
+	return persistence.NewMemoryChatReplayStore()
+}
+
 // newChatService wires the non-streaming chat spine. Nil ports fall back to
 // fail-closed foundations so production composition is safe by default; contract
 // fixtures inject controlled fakes.
@@ -753,15 +756,15 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 	}
 	replay := dependencies.ChatReplay
 	if replay == nil {
+		// Process-local default: I-CHAT-NO-DUPLICATE-EXEC holds only within one
+		// process until the durable chat replay ledger lands (#88, decision
+		// 0012). A restart drops in-flight claims, so a client retry with the
+		// same Idempotency-Key could re-execute and double-settle.
 		replay = persistence.NewMemoryChatReplayStore()
 	}
 	accounts := dependencies.Accounts
 	if accounts == nil {
 		accounts = persistence.NewMemoryAccountStore()
-	}
-	health := dependencies.Health
-	if health == nil {
-		health = persistence.NewMemoryHealthStore()
 	}
 	capabilities := dependencies.Capabilities
 	if capabilities == nil {
@@ -817,7 +820,6 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 		Admission:    admission,
 		Replay:       replay,
 		Accounts:     accounts,
-		Health:       health,
 		Capabilities: capabilities,
 		Circuits:     circuits,
 		Routing:      routing,

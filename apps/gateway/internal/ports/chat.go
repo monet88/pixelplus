@@ -96,13 +96,17 @@ type ChatSendBoundary interface {
 // authorized port resolves Vault credential internally and never returns
 // plaintext to application.
 type AuthorizedChatRequest struct {
-	Principal    domain.SecurityPrincipal
-	AccountID    domain.ProviderAccountID
-	AuthMode     domain.AuthMode
-	Version      int
-	Operation    domain.ChatOperation
-	Model        string
-	Messages     []domain.ChatMessage
+	Principal domain.SecurityPrincipal
+	AccountID domain.ProviderAccountID
+	AuthMode  domain.AuthMode
+	Version   int
+	Operation domain.ChatOperation
+	Model     string
+	Messages  []domain.ChatMessage
+	// RequestID is the boundary request correlation id for the audit
+	// projection; it is distinct from ExecutionID (one request may walk more
+	// than one account attempt under the same execution).
+	RequestID    domain.Identifier
 	ExecutionID  domain.Identifier
 	SendBoundary ChatSendBoundary
 }
