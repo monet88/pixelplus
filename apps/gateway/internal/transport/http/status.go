@@ -38,10 +38,10 @@ type statusResponse struct {
 // NewHandler composes the full public HTTP surface: the operational probes and
 // the stable /v1 product routes. Composition is the only caller so the route
 // table stays owned by the transport layer while wiring stays in composition.
-// Render is optional: a nil RenderGateway omits image/render-job routes so
-// fail-closed compositions without render dependencies stay safe (additive
-// constructor; existing call sites pass nil until wired).
-func NewHandler(clock clock, ids idGenerator, status Status, gateway ProviderAccountGateway, assets AssetGateway, capabilities CapabilityGateway, routing RoutingPolicyGateway, render RenderGateway) http.Handler {
+// Render and chat are optional: nil gateways omit their routes so fail-closed
+// compositions without those dependencies stay safe (additive constructor;
+// existing call sites pass nil until wired).
+func NewHandler(clock clock, ids idGenerator, status Status, gateway ProviderAccountGateway, assets AssetGateway, capabilities CapabilityGateway, routing RoutingPolicyGateway, render RenderGateway, chat ChatGateway) http.Handler {
 	mux := http.NewServeMux()
 	registerStatusRoutes(mux, clock, ids, status)
 	registerProviderAccountRoutes(mux, gateway, clock, ids)
@@ -49,6 +49,7 @@ func NewHandler(clock clock, ids idGenerator, status Status, gateway ProviderAcc
 	registerAssetRoutes(mux, assets, ids)
 	registerRoutingPolicyRoutes(mux, routing, ids)
 	registerRenderRoutes(mux, render, ids)
+	registerChatRoutes(mux, chat, ids)
 	return mux
 }
 

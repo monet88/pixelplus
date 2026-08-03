@@ -141,6 +141,16 @@ const (
 	// RemediationCapabilityUnsupported tells the Tenant the operation is not
 	// supported for this account/model and must not be attempted.
 	RemediationCapabilityUnsupported Remediation = "capability_unsupported"
+	// RemediationModelUnavailable tells the Tenant the model is not available
+	// for this account/operation and the request must not be attempted.
+	RemediationModelUnavailable Remediation = "model_unavailable"
+	// RemediationRouting asks the Tenant to adjust the routing policy / account
+	// usability because no same-Tenant candidate could serve the request.
+	RemediationRouting Remediation = "routing_remediation"
+	// RemediationSubmitNewRequest tells the Tenant to submit a new request
+	// because the prior execution may have been committed and no authoritative
+	// no-commit proof exists to retry.
+	RemediationSubmitNewRequest Remediation = "submit_new_request"
 	// RemediationDeleteAssetsOrWaitExpiry is the storage-cap remediation: the
 	// Tenant deletes Assets or waits for expiry to reclaim headroom (#13 section 6.1).
 	RemediationDeleteAssetsOrWaitExpiry Remediation = "delete_assets_or_wait_expiry"
@@ -164,6 +174,9 @@ const (
 	// StageCapability classifies a capability evidence rejection before
 	// upstream execution (capability semantics section 9/10).
 	StageCapability FailureStage = "capability"
+	// StageExecution classifies a failure raised during or after upstream
+	// execution (chat/render execution lifecycle; canonical-errors §4.5).
+	StageExecution  FailureStage = "execution"
 	StageRecovery   FailureStage = "recovery"
 	StageDependency FailureStage = "dependency"
 	StageInternal   FailureStage = "internal"
@@ -270,6 +283,39 @@ const (
 	// role/encoding versus a mask whose dimensions do not match its input.
 	ErrCodeInvalidMask           ErrorCode = "invalid_mask"
 	ErrCodeMaskDimensionMismatch ErrorCode = "mask_dimension_mismatch"
+	// Chat/execution capability and routing codes (chat lifecycle #12;
+	// canonical-errors #16 §4.2/§4.4). model_unavailable is a capability
+	// not_retryable outcome distinct from capability_unsupported.
+	ErrCodeModelUnavailable ErrorCode = "model_unavailable"
+	// ErrCodeRoutingNoCandidate is the routing fail-closed outcome when no
+	// same-Tenant candidate can serve the request; it never enumerates resources.
+	ErrCodeRoutingNoCandidate ErrorCode = "routing_no_candidate"
+	// ErrCodeRoutingFallbackNotAllowed is the routing fail-closed outcome when
+	// fallback is required but not authorized/viable for the request.
+	ErrCodeRoutingFallbackNotAllowed ErrorCode = "routing_fallback_not_allowed"
+	// ErrCodeRiskAckRequired is the routing outcome when a `gated`/`experimental`
+	// Auth Mode requires a Tenant residual-risk acknowledgement before use.
+	ErrCodeRiskAckRequired ErrorCode = "risk_ack_required"
+	// ErrCodeExecutionCanceled is the cancellation terminal outcome.
+	ErrCodeExecutionCanceled ErrorCode = "execution_canceled"
+	// ErrCodeExecutionPossiblyCommitted is the fail-closed outcome when commit
+	// certainty is unavailable after upstream, so no replacement is authorized.
+	ErrCodeExecutionPossiblyCommitted ErrorCode = "execution_possibly_committed"
+	// ErrCodeSensitiveDataUnavailable is the credential fail-closed outcome when
+	// a required credential cannot be decrypted for a resolved account.
+	ErrCodeSensitiveDataUnavailable ErrorCode = "sensitive_data_unavailable"
+	// Provider runtime codes (canonical-errors #16 §4.5). Each stays on its root
+	// code with commit_status/idempotency_state rather than splitting rate-limit
+	// unknown into a second code.
+	ErrCodeProviderRateLimited    ErrorCode = "provider_rate_limited"
+	ErrCodeProviderQuotaExhausted ErrorCode = "provider_quota_exhausted"
+	ErrCodeProviderAuthExpired    ErrorCode = "provider_auth_expired"
+	ErrCodeProviderChallenged     ErrorCode = "provider_challenged"
+	ErrCodeProviderBanned         ErrorCode = "provider_banned"
+	ErrCodeProviderRejected       ErrorCode = "provider_rejected"
+	ErrCodeUpstreamTimeout        ErrorCode = "upstream_timeout"
+	ErrCodeUpstreamUnavailable    ErrorCode = "upstream_unavailable"
+	ErrCodeUpstreamProtocolDrift  ErrorCode = "upstream_protocol_drift"
 )
 
 // Error satisfies the error interface so a CanonicalError can flow through Go
@@ -656,4 +702,161 @@ func NewStorageCapExceeded() CanonicalError {
 		Remediation:  RemediationDeleteAssetsOrWaitExpiry,
 		FailureStage: StageAsset,
 	}
+}
+
+// NewModelUnavailable builds the capability not_retryable outcome for a model
+// that is not available for the resolved account/operation. It is distinct from
+// capability_unsupported (operation not offered) and from a stale/unverified
+// snapshot (reprobe-able): the model itself is present but not offerable.
+func NewModelUnavailable() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeModelUnavailable,
+		Category:     CategoryCapability,
+		StatusClass:  StatusCapability,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationModelUnavailable,
+		FailureStage: StageCapability,
+	}
+}
+
+// NewRoutingNoCandidate builds the routing fail-closed outcome when no
+// same-Tenant candidate account can serve the request. It never enumerates
+// candidates or foreign resources.
+func NewRoutingNoCandidate() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeRoutingNoCandidate,
+		Category:     CategoryRouting,
+		StatusClass:  StatusAccountPolicy,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationRouting,
+		FailureStage: StageRouting,
+	}
+}
+
+// NewRoutingFallbackNotAllowed builds the routing fail-closed outcome when a
+// fallback re-attempt is required (authoritative no-commit proof) but the
+// fallback chain is not enabled or no fallback candidate is viable.
+func NewRoutingFallbackNotAllowed() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeRoutingFallbackNotAllowed,
+		Category:     CategoryRouting,
+		StatusClass:  StatusAccountPolicy,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationRouting,
+		FailureStage: StageRouting,
+	}
+}
+
+// NewRiskAckRequired builds the routing outcome when a `gated`/`experimental`
+// Auth Mode requires a Tenant residual-risk acknowledgement before any usable
+// credential may serve work (risk envelope §6.1).
+func NewRiskAckRequired() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeRiskAckRequired,
+		Category:     CategoryRouting,
+		StatusClass:  StatusAccountPolicy,
+		Retryability: RetryOperatorActionRequired,
+		Remediation:  RemediationAckRisk,
+		FailureStage: StageRouting,
+	}
+}
+
+// NewExecutionCanceled builds the cancellation terminal outcome for a
+// non-streaming execution that was canceled before/while running.
+func NewExecutionCanceled() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeExecutionCanceled,
+		Category:     CategoryExecution,
+		StatusClass:  StatusConflict,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationNone,
+		FailureStage: StageExecution,
+	}
+}
+
+// NewExecutionPossiblyCommitted builds the fail-closed outcome when commit
+// certainty is unavailable after upstream, so no retry/fallback replacement is
+// authorized (authoritative no-commit proof is absent; #12 §7.2, #16 §5.3).
+func NewExecutionPossiblyCommitted() CanonicalError {
+	return CanonicalError{
+		Code:            ErrCodeExecutionPossiblyCommitted,
+		Category:        CategoryExecution,
+		StatusClass:     StatusConflict,
+		Retryability:    RetryNewRequestOnly,
+		Remediation:     RemediationSubmitNewRequest,
+		FailureStage:    StageExecution,
+		RetryAfterClass: "new_request_only",
+	}
+}
+
+// NewSensitiveDataUnavailable builds the credential fail-closed outcome when a
+// required provider credential cannot be decrypted for a resolved same-Tenant
+// account. It never confirms credential existence to foreign callers.
+func NewSensitiveDataUnavailable() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeSensitiveDataUnavailable,
+		Category:     CategoryCredential,
+		StatusClass:  StatusAccountPolicy,
+		Retryability: RetryOperatorActionRequired,
+		Remediation:  RemediationSubmitCredential,
+		FailureStage: StageExecution,
+	}
+}
+
+// providerRuntime serves the shared runtime tuple for provider runtime codes.
+func providerRuntime(code ErrorCode, remediation Remediation, retryability Retryability, retryClass string) CanonicalError {
+	return CanonicalError{
+		Code:            code,
+		Category:        CategoryExecution,
+		StatusClass:     StatusAccountPolicy,
+		Retryability:    retryability,
+		Remediation:     remediation,
+		FailureStage:    StageExecution,
+		RetryAfterClass: retryClass,
+	}
+}
+
+// NewProviderRateLimited builds the provider runtime rate-limit outcome.
+func NewProviderRateLimited() CanonicalError {
+	return providerRuntime(ErrCodeProviderRateLimited, RemediationWaitProviderCooldown, RetryAfter, "provider_rate_limit")
+}
+
+// NewProviderQuotaExhausted builds the provider runtime quota outcome.
+func NewProviderQuotaExhausted() CanonicalError {
+	return providerRuntime(ErrCodeProviderQuotaExhausted, RemediationWaitProviderCooldown, RetryAfter, "provider_quota_exhausted")
+}
+
+// NewProviderAuthExpired builds the provider runtime expired-credential outcome.
+func NewProviderAuthExpired() CanonicalError {
+	return providerRuntime(ErrCodeProviderAuthExpired, RemediationReauthenticate, RetryOperatorActionRequired, "")
+}
+
+// NewProviderChallenged builds the provider runtime challenge/interstitial outcome.
+func NewProviderChallenged() CanonicalError {
+	return providerRuntime(ErrCodeProviderChallenged, RemediationContactOperator, RetryOperatorActionRequired, "")
+}
+
+// NewProviderBanned builds the provider runtime permanent-ban outcome.
+func NewProviderBanned() CanonicalError {
+	return providerRuntime(ErrCodeProviderBanned, RemediationContactOperator, RetryNotRetryable, "")
+}
+
+// NewProviderRejected builds the provider runtime generic-rejection outcome.
+func NewProviderRejected() CanonicalError {
+	return providerRuntime(ErrCodeProviderRejected, RemediationContactOperator, RetryNotRetryable, "")
+}
+
+// NewUpstreamTimeout builds the provider runtime upstream-timeout outcome.
+func NewUpstreamTimeout() CanonicalError {
+	return providerRuntime(ErrCodeUpstreamTimeout, RemediationNone, RetrySafeInternal, "")
+}
+
+// NewUpstreamUnavailable builds the provider runtime upstream-unavailable outcome.
+func NewUpstreamUnavailable() CanonicalError {
+	return providerRuntime(ErrCodeUpstreamUnavailable, RemediationNone, RetrySafeInternal, "")
+}
+
+// NewUpstreamProtocolDrift builds the provider runtime protocol-drift outcome.
+func NewUpstreamProtocolDrift() CanonicalError {
+	return providerRuntime(ErrCodeUpstreamProtocolDrift, RemediationContactOperator, RetryOperatorActionRequired, "")
 }

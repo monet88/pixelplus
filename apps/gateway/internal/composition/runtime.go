@@ -37,6 +37,10 @@ type Config struct {
 	// durable job store fails closed (UnavailableRenderJobStore). Contract
 	// fixtures set true for controlled in-process proofs only.
 	AllowInMemoryRenderJobs bool
+	// AllowInMemoryChat permits the fixture chat digester key when ChatDigester
+	// is nil. Production must leave this false so a missing durable chat digest
+	// key fails closed (FailClosedChatDigester).
+	AllowInMemoryChat bool
 }
 
 // Dependencies contains the controlled foundation ports owned by this slice.
@@ -126,6 +130,22 @@ type Dependencies struct {
 	// when RenderDigester is nil. Never logged. Empty in production without inject
 	// keeps readiness closed (no restart-unstable auto key).
 	RenderDigestKey []byte
+
+	// Chat execution ports (#58 / T15). When a port is nil, New substitutes
+	// fail-closed foundations so real production composition stays safe by
+	// default. Contract tests inject controlled fakes to prove the non-streaming
+	// chat spine (scope/admission, replay, routing, lifecycle, risk, capability,
+	// health, audit, Vault, Adapter, accounting) through real composition.
+	ChatReplay               ports.ChatReplayStore
+	ChatAdapter              ports.ChatAdapter
+	AuthorizedChat           ports.AuthorizedChat
+	ChatAudit                ports.ChatAuditRecorder
+	ChatCredentialAuthorizer ports.ChatCredentialAuthorizer
+	ChatDigester             ports.ChatDigester
+	// ChatDigestKey is optional raw key material for composing an HMAC chat
+	// digester when ChatDigester is nil. Never logged. Empty in production
+	// without inject keeps product digests fail-closed.
+	ChatDigestKey []byte
 	// RenderWorkerLeaseTTL / RenderHeartbeatInterval bound worker fence renewals
 	// (zero → foundation defaults: 2m lease, leaseTTL/3 heartbeat). Contract tests
 	// inject short intervals for deterministic cancel/heartbeat coverage.
@@ -317,9 +337,13 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	chatService, err := newChatService(config, dependencies)
+	if err != nil {
+		return nil, err
+	}
 	// Wire the real JobExecutor when the render spine is available.
 	runtime.worker = renderService
-	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service, renderService)
+	runtime.handler = httptransport.NewHandler(dependencies.Clock, dependencies.IDs, runtime, service, assetService, service, service, renderService, chatService)
 
 	// Reconcile replay ownership before queue recovery. If a process died after
 	// Jobs.Create but before Replay.Complete, startup binds the existing durable
@@ -712,6 +736,128 @@ func renderDigesterUsable(d ports.RenderDigester) bool {
 		return false
 	}
 	_, err := d.CreateFingerprint(domain.RenderOpImageGeneration, "ready-probe", "ready-probe", nil, "")
+	return err == nil
+}
+
+// newChatService wires the non-streaming chat spine. Nil ports fall back to
+// fail-closed foundations so production composition is safe by default; contract
+// fixtures inject controlled fakes.
+func newChatService(config Config, dependencies Dependencies) (*application.ChatService, error) {
+	principal := dependencies.Principal
+	if principal == nil {
+		principal = persistence.NewFailClosedPrincipalStore()
+	}
+	admission := dependencies.Admission
+	if admission == nil {
+		admission = persistence.NewAlwaysAdmitStore()
+	}
+	replay := dependencies.ChatReplay
+	if replay == nil {
+		replay = persistence.NewMemoryChatReplayStore()
+	}
+	accounts := dependencies.Accounts
+	if accounts == nil {
+		accounts = persistence.NewMemoryAccountStore()
+	}
+	health := dependencies.Health
+	if health == nil {
+		health = persistence.NewMemoryHealthStore()
+	}
+	capabilities := dependencies.Capabilities
+	if capabilities == nil {
+		capabilities = vaultpkg.NewFailClosedCapabilityStore()
+	}
+	circuits := dependencies.Circuits
+	if circuits == nil {
+		circuits = persistence.NewClosedCircuitStore()
+	}
+	routing := dependencies.Routing
+	if routing == nil {
+		routing = persistence.NewMemoryRoutingPolicyStore()
+	}
+	vault := dependencies.Vault
+	if vault == nil {
+		vault = vaultpkg.NewFailClosedCredentialVault()
+	}
+	audit := dependencies.ChatAudit
+	if audit == nil {
+		audit = observability.NewSlogChatAuditRecorder(dependencies.Logger)
+	}
+	authorized := dependencies.AuthorizedChat
+	if authorized == nil {
+		adapter := dependencies.ChatAdapter
+		if adapter == nil {
+			adapter = vaultpkg.NewFailClosedChatAdapter()
+		}
+		authorizer := dependencies.ChatCredentialAuthorizer
+		if authorizer == nil {
+			if config.AllowInMemoryChat {
+				authorizer = vaultpkg.NewPermissiveFixtureChatCredentialAuthorizer()
+			} else {
+				authorizer = vaultpkg.NewFailClosedChatCredentialAuthorizer()
+			}
+		}
+		authorized = vaultpkg.NewAuthorizedChatService(authorizer, adapter, audit)
+	}
+	digester := dependencies.ChatDigester
+	if digester == nil {
+		digester, _ = resolveChatDigester(config, dependencies)
+	}
+	telemetry := dependencies.Telemetry
+	if telemetry == nil {
+		telemetry = observability.NewSlogTelemetryRecorder(dependencies.Logger)
+	}
+	requestLog := dependencies.RequestLog
+	if requestLog == nil {
+		requestLog = observability.NewSlogRequestLogRecorder(dependencies.Logger)
+	}
+
+	return application.NewChatService(application.ChatDependencies{
+		Principal:    principal,
+		Admission:    admission,
+		Replay:       replay,
+		Accounts:     accounts,
+		Health:       health,
+		Capabilities: capabilities,
+		Circuits:     circuits,
+		Routing:      routing,
+		Vault:        vault,
+		Digester:     digester,
+		Authorized:   authorized,
+		Audit:        audit,
+		Telemetry:    telemetry,
+		RequestLog:   requestLog,
+		Clock:        dependencies.Clock,
+		IDs:          dependencies.IDs,
+	})
+}
+
+// resolveChatDigester builds the chat digester used for product create
+// fingerprints. Empty/weak/missing keys fail closed (FailClosedChatDigester).
+func resolveChatDigester(config Config, dependencies Dependencies) (ports.ChatDigester, bool) {
+	if dependencies.ChatDigester != nil {
+		return dependencies.ChatDigester, chatDigesterUsable(dependencies.ChatDigester)
+	}
+	key := dependencies.ChatDigestKey
+	if len(key) == 0 && config.AllowInMemoryChat {
+		// Fixture-only deterministic key; never used as production default.
+		key = []byte(vaultpkg.FixtureChatDigestKey)
+	}
+	if len(key) >= vaultpkg.MinChatDigestKeyBytes {
+		if d, err := vaultpkg.NewHMACChatDigester(key); err == nil {
+			return d, true
+		}
+	}
+	return vaultpkg.FailClosedChatDigester{}, false
+}
+
+// chatDigesterUsable probes whether the chat digester can mint a fingerprint.
+func chatDigesterUsable(d ports.ChatDigester) bool {
+	if d == nil {
+		return false
+	}
+	_, err := d.CreateFingerprint(domain.ChatOpCompletion, "ready-probe",
+		[]domain.ChatMessage{{Role: domain.ChatRoleUser, Content: "ready-probe"}})
 	return err == nil
 }
 

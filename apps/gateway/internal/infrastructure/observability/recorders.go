@@ -179,3 +179,34 @@ func (recorder *SlogRenderAuditRecorder) Record(_ context.Context, event ports.R
 }
 
 var _ ports.RenderAuditRecorder = (*SlogRenderAuditRecorder)(nil)
+
+// SlogChatAuditRecorder emits the secret-free chat product/security audit
+// projection. It never logs prompt, credential material, raw Provider payloads,
+// or foreign ids (chat execution lifecycle #12).
+type SlogChatAuditRecorder struct {
+	logger *slog.Logger
+}
+
+// NewSlogChatAuditRecorder builds a chat audit recorder.
+func NewSlogChatAuditRecorder(logger *slog.Logger) *SlogChatAuditRecorder {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &SlogChatAuditRecorder{logger: logger}
+}
+
+// Record writes one safe chat audit event.
+func (recorder *SlogChatAuditRecorder) Record(_ context.Context, event ports.ChatAuditEvent) error {
+	recorder.logger.Info("gateway.audit",
+		"action", string(event.Action),
+		"tenant_id", string(event.TenantID),
+		"client_api_key_id", string(event.ClientAPIKeyID),
+		"provider_account_id", string(event.ProviderAccountID),
+		"request_id", string(event.RequestID),
+		"execution_id", string(event.ExecutionID),
+		"outcome", event.Outcome,
+	)
+	return nil
+}
+
+var _ ports.ChatAuditRecorder = (*SlogChatAuditRecorder)(nil)
