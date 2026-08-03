@@ -140,3 +140,40 @@ func writeOutputRetry(writer http.ResponseWriter, statusCode int, result applica
 	}
 	writeJSON(writer, statusCode, wire)
 }
+
+// renderJobCancelWire is the flat, truthful RenderJobCancelResponse projection
+// (OpenAPI additionalProperties:false). It is a cancel acknowledgement, not a
+// full RenderJob body.
+type renderJobCancelWire struct {
+	JobID                  string `json:"job_id"`
+	LifecycleState         string `json:"lifecycle_state"`
+	UpstreamAbortAttempted bool   `json:"upstream_abort_attempted"`
+	UpstreamStopConfirmed  bool   `json:"upstream_stop_confirmed"`
+	StateRevision          int64  `json:"state_revision"`
+	RequestID              string `json:"request_id"`
+}
+
+// cancelAbortAttempted reports truthfully whether an upstream abort was
+// attempted. A queued→canceled job never called the Provider (zero attempts and
+// no payload), so it must not claim an abort was tried. Only a job that reached
+// the Adapter (attempt ledger exists / payload sent / response captured) can have
+// an abort attempted.
+func cancelAbortAttempted(job domain.RenderJob) bool {
+	if job.Lifecycle != domain.JobCancelRequested && job.Lifecycle != domain.JobCanceled {
+		return false
+	}
+	return job.Attempt.ID != "" || job.Attempt.PayloadSent || job.Attempt.ResponseCaptured
+}
+
+func writeRenderJobCancel(writer http.ResponseWriter, statusCode int, result application.RenderJobResult) {
+	job := result.Job
+	wire := renderJobCancelWire{
+		JobID:                  string(job.JobID),
+		LifecycleState:         string(job.Lifecycle),
+		UpstreamAbortAttempted: cancelAbortAttempted(job),
+		UpstreamStopConfirmed:  job.Lifecycle == domain.JobCanceled,
+		StateRevision:          job.StateRevision,
+		RequestID:              string(result.RequestID),
+	}
+	writeJSON(writer, statusCode, wire)
+}

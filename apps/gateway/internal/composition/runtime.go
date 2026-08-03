@@ -126,6 +126,11 @@ type Dependencies struct {
 	// when RenderDigester is nil. Never logged. Empty in production without inject
 	// keeps readiness closed (no restart-unstable auto key).
 	RenderDigestKey []byte
+	// RenderWorkerLeaseTTL / RenderHeartbeatInterval bound worker fence renewals
+	// (zero → foundation defaults: 2m lease, leaseTTL/3 heartbeat). Contract tests
+	// inject short intervals for deterministic cancel/heartbeat coverage.
+	RenderWorkerLeaseTTL    time.Duration
+	RenderHeartbeatInterval time.Duration
 }
 
 // Runtime is the single composition result shared by production and fixtures.
@@ -653,28 +658,30 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 	}
 
 	return application.NewRenderService(application.RenderDependencies{
-		Principal:    principal,
-		Admission:    admission,
-		Replay:       replay,
-		Jobs:         jobs,
-		Accounts:     accounts,
-		Health:       health,
-		Capabilities: capabilities,
-		Circuits:     circuits,
-		Routing:      routing,
-		Assets:       metadata,
-		Content:      content,
-		Staging:      staging,
-		Vault:        vault,
-		Prompts:      prompts,
-		Authorized:   authorized,
-		Digester:     digester,
-		Queue:        dependencies.Runtime,
-		Audit:        audit,
-		Telemetry:    telemetry,
-		RequestLog:   requestLog,
-		Clock:        dependencies.Clock,
-		IDs:          dependencies.IDs,
+		Principal:         principal,
+		Admission:         admission,
+		Replay:            replay,
+		Jobs:              jobs,
+		Accounts:          accounts,
+		Health:            health,
+		Capabilities:      capabilities,
+		Circuits:          circuits,
+		Routing:           routing,
+		Assets:            metadata,
+		Content:           content,
+		Staging:           staging,
+		Vault:             vault,
+		Prompts:           prompts,
+		Authorized:        authorized,
+		Digester:          digester,
+		Queue:             dependencies.Runtime,
+		Audit:             audit,
+		Telemetry:         telemetry,
+		RequestLog:        requestLog,
+		Clock:             dependencies.Clock,
+		IDs:               dependencies.IDs,
+		WorkerLeaseTTL:    dependencies.RenderWorkerLeaseTTL,
+		HeartbeatInterval: dependencies.RenderHeartbeatInterval,
 	})
 }
 

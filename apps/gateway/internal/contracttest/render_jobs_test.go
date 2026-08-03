@@ -35,6 +35,10 @@ type renderHarness struct {
 	digestKey        []byte
 	renderJobs       ports.RenderJobStore
 	assetMetadata    *assetFakeMetadataStore
+	// workerLeaseTTL / heartbeatInterval bound worker fence renewals (short in
+	// cancel tests so the heartbeat poll observes a client cancel deterministically).
+	workerLeaseTTL    time.Duration
+	heartbeatInterval time.Duration
 }
 
 func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarness {
@@ -148,6 +152,12 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	if h.assetMetadata != nil {
 		opts.AssetMetadata = h.assetMetadata
 	}
+	if h.workerLeaseTTL > 0 {
+		opts.RenderWorkerLeaseTTL = h.workerLeaseTTL
+	}
+	if h.heartbeatInterval > 0 {
+		opts.RenderHeartbeatInterval = h.heartbeatInterval
+	}
 	fixture, err := contracttest.NewFixture(opts)
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)
@@ -177,7 +187,7 @@ type countingRenderAdapter struct {
 	lastMask  atomic.Value // []byte
 }
 
-func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, assets ports.InputAssetInjection, cred ports.CredentialInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
+func (adapter *countingRenderAdapter) Render(ctx context.Context, cmd ports.RenderCommand, prompt ports.PromptInjection, assets ports.InputAssetInjection, cred ports.CredentialInjection, sink ports.RenderCaptureSink) (domain.RenderOutcome, error) {
 	adapter.harness.renderCalls.Add(1)
 	adapter.lastAuthMode.Store(cmd.AuthMode)
 	if prompt != nil {
@@ -205,7 +215,13 @@ func (adapter *countingRenderAdapter) Render(_ context.Context, cmd ports.Render
 		}
 	}
 	if adapter.block != nil {
-		<-adapter.block
+		// Honor cancellation: a client cancel must release the in-flight Adapter
+		// instead of waiting for block (cancel propagates through renderCtx).
+		select {
+		case <-adapter.block:
+		case <-ctx.Done():
+			return domain.RenderOutcome{}, ctx.Err()
+		}
 	}
 	if adapter.err != nil {
 		return domain.RenderOutcome{}, adapter.err
@@ -950,6 +966,13 @@ func TestQueuedCancelIsTerminalWithoutProviderCall(t *testing.T) {
 	_ = json.Unmarshal(cancelPayload, &canceled)
 	if canceled["lifecycle_state"] != "canceled" {
 		t.Fatalf("lifecycle_state = %v, want canceled", canceled["lifecycle_state"])
+	}
+	// Queued cancel has zero Provider calls: it must not claim an upstream abort.
+	if canceled["upstream_abort_attempted"] != false {
+		t.Fatalf("upstream_abort_attempted = %v, want false (queued cancel, no Provider call)", canceled["upstream_abort_attempted"])
+	}
+	if canceled["upstream_stop_confirmed"] != true {
+		t.Fatalf("upstream_stop_confirmed = %v, want true (canceled terminal)", canceled["upstream_stop_confirmed"])
 	}
 	if h.renderCalls.Load() != 0 {
 		t.Fatalf("render calls after queued cancel = %d, want 0", h.renderCalls.Load())
@@ -2511,6 +2534,12 @@ func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
 
 	h := newRenderHarness(t, func(h *renderHarness) {
 		seedRoutableImageAccount(h, "pa_cancel_running")
+		// Short heartbeat so the lease heartbeat poll observes the client cancel
+		// and cancels the in-flight Adapter deterministically (not the 40s default).
+		// Lease TTL is generous because the fixture clock advances 1s per Now(): it
+		// must stay ahead of the ticker drift so renews never look lost.
+		h.workerLeaseTTL = 30 * time.Second
+		h.heartbeatInterval = 50 * time.Millisecond
 	})
 	block := make(chan struct{})
 	entered := make(chan struct{})
@@ -2555,11 +2584,25 @@ func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
 	}
 	var mid map[string]any
 	_ = json.Unmarshal(cancelPayload, &mid)
-	if mid["lifecycle_state"] != "cancel_requested" {
-		t.Fatalf("mid cancel lifecycle = %v, want cancel_requested (honest)", mid["lifecycle_state"])
+	midState, _ := mid["lifecycle_state"].(string)
+	// The cancel response reflects the running job before the worker drains to
+	// terminal: either cancel_requested (before the heartbeat poll lands) or, if
+	// the 50ms heartbeat beat the response serialize, already canceled. Both are
+	// honest; the worker always settles canceled (asserted after ExecuteJob).
+	if midState != "cancel_requested" && midState != "canceled" {
+		t.Fatalf("mid cancel lifecycle = %q, want cancel_requested or canceled", midState)
 	}
-
-	close(block)
+	// The flat RenderJobCancelResponse must carry truthful top-level abort fields:
+	// the running Adapter is in-flight so an abort was attempted in either state.
+	if mid["upstream_abort_attempted"] != true {
+		t.Fatalf("mid upstream_abort_attempted = %v, want true (Adapter in-flight)", mid["upstream_abort_attempted"])
+	}
+	wantStopConfirmed := midState == string(domain.JobCanceled)
+	if mid["upstream_stop_confirmed"] != wantStopConfirmed {
+		t.Fatalf("mid upstream_stop_confirmed = %v, want %v for lifecycle %q", mid["upstream_stop_confirmed"], wantStopConfirmed, midState)
+	}
+	// block is never closed: cancel must release the in-flight Adapter by
+	// cancelling renderCtx (spec §7.2), not by waiting for the Provider to finish.
 	if err := <-errCh; err != nil {
 		t.Fatalf("ExecuteJob: %v", err)
 	}
