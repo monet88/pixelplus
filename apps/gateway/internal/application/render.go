@@ -1219,6 +1219,16 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 		// preserve — settle as canceled (spec §7.2 "abort succeeds before a
 		// committed result → canceled"). Distinguish from recovery (no abort
 		// evidence) where post-payload cancel stays fail-closed.
+		//
+		// Divergence with recoverAttemptWithoutRender (below), by design: the
+		// live worker holds direct abort proof (Adapter returned context.Canceled
+		// because our heartbeat signalled the cancel), so CommitNotCommitted here
+		// truthfully reads "we chose not to commit" — we aborted. Recovery has no
+		// such proof and stays CommitUnknown/fail-closed. Both reach a terminal
+		// lifecycle, so neither is ever re-rendered (ClaimWorker rejects
+		// terminal jobs) and no billing/admission reconciliation keys off the
+		// CommitStatus label on a terminal job — this affects only the terminal
+		// label, never re-render or billing semantics.
 		if clientCanceled() && errors.Is(renderErr, context.Canceled) {
 			commit := domain.CommitNotStarted
 			if attempt.PayloadSent {
@@ -1420,6 +1430,14 @@ func (service *RenderService) recoverAttemptWithoutRender(
 		// - Authoritative not_committed: may cancel (Provider never committed).
 		// - Post-payload empty/not_started or committed/unknown without abort proof:
 		//   failed + recovery + unknown/committed (never claim canceled).
+		//
+		// Divergence with the live worker (ExecuteJob cancel branch): recovery has
+		// no direct abort evidence, so post-payload cancel stays failed + unknown
+		// rather than the worker's canceled + not_committed. Both paths are
+		// terminal and both are fail-closed — neither is ever re-rendered and no
+		// billing/admission reconciliation keys off the CommitStatus label on a
+		// terminal job, so the shared physical state can settle differently by
+		// race without changing re-render or billing semantics.
 		commit := current.CommitStatus
 		if !current.Attempt.PayloadSent {
 			return service.persistTerminal(ctx, job, ports.FencedTransition{
@@ -1849,10 +1867,18 @@ func (service *RenderService) afterPlacementSettled(
 // Returns a child context canceled on first RenewWorkerLease failure OR when a
 // durable cancel_requested/canceled lifecycle is observed, plus:
 //   - a stop func that is idempotent, waits for the goroutine, and returns the
-//     lease-failure error (lease loss wins over client cancel);
+//     lease-failure error (non-nil only when the goroutine exited via lease
+//     loss; a client cancel leaves it nil);
 //   - a clientCanceled func reporting whether the cancel was client-initiated
 //     (as opposed to lease loss). ExecuteJob terminalizes fenced on it; the
 //     read-only Load here only ever *signals* the cancel — it never persists.
+//
+// Lease loss and client cancel are mutually exclusive exits of the goroutine —
+// whichever poll is observed first wins; there is no priority between them
+// inside this function. The precedence that matters lives in ExecuteJob, which
+// checks the stop() lease error (hbErr) before clientCanceled(), so a lost
+// lease always settles as a fail and only a clean client cancel settles as
+// canceled.
 func (service *RenderService) startLeaseHeartbeat(
 	parent context.Context,
 	ref domain.JobRef,

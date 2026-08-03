@@ -13,7 +13,7 @@
 
 ## Interface Contract
 
-- `POST /v1/render-jobs/{job_id}/cancel` returns the current safe Render Job projection.
+- `POST /v1/render-jobs/{job_id}/cancel` returns a flat `RenderJobCancelResponse` acknowledgement (job_id, lifecycle_state, upstream_abort_attempted, upstream_stop_confirmed, state_revision, request_id) — not a full RenderJob projection.
 - `POST /v1/render-jobs/{job_id}/outputs/{output_entry_id}/retry` returns `202 OutputRetryResponse` with `re_render=false`.
 - Foreign and unknown job/output identifiers return the same `404 resource_not_found` behavior and contain no resource reference.
 
