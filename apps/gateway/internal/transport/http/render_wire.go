@@ -106,8 +106,9 @@ func toRenderJobWire(job domain.RenderJob) renderJobWire {
 		wire.Cancel = &cancelFieldsWire{
 			RequestedAt:            timestampString(job.CancelRequestedAt),
 			UpstreamAbortAttempted: job.Lifecycle == domain.JobCancelRequested || job.Lifecycle == domain.JobCanceled,
-			// Stop is confirmed only for terminal canceled with no residual.
-			UpstreamStopConfirmed: job.Lifecycle == domain.JobCanceled,
+			// Stop is confirmed only if a worker/Adapter actually confirmed it
+			// (a queued→canceled job never called the Provider). See cancelStopConfirmed.
+			UpstreamStopConfirmed: cancelStopConfirmed(job),
 		}
 	}
 	return wire
@@ -165,13 +166,24 @@ func cancelAbortAttempted(job domain.RenderJob) bool {
 	return job.Attempt.ID != "" || job.Attempt.PayloadSent || job.Attempt.ResponseCaptured
 }
 
+// cancelStopConfirmed reports whether a worker/Adapter actually confirmed the
+// upstream stop, distinct from merely being canceled. A canceled job reached
+// with zero attempts (queued cancel — the Provider was never called) has nothing
+// that confirmed a stop, so the response MUST NOT claim upstream stopped here.
+// Only a canceled job that a worker drained/aborted (attempt ledger or payload
+// exists) proves stop was confirmed. Spec §7.2.3: the response MUST NOT claim
+// upstream stopped until a worker/Adapter confirms it.
+func cancelStopConfirmed(job domain.RenderJob) bool {
+	return job.Lifecycle == domain.JobCanceled && cancelAbortAttempted(job)
+}
+
 func writeRenderJobCancel(writer http.ResponseWriter, statusCode int, result application.RenderJobResult) {
 	job := result.Job
 	wire := renderJobCancelWire{
 		JobID:                  string(job.JobID),
 		LifecycleState:         string(job.Lifecycle),
 		UpstreamAbortAttempted: cancelAbortAttempted(job),
-		UpstreamStopConfirmed:  job.Lifecycle == domain.JobCanceled,
+		UpstreamStopConfirmed:  cancelStopConfirmed(job),
 		StateRevision:          job.StateRevision,
 		RequestID:              string(result.RequestID),
 	}

@@ -1214,30 +1214,39 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 
 	if renderErr != nil {
 		// Client cancel observed and the Adapter returned because renderCtx was
-		// cancelled (abort attempt took effect) before yielding a committed
-		// outcome. No manifest was captured, so there is no committed result to
-		// preserve — settle as canceled (spec §7.2 "abort succeeds before a
-		// committed result → canceled"). Distinguish from recovery (no abort
-		// evidence) where post-payload cancel stays fail-closed.
+		// cancelled before yielding a committed outcome. JobCanceled is only safe
+		// when the abort is authoritative.
 		//
-		// Divergence with recoverAttemptWithoutRender (below), by design: the
-		// live worker holds direct abort proof (Adapter returned context.Canceled
-		// because our heartbeat signalled the cancel), so CommitNotCommitted here
-		// truthfully reads "we chose not to commit" — we aborted. Recovery has no
-		// such proof and stays CommitUnknown/fail-closed. Both reach a terminal
-		// lifecycle, so neither is ever re-rendered (ClaimWorker rejects
-		// terminal jobs) and no billing/admission reconciliation keys off the
-		// CommitStatus label on a terminal job — this affects only the terminal
-		// label, never re-render or billing semantics.
+		// Pre-payload (PayloadSent=false): the Provider never received work, so
+		// there is no committed result to preserve and freeing create occupancy is
+		// safe — settle canceled + not_started (§7.2 "abort succeeds before a
+		// committed result → canceled").
+		//
+		// Post-payload: a local context.Canceled is NOT proof the Provider stopped
+		// or never committed (it may have committed and returned late, or ignored
+		// ctx entirely). Labeling that not_committed and freeing create occupancy
+		// would be an optimistic refund — forbidden by §7.3 ("no path frees
+		// capacity before upstream stops or conservative settlement completes")
+		// and AC3 ("do not refund or release accounting optimistically"). So an
+		// unproven post-payload abort settles conservatively, exactly like
+		// recoverAttemptWithoutRender for the same physical state: failed +
+		// recovery + commit unknown. It never claims canceled and never relabels
+		// uncertainty as a proven no-commit.
 		if clientCanceled() && errors.Is(renderErr, context.Canceled) {
-			commit := domain.CommitNotStarted
-			if attempt.PayloadSent {
-				commit = domain.CommitNotCommitted
+			if !attempt.PayloadSent {
+				now = service.nowTS()
+				if err := service.persistTerminal(ctx, job, ports.FencedTransition{
+					JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
+					CommitStatus: domain.CommitNotStarted, ClearLease: true, Now: now,
+				}); err != nil {
+					return err
+				}
+				return nil
 			}
-			now = service.nowTS()
 			if err := service.persistTerminal(ctx, job, ports.FencedTransition{
-				JobRef: ref, FencingToken: fence, To: domain.JobCanceled,
-				CommitStatus: commit, ClearLease: true, Now: now,
+				JobRef: ref, FencingToken: fence, To: domain.JobFailed,
+				FailureStage: domain.StageRecovery, FailureClass: domain.ErrCodeInternal,
+				CommitStatus: domain.CommitUnknown, ClearLease: true, Now: service.nowTS(),
 			}); err != nil {
 				return err
 			}
@@ -1358,7 +1367,9 @@ func (service *RenderService) ExecuteJob(ctx context.Context, ref domain.JobRef)
 
 	// Application owns Asset Reserve/Commit/Put via stable placement ids;
 	// job store only records the result.
-	// Issue #54 acceptance: completed only after durable output Asset placement.
+	// Issue #54 acceptance: the job completes on durable result capture, not on
+	// output Asset placement — a placement can legitimately stay pending (see the
+	// storage-cap handling below) without the job regressing or re-rendering.
 	// Storage-cap → job stays completed with the entry pending + storage_cap_exceeded
 	// (spec §8.2); capacity must be freed and output-retried later. Never fails the job.
 	// Post-placement cleanup debt (audit/purge/marker) must not fail the job —
@@ -1431,13 +1442,10 @@ func (service *RenderService) recoverAttemptWithoutRender(
 		// - Post-payload empty/not_started or committed/unknown without abort proof:
 		//   failed + recovery + unknown/committed (never claim canceled).
 		//
-		// Divergence with the live worker (ExecuteJob cancel branch): recovery has
-		// no direct abort evidence, so post-payload cancel stays failed + unknown
-		// rather than the worker's canceled + not_committed. Both paths are
-		// terminal and both are fail-closed — neither is ever re-rendered and no
-		// billing/admission reconciliation keys off the CommitStatus label on a
-		// terminal job, so the shared physical state can settle differently by
-		// race without changing re-render or billing semantics.
+		// Consistent with the live worker (ExecuteJob cancel branch): a post-payload
+		// cancel without authoritative non-commit proof settles failed + recovery +
+		// unknown in both paths — never canceled and never an optimistic refund
+		// (§7.3 / AC3).
 		commit := current.CommitStatus
 		if !current.Attempt.PayloadSent {
 			return service.persistTerminal(ctx, job, ports.FencedTransition{

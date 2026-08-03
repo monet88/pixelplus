@@ -967,12 +967,13 @@ func TestQueuedCancelIsTerminalWithoutProviderCall(t *testing.T) {
 	if canceled["lifecycle_state"] != "canceled" {
 		t.Fatalf("lifecycle_state = %v, want canceled", canceled["lifecycle_state"])
 	}
-	// Queued cancel has zero Provider calls: it must not claim an upstream abort.
+	// Queued cancel has zero Provider calls: it must not claim an upstream abort,
+	// and nothing ran to confirm a stop (§7.2.3) — both must be false.
 	if canceled["upstream_abort_attempted"] != false {
 		t.Fatalf("upstream_abort_attempted = %v, want false (queued cancel, no Provider call)", canceled["upstream_abort_attempted"])
 	}
-	if canceled["upstream_stop_confirmed"] != true {
-		t.Fatalf("upstream_stop_confirmed = %v, want true (canceled terminal)", canceled["upstream_stop_confirmed"])
+	if canceled["upstream_stop_confirmed"] != false {
+		t.Fatalf("upstream_stop_confirmed = %v, want false (queued cancel, nothing ran to confirm stop)", canceled["upstream_stop_confirmed"])
 	}
 	if h.renderCalls.Load() != 0 {
 		t.Fatalf("render calls after queued cancel = %d, want 0", h.renderCalls.Load())
@@ -2585,21 +2586,23 @@ func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
 	var mid map[string]any
 	_ = json.Unmarshal(cancelPayload, &mid)
 	midState, _ := mid["lifecycle_state"].(string)
-	// The cancel response reflects the running job before the worker drains to
-	// terminal: either cancel_requested (before the heartbeat poll lands) or, if
-	// the 50ms heartbeat beat the response serialize, already canceled. Both are
-	// honest; the worker always settles canceled (asserted after ExecuteJob).
-	if midState != "cancel_requested" && midState != "canceled" {
-		t.Fatalf("mid cancel lifecycle = %q, want cancel_requested or canceled", midState)
+	// AC1 §11.1.5: cancel of a running job atomically records cancel_requested and
+	// returns that durable state — it MUST NOT report canceled before a worker /
+	// Adapter confirms stop. The flat response is built from the post-CAS snapshot
+	// (CancelRenderJob does not reload a non-terminal job), so it deterministically
+	// reads cancel_requested here; the worker can only terminalize later, after the
+	// heartbeat cancels the in-flight Adapter.
+	if midState != string(domain.JobCancelRequested) {
+		t.Fatalf("mid cancel lifecycle = %q, want %q (cancel_requested before stop confirmation)", midState, domain.JobCancelRequested)
 	}
-	// The flat RenderJobCancelResponse must carry truthful top-level abort fields:
-	// the running Adapter is in-flight so an abort was attempted in either state.
+	// Truthful abort fields: the running Adapter is in-flight, so an abort WAS
+	// attempted; but it has not confirmed the stop, so upstream_stop_confirmed must
+	// be false (§7.2.3).
 	if mid["upstream_abort_attempted"] != true {
 		t.Fatalf("mid upstream_abort_attempted = %v, want true (Adapter in-flight)", mid["upstream_abort_attempted"])
 	}
-	wantStopConfirmed := midState == string(domain.JobCanceled)
-	if mid["upstream_stop_confirmed"] != wantStopConfirmed {
-		t.Fatalf("mid upstream_stop_confirmed = %v, want %v for lifecycle %q", mid["upstream_stop_confirmed"], wantStopConfirmed, midState)
+	if mid["upstream_stop_confirmed"] != false {
+		t.Fatalf("mid upstream_stop_confirmed = %v, want false (stop not yet confirmed)", mid["upstream_stop_confirmed"])
 	}
 	// block is never closed: cancel must release the in-flight Adapter by
 	// cancelling renderCtx (spec §7.2), not by waiting for the Provider to finish.
@@ -2617,8 +2620,18 @@ func TestRunningCancelExposesCancelRequestedBeforeTerminal(t *testing.T) {
 	if get.StatusCode != http.StatusOK {
 		t.Fatalf("get status = %d (body=%s)", get.StatusCode, getPayload)
 	}
-	// After worker observes cancel_requested, terminal is canceled (not completed).
-	if final["lifecycle_state"] != "canceled" {
-		t.Fatalf("final lifecycle = %v, want canceled", final["lifecycle_state"])
+	// The in-flight Adapter was still past the payload boundary (PayloadSent=true)
+	// when it was cancelled, and returned bare context.Canceled — no authoritative
+	// non-commit proof. So the worker settles conservatively as failed + recovery +
+	// commit unknown (§7.3, AC3), never an optimistic canceled. (A pre-payload or
+	// authoritatively not-committed cancel would settle canceled instead.)
+	if final["lifecycle_state"] != "failed" {
+		t.Fatalf("final lifecycle = %v, want failed (conservative post-payload cancel)", final["lifecycle_state"])
+	}
+	if final["failure_stage"] != "recovery" {
+		t.Fatalf("final failure_stage = %v, want recovery", final["failure_stage"])
+	}
+	if final["commit_status"] != "unknown" {
+		t.Fatalf("final commit_status = %v, want unknown", final["commit_status"])
 	}
 }
