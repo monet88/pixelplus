@@ -88,10 +88,37 @@ func (role ChatRole) Valid() bool {
 }
 
 // ChatMessage is one canonical chat turn. Content is the non-secret canonical
-// message text; it never carries credential material.
+// message text; it never carries credential material. Name is the optional
+// contract-declared message label (ChatMessage schema): it is bound into the
+// idempotency fingerprint but not consumed by the Adapter until real Provider
+// Adapters land (T19–T23, decision 0012).
 type ChatMessage struct {
 	Role    ChatRole
 	Content string
+	Name    string
+}
+
+// ChatRequestOptions carries every accepted ChatCompletionRequest field beyond
+// model and messages: the generation tuning fields (temperature, max_tokens,
+// top_p, n, stop, user) and the x_pixelplus routing inputs
+// (provider_account_id, allow_fallback, conversation_id). The tuning values
+// are shape-validated at the transport boundary and bound into the idempotency
+// fingerprint, so a same-key request differing in any accepted field conflicts
+// instead of replaying (idempotency policy §5.2, canonical-errors §7.1); the
+// Adapter does not consume them until real Provider Adapters land (T19–T23,
+// decision 0012). A nil pointer / nil Stop marks an absent field, and the
+// single-string stop form is canonicalized to a one-element list, so
+// semantically equal requests fingerprint identically.
+type ChatRequestOptions struct {
+	Temperature       *float64
+	MaxTokens         *int
+	TopP              *float64
+	N                 *int
+	Stop              []string
+	User              string
+	ProviderAccountID ProviderAccountID
+	AllowFallback     bool
+	ConversationID    string
 }
 
 // Valid reports whether the message carries a known role and non-empty content.

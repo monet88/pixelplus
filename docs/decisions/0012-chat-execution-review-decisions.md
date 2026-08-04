@@ -38,6 +38,14 @@ non-enumerating 404-class; the fallback walk never consulted
 affinity key was parsed then dropped; and this record's item 4 and Follow-Up
 contradicted the shipped code.
 
+A third review round (post-GW-058) added: a present JSON null was accepted
+for the non-nullable numeric options (and silently decoded to empty strings
+inside `stop` arrays) even though the published schema forbids null; the
+idempotency fingerprint omitted every accepted field beyond model and
+messages, so same-key requests differing in generation tuning or routing
+inputs replayed as the original completion instead of conflicting; and the
+foreign-pin test claimed zero Vault decrypts without asserting it.
+
 ## Decision
 
 1. The candidate-gate code divergence is intentional and pinned, not drift.
@@ -87,11 +95,12 @@ contradicted the shipped code.
 10. The request wire accepts every field the published `ChatCompletionRequest`
     / `ChatMessage` schemas declare. Generation tuning fields (`temperature`,
     `max_tokens`, `top_p`, `n`, `stop`, `user`, message `name`) are
-    shape-validated at the boundary (parse-first) but not carried into the
-    canonical command until real Provider Adapters consume them (T19–T23).
-    Array `content` is canonicalized by concatenating text parts; a non-text
-    part rejects `invalid_request` because silently dropping it would corrupt
-    the prompt.
+    shape-validated at the boundary (parse-first) and carried into the
+    canonical command only to bind the idempotency fingerprint (item 13); the
+    Adapter still does not consume them until real Provider Adapters land
+    (T19–T23). Array `content` is canonicalized by concatenating text parts; a
+    non-text part rejects `invalid_request` because silently dropping it would
+    corrupt the prompt.
 11. Conversation affinity (P3) is implemented as a policy-gated
     (`affinity.enabled`) soft preference over `conversation_id`, recorded on
     committed success and yielding whenever the preferred account leaves the
@@ -100,6 +109,20 @@ contradicted the shipped code.
     loss degrades to P4 policy selection — unlike the replay ledger it needs
     no fail-closed default. The durable store and the affinity window-class
     numeric remain deferred (#17 tunables; T25/#88 durable ledger).
+12. Boundary decoding is presence-aware: the published schema declares
+    non-nullable types, so a present JSON null on `stream`, `temperature`,
+    `max_tokens`, `top_p`, or `n` rejects `invalid_request` instead of being
+    treated as an omitted field, and null items inside the `stop` array
+    reject (items must be strings). A top-level `"stop": null` keeps the
+    documented treated-as-absent behavior.
+13. The chat idempotency fingerprint binds every accepted request field —
+    operation, model, ordered messages (name included), generation tuning,
+    and the `x_pixelplus` routing inputs — not only the fields the Adapter
+    consumes today (idempotency policy §5.2: every input that can change the
+    side effect). The payload version bumps to v2; the process-local and
+    fail-closed chat replay stores hold no durable v1 records, so no
+    migration is needed. Semantically equal forms (absent vs zero-value,
+    single-string vs one-element `stop`) canonicalize to one fingerprint.
 
 ## Alternatives Considered
 

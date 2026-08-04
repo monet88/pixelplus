@@ -31,6 +31,11 @@ code on HealthStore ownership and the production replay-store default.
   cross-Tenant, never cross-Auth-Mode.
 - Decision 0012 matches the code, including the deliberate claim-before-
   admission ordering justification.
+- Presence-aware decoding rejects a present JSON null on the non-nullable
+  fields (`stream`, numeric options) and null `stop` items as
+  `invalid_request`; the idempotency fingerprint binds every accepted request
+  field, so same-key requests differing in tuning or routing inputs conflict
+  instead of replaying (round-2 review).
 
 ## Affected Users
 
@@ -52,8 +57,9 @@ code on HealthStore ownership and the production replay-store default.
 
 - Streaming (T16), cancel/residual reconcile (T17), real Provider chat
   Adapters (T19–T23), durable chat replay ledger (T25/#88).
-- Carrying generation-tuning fields into the canonical command or Adapter
-  port (deferred until real Adapters exist).
+- Carrying generation-tuning fields into the Adapter port (deferred until
+  real Adapters exist). They are carried into the canonical command only to
+  bind the idempotency fingerprint (round-2 review).
 - Render-spine fallback auth-mode gating (render has no fallback walk today;
   recorded as a separate discovery).
 - PR thread replies, thread resolution, or merge.

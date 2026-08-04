@@ -1,6 +1,7 @@
 package httptransport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -42,50 +43,125 @@ func (handler chatHandler) newRequestID() domain.Identifier {
 // chatRequestWire mirrors the published ChatCompletionRequest schema
 // (OpenAI-compatible contract). Every schema-declared field is accepted —
 // DisallowUnknownFields rejects only fields the schema does not declare.
-// `stream` must be absent or false on this non-streaming route (JSON null is
-// rejected, distinguishing an absent field from a present null). Generation
-// tuning fields (temperature, max_tokens, top_p, n, stop, user, message name)
-// are shape-validated at this boundary but not carried into the canonical
-// command until real Provider Adapters consume them (T19–T23, decision 0012).
-// tenant_id is never accepted here.
+// `stream` must be absent or false on this non-streaming route. Presence-aware
+// RawMessage decoding keeps a present JSON null distinct from an absent field:
+// the schema declares non-nullable types, so a present null is rejected for
+// stream and the numeric options instead of being silently treated as an
+// omitted field. Generation tuning fields (temperature, max_tokens, top_p, n,
+// stop, user, message name) are shape-validated at this boundary and bound
+// into the idempotency fingerprint; the Adapter does not consume them until
+// real Provider Adapters land (T19–T23, decision 0012). tenant_id is never
+// accepted here.
 type chatRequestWire struct {
 	Model       string                 `json:"model"`
 	Messages    []chatMessageReq       `json:"messages"`
 	Stream      json.RawMessage        `json:"stream"`
-	Temperature *float64               `json:"temperature"`
-	MaxTokens   *int                   `json:"max_tokens"`
-	TopP        *float64               `json:"top_p"`
-	N           *int                   `json:"n"`
+	Temperature json.RawMessage        `json:"temperature"`
+	MaxTokens   json.RawMessage        `json:"max_tokens"`
+	TopP        json.RawMessage        `json:"top_p"`
+	N           json.RawMessage        `json:"n"`
 	Stop        json.RawMessage        `json:"stop"`
 	User        string                 `json:"user"`
 	Xpixelplus  *chatRequestXpixelplus `json:"x_pixelplus"`
 }
 
-// validOptionalFields shape-validates the contract-declared generation fields
-// whose values the schema bounds: max_tokens/n are >= 1 when present, and stop
-// is a string or an array of strings.
-func (wire chatRequestWire) validOptionalFields() bool {
-	if wire.MaxTokens != nil && *wire.MaxTokens < 1 {
-		return false
+// parseOptions shape-validates and canonicalizes the contract-declared
+// generation fields: max_tokens/n are >= 1 when present, stop is a string or
+// an array of strings without null items, and a present JSON null is rejected
+// for the non-nullable numeric options rather than treated as omission.
+func (wire chatRequestWire) parseOptions() (domain.ChatRequestOptions, bool) {
+	var options domain.ChatRequestOptions
+	temperature, ok := parseFloatOption(wire.Temperature)
+	if !ok {
+		return options, false
 	}
-	if wire.N != nil && *wire.N < 1 {
-		return false
+	options.Temperature = temperature
+	topP, ok := parseFloatOption(wire.TopP)
+	if !ok {
+		return options, false
 	}
-	return validStopWire(wire.Stop)
+	options.TopP = topP
+	maxTokens, ok := parseIntOption(wire.MaxTokens)
+	if !ok || (maxTokens != nil && *maxTokens < 1) {
+		return domain.ChatRequestOptions{}, false
+	}
+	options.MaxTokens = maxTokens
+	n, ok := parseIntOption(wire.N)
+	if !ok || (n != nil && *n < 1) {
+		return domain.ChatRequestOptions{}, false
+	}
+	options.N = n
+	stop, ok := parseStopWire(wire.Stop)
+	if !ok {
+		return domain.ChatRequestOptions{}, false
+	}
+	options.Stop = stop
+	options.User = wire.User
+	return options, true
 }
 
-// validStopWire accepts an absent stop, a single string, or a string array
-// (the published oneOf). A JSON null is treated as absent.
-func validStopWire(raw json.RawMessage) bool {
+// parseFloatOption parses one non-nullable numeric option: an absent field is
+// nil, a present JSON null or a non-number is invalid (ok=false).
+func parseFloatOption(raw json.RawMessage) (*float64, bool) {
 	if len(raw) == 0 {
-		return true
+		return nil, true
+	}
+	if isJSONNull(raw) {
+		return nil, false
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, false
+	}
+	return &value, true
+}
+
+// parseIntOption parses one non-nullable integer option: an absent field is
+// nil, a present JSON null or a non-integer is invalid (ok=false).
+func parseIntOption(raw json.RawMessage) (*int, bool) {
+	if len(raw) == 0 {
+		return nil, true
+	}
+	if isJSONNull(raw) {
+		return nil, false
+	}
+	var value int
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, false
+	}
+	return &value, true
+}
+
+// isJSONNull reports whether the raw value is the JSON null literal.
+func isJSONNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
+// parseStopWire canonicalizes the published stop oneOf: an absent stop (a
+// present JSON null keeps the documented treated-as-absent behavior), a single
+// string normalized to a one-element list, or a string array. Null array items
+// are invalid — the schema declares string items, and decoding through
+// nullable-aware pointers keeps a null element distinct from an empty string.
+func parseStopWire(raw json.RawMessage) ([]string, bool) {
+	if len(raw) == 0 || isJSONNull(raw) {
+		return nil, true
 	}
 	var single string
 	if err := json.Unmarshal(raw, &single); err == nil {
-		return true
+		return []string{single}, true
 	}
-	var many []string
-	return json.Unmarshal(raw, &many) == nil
+	var many []*string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return nil, false
+	}
+	stop := make([]string, 0, len(many))
+	for _, item := range many {
+		if item == nil {
+			return nil, false
+		}
+		stop = append(stop, *item)
+	}
+	return stop, true
 }
 
 // chatRequestXpixelplus is the documented optional routing extension. It never
@@ -152,24 +228,27 @@ func (handler chatHandler) completions(writer http.ResponseWriter, request *http
 	// rejected rather than silently executed as non-streaming.
 	if !malformed && len(wire.Stream) > 0 {
 		var stream bool
-		if err := json.Unmarshal(wire.Stream, &stream); err != nil || stream {
+		if isJSONNull(wire.Stream) {
+			malformed = true
+		} else if err := json.Unmarshal(wire.Stream, &stream); err != nil || stream {
 			malformed = true
 		}
 	}
 
-	// Contract-declared optional fields are shape-validated; out-of-shape values
-	// are the same invalid_request outcome as a malformed body.
-	if !malformed && !wire.validOptionalFields() {
-		malformed = true
+	// Contract-declared optional fields are shape-validated and canonicalized;
+	// out-of-shape values are the same invalid_request outcome as a malformed
+	// body.
+	var options domain.ChatRequestOptions
+	if !malformed {
+		var ok bool
+		options, ok = wire.parseOptions()
+		malformed = !ok
 	}
 
-	var providerAccountID domain.ProviderAccountID
-	var allowFallback bool
-	var conversationID string
 	if !malformed && wire.Xpixelplus != nil {
-		providerAccountID = domain.ProviderAccountID(wire.Xpixelplus.ProviderAccountID)
-		allowFallback = wire.Xpixelplus.AllowFallback
-		conversationID = wire.Xpixelplus.ConversationID
+		options.ProviderAccountID = domain.ProviderAccountID(wire.Xpixelplus.ProviderAccountID)
+		options.AllowFallback = wire.Xpixelplus.AllowFallback
+		options.ConversationID = wire.Xpixelplus.ConversationID
 	}
 
 	var messages []domain.ChatMessage
@@ -185,9 +264,7 @@ func (handler chatHandler) completions(writer http.ResponseWriter, request *http
 		IdempotencyKey:       idempotencyKey,
 		Model:                wire.Model,
 		Messages:             messages,
-		ProviderAccountID:    providerAccountID,
-		AllowFallback:        allowFallback,
-		ConversationID:       conversationID,
+		Options:              options,
 		OversizeBody:         oversize,
 		MalformedBody:        malformed,
 	}
@@ -212,6 +289,7 @@ func toDomainMessages(messages []chatMessageReq) ([]domain.ChatMessage, bool) {
 		out = append(out, domain.ChatMessage{
 			Role:    domain.ChatRole(message.Role),
 			Content: content,
+			Name:    message.Name,
 		})
 	}
 	return out, true

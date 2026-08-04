@@ -147,6 +147,23 @@ const fixtureChatDigestKey = "pixelplus-fixture-chat-digest-key-v1"
 type chatFingerprintMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	Name    string `json:"name,omitempty"`
+}
+
+// chatFingerprintOptions encodes every accepted request field beyond model and
+// messages — generation tuning and x_pixelplus routing inputs — so a same-key
+// request differing in any contracted field conflicts instead of replaying
+// (mirror of the production HMACChatDigester options payload).
+type chatFingerprintOptions struct {
+	Temperature       *float64 `json:"temperature,omitempty"`
+	MaxTokens         *int     `json:"max_tokens,omitempty"`
+	TopP              *float64 `json:"top_p,omitempty"`
+	N                 *int     `json:"n,omitempty"`
+	Stop              []string `json:"stop,omitempty"`
+	User              string   `json:"user,omitempty"`
+	ProviderAccountID string   `json:"provider_account_id,omitempty"`
+	AllowFallback     bool     `json:"allow_fallback,omitempty"`
+	ConversationID    string   `json:"conversation_id,omitempty"`
 }
 
 // stubChatDigester is a controlled, deterministic chat digester that logs
@@ -154,8 +171,8 @@ type chatFingerprintMessage struct {
 // input so identical requests replay deterministically. The fingerprint is
 // HMAC-SHA256 under a fixture key — never a raw unkeyed SHA-256 of the messages
 // (dictionary/oracle ban, ports.ChatDigester) — over a structured JSON encoding
-// of operation + model + ordered messages, mirroring the production
-// HMACChatDigester so replay coverage is faithful.
+// of operation + model + ordered messages + accepted request options,
+// mirroring the production HMACChatDigester so replay coverage is faithful.
 type stubChatDigester struct {
 	log *spineLog
 	key []byte
@@ -165,7 +182,7 @@ func newStubChatDigester(log *spineLog) *stubChatDigester {
 	return &stubChatDigester{log: log, key: []byte(fixtureChatDigestKey)}
 }
 
-func (d *stubChatDigester) CreateFingerprint(operation domain.ChatOperation, model string, messages []domain.ChatMessage) (domain.Fingerprint, error) {
+func (d *stubChatDigester) CreateFingerprint(operation domain.ChatOperation, model string, messages []domain.ChatMessage, options domain.ChatRequestOptions) (domain.Fingerprint, error) {
 	if d.log != nil {
 		d.log.add("digest")
 	}
@@ -174,18 +191,30 @@ func (d *stubChatDigester) CreateFingerprint(operation domain.ChatOperation, mod
 	}
 	msgs := make([]chatFingerprintMessage, 0, len(messages))
 	for _, m := range messages {
-		msgs = append(msgs, chatFingerprintMessage{Role: string(m.Role), Content: m.Content})
+		msgs = append(msgs, chatFingerprintMessage{Role: string(m.Role), Content: m.Content, Name: m.Name})
 	}
 	payload, err := json.Marshal(struct {
 		V         int                      `json:"v"`
 		Operation string                   `json:"op"`
 		Model     string                   `json:"model"`
 		Messages  []chatFingerprintMessage `json:"messages"`
+		Options   chatFingerprintOptions   `json:"options"`
 	}{
-		V:         1,
+		V:         2,
 		Operation: string(operation),
 		Model:     model,
 		Messages:  msgs,
+		Options: chatFingerprintOptions{
+			Temperature:       options.Temperature,
+			MaxTokens:         options.MaxTokens,
+			TopP:              options.TopP,
+			N:                 options.N,
+			Stop:              options.Stop,
+			User:              options.User,
+			ProviderAccountID: string(options.ProviderAccountID),
+			AllowFallback:     options.AllowFallback,
+			ConversationID:    options.ConversationID,
+		},
 	})
 	if err != nil {
 		return "", err
@@ -204,7 +233,7 @@ func TestStubChatDigesterKeyedFingerprint(t *testing.T) {
 	d := newStubChatDigester(nil)
 	messages := []domain.ChatMessage{{Role: domain.ChatRoleUser, Content: "hi"}}
 
-	fp, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, messages)
+	fp, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, messages, domain.ChatRequestOptions{})
 	if err != nil {
 		t.Fatalf("CreateFingerprint() error = %v", err)
 	}
@@ -229,19 +258,65 @@ func TestStubChatDigesterNoMessageCollision(t *testing.T) {
 	a, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, []domain.ChatMessage{
 		{Role: domain.ChatRoleUser, Content: "ab"},
 		{Role: domain.ChatRoleUser, Content: "c"},
-	})
+	}, domain.ChatRequestOptions{})
 	if err != nil {
 		t.Fatalf("CreateFingerprint(a) error = %v", err)
 	}
 	b, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, []domain.ChatMessage{
 		{Role: domain.ChatRoleUser, Content: "a"},
 		{Role: domain.ChatRoleUser, Content: "bc"},
-	})
+	}, domain.ChatRequestOptions{})
 	if err != nil {
 		t.Fatalf("CreateFingerprint(b) error = %v", err)
 	}
 	if a == b {
 		t.Fatalf("distinct message arrays collided into one fingerprint %q", a)
+	}
+}
+
+// AC: the fingerprint binds every accepted request field — identical messages
+// with different generation tuning or routing inputs must never collide, so a
+// same-key request differing in any contracted field conflicts instead of
+// replaying (idempotency policy §5.2, canonical-errors §7.1).
+func TestStubChatDigesterOptionsCovered(t *testing.T) {
+	d := newStubChatDigester(nil)
+	messages := []domain.ChatMessage{{Role: domain.ChatRoleUser, Content: "hi"}}
+
+	base, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, messages, domain.ChatRequestOptions{})
+	if err != nil {
+		t.Fatalf("CreateFingerprint(base) error = %v", err)
+	}
+
+	temperature := 0.7
+	maxTokens := 64
+	variations := map[string]domain.ChatRequestOptions{
+		"temperature":         {Temperature: &temperature},
+		"max_tokens":          {MaxTokens: &maxTokens},
+		"stop":                {Stop: []string{"END"}},
+		"user":                {User: "u_1"},
+		"provider_account_id": {ProviderAccountID: "pa_chat"},
+		"allow_fallback":      {AllowFallback: true},
+		"conversation_id":     {ConversationID: "conv-1"},
+	}
+	for name, options := range variations {
+		fp, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, messages, options)
+		if err != nil {
+			t.Fatalf("CreateFingerprint(%s) error = %v", name, err)
+		}
+		if fp == base {
+			t.Fatalf("%s: fingerprint %q equals the no-options fingerprint; the field is not bound", name, fp)
+		}
+	}
+
+	// A message name difference must also change the fingerprint.
+	named, err := d.CreateFingerprint(domain.ChatOpCompletion, chatModel, []domain.ChatMessage{
+		{Role: domain.ChatRoleUser, Content: "hi", Name: "dao"},
+	}, domain.ChatRequestOptions{})
+	if err != nil {
+		t.Fatalf("CreateFingerprint(named) error = %v", err)
+	}
+	if named == base {
+		t.Fatalf("message name not bound into the fingerprint %q", named)
 	}
 }
 

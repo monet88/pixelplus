@@ -44,11 +44,16 @@ type ChatReplayStore interface {
 }
 
 // ChatDigester produces opaque, keyed digests for chat create-time fingerprint
-// binding. The key never leaves the digester implementation. Unkeyed SHA-256 of
-// the messages MUST NOT equal these digests (dictionary/oracle ban, mirror of
-// RenderDigester). Method errors keep product paths fail-closed.
+// binding. The fingerprint covers the operation identity, model, ordered
+// canonical messages (name included), and every remaining accepted request
+// field in options — generation tuning and x_pixelplus routing inputs alike —
+// so a same-key request differing in any contracted field conflicts instead of
+// replaying (idempotency policy §5.2, canonical-errors §7.1). The key never
+// leaves the digester implementation. Unkeyed SHA-256 of the messages MUST NOT
+// equal these digests (dictionary/oracle ban, mirror of RenderDigester).
+// Method errors keep product paths fail-closed.
 type ChatDigester interface {
-	CreateFingerprint(operation domain.ChatOperation, model string, messages []domain.ChatMessage) (domain.Fingerprint, error)
+	CreateFingerprint(operation domain.ChatOperation, model string, messages []domain.ChatMessage, options domain.ChatRequestOptions) (domain.Fingerprint, error)
 }
 
 // ChatAffinityStore keeps the soft conversation→account preference (routing

@@ -19,20 +19,12 @@ type CreateChatCompletionCommand struct {
 	IdempotencyKey       string
 	Model                string
 	Messages             []domain.ChatMessage
-	// ProviderAccountID is the optional same-Tenant routing pin carried from the
-	// documented x_pixelplus routing fields (OpenAI-compatible contract §3.5).
-	// A foreign/unusable pin fails closed at routing instead of being rejected as
-	// an unknown request field. Empty means no pin.
-	ProviderAccountID domain.ProviderAccountID
-	// AllowFallback is the optional client opt-in hint from x_pixelplus. It is
-	// still subject to Tenant Routing Policy and the single-owner no-commit proof;
-	// it only permits (never forces) the existing fallback walk.
-	AllowFallback bool
-	// ConversationID is the optional affinity key from x_pixelplus. When the
-	// Tenant Routing Policy enables affinity, it drives the P3 soft preference
-	// (prefer the account that last served the conversation while it remains in
-	// the candidate set); otherwise it is inert. Empty means no affinity.
-	ConversationID string
+	// Options carries every remaining accepted request field: the generation
+	// tuning values (shape-validated at the boundary, bound into the
+	// idempotency fingerprint, not consumed by the Adapter until T19–T23) and
+	// the documented x_pixelplus routing inputs (OpenAI-compatible contract
+	// §3.5). See domain.ChatRequestOptions.
+	Options domain.ChatRequestOptions
 	// OversizeBody / MalformedBody are observed at the transport boundary and
 	// carried as flags so the single normative A0→A1→A2 order is enforced here
 	// (a pre-authenticated oversize still fails authentication_failed).
@@ -190,8 +182,11 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 		return ChatResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
 
-	// Keyed digester must succeed before any replay/admission side effect.
-	fingerprint, err := service.digester.CreateFingerprint(domain.ChatOpCompletion, command.Model, command.Messages)
+	// Keyed digester must succeed before any replay/admission side effect. The
+	// fingerprint binds every accepted request field (model, messages, tuning,
+	// x_pixelplus routing inputs), so a same-key request differing in any of
+	// them conflicts instead of replaying (idempotency policy §5.2).
+	fingerprint, err := service.digester.CreateFingerprint(domain.ChatOpCompletion, command.Model, command.Messages, command.Options)
 	if err != nil {
 		return ChatResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
@@ -237,7 +232,7 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 	}
 
 	// Deterministic same-Tenant routing (P1 pin → P3 affinity → P4 policy).
-	account, policy, canonical, ok := service.selectAccount(ctx, principal, domain.ChatOpCompletion, command.Model, sc.start, command.ProviderAccountID, command.ConversationID)
+	account, policy, canonical, ok := service.selectAccount(ctx, principal, domain.ChatOpCompletion, command.Model, sc.start, command.Options.ProviderAccountID, command.Options.ConversationID)
 	if !ok {
 		return ChatResult{}, service.failAfterRollback(ctx, sc, canonical, reservation, identity)
 	}
@@ -283,8 +278,8 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 	// by design — affinity is a soft preference (routing spec §5.1), never an
 	// authority, so a record failure only loses a hint and must never fail a
 	// completed execution.
-	if command.ConversationID != "" && policy.Affinity.Enabled {
-		_ = service.affinity.Record(ctx, domain.ChatAffinityScope{TenantID: principal.TenantID, Key: command.ConversationID}, completion.ProviderAccountID)
+	if command.Options.ConversationID != "" && policy.Affinity.Enabled {
+		_ = service.affinity.Record(ctx, domain.ChatAffinityScope{TenantID: principal.TenantID, Key: command.Options.ConversationID}, completion.ProviderAccountID)
 	}
 	if err := service.chatAudit(ctx, sc, principal, completion.ProviderAccountID, completion.ExecutionID, "completed"); err != nil {
 		return ChatResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
@@ -312,7 +307,7 @@ func (service *ChatService) runExecution(
 	executionID domain.Identifier,
 ) (domain.ChatCompletion, domain.CanonicalError, bool) {
 	request := chatRequest{model: command.Model, messages: command.Messages}
-	attempts := service.attemptAccounts(ctx, sc, principal, primary, policy, request, command.AllowFallback)
+	attempts := service.attemptAccounts(ctx, sc, principal, primary, policy, request, command.Options.AllowFallback)
 
 	for index, account := range attempts {
 		completion, canonical, committed := service.attemptOnAccount(ctx, sc, principal, account, request, executionID)

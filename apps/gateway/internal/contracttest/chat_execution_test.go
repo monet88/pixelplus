@@ -497,6 +497,114 @@ func countEvents(logs []string, target string) int {
 	return count
 }
 
+// AC: the idempotency fingerprint binds every accepted request field
+// (idempotency policy §5.2, canonical-errors §7.1, chat spec obligation 22):
+// a same-key request differing in any contracted field — generation tuning,
+// message name, or x_pixelplus routing inputs — returns idempotency_conflict
+// instead of replaying the original completion, even though the Adapter does
+// not consume the tuning values yet (T19–T23). An exact resend still replays.
+func TestChatReplayFingerprintCoversAcceptedRequestFields(t *testing.T) {
+	t.Parallel()
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", "pa_chat", domain.AuthModeChatGPTCodexOAuth)
+	})
+
+	base := `{"model":"gpt-4o","messages":[` +
+		`{"role":"system","content":"be kind"},` +
+		`{"role":"user","name":"dao","content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}` +
+		`],"temperature":0.7,"max_tokens":64,"top_p":0.9,"n":1,"stop":["\n","END"],"user":"u_1",` +
+		`"x_pixelplus":{"conversation_id":"conv-wire"}}`
+
+	first, firstPayload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-fp", body: base,
+	})
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d (body=%s)", first.StatusCode, firstPayload)
+	}
+	firstID := decodeCompletionBody(t, firstPayload)["id"]
+
+	// Each variation differs from the base in exactly one accepted field.
+	variations := []struct {
+		name     string
+		fragment [2]string // base fragment -> varied fragment
+	}{
+		{"temperature", [2]string{`"temperature":0.7`, `"temperature":0.8`}},
+		{"max_tokens", [2]string{`"max_tokens":64`, `"max_tokens":65`}},
+		{"top_p", [2]string{`"top_p":0.9`, `"top_p":0.8`}},
+		{"n", [2]string{`"n":1`, `"n":2`}},
+		{"stop", [2]string{`"stop":["\n","END"]`, `"stop":["\n","DONE"]`}},
+		{"user", [2]string{`"user":"u_1"`, `"user":"u_2"`}},
+		{"message name", [2]string{`"name":"dao"`, `"name":"ren"`}},
+		{"conversation_id", [2]string{`"conversation_id":"conv-wire"`, `"conversation_id":"conv-other"`}},
+		{"provider_account_id", [2]string{`"conversation_id":"conv-wire"`, `"conversation_id":"conv-wire","provider_account_id":"pa_chat"`}},
+		{"allow_fallback", [2]string{`"conversation_id":"conv-wire"`, `"conversation_id":"conv-wire","allow_fallback":true`}},
+	}
+	for _, tc := range variations {
+		if !strings.Contains(base, tc.fragment[0]) {
+			t.Fatalf("%s: base body lost fragment %s", tc.name, tc.fragment[0])
+		}
+		body := strings.Replace(base, tc.fragment[0], tc.fragment[1], 1)
+		response, payload := harness.do(t, requestSpec{
+			method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-fp", body: body,
+		})
+		if response.StatusCode != http.StatusConflict {
+			t.Fatalf("%s: status = %d, want 409 (body=%s)", tc.name, response.StatusCode, payload)
+		}
+		if code := decodeError(t, payload)["code"]; code != "idempotency_conflict" {
+			t.Fatalf("%s: error code = %v, want idempotency_conflict", tc.name, code)
+		}
+	}
+
+	// An exact resend still replays the original completion.
+	replay, replayPayload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-fp", body: base,
+	})
+	if replay.StatusCode != http.StatusOK {
+		t.Fatalf("replay status = %d (body=%s)", replay.StatusCode, replayPayload)
+	}
+	if got := decodeCompletionBody(t, replayPayload)["id"]; got != firstID {
+		t.Fatalf("replay id = %v, want original %v", got, firstID)
+	}
+	if calls := harness.adapter.CallCount(); calls != 1 {
+		t.Fatalf("adapter calls = %d, want 1 (conflicts and replays never re-execute)", calls)
+	}
+}
+
+// AC: semantically equal stop forms share one fingerprint — the single-string
+// form is canonicalized to a one-element list, so `"stop":"END"` and
+// `"stop":["END"]` replay instead of falsely conflicting.
+func TestChatReplayFingerprintCanonicalizesStopForm(t *testing.T) {
+	t.Parallel()
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", "pa_chat", domain.AuthModeChatGPTCodexOAuth)
+	})
+
+	first, firstPayload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-fp-stop",
+		body: `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stop":"END"}`,
+	})
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d (body=%s)", first.StatusCode, firstPayload)
+	}
+	firstID := decodeCompletionBody(t, firstPayload)["id"]
+
+	replay, replayPayload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-fp-stop",
+		body: `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stop":["END"]}`,
+	})
+	if replay.StatusCode != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 for the canonical-equal stop form (body=%s)", replay.StatusCode, replayPayload)
+	}
+	if got := decodeCompletionBody(t, replayPayload)["id"]; got != firstID {
+		t.Fatalf("replay id = %v, want original %v", got, firstID)
+	}
+	if calls := harness.adapter.CallCount(); calls != 1 {
+		t.Fatalf("adapter calls = %d, want 1 (canonical-equal forms replay)", calls)
+	}
+}
+
 // AC: retry/fallback share one owner and require authoritative no-commit proof.
 // A fallback single-walk runs exactly once on a proven not_committed outcome.
 func TestChatFallbackSingleWalkOnAuthoritativeNoCommit(t *testing.T) {
@@ -781,7 +889,9 @@ func TestChatExplicitPinSelectsPinnedAccount(t *testing.T) {
 // AC: a foreign or unknown explicit pin fails closed 404-class
 // (resource_not_found) — non-enumerating, zero Adapter calls, zero Vault
 // decrypts (routing spec §3.2/§4.1 P1/§7.2 NF-XTENANT; chat spec §8 rule 1,
-// test obligation 26). Foreign and unknown ids are indistinguishable.
+// test obligation 26). Foreign and unknown ids are indistinguishable. The
+// zero-decrypt obligation is asserted through the Vault validate boundary
+// counter: the pin path must never reach credential work.
 func TestChatExplicitPinForeignIsNotFound(t *testing.T) {
 	t.Parallel()
 
@@ -809,6 +919,9 @@ func TestChatExplicitPinForeignIsNotFound(t *testing.T) {
 	}
 	if calls := harness.adapter.CallCount(); calls != 0 {
 		t.Fatalf("adapter calls = %d, want 0 (foreign/unknown pin never reaches execution)", calls)
+	}
+	if validates := harness.vault.validCalls.Load(); validates != 0 {
+		t.Fatalf("vault validate calls = %d, want 0 (foreign/unknown pin does no credential work)", validates)
 	}
 }
 
@@ -1018,9 +1131,12 @@ func TestChatRequestWireAcceptsContractDeclaredFields(t *testing.T) {
 	}
 }
 
-// AC: contract-valid but semantically unsupported shapes fail as
+// AC: contract-declared fields with out-of-shape values fail as
 // invalid_request, not as unknown fields: a non-text content part (the
-// canonical surface carries text only) and out-of-range max_tokens.
+// canonical surface carries text only), out-of-range max_tokens, a present
+// JSON null on the non-nullable numeric options or stream (the schema types
+// are not nullable — null is not omission), and null items inside a stop
+// array (the schema declares string items).
 func TestChatRequestWireRejectsInvalidShapes(t *testing.T) {
 	t.Parallel()
 
@@ -1035,6 +1151,12 @@ func TestChatRequestWireRejectsInvalidShapes(t *testing.T) {
 		{"non-text content part", `{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/x.png"}}]}]}`},
 		{"max_tokens below minimum", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":0}`},
 		{"stop wrong shape", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stop":42}`},
+		{"null temperature", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"temperature":null}`},
+		{"null max_tokens", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":null}`},
+		{"null top_p", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"top_p":null}`},
+		{"null n", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"n":null}`},
+		{"null stream", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":null}`},
+		{"stop array with null item", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stop":["ok",null]}`},
 	}
 	for _, tc := range cases {
 		response, payload := harness.do(t, requestSpec{

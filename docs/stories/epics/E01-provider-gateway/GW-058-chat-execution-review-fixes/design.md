@@ -38,9 +38,18 @@ No OpenAPI change: the code is brought up to the published
 `ChatCompletionRequest`. The wire parses `temperature`, `max_tokens` (≥1),
 `top_p`, `n` (≥1), `stop` (string | string[]), `user`, message `name`, and
 `content` as string | text-part array (parts concatenated; non-text parts
-reject `invalid_request`). Generation-tuning values are validated at the
-boundary but not carried into the canonical command until real Adapters land
-(T19–T23). New inward port `ports.ChatAffinityStore`
+reject `invalid_request`). Decoding is presence-aware: the schema declares
+non-nullable types, so a present JSON null on `stream` or the numeric options
+rejects `invalid_request` instead of being treated as omission, and null
+items inside the `stop` array reject (items must be strings). Generation-
+tuning values are validated at the boundary and carried into the canonical
+command only to bind the idempotency fingerprint; the Adapter still does not
+consume them until real Adapters land (T19–T23). The fingerprint (payload v2)
+binds every accepted request field — operation, model, ordered messages
+(name included), tuning, and the `x_pixelplus` routing inputs — so a same-key
+request differing in any contracted field conflicts instead of replaying
+(idempotency policy §5.2, canonical-errors §7.1). New inward port
+`ports.ChatAffinityStore`
 (`Preferred`/`Record`); production composition wires the process-local
 `MemoryChatAffinityStore` — safe because affinity is a preference, not an
 authority, so process loss degrades to P4 (unlike the replay ledger, which
