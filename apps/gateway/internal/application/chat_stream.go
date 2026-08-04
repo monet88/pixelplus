@@ -334,6 +334,13 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 	// X5/X6: settle occupancy and quota exactly once against the ORIGINAL
 	// Tenant + Client API Key, whatever the terminal class was.
 	reservation.SettlementKey = chatSettlementKey(principal, executionID)
+	// Reconcile to the final actual usage the terminal carries. Only a naturally
+	// completed generation has a trustworthy count; a failed, canceled, or
+	// commit-uncertain terminal leaves Usage unknown so settlement stays
+	// fail-closed instead of recording a zero debit (§6.5 rule 3).
+	if terminal.Event == domain.ChatStreamCompleted {
+		reservation.Usage = admissionUsage(terminal.Usage)
+	}
 	settleErr := service.admission.Reconcile(ctx, reservation)
 
 	if !opened {

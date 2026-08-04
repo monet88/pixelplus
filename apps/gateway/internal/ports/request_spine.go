@@ -71,6 +71,30 @@ type AdmissionDecision struct {
 	Stage    AdmissionStage
 }
 
+// AdmissionUsage is the final actual resource consumption reported at
+// settlement. Known distinguishes "the Adapter observed this" from "we could not
+// obtain final usage", which the chat lifecycle spec treats as materially
+// different: §6.5 rule 3 requires reconciling to "final actual input+output
+// usage", and when it "cannot be obtained after bounded drain/recovery" the
+// Gateway MUST "retain the full reservation ... never assume zero".
+//
+// A zero-valued AdmissionUsage therefore means UNKNOWN, not "cost nothing", so a
+// caller that forgets to populate it fails closed instead of silently
+// zero-debiting a Tenant who really did burn Provider tokens.
+type AdmissionUsage struct {
+	// Known reports whether PromptTokens/CompletionTokens are authoritative.
+	Known bool
+	// PromptTokens is the final actual input token count.
+	PromptTokens int
+	// CompletionTokens is the final actual output token count.
+	CompletionTokens int
+}
+
+// TotalTokens is the settled input+output total.
+func (usage AdmissionUsage) TotalTokens() int {
+	return usage.PromptTokens + usage.CompletionTokens
+}
+
 // AdmissionReservation identifies an accepted admission so its occupancy and
 // quota effects can be reconciled after the operation settles.
 // SettlementKey, when non-empty, makes Reconcile logically idempotent for that
@@ -80,12 +104,21 @@ type AdmissionReservation struct {
 	Principal     domain.SecurityPrincipal
 	Operation     domain.OperationToken
 	SettlementKey string
+	// Usage is the final actual consumption for this unit of work, reported at
+	// X6. An unset (zero) Usage means final usage is unknown and MUST NOT be
+	// treated as a zero debit (§6.5 rule 3).
+	Usage AdmissionUsage
 }
 
 // AdmissionStore evaluates the A3-A5 admission gates in normative order and
 // reserves capacity on accept. Unavailable limit state MUST fail closed rather
 // than admit (#8 section 7.6). Reconcile with a non-empty SettlementKey MUST be
 // logically idempotent: a second settle for the same key is a no-op.
+//
+// Reconcile MUST reconcile the reserved quota to Reservation.Usage when it is
+// Known, and MUST fail closed — retaining the reservation or a conservative debit
+// no smaller than known usage — when it is not (§6.5 rule 3). It MUST never
+// settle an unknown usage as zero.
 type AdmissionStore interface {
 	Admit(context.Context, AdmissionRequest) (AdmissionDecision, AdmissionReservation, error)
 	Reconcile(context.Context, AdmissionReservation) error

@@ -42,9 +42,15 @@ func (*FailClosedPrincipalStore) Authenticate(context.Context, ports.PresentedCl
 // When SettlementKey is set, Reconcile is logically idempotent: the second
 // settle for the same key is a no-op even across redelivery after a successful
 // first settle (#8 §7.4 / #54 terminal cleanup).
+//
+// Usage reconciliation: this foundation holds no quota ledger, so there is no
+// balance to debit. It records the settled usage per key so operators and tests
+// can observe what X6 reported, and it never treats an unknown usage as zero — a
+// real quota ledger replacing this store must keep that rule (§6.5 rule 3).
 type AlwaysAdmitStore struct {
 	mu      sync.Mutex
 	settled map[string]struct{}
+	usage   map[string]ports.AdmissionUsage
 }
 
 // NewAlwaysAdmitStore builds the foundation admission store.
@@ -69,8 +75,27 @@ func (store *AlwaysAdmitStore) Reconcile(_ context.Context, reservation ports.Ad
 	if store.settled == nil {
 		store.settled = make(map[string]struct{})
 	}
+	if _, done := store.settled[reservation.SettlementKey]; done {
+		// Idempotent: a redelivered settle must not overwrite the first authoritative
+		// usage record, otherwise a later unknown-usage retry would erase a known
+		// debit.
+		return nil
+	}
 	store.settled[reservation.SettlementKey] = struct{}{}
+	if store.usage == nil {
+		store.usage = make(map[string]ports.AdmissionUsage)
+	}
+	store.usage[reservation.SettlementKey] = reservation.Usage
 	return nil
+}
+
+// SettledUsage reports the usage recorded for a settlement key
+// (test/operator observation only).
+func (store *AlwaysAdmitStore) SettledUsage(key string) (ports.AdmissionUsage, bool) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	usage, ok := store.usage[key]
+	return usage, ok
 }
 
 // LogicalSettleCount reports how many distinct SettlementKeys have been
