@@ -42,6 +42,19 @@ type chatHarness struct {
 
 func newChatHarness(t *testing.T, configure func(*chatHarness)) *chatHarness {
 	t.Helper()
+	return newChatHarnessWithOptions(t, func(harness *chatHarness, _ *contracttest.Options) {
+		if configure != nil {
+			configure(harness)
+		}
+	})
+}
+
+// newChatHarnessWithOptions builds the chat harness and lets the caller inject
+// extra composition Options (for example the streaming Adapter and lease store)
+// alongside the harness configuration, so both the non-streaming and streaming
+// suites share one wiring path.
+func newChatHarnessWithOptions(t *testing.T, configure func(*chatHarness, *contracttest.Options)) *chatHarness {
+	t.Helper()
 
 	log := &spineLog{}
 	principal := &stubPrincipalStore{
@@ -91,11 +104,7 @@ func newChatHarness(t *testing.T, configure func(*chatHarness)) *chatHarness {
 		digester:     newStubChatDigester(log),
 		chatAudit:    newStubChatAuditRecorder(log),
 	}
-	if configure != nil {
-		configure(harness)
-	}
-
-	fixture, err := contracttest.NewFixture(contracttest.Options{
+	options := contracttest.Options{
 		Principal:    harness.principal,
 		Admission:    harness.admission,
 		Accounts:     harness.accounts,
@@ -111,7 +120,12 @@ func newChatHarness(t *testing.T, configure func(*chatHarness)) *chatHarness {
 		ChatReplay:   harness.replay,
 		ChatDigester: harness.digester,
 		ChatAudit:    harness.chatAudit,
-	})
+	}
+	if configure != nil {
+		configure(harness, &options)
+	}
+
+	fixture, err := contracttest.NewFixture(options)
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)
 	}

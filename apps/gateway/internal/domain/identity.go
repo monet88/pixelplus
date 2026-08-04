@@ -66,6 +66,12 @@ const (
 	// OperationChatCompletion names the single-turn non-streaming chat completion
 	// operation (createChatCompletion). It requires chat.completions.
 	OperationChatCompletion OperationToken = "chat_completion"
+	// OperationChatCompletionStreaming names the streaming chat completion
+	// operation (createChatCompletion with stream=true). It requires
+	// chat.completions and is a distinct operation token so admission,
+	// telemetry, and request logs never conflate a stream with a
+	// non-streaming completion (chat lifecycle §3.2).
+	OperationChatCompletionStreaming OperationToken = "chat_completion_streaming"
 )
 
 // NewTimestamp wraps a concrete instant.

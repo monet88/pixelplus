@@ -114,6 +114,15 @@ type Options struct {
 	// Slog recorder; a controlled fake proves audit-before-allow protected-access
 	// intent and the terminal chat audit outcomes through real composition.
 	ChatAudit ports.ChatAuditRecorder
+
+	// Chat streaming ports (#59 / T16). A nil ChatStreamAdapter keeps the
+	// production fail-closed streaming foundation, so a fixture that does not
+	// inject one proves that a streaming request fails closed instead of being
+	// answered with a non-streaming body.
+	ChatStreamAdapter ports.ChatStreamAdapter
+	// ChatStreamLeases injects the hard chat_stream lease store so tests can
+	// observe lease acquisition/release through real composition.
+	ChatStreamLeases ports.ChatStreamLeaseStore
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -195,6 +204,9 @@ func NewFixture(options Options) (*Fixture, error) {
 		ChatDigester:             options.ChatDigester,
 		ChatDigestKey:            options.ChatDigestKey,
 		ChatAudit:                options.ChatAudit,
+
+		ChatStreamAdapter: options.ChatStreamAdapter,
+		ChatStreamLeases:  options.ChatStreamLeases,
 	})
 	if err != nil {
 		return nil, err

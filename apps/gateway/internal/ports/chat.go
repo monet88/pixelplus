@@ -17,6 +17,13 @@ var (
 	// must fail closed with dependency_unavailable before replay/admission
 	// side effects (chat lifecycle mirror of render #54).
 	ErrChatDigesterUnavailable = errors.New("chat digester unavailable")
+	// ErrChatStreamAdapterUnavailable fails closed when no controlled Provider
+	// streaming surface is configured. A streaming request MUST NOT silently
+	// degrade to the non-streaming Adapter (chat lifecycle §3.2 rule 2).
+	ErrChatStreamAdapterUnavailable = errors.New("chat stream adapter unavailable")
+	// ErrChatStreamLeaseHeld is returned when the hard chat_stream lease for the
+	// account is already held by another in-flight stream of the same Tenant.
+	ErrChatStreamLeaseHeld = errors.New("chat stream lease already held")
 )
 
 // ChatReplayDecision is the result of an atomic idempotency claim. On

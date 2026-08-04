@@ -63,6 +63,14 @@ type ChatService struct {
 	requestLog   ports.RequestLogRecorder
 	clock        ports.Clock
 	ids          ports.IDGenerator
+	// authorizedStream is the protected streaming execution boundary (T16). A
+	// nil value keeps StreamChat failing closed as dependency_unavailable rather
+	// than degrading a streaming request into a non-streaming answer.
+	authorizedStream ports.AuthorizedChatStream
+	// streamLeases records the hard P2 chat_stream account binding. A nil store
+	// means no lease is taken; the stream still cannot hop accounts once content
+	// has been delivered.
+	streamLeases ports.ChatStreamLeaseStore
 }
 
 // ChatDependencies bundles the controlled ports the chat spine owns.
@@ -84,6 +92,10 @@ type ChatDependencies struct {
 	RequestLog   ports.RequestLogRecorder
 	Clock        ports.Clock
 	IDs          ports.IDGenerator
+	// AuthorizedStream is the protected streaming execution boundary (T16).
+	AuthorizedStream ports.AuthorizedChatStream
+	// StreamLeases records hard chat_stream account leases (routing spec §5.2).
+	StreamLeases ports.ChatStreamLeaseStore
 }
 
 // NewChatService validates and wires the chat spine dependencies.
@@ -140,6 +152,9 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 		requestLog:   dependencies.RequestLog,
 		clock:        dependencies.Clock,
 		ids:          dependencies.IDs,
+
+		authorizedStream: dependencies.AuthorizedStream,
+		streamLeases:     dependencies.StreamLeases,
 	}, nil
 }
 
@@ -307,7 +322,7 @@ func (service *ChatService) runExecution(
 	executionID domain.Identifier,
 ) (domain.ChatCompletion, domain.CanonicalError, bool) {
 	request := chatRequest{model: command.Model, messages: command.Messages}
-	attempts := service.attemptAccounts(ctx, sc, principal, primary, policy, request, command.Options.AllowFallback)
+	attempts := service.attemptAccounts(ctx, sc, principal, primary, policy, domain.ChatOpCompletion, request, command.Options.AllowFallback)
 
 	for index, account := range attempts {
 		completion, canonical, committed := service.attemptOnAccount(ctx, sc, principal, account, request, executionID)
@@ -333,12 +348,19 @@ func (service *ChatService) runExecution(
 // allowFallback is the client x_pixelplus hint; it only permits (never forces)
 // the fallback walk and remains subject to Tenant Routing Policy and the
 // single-owner authoritative no-commit proof.
+//
+// operation is the operation the client actually requested (non-streaming chat
+// or streaming). Candidates MUST be vetted against it rather than a hardcoded
+// one: vetting a streaming request's fallback targets against non-streaming
+// `chat` would both admit accounts that cannot stream and discard accounts that
+// can (routing spec §6.3 — the capability match is on the requested `op`+`m`).
 func (service *ChatService) attemptAccounts(
 	ctx context.Context,
 	sc spineContext,
 	principal domain.SecurityPrincipal,
 	primary domain.ProviderAccount,
 	policy domain.RoutingPolicy,
+	operation domain.ChatOperation,
 	request chatRequest,
 	allowFallback bool,
 ) []domain.ProviderAccount {
@@ -365,7 +387,7 @@ func (service *ChatService) attemptAccounts(
 		if account.AuthMode != primary.AuthMode && !fallbackModesAllow(policy.FallbackAuthModes, primary.AuthMode, account.AuthMode) {
 			continue
 		}
-		if _, ok := service.candidateRejection(ctx, principal, account, domain.ChatOpCompletion, request.model, sc.start); !ok {
+		if _, ok := service.candidateRejection(ctx, principal, account, operation, request.model, sc.start); !ok {
 			continue
 		}
 		fallback = append(fallback, account)
@@ -869,10 +891,7 @@ func (service *ChatService) dependencyCanonical(err error) domain.CanonicalError
 }
 
 func (service *ChatService) chatAudit(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, executionID domain.Identifier, outcome string) error {
-	action := ports.AuditChatCompleted
-	if outcome == "replayed" {
-		action = ports.AuditChatReplayed
-	}
+	action := chatAuditAction(sc.operation, outcome)
 	return service.audit.Record(ctx, ports.ChatAuditEvent{
 		Action:            action,
 		TenantID:          principal.TenantID,
@@ -882,6 +901,23 @@ func (service *ChatService) chatAudit(ctx context.Context, sc spineContext, prin
 		ExecutionID:       executionID,
 		Outcome:           outcome,
 	})
+}
+
+// chatAuditAction maps the spine operation plus terminal outcome onto the
+// audit action. A streaming spine must never label its events with the
+// non-streaming action, otherwise the audit trail reports a stream terminal as
+// `chat_completion.completed` and the streaming actions never appear.
+func chatAuditAction(operation domain.OperationToken, outcome string) ports.ChatAuditAction {
+	if operation == domain.OperationChatCompletionStreaming {
+		if outcome == "stream_opened" {
+			return ports.AuditChatStreamOpened
+		}
+		return ports.AuditChatStreamTerminal
+	}
+	if outcome == "replayed" {
+		return ports.AuditChatReplayed
+	}
+	return ports.AuditChatCompleted
 }
 
 func (service *ChatService) fail(ctx context.Context, sc spineContext, canonical domain.CanonicalError) error {
