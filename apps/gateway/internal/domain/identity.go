@@ -63,6 +63,9 @@ const (
 	// OperationListModels names the offerable model list (listModels). It
 	// requires capabilities.read.
 	OperationListModels OperationToken = "list_models"
+	// OperationChatCompletion names the single-turn non-streaming chat completion
+	// operation (createChatCompletion). It requires chat.completions.
+	OperationChatCompletion OperationToken = "chat_completion"
 )
 
 // NewTimestamp wraps a concrete instant.

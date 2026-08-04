@@ -23,6 +23,8 @@ const (
 	IdentifierKindWorker IdentifierKind = "worker"
 	// IdentifierKindAttempt namespaces upstream attempt identities.
 	IdentifierKindAttempt IdentifierKind = "attempt"
+	// IdentifierKindExecution namespaces synchronous chat execution identities.
+	IdentifierKindExecution IdentifierKind = "execution"
 )
 
 // Identifier is a server-owned opaque identifier.

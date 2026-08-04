@@ -100,6 +100,20 @@ type Options struct {
 	// inject short intervals for deterministic cancel/heartbeat coverage.
 	RenderWorkerLeaseTTL    time.Duration
 	RenderHeartbeatInterval time.Duration
+
+	// Chat execution ports (#58 / T15). A nil port keeps the production
+	// fail-closed foundation; a controlled fake proves the non-streaming chat
+	// spine (replay, Adapter, credential, digester) through real composition.
+	ChatReplay               ports.ChatReplayStore
+	ChatAdapter              ports.ChatAdapter
+	ChatCredentialAuthorizer ports.ChatCredentialAuthorizer
+	ChatDigester             ports.ChatDigester
+	// ChatDigestKey injects key material when ChatDigester is nil.
+	ChatDigestKey []byte
+	// ChatAudit injects the chat spine audit recorder. A nil keeps the production
+	// Slog recorder; a controlled fake proves audit-before-allow protected-access
+	// intent and the terminal chat audit outcomes through real composition.
+	ChatAudit ports.ChatAuditRecorder
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -135,6 +149,7 @@ func NewFixture(options Options) (*Fixture, error) {
 		// Controlled fixtures only: process-local job store is not production
 		// durable state. Production composition leaves this false and fails closed.
 		AllowInMemoryRenderJobs: allowInMemory,
+		AllowInMemoryChat:       true,
 	}, composition.Dependencies{
 		Runtime: jobs,
 		Clock:   clock,
@@ -173,6 +188,13 @@ func NewFixture(options Options) (*Fixture, error) {
 		RenderDigestKey:         options.RenderDigestKey,
 		RenderWorkerLeaseTTL:    options.RenderWorkerLeaseTTL,
 		RenderHeartbeatInterval: options.RenderHeartbeatInterval,
+
+		ChatReplay:               options.ChatReplay,
+		ChatAdapter:              options.ChatAdapter,
+		ChatCredentialAuthorizer: options.ChatCredentialAuthorizer,
+		ChatDigester:             options.ChatDigester,
+		ChatDigestKey:            options.ChatDigestKey,
+		ChatAudit:                options.ChatAudit,
 	})
 	if err != nil {
 		return nil, err

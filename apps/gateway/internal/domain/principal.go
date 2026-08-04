@@ -36,6 +36,9 @@ const (
 	ScopeImagesEdit     Scope = "images.edit"
 	ScopeJobsRead       Scope = "jobs.read"
 	ScopeJobsManage     Scope = "jobs.manage"
+	// ScopeChatCompletions authorizes non-streaming chat completion
+	// (OperationChatCompletion; chat lifecycle #12 §3.2, OpenAPI x-required-scopes).
+	ScopeChatCompletions Scope = "chat.completions"
 )
 
 // ScopeSet is the set of operation ids granted to a Security Principal.
