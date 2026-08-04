@@ -3,6 +3,7 @@ package contracttest_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -649,6 +650,107 @@ func TestChatFallbackSingleWalkOnAuthoritativeNoCommit(t *testing.T) {
 	}
 	accounts := harness.adapter.Accounts()
 	if len(accounts) != 2 || accounts[0] != primary || accounts[1] != fallback {
+		t.Fatalf("adapter walked %v, want primary then exactly one fallback", accounts)
+	}
+}
+
+// AC / §7.2 rule 2: an Adapter TRANSPORT ERROR is not authoritative proof of
+// non-commit, so it must never trigger the fallback walk (#91).
+//
+// Cause and effect: the Adapter returns an error instead of a classified
+// domain.ChatOutcome, so the Gateway knows only that the call broke — never
+// whether the Provider already accepted the generation. §7.2 rule 2 is explicit
+// that "an HTTP status, missing response, timeout, reset, or absence of
+// client-visible deltas is not proof by itself", and §7.2 rule 4 binds fallback
+// to the same boundary. Walking to a second account would run a SECOND upstream
+// generation for one accepted request and answer HTTP 200 with it, while the
+// first may already have been billed — exactly what §7.5
+// I-CHAT-NO-DUPLICATE-EXEC forbids.
+func TestChatTransportErrorAfterSendNeverFallsBack(t *testing.T) {
+	t.Parallel()
+
+	var primary domain.ProviderAccountID = "pa_transport_primary"
+	var fallback domain.ProviderAccountID = "pa_transport_fallback"
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", string(primary), domain.AuthModeChatGPTCodexOAuth)
+		h.seedActive("tenant_a", string(fallback), domain.AuthModeChatGPTCodexOAuth)
+		h.routing.Seed("tenant_a", chatRoutingPolicy(
+			[]domain.ProviderAccountID{primary},
+			[]domain.ProviderAccountID{fallback},
+		))
+		// Primary breaks with a transport error AFTER the send boundary fired.
+		h.adapter.ScriptTransportErrors(errors.New("connection reset by peer"))
+		// If the fallback is ever attempted it would commit a second generation.
+		h.adapter.Script(
+			domain.ChatOutcome{},
+			chatSuccess(fallback, "", "", chatModel),
+		)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey,
+		idemKey: "idem-transport-error", body: chatSuccessBody,
+	})
+
+	accounts := harness.adapter.Accounts()
+	if len(accounts) != 1 {
+		t.Fatalf("adapter walked %v, want exactly 1 attempt: a transport error is not proof of non-commit (§7.2 rule 2), so falling back would run a second generation for one accepted request (body=%s)", accounts, payload)
+	}
+	if accounts[0] != primary {
+		t.Fatalf("attempted account = %q, want the primary %q", accounts[0], primary)
+	}
+	if response.StatusCode == http.StatusOK {
+		t.Fatalf("commit-uncertain transport failure answered 200, want a canonical failure status (body=%s)", payload)
+	}
+	if !strings.Contains(string(payload), string(domain.ErrCodeExecutionPossiblyCommitted)) {
+		t.Fatalf("error body = %s, want the possibly-committed canonical code (%s)", payload, domain.ErrCodeExecutionPossiblyCommitted)
+	}
+
+	// An uncertain claim is never released for automatic re-execution (§7.3 rule 4).
+	for _, entry := range harness.log.snapshot() {
+		if entry == "replay.abandon" {
+			t.Fatalf("replay claim was abandoned on an uncertain outcome; §7.3 rule 4 forbids releasing it for automatic re-execution; log=%v", harness.log.snapshot())
+		}
+	}
+}
+
+// AC / §7.2 rule 2 converse direction: a failure proved to be BEFORE payload
+// transmission is authoritative non-commit ("no request payload bytes were
+// transmitted"), so the single bounded fallback walk is still permitted. Without
+// this case, fixing the transport-error gap could silently turn every recoverable
+// pre-send failure into a client-visible error.
+func TestChatPreSendFailureStillFallsBack(t *testing.T) {
+	t.Parallel()
+
+	var primary domain.ProviderAccountID = "pa_presend_primary"
+	var fallback domain.ProviderAccountID = "pa_presend_fallback"
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", string(primary), domain.AuthModeChatGPTCodexOAuth)
+		h.seedActive("tenant_a", string(fallback), domain.AuthModeChatGPTCodexOAuth)
+		h.routing.Seed("tenant_a", chatRoutingPolicy(
+			[]domain.ProviderAccountID{primary},
+			[]domain.ProviderAccountID{fallback},
+		))
+		// The primary reports an authoritative no-commit CLASSIFICATION (not a
+		// transport error), so the payload demonstrably did not produce a
+		// generation and the walk may continue.
+		h.adapter.Script(
+			notCommittedOutcome(domain.ErrCodeUpstreamUnavailable),
+			chatSuccess(fallback, "", "", chatModel),
+		)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey,
+		idemKey: "idem-presend-fallback", body: chatSuccessBody,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: proven pre-send non-commit must still permit the bounded fallback walk (body=%s)", response.StatusCode, payload)
+	}
+	accounts := harness.adapter.Accounts()
+	if len(accounts) != 2 || accounts[1] != fallback {
 		t.Fatalf("adapter walked %v, want primary then exactly one fallback", accounts)
 	}
 }

@@ -263,6 +263,10 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 	completion, canonical, ok := service.runExecution(ctx, sc, principal, account, policy, command, executionID)
 	reservation.SettlementKey = chatSettlementKey(principal, executionID)
 	if !ok {
+		// No trustworthy usage exists on a failed or uncertain execution, so the
+		// reservation settles with Usage unknown. §6.5 rule 3 forbids assuming zero:
+		// the store must retain the reservation or a conservative debit rather than
+		// record that the attempt cost nothing.
 		// Exactly-once accounting/concurrency settlement against original
 		// Tenant+key on terminal failure too.
 		if err := service.admission.Reconcile(ctx, reservation); err != nil {
@@ -277,6 +281,10 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 		return ChatResult{}, service.fail(ctx, sc, canonical)
 	}
 
+	// Reconcile the A6 reservation to the final actual input+output usage the
+	// Adapter observed — the same counts the client is about to be shown
+	// (§6.5 rule 3).
+	reservation.Usage = admissionUsage(completion.Usage)
 	// Exactly-once accounting/concurrency settlement against original Tenant+key.
 	if err := service.admission.Reconcile(ctx, reservation); err != nil {
 		return ChatResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
@@ -446,6 +454,12 @@ func (service *ChatService) attemptOnAccount(
 		return domain.ChatCompletion{}, domain.NewAccountNotUsable(domain.RemediationSubmitCredential), false
 	}
 
+	// The send boundary is the only authoritative witness of whether Provider
+	// payload transmission began for THIS attempt. A transport error alone cannot
+	// distinguish "never left the Gateway" from "reached the Provider and the
+	// generation may be running", and §7.2 rule 2 requires that distinction before
+	// any re-attempt or fallback.
+	sendBoundary := &observedChatSendBoundary{}
 	outcome, err := service.authorized.Chat(ctx, ports.AuthorizedChatRequest{
 		Principal:    principal,
 		AccountID:    account.ID,
@@ -456,7 +470,7 @@ func (service *ChatService) attemptOnAccount(
 		Messages:     request.messages,
 		RequestID:    sc.requestID,
 		ExecutionID:  executionID,
-		SendBoundary: noopChatSendBoundary{},
+		SendBoundary: sendBoundary,
 	})
 	if err != nil {
 		if errors.Is(err, ports.ErrCredentialAbsent) {
@@ -464,6 +478,16 @@ func (service *ChatService) attemptOnAccount(
 		}
 		if errors.Is(err, ports.ErrChatAdapterUnavailable) || errors.Is(err, ports.ErrDependencyUnavailable) {
 			return domain.ChatCompletion{}, domain.NewDependencyUnavailable(), false
+		}
+		if sendBoundary.PayloadSent() {
+			// Payload transmission began and the Adapter returned an unclassified
+			// transport error, so this attempt is possibly committed: §7.2 rule 2
+			// states an "HTTP status, missing response, timeout, reset, or absence of
+			// client-visible deltas is not proof by itself". Fail closed on this
+			// account — never fall back, which §7.2 rule 4 binds to the same proof
+			// boundary — so one accepted request can never cause a second committed
+			// generation (§7.5).
+			return domain.ChatCompletion{}, domain.NewExecutionPossiblyCommitted(), false
 		}
 		return domain.ChatCompletion{}, service.dependencyCanonical(err), false
 	}
@@ -890,6 +914,19 @@ func (service *ChatService) dependencyCanonical(err error) domain.CanonicalError
 	return domain.NewInternalError()
 }
 
+// admissionUsage projects observed chat token usage onto the admission
+// settlement contract. It marks the usage Known, because it comes from an
+// Adapter observation on a committed generation; callers with no trustworthy
+// observation must leave Usage zero so settlement stays fail-closed rather than
+// recording a zero debit (§6.5 rule 3).
+func admissionUsage(usage domain.ChatUsage) ports.AdmissionUsage {
+	return ports.AdmissionUsage{
+		Known:            true,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+	}
+}
+
 func (service *ChatService) chatAudit(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, executionID domain.Identifier, outcome string) error {
 	action := chatAuditAction(sc.operation, outcome)
 	return service.audit.Record(ctx, ports.ChatAuditEvent{
@@ -969,12 +1006,3 @@ func (service *ChatService) resolveRequestID(boundaryID domain.Identifier) domai
 	}
 	return id
 }
-
-// noopChatSendBoundary is the synchronous payload-send marker. It is passed to
-// AuthorizedChat so the send surface is marked immediately before Adapter entry.
-type noopChatSendBoundary struct{}
-
-// MarkPayloadSent is a no-op for a synchronous single attempt; re-attempt and
-// occupancy semantics are owned by the application execution layer, so no
-// durable cross-request state is required here.
-func (noopChatSendBoundary) MarkPayloadSent(context.Context) error { return nil }

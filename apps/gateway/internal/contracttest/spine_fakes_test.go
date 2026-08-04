@@ -72,6 +72,10 @@ type stubAdmissionStore struct {
 	settledKeys        map[string]struct{}
 	// failMarker is unused on admit store; tests may inject settleErr.
 	settleErr error
+	// settledUsage records the usage reported at each settle, so a test can prove
+	// the quota ledger observed the SAME final token counts the client was shown
+	// (chat lifecycle §6.5 rule 3).
+	settledUsage []ports.AdmissionUsage
 }
 
 func (store *stubAdmissionStore) Admit(_ context.Context, request ports.AdmissionRequest) (ports.AdmissionDecision, ports.AdmissionReservation, error) {
@@ -96,6 +100,9 @@ func (store *stubAdmissionStore) Reconcile(_ context.Context, reservation ports.
 	if store.settleErr != nil {
 		return store.settleErr
 	}
+	store.mu.Lock()
+	store.settledUsage = append(store.settledUsage, reservation.Usage)
+	store.mu.Unlock()
 	if reservation.SettlementKey == "" {
 		return nil
 	}
@@ -123,6 +130,13 @@ func (store *stubAdmissionStore) OperationCount(operation domain.OperationToken)
 		}
 	}
 	return count
+}
+
+// SettledUsage returns the usage reported at each Reconcile call, in order.
+func (store *stubAdmissionStore) SettledUsage() []ports.AdmissionUsage {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return append([]ports.AdmissionUsage(nil), store.settledUsage...)
 }
 
 type stubReplayRecord struct {

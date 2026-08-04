@@ -24,6 +24,11 @@ type countingChatAdapter struct {
 	calls    int
 	accounts []domain.ProviderAccountID
 	script   []domain.ChatOutcome
+	// transportErrors[i] fails attempt i with that error instead of returning a
+	// classified outcome. A nil entry lets the attempt use `script` normally. This
+	// models an Adapter whose call broke (reset/timeout) rather than one that
+	// classified a Provider response.
+	transportErrors []error
 }
 
 func newCountingChatAdapter(log *spineLog) *countingChatAdapter {
@@ -35,6 +40,16 @@ func (adapter *countingChatAdapter) Script(outcomes ...domain.ChatOutcome) {
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
 	adapter.script = append([]domain.ChatOutcome(nil), outcomes...)
+}
+
+// ScriptTransportErrors sets the per-attempt transport failures. Entry i applies
+// to attempt i; a nil entry falls through to Script. Unlike a classified
+// domain.ChatOutcome, a transport error tells the Gateway only that the call
+// broke — never whether the Provider accepted the generation.
+func (adapter *countingChatAdapter) ScriptTransportErrors(errs ...error) {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	adapter.transportErrors = append([]error(nil), errs...)
 }
 
 func (adapter *countingChatAdapter) Run(
@@ -50,6 +65,9 @@ func (adapter *countingChatAdapter) Run(
 		adapter.log.add("adapter.run")
 	}
 	i := adapter.calls - 1
+	if i < len(adapter.transportErrors) && adapter.transportErrors[i] != nil {
+		return domain.ChatOutcome{}, adapter.transportErrors[i]
+	}
 	var outcome domain.ChatOutcome
 	switch {
 	case i < len(adapter.script):
