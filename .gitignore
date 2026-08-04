@@ -8,6 +8,10 @@
 .agents
 .scratch/
 
+# Agent instruction files (kept locally, not versioned)
+AGENTS.md
+CLAUDE.md
+
 # Secrets and local runtime data
 .env
 .env.*
