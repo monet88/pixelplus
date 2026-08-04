@@ -159,3 +159,45 @@ func TestChatStreamFailedTerminalNeverSettlesZeroUsage(t *testing.T) {
 		t.Fatalf("settlement claimed known usage for a failed stream with no usable usage report: %+v — §6.5 rule 3 forbids assuming zero", settled[0])
 	}
 }
+
+// #90 / §6.2 rule 3: a `canceled` stream is a COMMITTED generation that consumed
+// Provider tokens before the client stopped it, so its "token quota is
+// reconciled to actual tokens consumed so far".
+//
+// Cause and effect: treating `canceled` as untrustworthy would settle usage
+// unknown, so a Tenant could cancel every request after burning most of the
+// output and have none of it debited — a metered-cancel abuse path. The durable
+// record already persists this usage (a canceled terminal is replayable), so the
+// quota ledger must observe the same numbers.
+func TestChatStreamCanceledTerminalReconcilesConsumedUsage(t *testing.T) {
+	t.Parallel()
+
+	harness := newStreamHarness(t, func(h *streamHarness) {
+		h.seedStreamingAccount("tenant_a", "pa_stream_cancel_usage", domain.AuthModeChatGPTCodexOAuth, domain.StreamingReal)
+		h.stream.Script([]streamStep{
+			{delta: "partial output"},
+			{outcome: ptrStreamOutcome(streamCanceledWithAbort(domain.ChatUsage{PromptTokens: 7, CompletionTokens: 5}))},
+		})
+	})
+
+	_, events, payload := harness.streamRequest(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey,
+		idemKey: "idem-stream-cancel-usage", body: chatStreamBody,
+	})
+	terminals := terminalEvents(events)
+	if len(terminals) != 1 || terminals[0].Type != "canceled" {
+		t.Fatalf("terminals = %v, want exactly one canceled (body=%s)", eventTypes(events), payload)
+	}
+
+	settled := harness.admission.SettledUsage()
+	if len(settled) != 1 {
+		t.Fatalf("admission settles = %d, want exactly 1", len(settled))
+	}
+	usage := settled[0]
+	if !usage.Known {
+		t.Fatalf("canceled stream settled usage as unknown: %+v — §6.2 rule 3 requires reconciling to actual tokens consumed so far, otherwise cancel becomes a metered-quota bypass", usage)
+	}
+	if usage.PromptTokens != 7 || usage.CompletionTokens != 5 {
+		t.Fatalf("settled usage = %d prompt / %d completion, want 7/5 to match the tokens the cancellation actually consumed", usage.PromptTokens, usage.CompletionTokens)
+	}
+}
