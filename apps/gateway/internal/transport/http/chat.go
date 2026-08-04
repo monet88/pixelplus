@@ -11,24 +11,28 @@ import (
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 )
 
-// ChatGateway is the application seam for the non-streaming chat completion
-// route. Streaming (T16) is a separate surface.
+// ChatGateway is the application seam for the chat completion route. The same
+// published route serves both branches: the client selects streaming with
+// `stream: true`, which the handler dispatches to StreamChat (T16) while
+// `stream` absent/false dispatches to CreateChatCompletion (T15).
 type ChatGateway interface {
 	CreateChatCompletion(context.Context, application.CreateChatCompletionCommand) (application.ChatResult, error)
+	StreamChat(context.Context, application.StreamChatCommand, application.ChatStreamTransport) error
 }
 
 type chatHandler struct {
 	gateway ChatGateway
 	ids     idGenerator
+	clock   clock
 }
 
-// registerChatRoutes attaches the stable non-streaming chat route. The client
-// opts out of streaming by omitting/`stream=false`, which this route enforces.
-func registerChatRoutes(mux *http.ServeMux, gateway ChatGateway, ids idGenerator) {
+// registerChatRoutes attaches the stable chat route. One route serves both the
+// non-streaming JSON completion and the canonical SSE stream, as published.
+func registerChatRoutes(mux *http.ServeMux, gateway ChatGateway, ids idGenerator, clk clock) {
 	if gateway == nil {
 		return
 	}
-	handler := chatHandler{gateway: gateway, ids: ids}
+	handler := chatHandler{gateway: gateway, ids: ids, clock: clk}
 	mux.HandleFunc("POST /v1/chat/completions", handler.completions)
 }
 
@@ -43,15 +47,16 @@ func (handler chatHandler) newRequestID() domain.Identifier {
 // chatRequestWire mirrors the published ChatCompletionRequest schema
 // (OpenAI-compatible contract). Every schema-declared field is accepted —
 // DisallowUnknownFields rejects only fields the schema does not declare.
-// `stream` must be absent or false on this non-streaming route. Presence-aware
-// RawMessage decoding keeps a present JSON null distinct from an absent field:
-// the schema declares non-nullable types, so a present null is rejected for
-// stream and the numeric options instead of being silently treated as an
-// omitted field. Generation tuning fields (temperature, max_tokens, top_p, n,
-// stop, user, message name) are shape-validated at this boundary and bound
-// into the idempotency fingerprint; the Adapter does not consume them until
-// real Provider Adapters land (T19–T23, decision 0012). tenant_id is never
-// accepted here.
+// `stream` selects the response branch: absent/false yields the canonical JSON
+// completion, true yields the canonical SSE stream. Presence-aware RawMessage
+// decoding keeps a present JSON null distinct from an absent field: the schema
+// declares non-nullable types, so a present null is rejected for stream and the
+// numeric options instead of being silently treated as an omitted field.
+// Generation tuning fields (temperature, max_tokens, top_p, n, stop, user,
+// message name) are shape-validated at this boundary and bound into the
+// idempotency fingerprint; the Adapter does not consume them until real
+// Provider Adapters land (T19–T23, decision 0012). tenant_id is never accepted
+// here.
 type chatRequestWire struct {
 	Model       string                 `json:"model"`
 	Messages    []chatMessageReq       `json:"messages"`
@@ -222,16 +227,17 @@ func (handler chatHandler) completions(writer http.ResponseWriter, request *http
 	var wire chatRequestWire
 	malformed := decodeStrictJSON(body, &wire) != nil
 
-	// This route is strictly non-streaming (T16 owns streaming). `stream` must be
-	// absent or false; a present true, a non-boolean, or a JSON null are invalid.
-	// RawMessage keeps "stream": null distinct from an absent field so null is
-	// rejected rather than silently executed as non-streaming.
+	// `stream` selects the branch. A present JSON null or non-boolean is invalid
+	// rather than silently treated as non-streaming: RawMessage keeps
+	// "stream": null distinct from an absent field, and the schema declares a
+	// non-nullable boolean.
+	streaming := false
 	if !malformed && len(wire.Stream) > 0 {
-		var stream bool
 		if isJSONNull(wire.Stream) {
 			malformed = true
-		} else if err := json.Unmarshal(wire.Stream, &stream); err != nil || stream {
+		} else if err := json.Unmarshal(wire.Stream, &streaming); err != nil {
 			malformed = true
+			streaming = false
 		}
 	}
 
@@ -258,6 +264,20 @@ func (handler chatHandler) completions(writer http.ResponseWriter, request *http
 		malformed = !ok
 	}
 
+	if streaming {
+		handler.stream(writer, request, streamChatCommand{
+			requestID:      requestID,
+			presented:      presented,
+			idempotencyKey: idempotencyKey,
+			wire:           wire,
+			messages:       messages,
+			options:        options,
+			oversize:       oversize,
+			malformed:      malformed,
+		})
+		return
+	}
+
 	command := application.CreateChatCompletionCommand{
 		RequestID:            requestID,
 		PresentedKeyMaterial: presented,
@@ -275,6 +295,59 @@ func (handler chatHandler) completions(writer http.ResponseWriter, request *http
 		return
 	}
 	writeChatCompletion(writer, http.StatusOK, result)
+}
+
+// streamChatCommand carries the parsed request through to the streaming branch
+// so the parse/validate logic stays shared with the non-streaming branch.
+type streamChatCommand struct {
+	requestID      domain.Identifier
+	presented      string
+	idempotencyKey string
+	wire           chatRequestWire
+	messages       []domain.ChatMessage
+	options        domain.ChatRequestOptions
+	oversize       bool
+	malformed      bool
+}
+
+// stream serves the canonical SSE branch. Pre-upstream rejections are returned
+// as real HTTP status codes because no stream has been opened yet; once
+// StreamChat opens the stream the status is committed and every outcome is
+// delivered as exactly one canonical terminal event.
+func (handler chatHandler) stream(writer http.ResponseWriter, request *http.Request, parsed streamChatCommand) {
+	stream, ok := newSSEStream(writer, handler.clock)
+	if !ok {
+		// The response writer cannot flush, so incremental delivery is
+		// impossible. Fail closed rather than buffer a fake "stream".
+		writeCanonical(writer, domain.NewDependencyUnavailable().WithRequestID(parsed.requestID))
+		return
+	}
+
+	err := handler.gateway.StreamChat(request.Context(), application.StreamChatCommand{
+		RequestID:            parsed.requestID,
+		PresentedKeyMaterial: parsed.presented,
+		IdempotencyKey:       parsed.idempotencyKey,
+		Model:                parsed.wire.Model,
+		Messages:             parsed.messages,
+		Options:              parsed.options,
+		OversizeBody:         parsed.oversize,
+		MalformedBody:        parsed.malformed,
+	}, stream)
+	if err != nil {
+		if stream.Opened() {
+			// Defence in depth: StreamChat's contract is that a non-nil error means a
+			// PRE-stream rejection, and every post-open outcome is delivered as the
+			// single terminal event. If that contract is ever broken, writing an HTTP
+			// error here would attempt a second WriteHeader on an already-committed
+			// 200 and append a JSON body to the open SSE frame, corrupting the stream.
+			// The client already holds an open stream, so the least-harmful action is
+			// to write nothing further and let the terminal/EOF stand.
+			return
+		}
+		// Pre-stream rejection: nothing was written, so a canonical HTTP error is
+		// still expressible and no partial stream is left behind.
+		writeGatewayError(writer, err)
+	}
 }
 
 // toDomainMessages canonicalizes wire messages; ok=false when any content

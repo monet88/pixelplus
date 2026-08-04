@@ -49,7 +49,7 @@ func NewHandler(clock clock, ids idGenerator, status Status, gateway ProviderAcc
 	registerAssetRoutes(mux, assets, ids)
 	registerRoutingPolicyRoutes(mux, routing, ids)
 	registerRenderRoutes(mux, render, ids)
-	registerChatRoutes(mux, chat, ids)
+	registerChatRoutes(mux, chat, ids, clock)
 	return mux
 }
 

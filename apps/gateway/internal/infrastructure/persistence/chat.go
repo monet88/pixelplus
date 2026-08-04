@@ -151,3 +151,78 @@ func (store *MemoryChatAffinityStore) Record(_ context.Context, scope domain.Cha
 }
 
 var _ ports.ChatAffinityStore = (*MemoryChatAffinityStore)(nil)
+
+// chatStreamLeaseKey is the same-Tenant account identity of one hard lease.
+type chatStreamLeaseKey struct {
+	tenantID  domain.TenantID
+	accountID domain.ProviderAccountID
+}
+
+// MemoryChatStreamLeaseStore is the process-local hard streaming lease store.
+//
+// A lease is intentionally process-scoped state about an in-flight stream, not
+// durable business state: a stream cannot survive a restart, so losing the
+// binding when the process dies is correct rather than lossy — the stream it
+// guarded is gone too. What the store must guarantee is atomicity while the
+// process lives, so two concurrent streams cannot both bind one account
+// (routing spec §5.2 rule 1).
+type MemoryChatStreamLeaseStore struct {
+	mu     sync.Mutex
+	leases map[chatStreamLeaseKey]domain.Identifier
+}
+
+// NewMemoryChatStreamLeaseStore builds an empty process-local lease store.
+func NewMemoryChatStreamLeaseStore() *MemoryChatStreamLeaseStore {
+	return &MemoryChatStreamLeaseStore{leases: make(map[chatStreamLeaseKey]domain.Identifier)}
+}
+
+// Acquire atomically binds the account to the holder. A different in-flight
+// holder wins and this caller receives ErrChatStreamLeaseHeld; the same holder
+// re-acquiring is an idempotent success.
+func (store *MemoryChatStreamLeaseStore) Acquire(_ context.Context, lease ports.ChatStreamLease) error {
+	// TenantID is part of the lease key, so an empty one would let unrelated
+	// requests contend on a single shared zero-Tenant key and report misleading
+	// lease-held conflicts across Tenants. The spine only ever passes an
+	// authenticated principal's TenantID, so this is a store-level invariant
+	// (defence in depth) rather than a reachable path today.
+	if lease.Holder == "" || lease.AccountID == "" || lease.TenantID == "" {
+		return ports.ErrDependencyUnavailable
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	key := chatStreamLeaseKey{tenantID: lease.TenantID, accountID: lease.AccountID}
+	if holder, ok := store.leases[key]; ok && holder != lease.Holder {
+		return ports.ErrChatStreamLeaseHeld
+	}
+	store.leases[key] = lease.Holder
+	return nil
+}
+
+// Holder reports the execution currently holding the account's stream lease.
+func (store *MemoryChatStreamLeaseStore) Holder(
+	_ context.Context,
+	tenantID domain.TenantID,
+	accountID domain.ProviderAccountID,
+) (domain.Identifier, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	holder, ok := store.leases[chatStreamLeaseKey{tenantID: tenantID, accountID: accountID}]
+	return holder, ok, nil
+}
+
+// Release clears the binding when this holder owns it. Releasing a lease owned
+// by another holder is a no-op, so a late cleanup can never revoke a live
+// stream's binding.
+func (store *MemoryChatStreamLeaseStore) Release(_ context.Context, lease ports.ChatStreamLease) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	key := chatStreamLeaseKey{tenantID: lease.TenantID, accountID: lease.AccountID}
+	if holder, ok := store.leases[key]; ok && holder == lease.Holder {
+		delete(store.leases, key)
+	}
+	return nil
+}
+
+var _ ports.ChatStreamLeaseStore = (*MemoryChatStreamLeaseStore)(nil)

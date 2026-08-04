@@ -142,6 +142,13 @@ type Dependencies struct {
 	ChatAudit                ports.ChatAuditRecorder
 	ChatCredentialAuthorizer ports.ChatCredentialAuthorizer
 	ChatDigester             ports.ChatDigester
+	// Chat streaming ports (#59 / T16). A nil ChatStreamAdapter fails every
+	// stream closed; it never degrades to the non-streaming ChatAdapter.
+	ChatStreamAdapter    ports.ChatStreamAdapter
+	AuthorizedChatStream ports.AuthorizedChatStream
+	// ChatStreamLeases records hard chat_stream account leases. A nil store
+	// composes the process-local store (a lease never outlives its stream).
+	ChatStreamLeases ports.ChatStreamLeaseStore
 	// ChatAffinity stores the soft conversation→account preference (P3). A nil
 	// port substitutes the process-local memory store: affinity is a preference,
 	// never an authority, so process loss only degrades selection to P4 policy
@@ -747,9 +754,16 @@ func NewControlledChatReplayStore() ports.ChatReplayStore {
 	return persistence.NewMemoryChatReplayStore()
 }
 
-// newChatService wires the non-streaming chat spine. Nil ports fall back to
-// fail-closed foundations so production composition is safe by default; contract
-// fixtures inject controlled fakes.
+// NewControlledChatStreamLeaseStore exposes the process-local hard chat_stream
+// lease store so contract tests can wrap it with recording behavior without
+// importing infrastructure directly (ADR 0009 forbids that edge).
+func NewControlledChatStreamLeaseStore() ports.ChatStreamLeaseStore {
+	return persistence.NewMemoryChatStreamLeaseStore()
+}
+
+// newChatService wires the chat spine (non-streaming and streaming). Nil ports
+// fall back to fail-closed foundations so production composition is safe by
+// default; contract fixtures inject controlled fakes.
 func newChatService(config Config, dependencies Dependencies) (*application.ChatService, error) {
 	principal := dependencies.Principal
 	if principal == nil {
@@ -820,6 +834,33 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 		}
 		authorized = vaultpkg.NewAuthorizedChatService(authorizer, adapter, audit)
 	}
+	// Streaming boundary (T16). A nil AuthorizedChatStream composes the
+	// protected streaming service over the configured streaming Adapter; a nil
+	// Adapter fails every stream closed rather than degrading to the
+	// non-streaming Adapter, so a streaming request is never answered with a
+	// non-streaming body (chat lifecycle §3.2 rule 2).
+	authorizedStream := dependencies.AuthorizedChatStream
+	if authorizedStream == nil {
+		streamAdapter := dependencies.ChatStreamAdapter
+		if streamAdapter == nil {
+			streamAdapter = vaultpkg.NewFailClosedChatStreamAdapter()
+		}
+		streamAuthorizer := dependencies.ChatCredentialAuthorizer
+		if streamAuthorizer == nil {
+			if config.AllowInMemoryChat {
+				streamAuthorizer = vaultpkg.NewPermissiveFixtureChatCredentialAuthorizer()
+			} else {
+				streamAuthorizer = vaultpkg.NewFailClosedChatCredentialAuthorizer()
+			}
+		}
+		authorizedStream = vaultpkg.NewAuthorizedChatStreamService(streamAuthorizer, streamAdapter, audit)
+	}
+	// Hard chat_stream lease. Process-local is correct here: a lease guards an
+	// in-flight stream, which cannot outlive the process that serves it.
+	streamLeases := dependencies.ChatStreamLeases
+	if streamLeases == nil {
+		streamLeases = persistence.NewMemoryChatStreamLeaseStore()
+	}
 	digester := dependencies.ChatDigester
 	if digester == nil {
 		digester = resolveChatDigester(config, dependencies)
@@ -851,6 +892,9 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 		RequestLog:   requestLog,
 		Clock:        dependencies.Clock,
 		IDs:          dependencies.IDs,
+
+		AuthorizedStream: authorizedStream,
+		StreamLeases:     streamLeases,
 	})
 }
 

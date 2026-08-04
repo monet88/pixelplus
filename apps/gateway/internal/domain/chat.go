@@ -1,21 +1,26 @@
 package domain
 
-// ChatOperation names the immutable non-streaming chat operation bound to one
-// request. It is distinct from the streaming operation (T16) and from image
-// operations so scope, admission, telemetry, and capability checks classify the
-// right work.
+// ChatOperation names the immutable chat operation bound to one request. The
+// streaming and non-streaming operations are distinct values — not one value
+// plus a flag — and both are distinct from image operations, so scope,
+// admission, telemetry, and capability checks classify the right work.
 type ChatOperation string
 
 // Frozen chat operation vocabulary (OpenAPI / chat lifecycle #12 §3.2).
 const (
 	// ChatOpCompletion is the single-turn non-streaming chat completion operation.
 	ChatOpCompletion ChatOperation = "chat_completion"
+	// ChatOpCompletionStreaming is the streaming chat completion operation. It is
+	// a separate operation rather than a modifier on ChatOpCompletion so an
+	// account can honestly offer non-streaming chat while streaming stays
+	// unsupported/synthetic (capability spec §3.1, chat lifecycle §3.2).
+	ChatOpCompletionStreaming ChatOperation = "chat_completion_streaming"
 )
 
 // Valid reports whether the operation is in the frozen chat vocabulary.
 func (operation ChatOperation) Valid() bool {
 	switch operation {
-	case ChatOpCompletion:
+	case ChatOpCompletion, ChatOpCompletionStreaming:
 		return true
 	default:
 		return false
@@ -23,10 +28,16 @@ func (operation ChatOperation) Valid() bool {
 }
 
 // CapabilityOperation maps the chat operation onto the capability vocabulary.
+// Streaming resolves `chat_streaming`, never `chat`: a snapshot that verifies
+// non-streaming chat alone can therefore never satisfy a streaming request, so
+// the Gateway cannot silently downgrade a stream to a non-streaming answer
+// (chat lifecycle §3.2 rule 2, I-CHAT-STREAM-CLASS-HONEST).
 func (operation ChatOperation) CapabilityOperation() CapabilityOperation {
 	switch operation {
 	case ChatOpCompletion:
 		return CapabilityOpChat
+	case ChatOpCompletionStreaming:
+		return CapabilityOpChatStreaming
 	default:
 		return ""
 	}
@@ -35,7 +46,7 @@ func (operation ChatOperation) CapabilityOperation() CapabilityOperation {
 // RequiredScope returns the Client API Key scope required to run this operation.
 func (operation ChatOperation) RequiredScope() Scope {
 	switch operation {
-	case ChatOpCompletion:
+	case ChatOpCompletion, ChatOpCompletionStreaming:
 		return ScopeChatCompletions
 	default:
 		return ""

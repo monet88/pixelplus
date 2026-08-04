@@ -183,14 +183,20 @@ func writeGatewayError(writer http.ResponseWriter, err error) {
 // frozen schema requires a non-empty request_id, so a missing id falls back to
 // a safe placeholder rather than emitting an invalid empty value.
 func writeCanonical(writer http.ResponseWriter, canonical domain.CanonicalError) {
-	requestID := string(canonical.RequestID)
+	writeJSON(writer, canonical.HTTPStatus(), toCanonicalErrorWire(canonical))
+}
+
+// toCanonicalErrorWire projects a canonical error onto the frozen CanonicalError
+// schema. It is shared by the JSON error body and the SSE `failed` terminal
+// event so both surfaces carry byte-identical canonical error shape.
+func toCanonicalErrorWire(canonical domain.CanonicalError) canonicalErrorWire {
 	body := canonicalErrorWire{
 		Code:              string(canonical.Code),
 		Category:          string(canonical.Category),
 		StatusClass:       string(canonical.StatusClass),
 		Retryability:      string(canonical.Retryability),
 		Remediation:       string(canonical.Remediation),
-		RequestID:         requestID,
+		RequestID:         string(canonical.RequestID),
 		FailureStage:      string(canonical.FailureStage),
 		RetryAfterClass:   canonical.RetryAfterClass,
 		RetryAfterSeconds: canonical.RetryAfterSeconds,
@@ -199,7 +205,7 @@ func writeCanonical(writer http.ResponseWriter, canonical domain.CanonicalError)
 	if body.RequestID == "" {
 		body.RequestID = "req_unavailable"
 	}
-	writeJSON(writer, canonical.HTTPStatus(), body)
+	return body
 }
 
 // writeNoContent emits a 204 with no body for the delete operation. The frozen
