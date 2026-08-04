@@ -43,27 +43,6 @@ func TestChatMessageValid(t *testing.T) {
 	}
 }
 
-func TestChatCompletionEmptyAndIndex(t *testing.T) {
-	empty := ChatCompletion{}
-	if empty.FirstIndex() != -1 {
-		t.Fatalf("empty completion FirstIndex should be -1")
-	}
-	if !empty.Empty() {
-		t.Fatalf("empty completion should report Empty")
-	}
-	withChoice := ChatCompletion{Choices: []ChatChoice{{
-		Index:       0,
-		Message:     ChatMessage{Role: ChatRoleAssistant, Content: "hi"},
-		FinishClass: FinishStop,
-	}}}
-	if withChoice.FirstIndex() != 0 {
-		t.Fatalf("withChoice FirstIndex should be 0")
-	}
-	if withChoice.Empty() {
-		t.Fatalf("completion with assistant content should not report Empty")
-	}
-}
-
 func TestChatOutcomeCarriesAuthoritativeNoCommit(t *testing.T) {
 	notCommitted := ChatOutcome{Class: ChatOutcomeNotCommitted, Commit: CommitNotCommitted}
 	if notCommitted.Commit != CommitNotCommitted {

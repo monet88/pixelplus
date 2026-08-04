@@ -24,10 +24,19 @@ code comments:
   claim was never abandoned, so a same-key retry stuck on
   `idempotency_in_progress`.
 - The synchronous chat send boundary records no durable payload-sent marker.
-- `ChatService`/`RenderService` held a `HealthStore` port they never call;
-  execution gates read health from the `AccountStore` snapshot.
+- `RenderService` held a `HealthStore` port it never calls; its execution gates
+  read health from the `AccountStore` snapshot. `ChatService` does call the
+  authoritative `HealthStore` (scoped conditions, ADR 0009).
 - The protected-access chat audit event aliased `RequestID` to the execution
   id because the authorized request carried no request correlation id.
+
+A second review round (PR #87, two-axis) added: the explicit pin failed
+foreign/unknown ids with `routing_no_candidate` (409) instead of the locked
+non-enumerating 404-class; the fallback walk never consulted
+`fallback_auth_modes` (NF-XMODE); the request wire rejected contract-declared
+`ChatCompletionRequest` fields as unknown; the documented `conversation_id`
+affinity key was parsed then dropped; and this record's item 4 and Follow-Up
+contradicted the shipped code.
 
 ## Decision
 
@@ -48,15 +57,49 @@ code comments:
    (`noopChatSendBoundary`): re-attempt and occupancy semantics are owned by
    the application execution layer's single-owner walk, so no durable
    cross-request send state is required for synchronous chat.
-4. The execution spines do not depend on `HealthStore`; the dead port is
-   removed from `ChatService`/`RenderService`. Health gating reads the
-   `AccountStore` snapshot; the epoch `HealthStore` remains owned by the
-   account/credential lifecycle services.
+4. Only `RenderService`'s dead `HealthStore` port is removed; render gates
+   read the `AccountStore` snapshot. `ChatService` keeps and requires the
+   authoritative `HealthStore` (ADR 0009): scoped health conditions and
+   recovery permits are HealthStore authority, never the AccountStore copy,
+   and missing health evidence fails closed.
 5. Chat settlement identity includes the originating `client_api_key_id`
    (`tenant/client_api_key/execution/chat_occupancy`) per chat spec §6.5.5.
 6. `AuthorizedChatRequest` carries the boundary `RequestID` so the
    protected-access audit projection records the real request correlation id
    instead of aliasing the execution id.
+7. A foreign or unknown explicit pin (`x_pixelplus.provider_account_id`)
+   resolves to `resource_not_found` (404-class, non-enumerating) before
+   candidate construction, with zero Adapter calls and zero Vault decrypts
+   (routing spec §4.1 P1, §3.2, §7.2 NF-XTENANT; chat spec §8 rule 1). A
+   visible same-Tenant pin still passes C0–C5 and fails with the specific
+   gate class, never 404.
+8. Cross-Auth-Mode fallback is permitted only when the Tenant policy's
+   `fallback_auth_modes` names BOTH the primary's and the target's mode
+   (routing spec §6.2 sentence 2, §7.1 NF-XMODE); otherwise the walk fails
+   closed on the primary's own outcome. Same-mode fallback moves between
+   accounts, not modes, so it needs no listing.
+9. The replay claim deliberately precedes admission (A3–A5). Canonical-errors
+   §7.2.3 forbids a terminal replay from creating a new admission reservation
+   or quota debit, which only claim-first guarantees; the claim loser holds
+   no A6 slot, so chat spec §7.3.4's release-once premise is vacuously
+   satisfied while the claim owner settles exactly once on every path. This
+   mirrors the render spine order.
+10. The request wire accepts every field the published `ChatCompletionRequest`
+    / `ChatMessage` schemas declare. Generation tuning fields (`temperature`,
+    `max_tokens`, `top_p`, `n`, `stop`, `user`, message `name`) are
+    shape-validated at the boundary (parse-first) but not carried into the
+    canonical command until real Provider Adapters consume them (T19–T23).
+    Array `content` is canonicalized by concatenating text parts; a non-text
+    part rejects `invalid_request` because silently dropping it would corrupt
+    the prompt.
+11. Conversation affinity (P3) is implemented as a policy-gated
+    (`affinity.enabled`) soft preference over `conversation_id`, recorded on
+    committed success and yielding whenever the preferred account leaves the
+    candidate set. The store is process-local in-memory: affinity is a
+    preference, never an authority (routing spec §5.1 rule 1), so process
+    loss degrades to P4 policy selection — unlike the replay ledger it needs
+    no fail-closed default. The durable store and the affinity window-class
+    numeric remain deferred (#17 tunables; T25/#88 durable ledger).
 
 ## Alternatives Considered
 
@@ -95,8 +138,12 @@ Tradeoffs:
 
 ## Follow-Up
 
-- Durable chat replay: production composition currently defaults to the
-  process-local `MemoryChatReplayStore`, so `I-CHAT-NO-DUPLICATE-EXEC` holds
-  only within one process. A restart drops in-flight claims and a same-key
-  retry can re-execute and double-settle. The durable chat replay ledger
-  (mirror of `FileRenderReplayStore`) is tracked in #88 (T25).
+- Durable chat replay: production composition wires the fail-closed
+  `UnavailableChatReplayStore`; the process-local `MemoryChatReplayStore`
+  serves only fixtures / explicit `AllowInMemoryChat` mode, so
+  `I-CHAT-NO-DUPLICATE-EXEC` holds only within one process there. The durable
+  chat replay ledger (mirror of `FileRenderReplayStore`) is tracked in #88
+  (T25). The durable affinity store and window-class numeric follow the same
+  ticket wave (item 11).
+- Render has no fallback walk today, so `fallback_auth_modes` is unenforced
+  there; if render gains fallback it must apply item 8's rule.

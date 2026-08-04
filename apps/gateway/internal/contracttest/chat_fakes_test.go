@@ -177,9 +177,9 @@ func (d *stubChatDigester) CreateFingerprint(operation domain.ChatOperation, mod
 		msgs = append(msgs, chatFingerprintMessage{Role: string(m.Role), Content: m.Content})
 	}
 	payload, err := json.Marshal(struct {
-		V         int                     `json:"v"`
-		Operation string                  `json:"op"`
-		Model     string                  `json:"model"`
+		V         int                      `json:"v"`
+		Operation string                   `json:"op"`
+		Model     string                   `json:"model"`
 		Messages  []chatFingerprintMessage `json:"messages"`
 	}{
 		V:         1,
@@ -330,4 +330,13 @@ func chatRoutingPolicy(selectionOrder []domain.ProviderAccountID, fallbackChain 
 		UpdatedAt:         domain.SystemDefaultUpdatedAt,
 		UpdatedBy:         domain.SystemDefaultUpdatedBy,
 	}
+}
+
+// chatRoutingPolicyWithModes extends chatRoutingPolicy with an explicit
+// fallback_auth_modes list so tests can prove cross-Auth-Mode fallback gating
+// (routing spec §6.2, NF-XMODE).
+func chatRoutingPolicyWithModes(selectionOrder []domain.ProviderAccountID, fallbackChain []domain.ProviderAccountID, modes []domain.AuthMode) domain.RoutingPolicy {
+	policy := chatRoutingPolicy(selectionOrder, fallbackChain)
+	policy.FallbackAuthModes = modes
+	return policy
 }

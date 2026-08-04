@@ -28,6 +28,11 @@ type CreateChatCompletionCommand struct {
 	// still subject to Tenant Routing Policy and the single-owner no-commit proof;
 	// it only permits (never forces) the existing fallback walk.
 	AllowFallback bool
+	// ConversationID is the optional affinity key from x_pixelplus. When the
+	// Tenant Routing Policy enables affinity, it drives the P3 soft preference
+	// (prefer the account that last served the conversation while it remains in
+	// the candidate set); otherwise it is inert. Empty means no affinity.
+	ConversationID string
 	// OversizeBody / MalformedBody are observed at the transport boundary and
 	// carried as flags so the single normative A0→A1→A2 order is enforced here
 	// (a pre-authenticated oversize still fails authentication_failed).
@@ -57,6 +62,7 @@ type ChatService struct {
 	capabilities ports.CapabilityStore
 	circuits     ports.CircuitStore
 	routing      ports.RoutingPolicyStore
+	affinity     ports.ChatAffinityStore
 	vault        ports.CredentialVault
 	digester     ports.ChatDigester
 	authorized   ports.AuthorizedChat
@@ -77,6 +83,7 @@ type ChatDependencies struct {
 	Capabilities ports.CapabilityStore
 	Circuits     ports.CircuitStore
 	Routing      ports.RoutingPolicyStore
+	Affinity     ports.ChatAffinityStore
 	Vault        ports.CredentialVault
 	Digester     ports.ChatDigester
 	Authorized   ports.AuthorizedChat
@@ -104,6 +111,8 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 		return nil, errors.New("application: capability store is required")
 	case dependencies.Routing == nil:
 		return nil, errors.New("application: routing policy store is required")
+	case dependencies.Affinity == nil:
+		return nil, errors.New("application: chat affinity store is required")
 	case dependencies.Vault == nil:
 		return nil, errors.New("application: credential vault is required")
 	case dependencies.Digester == nil:
@@ -130,6 +139,7 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 		capabilities: dependencies.Capabilities,
 		circuits:     dependencies.Circuits,
 		routing:      dependencies.Routing,
+		affinity:     dependencies.Affinity,
 		vault:        dependencies.Vault,
 		digester:     dependencies.Digester,
 		authorized:   dependencies.Authorized,
@@ -168,7 +178,7 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 	if command.MalformedBody {
 		return ChatResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
-	if command.Model == "" || len(command.Messages) == 0 || !domain.ChatOpCompletion.Valid() {
+	if command.Model == "" || len(command.Messages) == 0 {
 		return ChatResult{}, service.fail(ctx, sc, domain.NewInvalidRequest())
 	}
 	for _, message := range command.Messages {
@@ -226,8 +236,8 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 		return ChatResult{}, service.fail(ctx, sc, canonical)
 	}
 
-	// Deterministic same-Tenant routing (P1-P4).
-	account, policy, canonical, ok := service.selectAccount(ctx, principal, domain.ChatOpCompletion, command.Model, sc.start, command.ProviderAccountID)
+	// Deterministic same-Tenant routing (P1 pin → P3 affinity → P4 policy).
+	account, policy, canonical, ok := service.selectAccount(ctx, principal, domain.ChatOpCompletion, command.Model, sc.start, command.ProviderAccountID, command.ConversationID)
 	if !ok {
 		return ChatResult{}, service.failAfterRollback(ctx, sc, canonical, reservation, identity)
 	}
@@ -267,6 +277,14 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 		// Uncertain replay leaves the client to retry; do not return the completion
 		// as if it were replay-stable.
 		return ChatResult{}, service.fail(ctx, sc, domain.NewIdempotencyUncertain())
+	}
+
+	// P3 affinity: remember the account that served this conversation. Best-effort
+	// by design — affinity is a soft preference (routing spec §5.1), never an
+	// authority, so a record failure only loses a hint and must never fail a
+	// completed execution.
+	if command.ConversationID != "" && policy.Affinity.Enabled {
+		_ = service.affinity.Record(ctx, domain.ChatAffinityScope{TenantID: principal.TenantID, Key: command.ConversationID}, completion.ProviderAccountID)
 	}
 	if err := service.chatAudit(ctx, sc, principal, completion.ProviderAccountID, completion.ExecutionID, "completed"); err != nil {
 		return ChatResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
@@ -342,12 +360,38 @@ func (service *ChatService) attemptAccounts(
 		if !principal.AllowsProviderAccount(id) {
 			continue
 		}
+		// NF-XMODE (routing spec §6.2, §7.1): a fallback target on a DIFFERENT
+		// Auth Mode is permitted only when the Tenant policy explicitly names
+		// BOTH the primary's and the target's mode in fallback_auth_modes;
+		// otherwise the walk fails closed on the primary's own outcome.
+		// Same-mode fallback moves between accounts, not modes, so it needs no
+		// listing. Prohibited/experimental modes are already excluded by
+		// candidateRejection below.
+		if account.AuthMode != primary.AuthMode && !fallbackModesAllow(policy.FallbackAuthModes, primary.AuthMode, account.AuthMode) {
+			continue
+		}
 		if _, ok := service.candidateRejection(ctx, principal, account, domain.ChatOpCompletion, request.model, sc.start); !ok {
 			continue
 		}
 		fallback = append(fallback, account)
 	}
 	return append(attempts, fallback...)
+}
+
+// fallbackModesAllow reports whether the policy's fallback_auth_modes names
+// both the primary and the target Auth Mode (routing spec §6.2: cross-mode
+// fallback is allowed only if the policy names both modes; it is never silent).
+func fallbackModesAllow(modes []domain.AuthMode, primary domain.AuthMode, target domain.AuthMode) bool {
+	havePrimary, haveTarget := false, false
+	for _, mode := range modes {
+		if mode == primary {
+			havePrimary = true
+		}
+		if mode == target {
+			haveTarget = true
+		}
+	}
+	return havePrimary && haveTarget
 }
 
 // attemptOnAccount runs the selected-account gates + Vault + authorized chat for
@@ -419,11 +463,12 @@ func (service *ChatService) classifyOutcome(
 	executionID domain.Identifier,
 ) (domain.ChatCompletion, domain.CanonicalError, bool) {
 	switch outcome.Class {
-	case domain.ChatOutcomeSuccess, domain.ChatOutcomeCommitted:
-		// A "success" without authoritative commit proof (CommitUnknown) must not
-		// be returned as committed: fail closed as possibly_committed before any
-		// replay Complete or accounting settlement, so an uncertain upstream
-		// execution is never treated as committed (decision 0012).
+	case domain.ChatOutcomeCommitted:
+		// A committed-class outcome without authoritative commit proof
+		// (CommitUnknown) must not be returned as committed: fail closed as
+		// possibly_committed before any replay Complete or accounting settlement,
+		// so an uncertain upstream execution is never treated as committed
+		// (decision 0012).
 		if outcome.Commit == domain.CommitUnknown {
 			return domain.ChatCompletion{}, domain.NewExecutionPossiblyCommitted(), false
 		}
@@ -521,9 +566,13 @@ func (service *ChatService) notCommittedCanonical(class domain.ErrorCode) domain
 }
 
 // selectAccount builds the deterministic same-Tenant candidate and returns the
-// primary account plus the policy (for fallback). P1-P4 precedence; never widens.
-// A non-empty pinned ID restricts selection to that same-Tenant candidate
-// (x_pixelplus provider_account_id); it is still vetted by Visible/allowability.
+// primary account plus the policy (for fallback). P1 pin → P3 affinity → P4
+// policy precedence; never widens. A non-empty pinned ID restricts selection to
+// that same-Tenant candidate (x_pixelplus provider_account_id); a foreign or
+// unknown pin fails closed 404-class non-enumerating before candidate work
+// (routing spec §4.1 P1, §3.2; chat spec §8 rule 1), while a visible
+// same-Tenant pin is still vetted by C0–C5 and fails with the specific gate
+// class.
 func (service *ChatService) selectAccount(
 	ctx context.Context,
 	principal domain.SecurityPrincipal,
@@ -531,12 +580,26 @@ func (service *ChatService) selectAccount(
 	model string,
 	now time.Time,
 	pinned domain.ProviderAccountID,
+	conversationID string,
 ) (domain.ProviderAccount, domain.RoutingPolicy, domain.CanonicalError, bool) {
 	policy, err := service.routing.Read(ctx, principal)
 	if err != nil {
 		if errors.Is(err, ports.ErrRoutingPolicyNotFound) {
 			policy = domain.FailClosedDefaultRoutingPolicy()
 		} else {
+			return domain.ProviderAccount{}, policy, service.dependencyCanonical(err), false
+		}
+	}
+
+	if pinned != "" {
+		// P1 visibility: a foreign or unknown pin is indistinguishable
+		// (ErrAccountNotVisible) and maps to the non-enumerating 404-class —
+		// never a 403/409 that would confirm existence, and never a fallback
+		// candidate. Zero Adapter call, zero Vault decrypt for the foreign id.
+		if _, err := service.accounts.Visible(ctx, principal, pinned); err != nil {
+			if errors.Is(err, ports.ErrAccountNotVisible) {
+				return domain.ProviderAccount{}, policy, domain.NewResourceNotFound(), false
+			}
 			return domain.ProviderAccount{}, policy, service.dependencyCanonical(err), false
 		}
 	}
@@ -576,6 +639,22 @@ func (service *ChatService) selectAccount(
 		}
 		return domain.ProviderAccount{}, policy, domain.NewRoutingNoCandidate(), false
 	}
+
+	// P3 affinity (routing spec §5.1, chat spec §5.2): a policy-enabled soft
+	// preference for the account that last served this conversation. It only
+	// selects within the surviving candidate set — a preferred account that left
+	// the set (or a store miss/error) falls through to P4, never to a foreign
+	// or cross-Auth-Mode account. An explicit pin (P1) outranks affinity.
+	if pinned == "" && conversationID != "" && policy.Affinity.Enabled {
+		if preferred, ok, err := service.affinity.Preferred(ctx, domain.ChatAffinityScope{TenantID: principal.TenantID, Key: conversationID}); err == nil && ok {
+			for _, candidate := range candidates {
+				if candidate.ID == preferred {
+					return candidate, policy, domain.CanonicalError{}, true
+				}
+			}
+		}
+	}
+
 	// P4: first surviving policy-ordered candidate (deterministic).
 	return candidates[0], policy, domain.CanonicalError{}, true
 }
@@ -795,9 +874,6 @@ func (service *ChatService) dependencyCanonical(err error) domain.CanonicalError
 }
 
 func (service *ChatService) chatAudit(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, executionID domain.Identifier, outcome string) error {
-	if service.audit == nil {
-		return ports.ErrDependencyUnavailable
-	}
 	action := ports.AuditChatCompleted
 	if outcome == "replayed" {
 		action = ports.AuditChatReplayed

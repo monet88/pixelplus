@@ -140,25 +140,11 @@ type ChatCompletion struct {
 	Usage ChatUsage
 }
 
-// FirstIndex returns the canonical choice index (0-based) or -1 when empty.
-func (completion ChatCompletion) FirstIndex() int {
-	if len(completion.Choices) == 0 {
-		return -1
-	}
-	return completion.Choices[0].Index
-}
-
-// Empty reports whether the completion carries no committed assistant content.
-func (completion ChatCompletion) Empty() bool {
-	return len(completion.Choices) == 0 || completion.Choices[0].Message.Content == ""
-}
-
 // ChatOutcomeClass classifies a controlled Provider chat result.
 type ChatOutcomeClass string
 
 // Controlled Provider chat outcome classes for the Adapter port.
 const (
-	ChatOutcomeSuccess      ChatOutcomeClass = "success"
 	ChatOutcomeCommitted    ChatOutcomeClass = "committed"
 	ChatOutcomeNotCommitted ChatOutcomeClass = "not_committed"
 	ChatOutcomeUnknown      ChatOutcomeClass = "unknown"
@@ -178,4 +164,13 @@ type ChatOutcome struct {
 	// FailureClass is a safe canonical class when not committed / unknown (never
 	// a raw provider string).
 	FailureClass ErrorCode
+}
+
+// ChatAffinityScope is the same-Tenant scope of a conversation affinity
+// preference (routing spec §5.1, chat lifecycle §5.2): Key is the client
+// conversation_id. The preference never crosses Tenants, and because selection
+// still requires candidate-set membership it can never widen execution.
+type ChatAffinityScope struct {
+	TenantID TenantID
+	Key      string
 }

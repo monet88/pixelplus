@@ -739,6 +739,320 @@ func TestChatRiskAckGateRejectedBeforeAdapter(t *testing.T) {
 	}
 }
 
+// AC: an explicit x_pixelplus.provider_account_id pin (P1) selects the pinned
+// same-Tenant account even when policy order prefers another — selection
+// precedence chooses a deterministic same-Tenant account and never widens.
+func TestChatExplicitPinSelectsPinnedAccount(t *testing.T) {
+	t.Parallel()
+
+	var first domain.ProviderAccountID = "pa_first"
+	var second domain.ProviderAccountID = "pa_second"
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", string(first), domain.AuthModeChatGPTCodexOAuth)
+		h.seedActive("tenant_a", string(second), domain.AuthModeChatGPTCodexOAuth)
+		h.routing.Seed("tenant_a", chatRoutingPolicy(
+			[]domain.ProviderAccountID{first, second},
+			nil,
+		))
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/chat/completions",
+		bearer:  tenantAKey,
+		idemKey: "idem-pin",
+		body:    `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"x_pixelplus":{"provider_account_id":"pa_second"}}`,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	accounts := harness.adapter.Accounts()
+	if len(accounts) != 1 || accounts[0] != second {
+		t.Fatalf("adapter served %v, want exactly the pinned %s", accounts, second)
+	}
+	body := decodeCompletionBody(t, payload)
+	meta, _ := body["x_pixelplus"].(map[string]any)
+	if meta["provider_account_id"] != string(second) {
+		t.Fatalf("response provider_account_id = %v, want %s", meta["provider_account_id"], second)
+	}
+}
+
+// AC: a foreign or unknown explicit pin fails closed 404-class
+// (resource_not_found) — non-enumerating, zero Adapter calls, zero Vault
+// decrypts (routing spec §3.2/§4.1 P1/§7.2 NF-XTENANT; chat spec §8 rule 1,
+// test obligation 26). Foreign and unknown ids are indistinguishable.
+func TestChatExplicitPinForeignIsNotFound(t *testing.T) {
+	t.Parallel()
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", "pa_chat", domain.AuthModeChatGPTCodexOAuth)
+		// A foreign tenant_b account must never be enumerated through the pin.
+		h.accounts.seed("tenant_b", activeAccount("pa_foreign", domain.AuthModeChatGPTCodexOAuth))
+	})
+
+	for _, pin := range []string{"pa_foreign", "pa_unknown"} {
+		response, payload := harness.do(t, requestSpec{
+			method:  http.MethodPost,
+			path:    "/v1/chat/completions",
+			bearer:  tenantAKey,
+			idemKey: "idem-pin-404-" + pin,
+			body:    `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"x_pixelplus":{"provider_account_id":"` + pin + `"}}`,
+		})
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("pin %s: status = %d, want 404 (body=%s)", pin, response.StatusCode, payload)
+		}
+		body := decodeError(t, payload)
+		if body["code"] != "resource_not_found" {
+			t.Fatalf("pin %s: error code = %v, want resource_not_found", pin, body["code"])
+		}
+	}
+	if calls := harness.adapter.CallCount(); calls != 0 {
+		t.Fatalf("adapter calls = %d, want 0 (foreign/unknown pin never reaches execution)", calls)
+	}
+}
+
+// AC: a same-Tenant pin that is visible but gated fails closed with the
+// SPECIFIC gate class (routing spec §4.1 P1), never the 404 reserved for
+// foreign/unknown ids.
+func TestChatExplicitPinSameTenantGatedKeepsSpecificClass(t *testing.T) {
+	t.Parallel()
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		account := activeAccount("pa_gated", domain.AuthModeChatGPTCodexOAuth)
+		account.RiskAcknowledged = false
+		stripped, health, permit := seedAccountHealth(account)
+		h.accounts.seed("tenant_a", stripped)
+		h.health.Seed("tenant_a", account.ID, health, permit)
+		h.routing.Seed("tenant_a", chatRoutingPolicy([]domain.ProviderAccountID{account.ID}, nil))
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/chat/completions",
+		bearer:  tenantAKey,
+		idemKey: "idem-pin-gated",
+		body:    `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"x_pixelplus":{"provider_account_id":"pa_gated"}}`,
+	})
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeError(t, payload)
+	if body["code"] != "risk_ack_required" {
+		t.Fatalf("error code = %v, want risk_ack_required (specific gate class, not 404)", body["code"])
+	}
+	if calls := harness.adapter.CallCount(); calls != 0 {
+		t.Fatalf("adapter calls = %d, want 0 (gate precedes Adapter)", calls)
+	}
+}
+
+// AC: cross-Auth-Mode fallback fails closed unless the Tenant policy names
+// BOTH modes in fallback_auth_modes (routing spec §6.2, §7.1 NF-XMODE). With
+// no modes listed, the walk stops at the primary's own outcome.
+func TestChatFallbackCrossModeRequiresPolicyListedModes(t *testing.T) {
+	t.Parallel()
+
+	var primary domain.ProviderAccountID = "pa_primary"
+	var fallback domain.ProviderAccountID = "pa_fallback_xmode"
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", string(primary), domain.AuthModeChatGPTCodexOAuth)
+		// Cross-mode fallback target: a different, product-enabled Auth Mode.
+		h.seedActive("tenant_a", string(fallback), domain.AuthModeGeminiAntigravityOAuth)
+		h.routing.Seed("tenant_a", chatRoutingPolicyWithModes(
+			[]domain.ProviderAccountID{primary},
+			[]domain.ProviderAccountID{fallback},
+			[]domain.AuthMode{}, // policy names no modes: cross-mode fallback forbidden
+		))
+		h.adapter.Script(
+			notCommittedOutcome(domain.ErrCodeUpstreamUnavailable), // primary: authoritative no-commit
+			chatSuccess(fallback, "", "", chatModel),               // would succeed — must never run
+		)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-xmode", body: chatSuccessBody,
+	})
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (primary's own outcome, body=%s)", response.StatusCode, payload)
+	}
+	body := decodeError(t, payload)
+	if body["code"] != "upstream_unavailable" {
+		t.Fatalf("error code = %v, want upstream_unavailable (fail closed on primary)", body["code"])
+	}
+	accounts := harness.adapter.Accounts()
+	if len(accounts) != 1 || accounts[0] != primary {
+		t.Fatalf("adapter walked %v, want only the primary (NF-XMODE fail closed)", accounts)
+	}
+}
+
+// AC: cross-Auth-Mode fallback is permitted when the policy names both the
+// primary's and the target's mode — the single-owner walk then runs exactly
+// once on authoritative no-commit proof (routing spec §6.2).
+func TestChatFallbackCrossModeWithListedModes(t *testing.T) {
+	t.Parallel()
+
+	var primary domain.ProviderAccountID = "pa_primary"
+	var fallback domain.ProviderAccountID = "pa_fallback_xmode"
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", string(primary), domain.AuthModeChatGPTCodexOAuth)
+		h.seedActive("tenant_a", string(fallback), domain.AuthModeGeminiAntigravityOAuth)
+		h.routing.Seed("tenant_a", chatRoutingPolicyWithModes(
+			[]domain.ProviderAccountID{primary},
+			[]domain.ProviderAccountID{fallback},
+			[]domain.AuthMode{domain.AuthModeChatGPTCodexOAuth, domain.AuthModeGeminiAntigravityOAuth},
+		))
+		h.adapter.Script(
+			notCommittedOutcome(domain.ErrCodeUpstreamUnavailable),
+			chatSuccess(fallback, "", "", chatModel),
+		)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-xmode-ok", body: chatSuccessBody,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", response.StatusCode, payload)
+	}
+	accounts := harness.adapter.Accounts()
+	if len(accounts) != 2 || accounts[0] != primary || accounts[1] != fallback {
+		t.Fatalf("adapter walked %v, want primary then exactly one cross-mode fallback", accounts)
+	}
+}
+
+// AC: conversation affinity (P3) prefers the account that last served the
+// conversation over fresh policy order, and yields to P4 the moment that
+// account leaves the candidate set — never a foreign or cross-mode account
+// (routing spec §5.1, chat spec §5.2, test obligation 14).
+func TestChatConversationAffinityPrefersPriorAccount(t *testing.T) {
+	t.Parallel()
+
+	var first domain.ProviderAccountID = "pa_affinity_a"
+	var second domain.ProviderAccountID = "pa_affinity_b"
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", string(first), domain.AuthModeChatGPTCodexOAuth)
+		h.seedActive("tenant_a", string(second), domain.AuthModeChatGPTCodexOAuth)
+		policy := chatRoutingPolicy([]domain.ProviderAccountID{first, second}, nil)
+		policy.Affinity = domain.AffinityPolicy{Enabled: true, WindowClass: "AFFINITY-WINDOW-CLASS"}
+		h.routing.Seed("tenant_a", policy)
+	})
+
+	affinityBody := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"x_pixelplus":{"conversation_id":"conv-1"}}`
+
+	// Turn 1: no preference recorded — P4 picks the first policy candidate.
+	response, payload := harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-aff-1", body: affinityBody,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("turn 1: status = %d (body=%s)", response.StatusCode, payload)
+	}
+
+	// Policy order flips: P4 alone would now pick the second account.
+	flipped := chatRoutingPolicy([]domain.ProviderAccountID{second, first}, nil)
+	flipped.Affinity = domain.AffinityPolicy{Enabled: true, WindowClass: "AFFINITY-WINDOW-CLASS"}
+	harness.routing.Seed("tenant_a", flipped)
+
+	// Turn 2: P3 affinity still prefers the first account (it remains a candidate).
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-aff-2", body: affinityBody,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("turn 2: status = %d (body=%s)", response.StatusCode, payload)
+	}
+
+	// The preferred account leaves the candidate set (scoped cooling_down).
+	accountA := activeAccount(string(first), domain.AuthModeChatGPTCodexOAuth)
+	harness.health.Seed("tenant_a", accountA.ID, domain.HealthSummary{
+		SummaryState: domain.HealthCoolingDown,
+		Conditions: []domain.HealthCondition{{
+			Scope:             domain.HealthScope{Kind: domain.HealthScopeAccount},
+			State:             domain.HealthCoolingDown,
+			Reason:            domain.HealthReasonProviderRateLimited,
+			CredentialVersion: accountA.Credential.Version,
+			Remediation:       domain.RemediationWaitProviderCooldown,
+		}},
+	}, domain.RecoveryPermit{})
+
+	// Turn 3: affinity yields — P4 policy picks the surviving second account.
+	response, payload = harness.do(t, requestSpec{
+		method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-aff-3", body: affinityBody,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("turn 3: status = %d (body=%s)", response.StatusCode, payload)
+	}
+
+	accounts := harness.adapter.Accounts()
+	if len(accounts) != 3 || accounts[0] != first || accounts[1] != first || accounts[2] != second {
+		t.Fatalf("adapter served %v, want [%s %s %s] (policy, affinity, affinity-yield)", accounts, first, first, second)
+	}
+}
+
+// AC: the request wire accepts every field the published ChatCompletionRequest
+// schema declares — generation tuning fields, message name, stop as string
+// array, and array text content — instead of rejecting them as unknown.
+func TestChatRequestWireAcceptsContractDeclaredFields(t *testing.T) {
+	t.Parallel()
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", "pa_chat", domain.AuthModeChatGPTCodexOAuth)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/chat/completions",
+		bearer:  tenantAKey,
+		idemKey: "idem-wire-full",
+		body: `{"model":"gpt-4o","messages":[` +
+			`{"role":"system","content":"be kind"},` +
+			`{"role":"user","name":"dao","content":[{"type":"text","text":"hello "},{"type":"text","text":"world"}]}` +
+			`],"stream":false,"temperature":0.7,"max_tokens":64,"top_p":0.9,"n":1,"stop":["\n","END"],"user":"u_1",` +
+			`"x_pixelplus":{"conversation_id":"conv-wire"}}`,
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for contract-declared fields (body=%s)", response.StatusCode, payload)
+	}
+	if calls := harness.adapter.CallCount(); calls != 1 {
+		t.Fatalf("adapter calls = %d, want 1", calls)
+	}
+}
+
+// AC: contract-valid but semantically unsupported shapes fail as
+// invalid_request, not as unknown fields: a non-text content part (the
+// canonical surface carries text only) and out-of-range max_tokens.
+func TestChatRequestWireRejectsInvalidShapes(t *testing.T) {
+	t.Parallel()
+
+	harness := newChatHarness(t, func(h *chatHarness) {
+		h.seedActive("tenant_a", "pa_chat", domain.AuthModeChatGPTCodexOAuth)
+	})
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"non-text content part", `{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/x.png"}}]}]}`},
+		{"max_tokens below minimum", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":0}`},
+		{"stop wrong shape", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stop":42}`},
+	}
+	for _, tc := range cases {
+		response, payload := harness.do(t, requestSpec{
+			method: http.MethodPost, path: "/v1/chat/completions", bearer: tenantAKey, idemKey: "idem-wire-bad-" + tc.name, body: tc.body,
+		})
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400 (body=%s)", tc.name, response.StatusCode, payload)
+		}
+		body := decodeError(t, payload)
+		if body["code"] != "invalid_request" {
+			t.Fatalf("%s: error code = %v, want invalid_request", tc.name, body["code"])
+		}
+	}
+	if calls := harness.adapter.CallCount(); calls != 0 {
+		t.Fatalf("adapter calls = %d, want 0 (validation precedes Adapter)", calls)
+	}
+}
+
 // AC: health gate rejects a cooling/blocked account before Any Adapter work. The
 // cooling/blocked health condition must be what prevents Adapter execution — the
 // request is seeded with a fresh chat capability snapshot so it passes the

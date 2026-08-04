@@ -142,6 +142,11 @@ type Dependencies struct {
 	ChatAudit                ports.ChatAuditRecorder
 	ChatCredentialAuthorizer ports.ChatCredentialAuthorizer
 	ChatDigester             ports.ChatDigester
+	// ChatAffinity stores the soft conversation→account preference (P3). A nil
+	// port substitutes the process-local memory store: affinity is a preference,
+	// never an authority, so process loss only degrades selection to P4 policy
+	// (decision 0012) — unlike the replay ledger, it needs no fail-closed default.
+	ChatAffinity ports.ChatAffinityStore
 	// ChatDigestKey is optional raw key material for composing an HMAC chat
 	// digester when ChatDigester is nil. Never logged. Empty in production
 	// without inject keeps product digests fail-closed.
@@ -787,6 +792,10 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 	if routing == nil {
 		routing = persistence.NewMemoryRoutingPolicyStore()
 	}
+	affinity := dependencies.ChatAffinity
+	if affinity == nil {
+		affinity = persistence.NewMemoryChatAffinityStore()
+	}
 	vault := dependencies.Vault
 	if vault == nil {
 		vault = vaultpkg.NewFailClosedCredentialVault()
@@ -813,7 +822,7 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 	}
 	digester := dependencies.ChatDigester
 	if digester == nil {
-		digester, _ = resolveChatDigester(config, dependencies)
+		digester = resolveChatDigester(config, dependencies)
 	}
 	telemetry := dependencies.Telemetry
 	if telemetry == nil {
@@ -833,6 +842,7 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 		Capabilities: capabilities,
 		Circuits:     circuits,
 		Routing:      routing,
+		Affinity:     affinity,
 		Vault:        vault,
 		Digester:     digester,
 		Authorized:   authorized,
@@ -846,10 +856,9 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 
 // resolveChatDigester builds the chat digester used for product create
 // fingerprints. Empty/weak/missing keys fail closed (FailClosedChatDigester).
-func resolveChatDigester(config Config, dependencies Dependencies) (ports.ChatDigester, bool) {
-	if dependencies.ChatDigester != nil {
-		return dependencies.ChatDigester, chatDigesterUsable(dependencies.ChatDigester)
-	}
+// Unlike the render twin it reports no usability signal: chat readiness has no
+// durability consumer, so the probe bool was dead weight (decision 0012).
+func resolveChatDigester(config Config, dependencies Dependencies) ports.ChatDigester {
 	key := dependencies.ChatDigestKey
 	if len(key) == 0 && config.AllowInMemoryChat {
 		// Fixture-only deterministic key; never used as production default.
@@ -857,20 +866,10 @@ func resolveChatDigester(config Config, dependencies Dependencies) (ports.ChatDi
 	}
 	if len(key) >= vaultpkg.MinChatDigestKeyBytes {
 		if d, err := vaultpkg.NewHMACChatDigester(key); err == nil {
-			return d, true
+			return d
 		}
 	}
-	return vaultpkg.FailClosedChatDigester{}, false
-}
-
-// chatDigesterUsable probes whether the chat digester can mint a fingerprint.
-func chatDigesterUsable(d ports.ChatDigester) bool {
-	if d == nil {
-		return false
-	}
-	_, err := d.CreateFingerprint(domain.ChatOpCompletion, "ready-probe",
-		[]domain.ChatMessage{{Role: domain.ChatRoleUser, Content: "ready-probe"}})
-	return err == nil
+	return vaultpkg.FailClosedChatDigester{}
 }
 
 // Handler returns the real composed HTTP surface.

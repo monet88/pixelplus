@@ -117,3 +117,37 @@ func (*UnavailableChatReplayStore) Abandon(context.Context, domain.ReplayIdentit
 }
 
 var _ ports.ChatReplayStore = (*UnavailableChatReplayStore)(nil)
+
+// MemoryChatAffinityStore is the process-local conversation affinity store.
+// Unlike the replay ledger, an affinity record is a soft P3 preference, never
+// an authority (routing spec §5.1 rule 1): losing it on restart only degrades
+// selection to P4 policy order, so production may run in-memory until a
+// durable store lands (decision 0012). The affinity window-class numeric is
+// #17-owned; the process-local map is bounded by process lifetime.
+type MemoryChatAffinityStore struct {
+	mu        sync.Mutex
+	preferred map[domain.ChatAffinityScope]domain.ProviderAccountID
+}
+
+// NewMemoryChatAffinityStore builds an empty process-local affinity store.
+func NewMemoryChatAffinityStore() *MemoryChatAffinityStore {
+	return &MemoryChatAffinityStore{preferred: make(map[domain.ChatAffinityScope]domain.ProviderAccountID)}
+}
+
+// Preferred returns the recorded preference for the scope, if any.
+func (store *MemoryChatAffinityStore) Preferred(_ context.Context, scope domain.ChatAffinityScope) (domain.ProviderAccountID, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	account, ok := store.preferred[scope]
+	return account, ok, nil
+}
+
+// Record stores the account that just served the scoped conversation.
+func (store *MemoryChatAffinityStore) Record(_ context.Context, scope domain.ChatAffinityScope, account domain.ProviderAccountID) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.preferred[scope] = account
+	return nil
+}
+
+var _ ports.ChatAffinityStore = (*MemoryChatAffinityStore)(nil)

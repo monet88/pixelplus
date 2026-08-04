@@ -200,9 +200,6 @@ const (
 	// StageCapability classifies a capability evidence rejection before
 	// upstream execution (capability semantics section 9/10).
 	StageCapability FailureStage = "capability"
-	// StageExecution classifies a failure raised during or after upstream
-	// execution (chat/render execution lifecycle; canonical-errors §4.5).
-	StageExecution  FailureStage = "execution"
 	StageRecovery   FailureStage = "recovery"
 	StageDependency FailureStage = "dependency"
 	StageInternal   FailureStage = "internal"
@@ -322,20 +319,12 @@ const (
 	// ErrCodeRoutingNoCandidate is the routing fail-closed outcome when no
 	// same-Tenant candidate can serve the request; it never enumerates resources.
 	ErrCodeRoutingNoCandidate ErrorCode = "routing_no_candidate"
-	// ErrCodeRoutingFallbackNotAllowed is the routing fail-closed outcome when
-	// fallback is required but not authorized/viable for the request.
-	ErrCodeRoutingFallbackNotAllowed ErrorCode = "routing_fallback_not_allowed"
 	// ErrCodeRiskAckRequired is the routing outcome when a `gated`/`experimental`
 	// Auth Mode requires a Tenant residual-risk acknowledgement before use.
 	ErrCodeRiskAckRequired ErrorCode = "risk_ack_required"
-	// ErrCodeExecutionCanceled is the cancellation terminal outcome.
-	ErrCodeExecutionCanceled ErrorCode = "execution_canceled"
 	// ErrCodeExecutionPossiblyCommitted is the fail-closed outcome when commit
 	// certainty is unavailable after upstream, so no replacement is authorized.
 	ErrCodeExecutionPossiblyCommitted ErrorCode = "execution_possibly_committed"
-	// ErrCodeSensitiveDataUnavailable is the credential fail-closed outcome when
-	// a required credential cannot be decrypted for a resolved account.
-	ErrCodeSensitiveDataUnavailable ErrorCode = "sensitive_data_unavailable"
 	// Provider runtime codes (canonical-errors #16 §4.5). Each stays on its root
 	// code with commit_status/idempotency_state rather than splitting rate-limit
 	// unknown into a second code.
@@ -765,20 +754,6 @@ func NewRoutingNoCandidate() CanonicalError {
 	}
 }
 
-// NewRoutingFallbackNotAllowed builds the routing fail-closed outcome when a
-// fallback re-attempt is required (authoritative no-commit proof) but the
-// fallback chain is not enabled or no fallback candidate is viable.
-func NewRoutingFallbackNotAllowed() CanonicalError {
-	return CanonicalError{
-		Code:         ErrCodeRoutingFallbackNotAllowed,
-		Category:     CategoryRouting,
-		StatusClass:  StatusAccountPolicy,
-		Retryability: RetryNotRetryable,
-		Remediation:  RemediationRouting,
-		FailureStage: StageRouting,
-	}
-}
-
 // NewRiskAckRequired builds the routing outcome when a `gated`/`experimental`
 // Auth Mode requires a Tenant residual-risk acknowledgement before any usable
 // credential may serve work (risk envelope §6.1).
@@ -790,21 +765,6 @@ func NewRiskAckRequired() CanonicalError {
 		Retryability: RetryOperatorActionRequired,
 		Remediation:  RemediationAckRisk,
 		FailureStage: StageRouting,
-	}
-}
-
-// NewExecutionCanceled builds the cancellation terminal outcome for a
-// non-streaming execution that was canceled before/while running. It emits the
-// dedicated `cancellation` failure stage so clients/telemetry/accounting see a
-// cancellation rather than a generic execution failure (canonical-errors §4.4).
-func NewExecutionCanceled() CanonicalError {
-	return CanonicalError{
-		Code:         ErrCodeExecutionCanceled,
-		Category:     CategoryExecution,
-		StatusClass:  StatusConflict,
-		Retryability: RetryNotRetryable,
-		Remediation:  RemediationNone,
-		FailureStage: StageCancellation,
 	}
 }
 
@@ -820,25 +780,6 @@ func NewExecutionPossiblyCommitted() CanonicalError {
 		Remediation:     RemediationSubmitNewRequest,
 		FailureStage:    StageUpstreamExecution,
 		RetryAfterClass: "new_request_only",
-	}
-}
-
-// NewSensitiveDataUnavailable builds the protected-data fail-closed outcome when
-// Vault, key service, audit-before-allow, revocation, retention, or binding state
-// cannot authorize protected data. The credential itself may be valid; the
-// protected dependency is unavailable, so it surfaces as a dependency/credential
-// outcome (never an account-policy "submit credentials" gate) and directs
-// remediation to dependency recovery rather than credential submission
-// (canonical-errors §4.6, I-CREDENTIAL-ERROR-FAIL-CLOSED).
-func NewSensitiveDataUnavailable() CanonicalError {
-	return CanonicalError{
-		Code:            ErrCodeSensitiveDataUnavailable,
-		Category:        CategoryCredential,
-		StatusClass:     StatusDependency,
-		Retryability:    RetryAfter,
-		Remediation:     RemediationContactOperator,
-		FailureStage:    StageCredential,
-		RetryAfterClass: "dependency_recovery",
 	}
 }
 

@@ -51,6 +51,19 @@ type ChatDigester interface {
 	CreateFingerprint(operation domain.ChatOperation, model string, messages []domain.ChatMessage) (domain.Fingerprint, error)
 }
 
+// ChatAffinityStore keeps the soft conversation→account preference (routing
+// spec §5.1, chat lifecycle §5.2). It is a preference record only, never a
+// routing authority: selection still requires candidate-set membership
+// (C0–C5), so a stale or foreign preference can never widen execution, and a
+// lost preference simply falls through to P4 policy selection.
+type ChatAffinityStore interface {
+	// Preferred returns the account that last successfully served the scoped
+	// conversation; ok=false when no preference is recorded.
+	Preferred(context.Context, domain.ChatAffinityScope) (domain.ProviderAccountID, bool, error)
+	// Record stores the account that just served the scoped conversation.
+	Record(context.Context, domain.ChatAffinityScope, domain.ProviderAccountID) error
+}
+
 // ChatCommand is the safe Adapter invocation after authorization. It carries
 // only safe identities and the canonical messages; credential material is never
 // a durable field and is injected via CredentialInjection.
