@@ -908,14 +908,18 @@ func (service *ChatService) chatAudit(ctx context.Context, sc spineContext, prin
 // non-streaming action, otherwise the audit trail reports a stream terminal as
 // `chat_completion.completed` and the streaming actions never appear.
 func chatAuditAction(operation domain.OperationToken, outcome string) ports.ChatAuditAction {
+	// A replay is a replay on both spines: it re-delivers a durable record without
+	// a new Adapter call, so it must stay distinguishable from a live terminal.
+	// Checking the streaming operation first would label a streamed replay
+	// `stream_terminal`, making it indistinguishable from a fresh generation.
+	if outcome == "replayed" {
+		return ports.AuditChatReplayed
+	}
 	if operation == domain.OperationChatCompletionStreaming {
 		if outcome == "stream_opened" {
 			return ports.AuditChatStreamOpened
 		}
 		return ports.AuditChatStreamTerminal
-	}
-	if outcome == "replayed" {
-		return ports.AuditChatReplayed
 	}
 	return ports.AuditChatCompleted
 }

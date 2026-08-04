@@ -334,6 +334,16 @@ func (handler chatHandler) stream(writer http.ResponseWriter, request *http.Requ
 		MalformedBody:        parsed.malformed,
 	}, stream)
 	if err != nil {
+		if stream.Opened() {
+			// Defence in depth: StreamChat's contract is that a non-nil error means a
+			// PRE-stream rejection, and every post-open outcome is delivered as the
+			// single terminal event. If that contract is ever broken, writing an HTTP
+			// error here would attempt a second WriteHeader on an already-committed
+			// 200 and append a JSON body to the open SSE frame, corrupting the stream.
+			// The client already holds an open stream, so the least-harmful action is
+			// to write nothing further and let the terminal/EOF stand.
+			return
+		}
 		// Pre-stream rejection: nothing was written, so a canonical HTTP error is
 		// still expressible and no partial stream is left behind.
 		writeGatewayError(writer, err)

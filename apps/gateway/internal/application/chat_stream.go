@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -60,6 +61,11 @@ type ChatStreamTerminal struct {
 	// UpstreamStopConfirmed reports only confirmed upstream stops. Cancellation
 	// alone is not proof upstream stopped (OpenAPI ChatCanceledEvent).
 	UpstreamStopConfirmed bool
+	// DeliveredContent is the concatenated assistant content the client actually
+	// received. It never reaches the wire — the client already got it as deltas —
+	// but the durable replay record must persist it, otherwise a matching replay
+	// reconstructs an empty assistant message and silently loses the text.
+	DeliveredContent string
 }
 
 // ChatStreamTransport is the transport-owned side of one streaming response.
@@ -114,6 +120,11 @@ type lazyStream struct {
 	opened  bool
 	openErr error
 	sealed  bool
+	// delivered accumulates the canonical assistant content actually delivered to
+	// the client. It is what the durable replay record must persist: without it a
+	// matching replay reconstructs an EMPTY assistant message, so an idempotent
+	// retry silently loses the text the first call already delivered.
+	delivered strings.Builder
 }
 
 // ensureOpen writes the open event once, on first demand. Callers must hold mu.
@@ -144,7 +155,13 @@ func (stream *lazyStream) Delta(delta domain.ChatDelta) error {
 	if err := stream.ensureOpen(); err != nil {
 		return err
 	}
-	return stream.transport.Sink().Delta(delta)
+	if err := stream.transport.Sink().Delta(delta); err != nil {
+		return err
+	}
+	// Record only what the transport accepted, so the replay record can never
+	// claim content the client did not receive.
+	stream.delivered.WriteString(delta.Content)
+	return nil
 }
 
 // Heartbeat opens the stream on first keepalive, then delivers it.
@@ -182,6 +199,14 @@ func (stream *lazyStream) seal() {
 // deltaCount reports delivered canonical deltas.
 func (stream *lazyStream) deltaCount() int {
 	return stream.transport.DeltaCount()
+}
+
+// deliveredContent is the concatenated assistant content the client received, for
+// the durable replay record.
+func (stream *lazyStream) deliveredContent() string {
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return stream.delivered.String()
 }
 
 var _ domain.ChatSink = (*lazyStream)(nil)
@@ -352,6 +377,12 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 	// The stream was opened and its single terminal event has been delivered, so
 	// the client outcome is already final. Record durable state and observability
 	// without emitting any second client event (§6.5 rule 1).
+	//
+	// The open audit is recorded HERE, once, because only now is it true: the
+	// stream really opened on `served`. Recording it before the Adapter ran would
+	// claim `stream_opened` for a fail-closed Adapter that never opened anything,
+	// and would emit one record per attempted account during a fallback walk.
+	_ = service.chatAudit(ctx, sc, principal, served.ID, executionID, "stream_opened")
 	service.recordStreamTerminalState(ctx, execution, served, terminal, identity, settleErr)
 	service.recordTelemetry(ctx, sc.operation, terminal.Error.Code, terminal.HTTPStatusHint())
 	service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), terminal.HTTPStatusHint(), terminal.logMessage(), sc.start)
@@ -472,8 +503,6 @@ func (service *ChatService) attemptStreamOnAccount(
 			StreamingClass:    service.streamingClass(ctx, execution.principal, account, execution.sc.start),
 		},
 	}
-	_ = service.chatAudit(ctx, execution.sc, execution.principal, account.ID, execution.executionID, "stream_opened")
-
 	// The send boundary is the only authoritative witness of whether Provider
 	// payload transmission began for THIS attempt. A transport error alone cannot
 	// distinguish "never left the Gateway" from "reached the Provider and the
@@ -535,10 +564,24 @@ func (service *ChatService) attemptStreamOnAccount(
 
 	terminal, opened, canonical, settled := service.classifyStreamOutcome(execution, stream, outcome)
 	if opened {
+		// Capture what the client actually received BEFORE the terminal seals the
+		// sink, so the durable replay record can reconstruct the same content.
+		terminal.DeliveredContent = stream.deliveredContent()
 		// Deliver the single terminal event through the same lazy stream, so a
 		// zero-delta stream still emits `open` before its terminal.
 		if err := stream.terminal(terminal); err != nil {
-			return terminal, stream.Opened(), canonical, true
+			if !stream.Opened() {
+				// The generation committed upstream but the client never saw a byte:
+				// the open/terminal write failed. Reporting the zero-value canonical
+				// error here would (a) hand `service.fail` an unclassified error and
+				// (b) let the !opened branch abandon the replay claim for a generation
+				// that ACTUALLY COMMITTED, which §7.3 rule 4 forbids ("an uncertain/
+				// possibly-committed claim is not stolen for automatic re-execution").
+				uncertain := domain.NewExecutionPossiblyCommitted().WithRequestID(execution.sc.requestID)
+				terminal.Error = uncertain
+				return terminal, false, uncertain, true
+			}
+			return terminal, true, canonical, true
 		}
 		return terminal, true, canonical, true
 	}
@@ -641,7 +684,15 @@ func (service *ChatService) recordStreamTerminalState(
 	identity domain.ReplayIdentity,
 	settleErr error,
 ) {
-	if terminal.Event == domain.ChatStreamCompleted {
+	// `completed` and `canceled` are both COMMITTED generations: the Provider
+	// accepted the work and consumed tokens. Both must record a durable terminal so
+	// a retry under the same Idempotency-Key replays that outcome instead of
+	// launching a second billed generation (§7.5 I-CHAT-NO-DUPLICATE-EXEC).
+	//
+	// Recording only `completed` used to leave a canceled stream's claim stuck
+	// in_progress forever, so every retry received 409 idempotency_in_progress and
+	// the work could never be replayed.
+	if terminal.Event == domain.ChatStreamCompleted || terminal.Event == domain.ChatStreamCanceled {
 		completion := domain.ChatCompletion{
 			ID:                execution.executionID,
 			Object:            "chat.completion",
@@ -652,7 +703,7 @@ func (service *ChatService) recordStreamTerminalState(
 			ExecutionID:       execution.executionID,
 			Choices: []domain.ChatChoice{{
 				Index:       0,
-				Message:     domain.ChatMessage{Role: domain.ChatRoleAssistant, Content: ""},
+				Message:     domain.ChatMessage{Role: domain.ChatRoleAssistant, Content: terminal.DeliveredContent},
 				FinishClass: terminal.FinishClass,
 			}},
 			Usage: terminal.Usage,
@@ -696,6 +747,11 @@ func (service *ChatService) streamReplay(
 		ExecutionID:       completion.ExecutionID,
 		ProviderAccountID: completion.ProviderAccountID,
 		Model:             completion.Model,
+		// A replay is reconstructed from a durable record, never re-streamed from
+		// the Provider, so it must disclose synthetic rather than inherit the
+		// original attempt's class or leave the field ambiguous (§5.3: streaming
+		// class is disclosed, never claimed).
+		StreamingClass: domain.StreamingSynthetic,
 	}
 	if err := transport.Open(handshake); err != nil {
 		return nil

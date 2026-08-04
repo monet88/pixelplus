@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -131,35 +132,69 @@ func TestChatStreamClientDisconnectStopsDelivery(t *testing.T) {
 	if strings.Contains(delivered, `"type":"completed"`) {
 		t.Fatalf("a terminal reached a client that had already disconnected: %q", delivered)
 	}
+
+	// The gate must have been released by this test, not by its safety deadline.
+	// A silently expired gate would mean the Adapter never reached the
+	// post-disconnect steps, so the assertions above would pass for the wrong
+	// reason.
+	gate.AssertReleased(t)
 }
 
 // readUntil reads SSE frames until the marker appears or the stream ends. It
 // bounds itself so a hung stream fails the test rather than blocking forever.
+//
+// The reads run on their own goroutine because `body.Read` is synchronous and
+// unbounded: a stream that stalls without delivering bytes would block the read
+// itself, so a deadline that only gates the loop would never be evaluated and the
+// test would hang instead of failing. A hanging test stalls CI with no diagnosis,
+// which is strictly worse than a failing one.
 func readUntil(t *testing.T, body io.Reader, marker string) string {
 	t.Helper()
 
-	var builder strings.Builder
-	buffer := make([]byte, 512)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		count, err := body.Read(buffer)
-		if count > 0 {
-			builder.Write(buffer[:count])
-			if strings.Contains(builder.String(), marker) {
-				return builder.String()
+	type readResult struct {
+		data string
+	}
+	done := make(chan readResult, 1)
+
+	go func() {
+		var builder strings.Builder
+		buffer := make([]byte, 512)
+		for {
+			count, err := body.Read(buffer)
+			if count > 0 {
+				builder.Write(buffer[:count])
+				if strings.Contains(builder.String(), marker) {
+					break
+				}
+			}
+			if err != nil {
+				break
 			}
 		}
-		if err != nil {
-			break
-		}
+		// Buffered channel: if the deadline already fired, this send must not block
+		// forever and leak the goroutine.
+		done <- readResult{data: builder.String()}
+	}()
+
+	select {
+	case result := <-done:
+		return result.data
+	case <-time.After(5 * time.Second):
+		// Reporting through the test goroutine is required: writing to *testing.T
+		// from the reader goroutine after the test returned would panic.
+		t.Fatalf("stream stalled: marker %q not seen within 5s", marker)
+		return ""
 	}
-	return builder.String()
 }
 
 // deliveryGate lets a test hold an Adapter mid-stream until it releases it.
 type deliveryGate struct {
 	once    sync.Once
 	release chan struct{}
+	// expired records that the safety deadline fired instead of a real Release, so
+	// the owning test can fail explicitly rather than silently proceeding against a
+	// still-blocked Adapter.
+	expired atomic.Bool
 }
 
 func newDeliveryGate() *deliveryGate {
@@ -172,9 +207,26 @@ func (gate *deliveryGate) Release() {
 }
 
 // wait blocks the Adapter until released or a safety deadline elapses.
-func (gate *deliveryGate) wait() {
+//
+// It returns whether it was genuinely released. A silent timeout would let the
+// test continue against a still-blocked Adapter and pass for the wrong reason, so
+// callers must surface the expiry.
+func (gate *deliveryGate) wait() bool {
 	select {
 	case <-gate.release:
+		return true
 	case <-time.After(5 * time.Second):
+		gate.expired.Store(true)
+		return false
+	}
+}
+
+// AssertReleased fails the test when the gate expired on its safety deadline.
+// It must be called from the test goroutine: the Adapter blocks on `wait` in its
+// own goroutine, where writing to *testing.T after the test returned would panic.
+func (gate *deliveryGate) AssertReleased(t *testing.T) {
+	t.Helper()
+	if gate.expired.Load() {
+		t.Fatalf("delivery gate was never released; the Adapter stayed blocked for its full 5s safety deadline, so this test proved nothing")
 	}
 }

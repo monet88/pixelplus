@@ -180,7 +180,12 @@ func NewMemoryChatStreamLeaseStore() *MemoryChatStreamLeaseStore {
 // holder wins and this caller receives ErrChatStreamLeaseHeld; the same holder
 // re-acquiring is an idempotent success.
 func (store *MemoryChatStreamLeaseStore) Acquire(_ context.Context, lease ports.ChatStreamLease) error {
-	if lease.Holder == "" || lease.AccountID == "" {
+	// TenantID is part of the lease key, so an empty one would let unrelated
+	// requests contend on a single shared zero-Tenant key and report misleading
+	// lease-held conflicts across Tenants. The spine only ever passes an
+	// authenticated principal's TenantID, so this is a store-level invariant
+	// (defence in depth) rather than a reachable path today.
+	if lease.Holder == "" || lease.AccountID == "" || lease.TenantID == "" {
 		return ports.ErrDependencyUnavailable
 	}
 	store.mu.Lock()

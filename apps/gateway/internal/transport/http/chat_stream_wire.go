@@ -152,6 +152,21 @@ func (stream *sseStream) Sink() domain.ChatSink {
 	return stream
 }
 
+// Opened reports whether the canonical open event was written, and therefore
+// whether the HTTP status is already committed to a 200 text/event-stream
+// response.
+//
+// The handler needs this because it cannot otherwise tell a pre-stream rejection
+// (safe to answer with a canonical HTTP error) from a failure raised after the
+// stream was already committed. Writing an HTTP error in the latter case would
+// attempt a second WriteHeader on a committed response and append a JSON error
+// body to the open SSE frame, corrupting the stream for the client.
+func (stream *sseStream) Opened() bool {
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return stream.order.Opened()
+}
+
 // Delta writes one canonical content event in arrival order. Ordering is
 // preserved and content is never merged or reordered, so concatenating the
 // delivered deltas reconstructs the assistant message (§4.3 rule 4).
