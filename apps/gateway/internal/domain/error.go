@@ -177,6 +177,11 @@ const (
 	// because the prior execution may have been committed and no authoritative
 	// no-commit proof exists to retry.
 	RemediationSubmitNewRequest Remediation = "submit_new_request"
+	// RemediationExecutionRecovery lets the owning execution/recovery path
+	// resolve a transient dependency or an uncertain upstream state; client
+	// action follows the emitted retryability and commit status
+	// (canonical-errors §5.2, §4.5 `upstream_timeout`/`upstream_unavailable`).
+	RemediationExecutionRecovery Remediation = "execution_recovery"
 	// RemediationDeleteAssetsOrWaitExpiry is the storage-cap remediation: the
 	// Tenant deletes Assets or waits for expiry to reclaim headroom (#13 section 6.1).
 	RemediationDeleteAssetsOrWaitExpiry Remediation = "delete_assets_or_wait_expiry"
@@ -831,12 +836,12 @@ func NewProviderRejected() CanonicalError {
 
 // NewUpstreamTimeout builds the provider runtime upstream-timeout outcome.
 func NewUpstreamTimeout() CanonicalError {
-	return providerRuntime(ErrCodeUpstreamTimeout, StatusUpstreamTimeout, StageUpstreamExecution, RemediationNone, RetrySafeInternal, "")
+	return providerRuntime(ErrCodeUpstreamTimeout, StatusUpstreamTimeout, StageUpstreamExecution, RemediationExecutionRecovery, RetrySafeInternal, "")
 }
 
 // NewUpstreamUnavailable builds the provider runtime upstream-unavailable outcome.
 func NewUpstreamUnavailable() CanonicalError {
-	return providerRuntime(ErrCodeUpstreamUnavailable, StatusUpstreamUnavailable, StageUpstreamExecution, RemediationNone, RetrySafeInternal, "")
+	return providerRuntime(ErrCodeUpstreamUnavailable, StatusUpstreamUnavailable, StageUpstreamExecution, RemediationExecutionRecovery, RetrySafeInternal, "")
 }
 
 // NewUpstreamProtocolDrift builds the provider runtime protocol-drift outcome.

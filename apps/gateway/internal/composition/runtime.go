@@ -149,6 +149,14 @@ type Dependencies struct {
 	// ChatStreamLeases records hard chat_stream account leases. A nil store
 	// composes the process-local store (a lease never outlives its stream).
 	ChatStreamLeases ports.ChatStreamLeaseStore
+	// ResidualStore bounds same-Tenant residual tracking for surviving upstream
+	// executions (§6.5 rule 2, T17). A nil store means no residual capacity is
+	// available, so the spine retains the original request state.
+	ResidualStore ports.ChatResidualStore
+	// ResidualDrain performs bounded drain/recovery of surviving upstream
+	// executions between X5 and X6 (§6.5 rules 3-4, T17). A nil drain means the
+	// drain returns unknown usage immediately, so settlement fails closed.
+	ResidualDrain ports.ChatResidualDrain
 	// ChatAffinity stores the soft conversation→account preference (P3). A nil
 	// port substitutes the process-local memory store: affinity is a preference,
 	// never an authority, so process loss only degrades selection to P4 policy
@@ -895,6 +903,8 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 
 		AuthorizedStream: authorizedStream,
 		StreamLeases:     streamLeases,
+		ResidualStore:    dependencies.ResidualStore,
+		ResidualDrain:    dependencies.ResidualDrain,
 	})
 }
 

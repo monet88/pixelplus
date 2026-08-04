@@ -354,21 +354,26 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 		leased:      lease != nil,
 	}
 
+	// Register the in-flight execution so an explicit cancel (§6.2) or
+	// disconnect (§6.3) can signal it. The cancel context is a child of the
+	// request context: a client disconnect cancels the request context, which
+	// cancels this child; an explicit cancel calls the registered CancelFunc.
+	_, execCancel := context.WithCancel(ctx)
+	service.executions.register(principal.TenantID, principal.ClientAPIKeyID, executionID, execCancel)
+	defer func() {
+		execCancel()
+	}()
+
 	served, terminal, opened := service.runStream(ctx, execution, account)
 
-	// X5/X6: settle occupancy and quota exactly once against the ORIGINAL
-	// Tenant + Client API Key, whatever the terminal class was.
-	reservation.SettlementKey = chatSettlementKey(principal, executionID)
-	// Reconcile to the final actual usage the terminal carries. `completed` and
-	// `canceled` are both COMMITTED generations that consumed Provider tokens, and
-	// §6.2 rule 3 requires a canceled execution's "token quota is reconciled to
-	// actual tokens consumed so far". A failed or commit-uncertain terminal has no
-	// trustworthy count, so it leaves Usage unknown and settlement stays
-	// fail-closed instead of recording a zero debit (§6.5 rule 3).
-	if terminal.Event == domain.ChatStreamCompleted || terminal.Event == domain.ChatStreamCanceled {
-		reservation.Usage = admissionUsage(terminal.Usage)
-	}
-	settleErr := service.admission.Reconcile(ctx, reservation)
+	// X5/X6 settlement (§6.5). The terminal determines whether occupancy
+	// releases immediately at X5 (upstream stopped confirmed or authoritative
+	// non-commit) or is held for a bounded drain at X6 (upstream may survive).
+reservation.SettlementKey = chatSettlementKey(principal, executionID)
+
+	// Record terminal state in the registry so a later explicit cancel is an
+	// idempotent no-op (§6.2 rule 5).
+	service.executions.markTerminal(executionID, terminal.UpstreamAbortAttempted, terminal.UpstreamStopConfirmed)
 
 	if !opened {
 		// Pre-upstream rejection: no stream was opened, so the client can still
@@ -377,11 +382,23 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 		if terminal.Error.Code != domain.ErrCodeExecutionPossiblyCommitted {
 			_ = service.abandon(ctx, identity)
 		}
-		if settleErr != nil {
-			return service.fail(ctx, sc, service.dependencyCanonical(settleErr))
+		// For a pre-upstream rejection there is no stream to drain: settle
+		// immediately (X5 = X6). The reservation reconciles to whatever the
+		// terminal carries (nothing for a failed/possibly-committed terminal,
+		// which is the correct fail-closed behavior per §6.5 rule 3).
+		if terminal.Event == domain.ChatStreamCompleted || terminal.Event == domain.ChatStreamCanceled {
+			reservation.Usage = admissionUsage(terminal.Usage)
+		}
+		if reconcileErr := service.admission.Reconcile(ctx, reservation); reconcileErr != nil {
+			return service.fail(ctx, sc, service.dependencyCanonical(reconcileErr))
 		}
 		return service.fail(ctx, sc, terminal.Error)
 	}
+
+	// For an opened stream, X5 may differ from X6 when the upstream may survive
+	// the client terminal (§6.5 rule 1). settleStream handles the coincide
+	// (release now) and split (hold + drain + release at X6) paths.
+	settleErr := service.settleStream(ctx, reservation, terminal, execution, served, identity)
 
 	// The stream was opened and its single terminal event has been delivered, so
 	// the client outcome is already final. Record durable state and observability
@@ -395,6 +412,109 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 	service.recordStreamTerminalState(ctx, execution, served, terminal, identity, settleErr)
 	service.recordTelemetry(ctx, sc.operation, terminal.Error.Code, terminal.HTTPStatusHint())
 	service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), terminal.HTTPStatusHint(), terminal.logMessage(), sc.start)
+	return nil
+}
+
+// settleStream performs the X5/X6 settlement for one stream terminal. When X5
+// and X6 coincide (upstream stopped confirmed or authoritative non-commit), it
+// reconciles immediately. When they split (upstream may survive), it holds the
+// reservation, optionally acquires residual tracking, runs a bounded drain,
+// and reconciles at X6 (§6.5 rules 1-4).
+//
+// The returned error is non-nil only when settlement itself failed (a
+// dependency outcome) or when final usage is unavailable after bounded drain
+// (§6.5 rule 3 accounting fault); it is folded into audit/telemetry rather
+// than emitted to the client, because the client terminal was already
+// delivered.
+func (service *ChatService) settleStream(
+	ctx context.Context,
+	reservation ports.AdmissionReservation,
+	terminal ChatStreamTerminal,
+	execution chatStreamExecution,
+	served domain.ProviderAccount,
+	identity domain.ReplayIdentity,
+) error {
+	// X5 and X6 coincide when upstream stopped confirmed or the attempt was
+	// authoritatively non-committed (nothing to drain). `completed` implies
+	// upstream stopped naturally; `canceled` with UpstreamStopConfirmed means
+	// the Adapter proved the stop; a non-commit `failed` never reached upstream.
+	upstreamStopped := terminal.Event == domain.ChatStreamCompleted ||
+		(terminal.Event == domain.ChatStreamCanceled && terminal.UpstreamStopConfirmed) ||
+		(terminal.Event == domain.ChatStreamFailed && terminal.Error.Code != domain.ErrCodeExecutionPossiblyCommitted && !terminal.UpstreamAbortAttempted)
+
+	if upstreamStopped {
+		// X5 = X6: release occupancy and settle quota now (§6.5 rule 1).
+		if terminal.Event == domain.ChatStreamCompleted || terminal.Event == domain.ChatStreamCanceled {
+			reservation.Usage = admissionUsage(terminal.Usage)
+		}
+		return service.admission.Reconcile(ctx, reservation)
+	}
+
+	// X5 != X6: upstream may survive. Hold the reservation and try residual
+	// tracking (§6.5 rule 2). The client terminal is already delivered; X6 emits
+	// no second client event.
+	hold := ports.ChatResidualHold{
+		TenantID:       execution.principal.TenantID,
+		ClientAPIKeyID: execution.principal.ClientAPIKeyID,
+		ExecutionID:    execution.executionID,
+	}
+	residualAcquired := false
+	if service.residualStore != nil {
+		if err := service.residualStore.Acquire(ctx, hold); err != nil {
+			// Capacity full: retain the original request state. The spine keeps
+			// the original occupancy and reservation held; no transfer occurs
+			// (§6.5 rule 2 "If residual tracking is full, retain the original
+			// request state"). Neither path frees capacity for another A6 accept.
+			residualAcquired = false
+		} else {
+			residualAcquired = true
+		}
+	}
+
+	// Bounded drain/recovery (§6.5 rule 3). A nil drain returns unknown usage
+	// immediately, so settlement fails closed (retain full reservation).
+	finalUsage := terminal.Usage
+	usageKnown := terminal.Event == domain.ChatStreamCompleted || terminal.Event == domain.ChatStreamCanceled
+	stopConfirmed := terminal.UpstreamStopConfirmed
+	if service.residualDrain != nil {
+		outcome, err := service.residualDrain.Drain(ctx, ports.ChatResidualDrainRequest{
+			Hold:               hold,
+			AccountID:          served.ID,
+			ObservedUsage:      terminal.Usage,
+			ObservedUsageKnown: usageKnown,
+		})
+		if err == nil {
+			if outcome.UsageKnown {
+				finalUsage = outcome.Usage
+				usageKnown = true
+			}
+			stopConfirmed = stopConfirmed || outcome.StopConfirmed
+		}
+		// A drain error or unknown usage keeps usageKnown false so settlement
+		// fails closed (§6.5 rule 3 "never assume zero").
+	}
+
+	// X6: settle quota and release occupancy exactly once (§6.5 rule 4).
+	if usageKnown {
+		reservation.Usage = admissionUsage(finalUsage)
+	}
+	settleErr := service.admission.Reconcile(ctx, reservation)
+
+	// Release the residual hold if it was acquired.
+	if residualAcquired && service.residualStore != nil {
+		_ = service.residualStore.Release(ctx, hold)
+	}
+
+	if settleErr != nil {
+		return settleErr
+	}
+
+	// If usage is unknown after bounded drain, emit the accounting fault marker
+	// so the audit record carries the conservative-settlement outcome (§6.5
+	// rule 3 "emit an operator-visible accounting fault").
+	if !usageKnown {
+		return errors.New("chat residual accounting fault: final usage unavailable after bounded drain")
+	}
 	return nil
 }
 

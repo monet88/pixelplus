@@ -71,6 +71,19 @@ type ChatService struct {
 	// means no lease is taken; the stream still cannot hop accounts once content
 	// has been delivered.
 	streamLeases ports.ChatStreamLeaseStore
+	// executions tracks in-flight chat executions for explicit cancel (§6.2)
+	// and disconnect (§6.3). Process-local: a cancel targets a live execution
+	// in this process only.
+	executions *chatExecutionRegistry
+	// residualStore bounds same-Tenant residual tracking for executions whose
+	// upstream may survive the client terminal (§6.5 rule 2). A nil store means
+	// no residual capacity is available, so the spine retains the original
+	// request state (occupancy held, no transfer).
+	residualStore ports.ChatResidualStore
+	// residualDrain performs the bounded drain/recovery of a surviving upstream
+	// execution between X5 and X6 (§6.5 rules 3-4). A nil drain means the drain
+	// returns unknown usage immediately, so settlement fails closed.
+	residualDrain ports.ChatResidualDrain
 }
 
 // ChatDependencies bundles the controlled ports the chat spine owns.
@@ -96,6 +109,12 @@ type ChatDependencies struct {
 	AuthorizedStream ports.AuthorizedChatStream
 	// StreamLeases records hard chat_stream account leases (routing spec §5.2).
 	StreamLeases ports.ChatStreamLeaseStore
+	// ResidualStore bounds same-Tenant residual tracking (§6.5 rule 2, T17).
+	// A nil store means no residual capacity is available.
+	ResidualStore ports.ChatResidualStore
+	// ResidualDrain performs bounded drain/recovery of surviving upstream
+	// executions between X5 and X6 (§6.5 rules 3-4, T17).
+	ResidualDrain ports.ChatResidualDrain
 }
 
 // NewChatService validates and wires the chat spine dependencies.
@@ -155,6 +174,9 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 
 		authorizedStream: dependencies.AuthorizedStream,
 		streamLeases:     dependencies.StreamLeases,
+		executions:       newChatExecutionRegistry(),
+		residualStore:   dependencies.ResidualStore,
+		residualDrain:   dependencies.ResidualDrain,
 	}, nil
 }
 

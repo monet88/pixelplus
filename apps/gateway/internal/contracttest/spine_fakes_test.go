@@ -138,6 +138,11 @@ func (store *stubAdmissionStore) SettledUsage() []ports.AdmissionUsage {
 	defer store.mu.Unlock()
 	return append([]ports.AdmissionUsage(nil), store.settledUsage...)
 }
+// ReconcileCalls returns the total number of Reconcile calls (including
+// idempotent no-ops for the same SettlementKey).
+func (store *stubAdmissionStore) ReconcileCalls() int {
+	return int(store.reconcileCalls.Load())
+}
 
 type stubReplayRecord struct {
 	fingerprint domain.Fingerprint

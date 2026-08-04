@@ -2,6 +2,7 @@ package ports
 
 import (
 	"context"
+	"errors"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 )
@@ -93,10 +94,100 @@ type ChatStreamLeaseStore interface {
 	Release(context.Context, ChatStreamLease) error
 }
 
+// ErrChatResidualCapacityFull reports that same-Tenant residual tracking has no
+// free slot under `L-TENANT-CHAT-RESIDUAL`. It is NOT a failure of the client
+// terminal: chat lifecycle §6.5 rule 2 says that when residual tracking is full
+// the Gateway "retain[s] the original request state", so the spine keeps the
+// original occupancy and reservation held instead of releasing anything.
+var ErrChatResidualCapacityFull = errors.New("chat residual tracking capacity is full")
+
+// ChatResidualHold identifies one same-Tenant residual bookkeeping entry for an
+// execution whose upstream may still be running after the client terminal (X5).
+//
+// Every field is part of the ownership identity on purpose: §6.5 rule 5 requires
+// residual tracking to stay same-Tenant and "remain charged to the originating
+// `client_api_key_id`", so a hold can never migrate surviving work onto another
+// Tenant or another key by disconnecting.
+type ChatResidualHold struct {
+	TenantID       domain.TenantID
+	ClientAPIKeyID domain.ClientAPIKeyID
+	ExecutionID    domain.Identifier
+}
+
+// ChatResidualStore bounds how many of a Tenant's occupied executions are
+// represented in residual tracking (`L-TENANT-CHAT-RESIDUAL`, chat lifecycle
+// §6.5 rule 2 and I-CHAT-RESIDUAL-BOUNDED). The numeric limit is #17; this port
+// owns only the atomic bounded-acquire semantics.
+//
+// Acquire MUST be atomic and MUST return ErrChatResidualCapacityFull rather than
+// exceeding the limit: residual tracking is bookkeeping for work that already
+// holds concurrency, never extra execution capacity, so silently growing it
+// would let cancel amplification hide surviving upstream generations.
+//
+// Release MUST be idempotent and MUST release exactly one logical hold per
+// execution (§6.5 rule 4 "release ... residual tracking state exactly once").
+type ChatResidualStore interface {
+	// Acquire claims residual tracking for the execution, or reports
+	// ErrChatResidualCapacityFull when the Tenant limit leaves no room.
+	Acquire(context.Context, ChatResidualHold) error
+	// Release clears the residual hold at the accounting terminal (X6).
+	Release(context.Context, ChatResidualHold) error
+}
+
+// ChatResidualOutcome is the safe result of a bounded drain/recovery attempt on
+// an execution whose upstream survived the client terminal.
+//
+// Usage is authoritative ONLY when UsageKnown is true. An unknown usage after a
+// bounded drain is not zero: §6.5 rule 3 requires the Gateway to "retain the
+// full reservation (or a platform-configured conservative debit no smaller than
+// known usage) and emit an operator-visible accounting fault; never assume
+// zero".
+type ChatResidualOutcome struct {
+	// UsageKnown reports whether Usage is the final actual Provider usage.
+	UsageKnown bool
+	// Usage is the final actual input+output usage including tokens consumed
+	// after the client terminal.
+	Usage domain.ChatUsage
+	// StopConfirmed reports a CONFIRMED upstream stop observed during the drain.
+	// It is an observation, never an inference from reaching the deadline.
+	StopConfirmed bool
+}
+
+// ChatResidualDrainRequest is the safe drain instruction for one execution.
+type ChatResidualDrainRequest struct {
+	Hold ChatResidualHold
+	// AccountID is the account that served the surviving execution, so a drain
+	// implementation resolves the same same-Tenant binding the stream used.
+	AccountID domain.ProviderAccountID
+	// ObservedUsage is what the Adapter already reported at the client terminal,
+	// so a drain that cannot learn more never settles BELOW known usage.
+	ObservedUsage domain.ChatUsage
+	// ObservedUsageKnown reports whether ObservedUsage is authoritative.
+	ObservedUsageKnown bool
+}
+
+// ChatResidualDrain performs the bounded drain/recovery of a surviving upstream
+// execution between X5 and X6 (chat lifecycle §6.5 rules 3-4).
+//
+// Drain MUST be bounded: reaching the deadline is a legitimate outcome reported
+// as an unknown usage, which fails accounting closed. Reaching the deadline
+// never authorizes an optimistic refund, and Drain MUST NOT start a replacement
+// generation.
+type ChatResidualDrain interface {
+	Drain(context.Context, ChatResidualDrainRequest) (ChatResidualOutcome, error)
+}
+
 // Streaming audit actions emitted by the chat stream spine.
 const (
 	// AuditChatStreamOpened records that a stream was opened for execution.
 	AuditChatStreamOpened ChatAuditAction = "chat_completion.stream_opened"
 	// AuditChatStreamTerminal records the single client terminal outcome.
 	AuditChatStreamTerminal ChatAuditAction = "chat_completion.stream_terminal"
+	// AuditChatCanceled records an explicit same-Tenant cancel request and its
+	// honest acknowledgement state (chat lifecycle §6.2).
+	AuditChatCanceled ChatAuditAction = "chat_completion.canceled"
+	// AuditChatResidual records the accounting terminal of a surviving upstream
+	// execution: the bounded drain settled, or failed closed with an
+	// operator-visible accounting fault (§6.5 rule 3).
+	AuditChatResidual ChatAuditAction = "chat_completion.residual_settled"
 )
