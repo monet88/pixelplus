@@ -50,6 +50,42 @@ func (adapter *countingStreamAdapter) Stream(_ context.Context, _ ports.ChatStre
 	return domain.ChatStreamOutcome{}, nil
 }
 
+// dualSurfaceAdapter implements BOTH ports.ChatStreamAdapter and
+// ports.ChatAdapter on a single object, and counts the two surfaces separately.
+//
+// Why one object rather than two doubles: the degradation this guards against
+// is not "some unrelated Adapter ran", it is "the streaming registry held an
+// Adapter and reached for its NON-streaming method". Real Adapters expose both
+// surfaces — chatgptweb.Adapter asserts `_ ports.ChatAdapter` and
+// `_ ports.ChatStreamAdapter` on the same struct — so a registry that type-
+// asserted its way onto Run() would still be handing work to "the right"
+// Adapter while silently producing a buffered body. Counting Run() and Stream()
+// on the same receiver is the only way to observe that: two separate doubles
+// would leave the non-streaming counter unreachable, which is precisely the
+// vacuous assertion this test used to make.
+type dualSurfaceAdapter struct {
+	label       string
+	streamCalls int
+	runCalls    int
+	modes       []domain.AuthMode
+}
+
+func (adapter *dualSurfaceAdapter) Stream(_ context.Context, command ports.ChatStreamCommand, _ ports.CredentialInjection, _ domain.ChatSink) (domain.ChatStreamOutcome, error) {
+	adapter.streamCalls++
+	adapter.modes = append(adapter.modes, command.AuthMode)
+	return domain.ChatStreamOutcome{}, nil
+}
+
+func (adapter *dualSurfaceAdapter) Run(_ context.Context, _ ports.ChatCommand, _ ports.CredentialInjection) (domain.ChatOutcome, error) {
+	adapter.runCalls++
+	return domain.ChatOutcome{Class: domain.ChatOutcomeCommitted}, nil
+}
+
+var (
+	_ ports.ChatStreamAdapter = (*dualSurfaceAdapter)(nil)
+	_ ports.ChatAdapter       = (*dualSurfaceAdapter)(nil)
+)
+
 func TestChatRegistryDispatchesOnAuthModeAndFallsBackOtherwise(t *testing.T) {
 	t.Parallel()
 
@@ -106,17 +142,51 @@ func TestRegistriesFailClosedWithoutAFallback(t *testing.T) {
 func TestStreamRegistryNeverDegradesToTheNonStreamingPath(t *testing.T) {
 	t.Parallel()
 
-	nonStreaming := &countingChatAdapter{}
-	registry := adapters.NewChatStreamAdapterRegistry(nil, nil)
+	// Both Adapters in play expose a streaming AND a non-streaming surface, so
+	// every dispatch below has a non-streaming method available to degrade onto.
+	// That is what makes the zero on runCalls a real observation rather than a
+	// statement about an object nobody wired in.
+	registered := &dualSurfaceAdapter{label: "registered"}
+	fallback := &dualSurfaceAdapter{label: "fallback"}
+	registry := adapters.NewChatStreamAdapterRegistry(fallback, map[domain.AuthMode]ports.ChatStreamAdapter{
+		domain.AuthModeChatGPTWebAccess: registered,
+	})
 
-	// The streaming registry holds no reference to a non-streaming Adapter at
-	// all, so a missing stream Adapter cannot be answered with a buffered body
-	// (chat lifecycle §3.2 rule 2).
-	if _, err := registry.Stream(t.Context(), ports.ChatStreamCommand{}, nil, nil); err == nil {
-		t.Fatal("missing stream adapter succeeded")
+	// Mode 1 — registered. The mapped Adapter must be entered through Stream().
+	if _, err := registry.Stream(t.Context(), ports.ChatStreamCommand{AuthMode: domain.AuthModeChatGPTWebAccess}, nil, nil); err != nil {
+		t.Fatalf("Stream() on the registered mode error = %v", err)
 	}
-	if nonStreaming.calls != 0 {
-		t.Errorf("non-streaming adapter called %d times, want 0", nonStreaming.calls)
+	// Mode 2 — NOT registered. This is the interesting half: the lookup misses, and
+	// the registry must still resolve to a STREAMING Adapter (the fallback's
+	// Stream), never to any buffered path. A streaming request answered with a
+	// non-streaming body would hand the client a complete completion where it
+	// contracted for incremental deltas — chat lifecycle §3.2 rule 2 forbids that
+	// substitution even when the buffered result would be "correct" content.
+	if _, err := registry.Stream(t.Context(), ports.ChatStreamCommand{AuthMode: domain.AuthModeChatGPTCodexOAuth}, nil, nil); err != nil {
+		t.Fatalf("Stream() on the unregistered mode error = %v", err)
+	}
+
+	if registered.streamCalls != 1 {
+		t.Errorf("registered adapter Stream calls = %d, want 1", registered.streamCalls)
+	}
+	if fallback.streamCalls != 1 {
+		t.Errorf("streaming fallback Stream calls = %d, want 1 (a missing mode must resolve to the streaming fallback)", fallback.streamCalls)
+	}
+	// The core rule. If either counter is non-zero the registry degraded a
+	// streaming dispatch onto the non-streaming surface of the very same Adapter.
+	if registered.runCalls != 0 {
+		t.Errorf("registered adapter Run calls = %d, want 0; a streaming dispatch degraded to the non-streaming path", registered.runCalls)
+	}
+	if fallback.runCalls != 0 {
+		t.Errorf("fallback Run calls = %d, want 0; a missing stream Adapter degraded to the non-streaming path", fallback.runCalls)
+	}
+	// Dispatch must not smear one mode's traffic onto the other Adapter: the
+	// registered Adapter may only ever see the mode it was registered for.
+	if len(registered.modes) != 1 || registered.modes[0] != domain.AuthModeChatGPTWebAccess {
+		t.Errorf("registered adapter saw %v, want only chatgpt_web_access", registered.modes)
+	}
+	if len(fallback.modes) != 1 || fallback.modes[0] != domain.AuthModeChatGPTCodexOAuth {
+		t.Errorf("fallback saw %v, want only chatgpt_codex_oauth", fallback.modes)
 	}
 }
 

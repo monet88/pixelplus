@@ -145,6 +145,46 @@ func (result turnResult) producedNothing() bool {
 	return !result.sawContent && !result.finished && !result.blocked && result.imagePointer == ""
 }
 
+// driftedWithoutEvidence reports a drift on a turn that produced nothing this
+// surface could observe: no content delta, no image pointer.
+//
+// This is the ordinary "we could not parse anything" case, and it stays
+// AUTHORITATIVELY not-committed on purpose. The spine's fallback walk depends on
+// an authoritative no-commit to be allowed to re-attempt on another account; if
+// every unparseable payload became UNKNOWN, fallback would be disabled for the
+// whole Web surface and a single Provider-side protocol change would strand
+// every turn instead of failing over. Nothing left the Gateway and nothing
+// proves the upstream generated, so re-attempting cannot double-bill.
+//
+// `finished`/`blocked` deliberately do NOT rescue the turn from this branch: a
+// finish marker on a transcript whose content payloads were all undecodable
+// still delivered no generation, so there is nothing to be uncertain about.
+func (result turnResult) driftedWithoutEvidence() bool {
+	return result.drifted && !result.sawContent && result.imagePointer == ""
+}
+
+// driftedAfterEvidence reports a drift on a turn that HAD already produced
+// something: at least one content delta, or a confirmed image pointer.
+//
+// This is the case the certainty ladder must not swallow. The upstream
+// demonstrably generated (and may have billed) — and then the protocol moved
+// somewhere this Adapter cannot follow, so what happened AFTER the last decodable
+// event is unknowable from here. Neither authoritative answer is defensible:
+//
+//   - `committed` with a `stop` finish class would present whatever text
+//     happened to arrive before the undecodable event as the model's complete,
+//     deliberately-ended answer, hiding the protocol movement entirely — exactly
+//     the KS-5 observation drift must stay observable for (evidence §7).
+//   - `not_committed` is authoritative no-commit proof and would authorize the
+//     fallback walk to generate a second time, paying twice for a generation the
+//     upstream already performed (§6.2 authoritative-no-commit rule).
+//
+// So the honest answer is UNKNOWN: the success is withheld and so is permission
+// to re-generate.
+func (result turnResult) driftedAfterEvidence() bool {
+	return result.drifted && (result.sawContent || result.imagePointer != "")
+}
+
 // truncated reports a turn whose body ended prematurely: content arrived but the
 // stream carried neither a finish marker nor the `[DONE]` terminator.
 //
@@ -160,7 +200,8 @@ func (result turnResult) truncated() bool {
 	return result.sawContent && !result.finished && !result.blocked && !result.sawDone
 }
 
-// undeliverableImage reports a turn whose only product is an image asset.
+// undeliverableImage reports a turn that produced an image asset this surface
+// cannot carry — whether or not it also produced text.
 //
 // This Adapter serves the CHAT surface, and the canonical chat vocabulary has no
 // carrier for an asset: domain.ChatChoice.Message holds text and domain.ChatDelta
@@ -180,8 +221,18 @@ func (result turnResult) truncated() bool {
 // deliver it, and no replacement attempt is authorized. The pointer itself is
 // never returned — it is Provider-specific and domain.ChatCompletion carries no
 // raw Provider payload.
+//
+// A turn carrying BOTH text and a confirmed image is the same problem, not a
+// lesser one, which is why the presence of text does not rescue it. Committing
+// such a turn would return the text alone and drop the asset on the floor: the
+// caller receives a plain `committed`/`stop` completion and has no observable
+// way to tell that an image was also generated (and, on a metered Provider,
+// billed). That is a silent, unrecoverable loss of a delivered product, and it is
+// worse than the empty-success case above because the plausible-looking text
+// makes the loss invisible. UNKNOWN keeps the discrepancy visible to the spine
+// while still refusing to authorize a re-generation.
 func (result turnResult) undeliverableImage() bool {
-	return result.imagePointer != "" && !result.sawContent
+	return result.imagePointer != ""
 }
 
 // Run executes one non-streaming chat completion.
@@ -209,10 +260,16 @@ func (adapter *Adapter) Run(ctx context.Context, command ports.ChatCommand, cred
 	if err != nil {
 		return chatFailureOutcome(ctx, err, result), nil
 	}
-	if (result.drifted && !result.sawContent) || result.producedNothing() {
+	if result.driftedWithoutEvidence() || result.producedNothing() {
 		// Nothing was delivered and nothing proved a generation happened, so
 		// claiming a completion would invent one. No content left the Gateway, so
 		// this is authoritatively not committed and the spine may re-attempt.
+		//
+		// This branch is FIRST because it is the only one that may answer
+		// authoritatively, and it is also the narrowest: it requires the absence of
+		// every piece of evidence the branches below key on. Anything it does not
+		// catch necessarily produced something observable, and therefore falls
+		// through to a conservative UNKNOWN rather than to `committed`.
 		return domain.ChatOutcome{
 			Class:        domain.ChatOutcomeNotCommitted,
 			Commit:       domain.CommitNotCommitted,
@@ -220,11 +277,27 @@ func (adapter *Adapter) Run(ctx context.Context, command ports.ChatCommand, cred
 		}, nil
 	}
 
+	// One turn can be several things at once — drifted AND carrying an image AND
+	// truncated — and all three resolve to the same conservative answer, so the
+	// order among them cannot change the outcome. They stay separate branches
+	// because each documents a distinct reason certainty was lost.
+	if result.driftedAfterEvidence() {
+		// The upstream produced content or an asset and THEN the protocol moved. See
+		// turnResult.driftedAfterEvidence: committing would present a partial answer
+		// as a complete one and hide the drift, while an authoritative no-commit
+		// would authorize paying for a second generation.
+		return domain.ChatOutcome{
+			Class:        domain.ChatOutcomeUnknown,
+			Commit:       domain.CommitUnknown,
+			FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
+		}, nil
+	}
+
 	if result.undeliverableImage() {
-		// The upstream produced an image asset and nothing this chat surface can
-		// carry. See turnResult.undeliverableImage: committing would return an
-		// empty success, and an authoritative no-commit would authorize paying for
-		// a second generation.
+		// The upstream produced an image asset this chat surface cannot carry. See
+		// turnResult.undeliverableImage: committing would either return an empty
+		// success or silently drop the asset behind whatever text arrived, and an
+		// authoritative no-commit would authorize paying for a second generation.
 		return domain.ChatOutcome{
 			Class:        domain.ChatOutcomeUnknown,
 			Commit:       domain.CommitUnknown,
@@ -290,10 +363,14 @@ func (adapter *Adapter) Stream(
 	if err != nil {
 		return streamFailureOutcome(ctx, err, result), nil
 	}
-	if (result.drifted && !result.sawContent) || result.producedNothing() {
+	if result.driftedWithoutEvidence() || result.producedNothing() {
 		// Same rule as the non-streaming path: a turn that produced nothing
 		// observable must not commit. On the streaming surface no delta reached the
 		// sink either, so the spine is free to re-attempt.
+		//
+		// Ordered first for the same reason as in Run: it is the only authoritative
+		// answer, and it requires the absence of all the evidence the UNKNOWN
+		// branches below key on.
 		return domain.ChatStreamOutcome{
 			Class:        domain.ChatOutcomeNotCommitted,
 			Commit:       domain.CommitNotCommitted,
@@ -302,10 +379,22 @@ func (adapter *Adapter) Stream(
 		}, nil
 	}
 
+	if result.driftedAfterEvidence() {
+		// Same rule as the non-streaming path. Here the deltas already reached the
+		// client, which makes committing worse rather than better: the client would
+		// be told the partial text it already consumed was the model's complete,
+		// deliberately-ended answer.
+		return domain.ChatStreamOutcome{
+			Class:        domain.ChatOutcomeUnknown,
+			Commit:       domain.CommitUnknown,
+			FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
+		}, nil
+	}
+
 	if result.undeliverableImage() {
-		// Same rule as the non-streaming path. No delta reached the sink, but the
-		// upstream committed an image this surface cannot carry, so UNKNOWN both
-		// withholds a fabricated empty success and withholds permission to
+		// Same rule as the non-streaming path. Whatever text existed already reached
+		// the sink, but the asset did not and cannot, so UNKNOWN both withholds a
+		// success that would hide the missing image and withholds permission to
 		// re-generate.
 		return domain.ChatStreamOutcome{
 			Class:        domain.ChatOutcomeUnknown,

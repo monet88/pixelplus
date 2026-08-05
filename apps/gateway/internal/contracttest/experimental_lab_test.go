@@ -503,16 +503,35 @@ func TestProductionChatRefusesTheExperimentalModeBeforeTheAdapter(t *testing.T) 
 	}
 }
 
-// AC2 (paired positive): the identical chat request succeeds when the operator
-// enabled the mode, which is what makes the production refusal above a proof of
-// the gate rather than of an unrelated misconfiguration.
+// AC2 (paired positive): the identical chat request gets PAST the Auth Mode gate
+// when the operator enabled the mode, which is what makes the production refusal
+// above a proof of the gate rather than of an unrelated misconfiguration.
 //
 // The lab harness keeps its controlled ChatAdapter injected. Composition wraps
 // that fallback in the Auth-Mode registry, and because no real transport is
-// supplied the registry still dispatches this mode to the real ChatGPT Web
-// Adapter — so this test asserts the request got PAST the Auth Mode gate rather
-// than that it completed. Reaching the Adapter boundary is the observable that
-// distinguishes the two compositions.
+// supplied the registry dispatches this mode to the real ChatGPT Web Adapter —
+// so this test asserts the request reached the Adapter boundary rather than that
+// it completed.
+//
+// The observable is the CONCRETE post-gate outcome, not merely the absence of a
+// refusal. Asserting only "the code is not auth_mode_unavailable" would pass for
+// any unrelated breakage on the chat path — a validation rejection, an admission
+// denial, no eligible routing candidate, a settlement failure — because each of
+// those also yields some other code with zero fallback-Adapter calls. That is a
+// test that cannot fail for the one reason it exists, so it is pinned to the
+// exact failure the nil-transport Adapter produces:
+//
+//	503 / upstream_unavailable
+//
+// This mirrors TestLabRegistrationReplacesTheStubAdapterWithoutGrantingEgress,
+// which pins the same boundary on the probe surface. The two codes differ, and
+// the difference is the ports contract rather than an inconsistency: the probe
+// port reports a missing dependency as ports.ErrDependencyUnavailable
+// (dependency_unavailable), while the chat port classifies
+// chatgptweb.ErrTransportUnavailable through canonicalFailureClass into
+// domain.ErrCodeUpstreamUnavailable (upstream_unavailable). Both are 503, and
+// both say the same thing: the gate opened, the Adapter was entered, and
+// enabling a mode granted no egress by itself.
 func TestLabChatReachesTheAdapterBoundaryForTheEnabledMode(t *testing.T) {
 	t.Parallel()
 
@@ -528,14 +547,31 @@ func TestLabChatReachesTheAdapterBoundaryForTheEnabledMode(t *testing.T) {
 		idemKey: "idem-web-chat-lab",
 		body:    chatSuccessBody,
 	})
+	body := decodeCompletionBody(t, payload)
+	code, _ := body["code"].(string)
 	// The Auth Mode gate returns auth_mode_unavailable (409). Anything else means
-	// the gate passed and the request reached the execution path.
-	if code, _ := decodeCompletionBody(t, payload)["code"].(string); code == "auth_mode_unavailable" {
+	// the gate passed and the request reached the execution path. Kept as its own
+	// check so a gate regression is named explicitly rather than reported as a
+	// generic code mismatch.
+	if code == "auth_mode_unavailable" {
 		t.Fatalf("lab composition still refused the enabled mode at the Auth Mode gate (status=%d body=%s)",
 			response.StatusCode, payload)
 	}
+	// The positive claim. 503 is only reachable AFTER routing picked the
+	// experimental account, admission passed, and the registry dispatched into the
+	// real ChatGPT Web Adapter, which then failed on its absent transport. Any
+	// earlier failure on the chat path produces a different status or code here.
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("lab chat status = %d, want 503 — the request did not reach the Adapter boundary (body=%s)",
+			response.StatusCode, payload)
+	}
+	if code != "upstream_unavailable" {
+		t.Fatalf("lab chat code = %q, want upstream_unavailable — the registered Adapter ships with a nil transport, "+
+			"so this is the only outcome that proves the Adapter boundary was entered (body=%s)", code, payload)
+	}
 	// The controlled fallback Adapter must NOT have served this mode: the registry
-	// dispatches it to the real Adapter, which has no transport.
+	// dispatches it to the real Adapter, which has no transport. Had the registry
+	// not been built, this would be 1 and the request would have succeeded with 200.
 	if calls := harness.adapter.CallCount(); calls != 0 {
 		t.Fatalf("fallback chat Adapter served the enabled experimental mode %d times, want 0", calls)
 	}

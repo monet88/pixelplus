@@ -112,6 +112,59 @@ func TestAdapterOwnsNoSpineResponsibility(t *testing.T) {
 	}
 }
 
+// resolveImportName reports the local identifier a file uses for one import
+// path, plus whether that import was made with `.` (a dot-import).
+//
+// Why this exists: matching a selector's base identifier against the literal
+// string "http" is a spelling check, not an import check. Go lets a file write
+// `import httpx "net/http"` and then `httpx.NewRequest(...)`, which is the exact
+// same egress with a different first token — a name-only guard reports clean
+// while the Adapter dials out. Resolving the file's ACTUAL local name closes
+// that hole in the direction that matters: renaming the import can no longer
+// disable the check.
+//
+// The three cases the AST forces us to handle:
+//
+//   - spec.Name == nil — the ordinary `import "net/http"`. The local name is the
+//     package's own name, which for net/http is the last path segment, "http".
+//   - spec.Name.Name == "_" — a blank import. It binds no identifier, so no
+//     selector can reference it and it cannot produce egress. Skipped.
+//   - spec.Name.Name == "." — a dot-import. Every exported name lands in file
+//     scope unqualified, so egress becomes a bare `Client{}` or `NewRequest(...)`
+//     with no base identifier at all. There is nothing for a selector-based
+//     guard to match, so the caller must refuse it rather than pretend to have
+//     checked.
+//
+// Using the last path segment as the default name is exact for net/http; it is
+// an approximation only for packages whose declared name differs from their
+// directory, which is not the case for anything this guard inspects.
+func resolveImportName(t *testing.T, fileName string, file *ast.File, importPath string) (local string, dotImported bool, imported bool) {
+	t.Helper()
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			t.Fatalf("unquote import in %s: %v", fileName, err)
+		}
+		if path != importPath {
+			continue
+		}
+		if spec.Name == nil {
+			segments := strings.Split(path, "/")
+			return segments[len(segments)-1], false, true
+		}
+		switch spec.Name.Name {
+		case "_":
+			// Bound to nothing; it cannot be the base of a selector.
+			continue
+		case ".":
+			return "", true, true
+		default:
+			return spec.Name.Name, false, true
+		}
+	}
+	return "", false, false
+}
+
 func TestAdapterPerformsNoHTTPEgressOfItsOwn(t *testing.T) {
 	t.Parallel()
 
@@ -119,22 +172,119 @@ func TestAdapterPerformsNoHTTPEgressOfItsOwn(t *testing.T) {
 	// What it must not do is build a client or a request: every byte leaving this
 	// package goes through the injected Transport, so a lab deployment that
 	// enables the mode without supplying transport still cannot reach a Provider.
+	//
+	// The check resolves each file's own local name for net/http instead of
+	// assuming the identifier is spelled "http". Cause and effect: under a literal
+	// "http" comparison, adding `import httpx "net/http"` plus
+	// `httpx.NewRequest(ctx, ...)` is real egress the guard scores as clean,
+	// because no selector base is spelled "http" any more. That rename is a
+	// one-token edit, and the property it silently deletes is the entire non-goal
+	// ("this story ships no HTTP egress").
 	for name, file := range packageFiles(t) {
+		local, dotImported, imported := resolveImportName(t, name, file, "net/http")
+		if !imported {
+			continue
+		}
+		if dotImported {
+			// A dot-import makes `Client{}` and `NewRequest(...)` legal with no
+			// qualifier, so no base identifier survives for this guard to inspect.
+			// Refusing the import is the only honest outcome: a guard that cannot
+			// observe the property must fail, not pass.
+			t.Errorf("%s dot-imports net/http; egress identifiers become unqualified and unverifiable, "+
+				"so the Transport-seam guard cannot hold — import it with a qualifier", name)
+			continue
+		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			selector, ok := node.(*ast.SelectorExpr)
 			if !ok {
 				return true
 			}
 			pkg, ok := selector.X.(*ast.Ident)
-			if !ok || pkg.Name != "http" {
+			if !ok || pkg.Name != local {
 				return true
 			}
 			for _, forbidden := range forbiddenEgress {
 				if selector.Sel.Name == forbidden {
-					t.Errorf("%s uses http.%s; egress must go through the Transport seam", name, forbidden)
+					t.Errorf("%s uses %s.%s (net/http imported as %q); egress must go through the Transport seam",
+						name, local, forbidden, local)
 				}
 			}
 			return true
+		})
+	}
+}
+
+// TestResolveImportNameHandlesEveryImportForm pins the resolver the egress guard
+// depends on.
+//
+// This exists because one of the forms below cannot be exercised by mutating the
+// real package. A dot-import of net/http is a COMPILE error here: the package
+// declares its own Request, Response, and Transport types, and a dot-import
+// drops net/http's identically-named types into the same file scope
+// ("Request already declared through dot-import of package http"). So the
+// dot-import branch of the guard can only be proved against a synthetic file,
+// and without this test that branch would itself be unverified — the same
+// false-confidence defect the guard was fixed for.
+func TestResolveImportNameHandlesEveryImportForm(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name        string
+		source      string
+		wantLocal   string
+		wantDot     bool
+		wantPresent bool
+	}{
+		{
+			// No Name node at all: the local name is the package name, "http".
+			name:        "default name",
+			source:      "package p\nimport \"net/http\"\n",
+			wantLocal:   "http",
+			wantPresent: true,
+		},
+		{
+			// The hole the old literal "http" comparison left open.
+			name:        "alias",
+			source:      "package p\nimport httpx \"net/http\"\n",
+			wantLocal:   "httpx",
+			wantPresent: true,
+		},
+		{
+			// Binds no identifier, so it can never be a selector base.
+			name:        "blank",
+			source:      "package p\nimport _ \"net/http\"\n",
+			wantPresent: false,
+		},
+		{
+			// Reported as dot-imported so the caller can refuse it.
+			name:        "dot",
+			source:      "package p\nimport . \"net/http\"\n",
+			wantDot:     true,
+			wantPresent: true,
+		},
+		{
+			// A same-suffix path must not be mistaken for net/http.
+			name:        "absent with a decoy suffix",
+			source:      "package p\nimport \"example.com/fake/net/http\"\n",
+			wantPresent: false,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			file, err := parser.ParseFile(token.NewFileSet(), "synthetic.go", testCase.source, parser.AllErrors)
+			if err != nil {
+				t.Fatalf("parse synthetic source: %v", err)
+			}
+			local, dotImported, imported := resolveImportName(t, "synthetic.go", file, "net/http")
+			if imported != testCase.wantPresent {
+				t.Errorf("imported = %v, want %v", imported, testCase.wantPresent)
+			}
+			if dotImported != testCase.wantDot {
+				t.Errorf("dotImported = %v, want %v", dotImported, testCase.wantDot)
+			}
+			if local != testCase.wantLocal {
+				t.Errorf("local = %q, want %q", local, testCase.wantLocal)
+			}
 		})
 	}
 }
@@ -176,12 +326,71 @@ func TestAdapterHoldsNoStateAcrossCalls(t *testing.T) {
 	}
 }
 
+// isErrorSentinel reports whether one package-level ValueSpec declares genuine
+// immutable error sentinels rather than mutable state.
+//
+// The property being enforced is "the Adapter holds no cross-call state", and a
+// name prefix cannot enforce it. `var errCount int` and
+// `var errAuthFailed = errors.New(...)` both start with "err"; only the second
+// is a sentinel. The first is a process-wide counter shared by every Tenant and
+// account the Adapter serves — exactly the accumulator AC1 forbids — and a
+// prefix check waves it through.
+//
+// So the value is inspected instead of the name. A sentinel must:
+//
+//  1. have an initializer for every declared name (a bare `var errCount int` has
+//     none, which is itself proof it is zero-valued mutable state), and
+//  2. initialize each name with a call to errors.New or fmt.Errorf, resolved
+//     through the file's own local import names so an alias cannot spoof it.
+//
+// Note this is deliberately stricter than "is of error type": a var holding an
+// error returned by some helper could still be reassigned meaningfully, whereas
+// an errors.New/fmt.Errorf value created once at init is the idiomatic
+// write-once sentinel the package actually declares.
+func isErrorSentinel(t *testing.T, fileName string, file *ast.File, value *ast.ValueSpec) bool {
+	t.Helper()
+	// No initializer at all: `var errCount int`. Zero-valued, therefore mutable.
+	if len(value.Values) != len(value.Names) {
+		return false
+	}
+	errorsLocal, errorsDot, errorsImported := resolveImportName(t, fileName, file, "errors")
+	fmtLocal, fmtDot, fmtImported := resolveImportName(t, fileName, file, "fmt")
+	for _, expr := range value.Values {
+		call, ok := expr.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		pkg, ok := selector.X.(*ast.Ident)
+		if !ok {
+			return false
+		}
+		isErrorsNew := errorsImported && !errorsDot && pkg.Name == errorsLocal && selector.Sel.Name == "New"
+		isFmtErrorf := fmtImported && !fmtDot && pkg.Name == fmtLocal && selector.Sel.Name == "Errorf"
+		if !isErrorsNew && !isFmtErrorf {
+			return false
+		}
+	}
+	return true
+}
+
 func TestAdapterPackageDeclaresNoMutableGlobals(t *testing.T) {
 	t.Parallel()
 
 	// A package-level var is process-wide state shared across every Tenant and
 	// account the Adapter serves. Only the sentinel error values and interface
 	// assertions are acceptable, and both are immutable.
+	//
+	// The exemption is proved from the declaration's VALUE, not its name. Concrete
+	// cause and effect: a future `var errCount int` incremented on each failure
+	// would make consecutive requests observe each other — two Tenants sharing one
+	// counter — and under the old `strings.HasPrefix(name, "err")` rule it was
+	// exempt on the strength of three characters. Requiring an errors.New /
+	// fmt.Errorf initializer keeps every real sentinel in chat.go and transport.go
+	// passing while that counter fails.
 	for name, file := range packageFiles(t) {
 		for _, decl := range file.Decls {
 			general, ok := decl.(*ast.GenDecl)
@@ -193,15 +402,19 @@ func TestAdapterPackageDeclaresNoMutableGlobals(t *testing.T) {
 				if !ok {
 					continue
 				}
-				for index, ident := range value.Names {
+				// `_ = ports.ChatAdapter((*Adapter)(nil))` and friends bind no name and
+				// allocate no storage; they are compile-time interface assertions.
+				sentinel := isErrorSentinel(t, name, file, value)
+				for _, ident := range value.Names {
 					if ident.Name == "_" {
 						continue
 					}
-					if strings.HasPrefix(ident.Name, "Err") || strings.HasPrefix(ident.Name, "err") {
+					if sentinel {
 						continue
 					}
-					_ = index
-					t.Errorf("%s: package-level var %q is mutable cross-call state", name, ident.Name)
+					t.Errorf("%s: package-level var %q is mutable cross-call state "+
+						"(only errors.New/fmt.Errorf sentinels and blank interface assertions are permitted)",
+						name, ident.Name)
 				}
 			}
 		}

@@ -243,9 +243,12 @@ func (service *ProviderAccountService) policyCandidateRejection(ctx context.Cont
 	// An `experimental` mode is only a routing candidate in a deployment that
 	// deliberately enabled it as a lab profile; ordinary production has none, so
 	// the zero-value profile keeps this fail-closed (§5.1, §6.1).
-	if service.labProfile.BlocksExperimental(account.AuthMode) {
-		return domain.NewAuthModeUnavailable(), false
-	}
+	//
+	// The check lives inside authModeGate rather than as a separate branch here:
+	// that gate already evaluates Prohibited, BlocksExperimental,
+	// AuthModeExecutionEnabled, and RequiresRiskAck in the required order, and
+	// duplicating one of its conditions at this call site would mean two places to
+	// keep in sync the next time the risk gates change.
 	if canonical, ok := service.authModeGate(account); !ok {
 		return canonical, false
 	}

@@ -229,6 +229,14 @@ a composition gap.
 - The numeric FG-5 / KS-2 challenge-rate and drift thresholds (#61 non-goal).
 - A real `chatgptweb.Transport` implementation, which is a separate authorized
   change and requires authorization for the exact account before any live probe.
+  **Blocked by #111**: `ports.ProbeAdapter` and `ports.CapabilityAdapter` carry
+  identifiers but no credential, and composition supplies one Transport per
+  deployment, so nothing binds a probe exchange to the account named in the
+  command. A shared client would either report a healthy account as
+  `reauth_required` (no session) or prove one session for every account and mint a
+  Capability Snapshot describing the wrong entitlements (some session). Latent
+  only because the field ships nil and both methods fail closed first; the
+  constraint is recorded on the `Transport` doc comment.
 - Whether ChatGPT Web image results should be deliverable at all, and on which
   surface. Until that is decided, an image-only chat turn is UNKNOWN rather than
   a silently empty success.

@@ -71,6 +71,37 @@ type Stream interface {
 // A Transport implementation MUST NOT retry a full operation. Retry ownership
 // belongs to the spine, which is the only layer that can honor the
 // authoritative-no-commit rule before re-attempting on another account.
+//
+// UNRESOLVED — a Transport MUST NOT ship as a shared ambient client.
+//
+// Chat and Stream receive ports.CredentialInjection and build their headers
+// inside the Use callback, so those surfaces are account-bound by construction.
+// Probe and Observe are not: ports.ProbeCommand and
+// ports.CapabilityObservationCommand carry Principal/AccountID/AuthMode/Version
+// identifiers and no credential, because those ports predate this Adapter and
+// were written for a spine that validates the stored version through the Vault
+// first.
+//
+// Composition supplies ONE Transport for the whole deployment
+// (Dependencies.ExperimentalChatGPTWebTransport), so nothing here binds an
+// exchange to the account named in the command. Cause and effect if a real
+// client shipped against this seam as written:
+//
+//   - A Transport holding no session sends /backend-api/me unauthenticated, the
+//     upstream answers 401, and Probe faithfully reports Authenticated=false —
+//     moving a perfectly good account to reauth_required.
+//   - Worse, a Transport holding SOME session proves that session for every
+//     account routed to it. Probe would report success for account B while
+//     actually authenticating as account A, and Observe would mint account B a
+//     Capability Snapshot describing A's entitlements.
+//
+// Neither is reachable today: this story ships the field nil, so both methods
+// fail closed with ErrTransportUnavailable before any exchange. That is what
+// makes the gap latent rather than live. Binding the probe/observe surfaces to a
+// per-account credential requires a ports change and is tracked separately —
+// see the Follow-Up in
+// docs/decisions/0013-experimental-lab-profile-and-capability-baseline.md.
+// A real Transport MUST NOT be wired before that is resolved.
 type Transport interface {
 	Exchange(ctx context.Context, request Request) (Response, error)
 }

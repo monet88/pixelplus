@@ -2,6 +2,11 @@
 
 ## Current Behavior
 
+This section describes the pre-story baseline — the tree at this story's
+merge-base, not the post-implementation state. Quoted comments below are
+locatable with `git show main:<path>`; several were rewritten by this story, so
+searching the working tree for them will not find them.
+
 Every Provider Adapter port in the Gateway resolves to a fail-closed foundation.
 `internal/adapters` holds only `doc.go`; no package translates a real Provider
 protocol. Chat, streaming, probe, and capability observation all run against
@@ -16,6 +21,8 @@ fails it closed with a hardcoded rejection:
 - `application/render.go` `candidateRejection` rejects `Experimental()` accounts.
 - `application/routing.go` `policyCandidateRejection` rejects them with the
   comment "Production fail-closed: experimental modes have no lab profile."
+  (This story replaces that branch: the same refusal now comes from
+  `authModeGate`, which evaluates the risk gates in one place.)
 - `domain/routing.go` `ValidateRoutingPolicyShape` rejects an experimental
   `fallback_auth_modes` entry.
 

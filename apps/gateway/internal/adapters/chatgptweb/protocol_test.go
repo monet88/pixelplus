@@ -814,3 +814,285 @@ func TestAnAssistantFinishMarkerStillEndsTheTurn(t *testing.T) {
 		t.Errorf("content = %q, want the full answer", got)
 	}
 }
+
+func TestProtocolDriftAfterContentIsUnknownRatherThanASilentCompletion(t *testing.T) {
+	t.Parallel()
+
+	// The regression this guards: the ladder used to test `drifted && !sawContent`,
+	// so a single decodable delta arriving BEFORE an undecodable payload made the
+	// drift flag irrelevant and the turn fell through to committed/stop.
+	//
+	// This transcript is exactly that shape. One content delta lands, then the
+	// Provider emits a self-describing event type this Adapter has never seen
+	// (eventDrift), and only then does the body close normally with a finish
+	// marker and [DONE]. Because the terminator is clean, `truncated()` is false
+	// and NOTHING else in the ladder would catch the turn: without the fix the
+	// caller receives "the first half" as a complete, deliberately-ended answer
+	// and the protocol movement is invisible (evidence §7).
+	//
+	// The upstream demonstrably generated, so an authoritative no-commit would
+	// wrongly authorize a second billed generation; the correct answer is UNKNOWN.
+	transcript := "\"v1\"\n" +
+		`{"p":"/message/content/parts/0","o":"append","v":"the first half"}` + "\n" +
+		`{"type":"an_event_type_this_adapter_has_never_seen","payload":{"nested":true}}` + "\n" +
+		`{"p":"/message/status","o":"replace","v":"finished_successfully"}` + "\n" +
+		"[DONE]\n"
+
+	outcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Run(t.Context(), chatCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitUnknown {
+		t.Errorf("commit = %s, want unknown (drift after content loses certainty)", outcome.Commit)
+	}
+	if outcome.FailureClass != domain.ErrCodeExecutionPossiblyCommitted {
+		t.Errorf("failure class = %s, want execution_possibly_committed", outcome.FailureClass)
+	}
+	// A partial answer must not be presented as the completion.
+	if len(outcome.Completion.Choices) != 0 {
+		t.Errorf("returned %d choices from a drifted turn, want 0", len(outcome.Completion.Choices))
+	}
+
+	// Both surfaces must agree on the commit question even though the streaming
+	// client already consumed the partial text.
+	sink := &recordingSink{}
+	streamOutcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Stream(t.Context(), streamCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder}, sink)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if streamOutcome.Commit != domain.CommitUnknown {
+		t.Errorf("stream commit = %s, want unknown", streamOutcome.Commit)
+	}
+	if streamOutcome.FailureClass != domain.ErrCodeExecutionPossiblyCommitted {
+		t.Errorf("stream failure class = %s, want execution_possibly_committed", streamOutcome.FailureClass)
+	}
+	if streamOutcome.FinishClass == domain.FinishStop {
+		t.Error("drifted stream claimed a clean stop")
+	}
+	// The delta itself is still delivered: it was valid content, and withholding
+	// it would not make the turn any more certain.
+	if got := sink.joined(); got != "the first half" {
+		t.Errorf("delta content = %q, want the decoded prefix still delivered", got)
+	}
+}
+
+func TestProtocolDriftWithNoContentStaysAuthoritativelyNotCommittedOnBothSurfaces(t *testing.T) {
+	t.Parallel()
+
+	// The control for the test above, and the reason the drift fix is scoped to
+	// "after evidence" rather than applied to every drift.
+	//
+	// An authoritative not-committed is what AUTHORIZES the spine's fallback walk
+	// to re-attempt on another account. If every unparseable payload became
+	// UNKNOWN, fallback would be disabled for this entire surface: one Provider
+	// protocol change would strand every turn instead of failing over. The
+	// ordinary "we could not parse anything" case must therefore keep its
+	// authoritative answer, and nothing here proves a generation happened, so
+	// re-attempting cannot double-bill.
+	transcript := loadFixture(t, "protocol_drift.sse")
+
+	outcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Run(t.Context(), chatCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitNotCommitted {
+		t.Errorf("commit = %s, want not_committed (fallback must stay authorized)", outcome.Commit)
+	}
+	if outcome.FailureClass != domain.ErrCodeUpstreamProtocolDrift {
+		t.Errorf("failure class = %s, want upstream_protocol_drift", outcome.FailureClass)
+	}
+
+	sink := &recordingSink{}
+	streamOutcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Stream(t.Context(), streamCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder}, sink)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if streamOutcome.Commit != domain.CommitNotCommitted {
+		t.Errorf("stream commit = %s, want not_committed", streamOutcome.Commit)
+	}
+	if streamOutcome.FailureClass != domain.ErrCodeUpstreamProtocolDrift {
+		t.Errorf("stream failure class = %s, want upstream_protocol_drift", streamOutcome.FailureClass)
+	}
+	if len(sink.content()) != 0 {
+		t.Errorf("drift delivered %d deltas, want 0", len(sink.content()))
+	}
+}
+
+func TestDriftBesideAFinishMarkerButNoContentIsStillAuthoritativelyNotCommitted(t *testing.T) {
+	t.Parallel()
+
+	// The second half of the fallback control, and the case that actually pins
+	// driftedWithoutEvidence() rather than producedNothing().
+	//
+	// protocol_drift.sse carries no content, no finish marker, no block and no
+	// image, so producedNothing() is true and would return the authoritative
+	// not-committed on its own — which means that fixture cannot prove the drift
+	// predicate is doing anything. This transcript closes that hole: every content
+	// payload is undecodable, but a REAL assistant finish marker arrives, so
+	// producedNothing() is false and driftedWithoutEvidence() is the only branch
+	// left that can answer authoritatively.
+	//
+	// The classification must still be not-committed. A finish marker says the
+	// upstream turn ended; it does not say a generation was delivered, and nothing
+	// decodable reached this Adapter, so there is no evidence to be uncertain
+	// about and no risk of double-billing a re-attempt. If this turned UNKNOWN the
+	// spine's fallback walk would be disabled for a whole class of drifted turns;
+	// if it fell through to the bottom of the ladder it would commit an EMPTY
+	// answer with a `stop` finish class.
+	transcript := "\"v1\"\n" +
+		`{"type":"an_event_type_this_adapter_has_never_seen","payload":{"nested":true}}` + "\n" +
+		`{"p":"/message/content/parts/0","o":"append","v":12345}` + "\n" +
+		`{"p":"/message/status","o":"replace","v":"finished_successfully"}` + "\n" +
+		"[DONE]\n"
+
+	outcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Run(t.Context(), chatCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitNotCommitted {
+		t.Errorf("commit = %s, want not_committed (a finish marker is not a delivered generation)", outcome.Commit)
+	}
+	if outcome.FailureClass != domain.ErrCodeUpstreamProtocolDrift {
+		t.Errorf("failure class = %s, want upstream_protocol_drift", outcome.FailureClass)
+	}
+	// An empty committed answer would be the fall-through bug.
+	if len(outcome.Completion.Choices) != 0 {
+		t.Errorf("returned %d choices for a fully drifted turn, want 0", len(outcome.Completion.Choices))
+	}
+
+	sink := &recordingSink{}
+	streamOutcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Stream(t.Context(), streamCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder}, sink)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if streamOutcome.Commit != domain.CommitNotCommitted {
+		t.Errorf("stream commit = %s, want not_committed", streamOutcome.Commit)
+	}
+	if streamOutcome.FailureClass != domain.ErrCodeUpstreamProtocolDrift {
+		t.Errorf("stream failure class = %s, want upstream_protocol_drift", streamOutcome.FailureClass)
+	}
+	if len(sink.content()) != 0 {
+		t.Errorf("fully drifted turn delivered %d deltas, want 0", len(sink.content()))
+	}
+}
+
+func TestATurnCarryingBothTextAndAnImageDoesNotCommitAndDiscardTheImage(t *testing.T) {
+	t.Parallel()
+
+	// The regression this guards: undeliverableImage() used to require
+	// `!sawContent`, so a turn that produced text AND a confirmed image asset
+	// committed on the strength of the text alone and dropped the asset silently.
+	//
+	// That is worse than the image-only case, not better. In the image-only case
+	// the caller at least receives an observably empty answer; here the plausible
+	// text makes the loss invisible — the caller cannot tell an image was
+	// generated (and, on a metered Provider, billed), because the canonical chat
+	// vocabulary has no carrier for an asset (ChatChoice.Message and ChatDelta
+	// hold text only).
+	//
+	// The transcript is a normal text turn with a confirmed image-tool output
+	// spliced in: role `tool`, async_task_type `image_gen`, resolvable pointer —
+	// all three conditions the output rule requires. It terminates cleanly with a
+	// finish marker and [DONE], so neither truncated() nor any drift branch can
+	// catch it: undeliverableImage() is the only thing standing between this turn
+	// and a committed answer with a missing image.
+	transcript := "\"v1\"\n" +
+		`{"p":"/message/content/parts/0","o":"append","v":"here is your image"}` + "\n" +
+		`{"v":{"message":{"author":{"role":"tool"},"content":{"content_type":"multimodal_text","parts":[{"asset_pointer":"file-service://file_fixture_mixed_result"}]},"metadata":{"async_task_type":"image_gen"}},"conversation_id":"conv-fixture-0011"}}` + "\n" +
+		`{"p":"/message/status","o":"replace","v":"finished_successfully"}` + "\n" +
+		"[DONE]\n"
+
+	outcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Run(t.Context(), chatCommand("gpt-image-fixture"), &staticCredential{material: fixturePlaceholder})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitUnknown {
+		t.Errorf("commit = %s, want unknown (the asset cannot be delivered alongside the text)", outcome.Commit)
+	}
+	if outcome.FailureClass != domain.ErrCodeExecutionPossiblyCommitted {
+		t.Errorf("failure class = %s, want execution_possibly_committed", outcome.FailureClass)
+	}
+	// Returning the text alone would be the exact silent-discard bug.
+	if len(outcome.Completion.Choices) != 0 {
+		t.Errorf("returned %d choices for a text+image turn, want 0", len(outcome.Completion.Choices))
+	}
+
+	sink := &recordingSink{}
+	streamOutcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Stream(t.Context(), streamCommand("gpt-image-fixture"), &staticCredential{material: fixturePlaceholder}, sink)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if streamOutcome.Commit != domain.CommitUnknown {
+		t.Errorf("stream commit = %s, want unknown", streamOutcome.Commit)
+	}
+	if streamOutcome.FailureClass != domain.ErrCodeExecutionPossiblyCommitted {
+		t.Errorf("stream failure class = %s, want execution_possibly_committed", streamOutcome.FailureClass)
+	}
+	if streamOutcome.FinishClass == domain.FinishStop {
+		t.Error("text+image stream claimed a clean stop while dropping the asset")
+	}
+	// The Provider-specific pointer must never surface downstream, on any path.
+	if joined := sink.joined(); strings.Contains(joined, "file-service://") || strings.Contains(joined, "sediment://") {
+		t.Errorf("asset pointer leaked into canonical deltas: %q", joined)
+	}
+}
+
+func TestAnOrdinaryTextTurnStillCommitsOnBothSurfaces(t *testing.T) {
+	t.Parallel()
+
+	// The control for both fixes above. Widening drift and image handling to
+	// UNKNOWN is only safe if the happy path is untouched: a turn with plain text
+	// and a clean [DONE] carries no drift flag and no asset pointer, so it must
+	// still return an authoritative committed/stop with the aggregated answer.
+	//
+	// Without this guard, an over-broad predicate (for example dropping the
+	// drift/image conditions entirely and returning UNKNOWN whenever content
+	// exists) would pass every other test in this file while making the Adapter
+	// incapable of ever reporting success.
+	transcript := loadFixture(t, "chat_stream.sse")
+
+	outcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Run(t.Context(), chatCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitCommitted {
+		t.Fatalf("commit = %s, want committed (the happy path must survive both fixes)", outcome.Commit)
+	}
+	if outcome.Class != domain.ChatOutcomeCommitted {
+		t.Errorf("class = %s, want committed", outcome.Class)
+	}
+	if len(outcome.Completion.Choices) != 1 {
+		t.Fatalf("choices = %d, want 1", len(outcome.Completion.Choices))
+	}
+	if got := outcome.Completion.Choices[0].Message.Content; got != "Hello world!" {
+		t.Errorf("aggregated content = %q, want %q", got, "Hello world!")
+	}
+	if outcome.Completion.Choices[0].FinishClass != domain.FinishStop {
+		t.Errorf("finish class = %s, want stop", outcome.Completion.Choices[0].FinishClass)
+	}
+
+	sink := &recordingSink{}
+	streamOutcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Stream(t.Context(), streamCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder}, sink)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if streamOutcome.Commit != domain.CommitCommitted {
+		t.Fatalf("stream commit = %s, want committed", streamOutcome.Commit)
+	}
+	if streamOutcome.FinishClass != domain.FinishStop {
+		t.Errorf("stream finish class = %s, want stop", streamOutcome.FinishClass)
+	}
+	if got := sink.joined(); got != "Hello world!" {
+		t.Errorf("delta content = %q, want %q", got, "Hello world!")
+	}
+}
