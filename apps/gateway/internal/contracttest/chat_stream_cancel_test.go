@@ -69,8 +69,10 @@ func TestChatStreamTimestampsComeFromControlledClock(t *testing.T) {
 // AC3/AC6: a client that disconnects mid-stream stops delivery, and the Gateway
 // never writes past the point the client vanished. Disconnect is an implicit
 // cancel (chat lifecycle §6.3 rule 1); the explicit cancel route and the bounded
-// residual-tracking protocol are T17 (#60), so this asserts the streaming
-// contract only: delivery stops and no post-disconnect frame is produced.
+// residual-tracking protocol are T17 (#60); the explicit cancel route
+// (POST /v1/chat/executions/{id}/cancel) and the X5/X6 split are implemented
+// in GW-060. This test asserts the streaming contract only: delivery stops and
+// no post-disconnect frame is produced.
 func TestChatStreamClientDisconnectStopsDelivery(t *testing.T) {
 	t.Parallel()
 

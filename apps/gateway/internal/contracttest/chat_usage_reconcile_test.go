@@ -169,6 +169,10 @@ func TestChatStreamFailedTerminalNeverSettlesZeroUsage(t *testing.T) {
 // output and have none of it debited — a metered-cancel abuse path. The durable
 // record already persists this usage (a canceled terminal is replayable), so the
 // quota ledger must observe the same numbers.
+//
+// This uses a stop-CONFIRMED cancel: the Adapter proved the upstream stopped, so
+// X5 and X6 coincide (§6.5 rule 1) and settlement debits the observed usage
+// immediately rather than holding it through the residual drain path.
 func TestChatStreamCanceledTerminalReconcilesConsumedUsage(t *testing.T) {
 	t.Parallel()
 
@@ -176,7 +180,7 @@ func TestChatStreamCanceledTerminalReconcilesConsumedUsage(t *testing.T) {
 		h.seedStreamingAccount("tenant_a", "pa_stream_cancel_usage", domain.AuthModeChatGPTCodexOAuth, domain.StreamingReal)
 		h.stream.Script([]streamStep{
 			{delta: "partial output"},
-			{outcome: ptrStreamOutcome(streamCanceledWithAbort(domain.ChatUsage{PromptTokens: 7, CompletionTokens: 5}))},
+			{outcome: ptrStreamOutcome(streamCanceledConfirmedStop(domain.ChatUsage{PromptTokens: 7, CompletionTokens: 5}))},
 		})
 	})
 

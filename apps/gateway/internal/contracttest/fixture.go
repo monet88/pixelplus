@@ -123,6 +123,14 @@ type Options struct {
 	// ChatStreamLeases injects the hard chat_stream lease store so tests can
 	// observe lease acquisition/release through real composition.
 	ChatStreamLeases ports.ChatStreamLeaseStore
+	// ResidualStore injects the residual tracking store (T17, §6.5 rule 2).
+	// A nil store means no residual capacity is available, so the spine retains
+	// the original request state.
+	ResidualStore ports.ChatResidualStore
+	// ResidualDrain injects the residual drain/recovery port (T17, §6.5 rules
+	// 3-4). A nil drain means unknown usage immediately, so settlement fails
+	// closed.
+	ResidualDrain ports.ChatResidualDrain
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -207,6 +215,8 @@ func NewFixture(options Options) (*Fixture, error) {
 
 		ChatStreamAdapter: options.ChatStreamAdapter,
 		ChatStreamLeases:  options.ChatStreamLeases,
+		ResidualStore:     options.ResidualStore,
+		ResidualDrain:     options.ResidualDrain,
 	})
 	if err != nil {
 		return nil, err

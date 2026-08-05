@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,41 @@ type streamStep struct {
 	// blockOn holds the Adapter mid-stream until the test releases it, so a test
 	// can disconnect the client at a known point in the event sequence.
 	blockOn *deliveryGate
+	// cancelGate holds the Adapter until its CONTEXT is canceled. It proves the
+	// cancel/disconnect signal actually reached the Adapter (AC1 / §6.2, §6.3),
+	// which is impossible to infer from a mock that ignores its context.
+	cancelGate *contextCancelGate
+}
+
+// contextCancelGate blocks the Adapter until the request execution context is
+// canceled and records that it observed the cancellation. It models a real
+// Adapter body reader that returns promptly when the Gateway signals abort.
+type contextCancelGate struct {
+	entered  chan struct{}
+	canceled chan struct{}
+	once     sync.Once
+}
+
+func newContextCancelGate() *contextCancelGate {
+	return &contextCancelGate{
+		entered:  make(chan struct{}),
+		canceled: make(chan struct{}),
+	}
+}
+
+// wait blocks until ctx is canceled. It closes entered when it starts blocking
+// so a test can wait for the Adapter to be in-flight before issuing the cancel.
+func (gate *contextCancelGate) wait(ctx context.Context) {
+	gate.once.Do(func() { close(gate.entered) })
+	select {
+	case <-ctx.Done():
+		close(gate.canceled)
+	}
+}
+
+// Canceled returns a channel closed after the Adapter observed ctx cancellation.
+func (gate *contextCancelGate) Canceled() <-chan struct{} {
+	return gate.canceled
 }
 
 // rogueWriter coordinates an Adapter goroutine that attempts sink writes after
@@ -103,7 +139,7 @@ func (adapter *scriptedChatStreamAdapter) Script(scripts ...[]streamStep) {
 }
 
 func (adapter *scriptedChatStreamAdapter) Stream(
-	_ context.Context,
+	ctx context.Context,
 	command ports.ChatStreamCommand,
 	_ ports.CredentialInjection,
 	sink domain.ChatSink,
@@ -129,6 +165,8 @@ func (adapter *scriptedChatStreamAdapter) Stream(
 		switch {
 		case step.blockOn != nil:
 			step.blockOn.wait()
+		case step.cancelGate != nil:
+			step.cancelGate.wait(ctx)
 		case step.rogueAfter != nil:
 			// Leak a goroutine that keeps writing after this attempt returns.
 			rogue := step.rogueAfter
@@ -235,8 +273,21 @@ func streamCanceledNonCancelable(usage domain.ChatUsage) domain.ChatStreamOutcom
 	return streamCommitted(domain.FinishCanceled, usage)
 }
 
+// streamCanceledConfirmedStop is a committed `canceled` outcome where the
+// Adapter PROVED the upstream stopped. That collapses X5 onto X6 (§6.5 rule 1),
+// so settlement debits the observed usage immediately instead of entering the
+// residual drain path.
+func streamCanceledConfirmedStop(usage domain.ChatUsage) domain.ChatStreamOutcome {
+	outcome := streamCommitted(domain.FinishCanceled, usage)
+	outcome.UpstreamStopConfirmed = true
+	return outcome
+}
+
 // recordingStreamLeases wraps the hard lease store and records acquire/release
-// order so tests can prove the lease is held for the stream's duration.
+// order so tests can prove the lease is held for the stream's duration, and
+// whether a release ever received an already-canceled context (review finding 1:
+// release must survive the client, so it must run on settleCtx, not the request
+// context).
 type recordingStreamLeases struct {
 	log   *spineLog
 	inner ports.ChatStreamLeaseStore
@@ -244,6 +295,9 @@ type recordingStreamLeases struct {
 	mu       sync.Mutex
 	acquired []ports.ChatStreamLease
 	released []ports.ChatStreamLease
+	// sawCanceledRelease is set when Release is called with a canceled context —
+	// a real resilient store would reject the write and leak the account binding.
+	sawCanceled atomic.Bool
 }
 
 func newRecordingStreamLeases(log *spineLog, inner ports.ChatStreamLeaseStore) *recordingStreamLeases {
@@ -268,6 +322,9 @@ func (store *recordingStreamLeases) Holder(ctx context.Context, tenant domain.Te
 }
 
 func (store *recordingStreamLeases) Release(ctx context.Context, lease ports.ChatStreamLease) error {
+	if ctx.Err() != nil {
+		store.sawCanceled.Store(true)
+	}
 	if err := store.inner.Release(ctx, lease); err != nil {
 		return err
 	}
@@ -278,6 +335,10 @@ func (store *recordingStreamLeases) Release(ctx context.Context, lease ports.Cha
 		store.log.add("lease.release")
 	}
 	return nil
+}
+
+func (store *recordingStreamLeases) sawCanceledRelease() bool {
+	return store.sawCanceled.Load()
 }
 
 func (store *recordingStreamLeases) Acquisitions() []ports.ChatStreamLease {

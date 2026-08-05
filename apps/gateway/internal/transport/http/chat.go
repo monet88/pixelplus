@@ -18,6 +18,7 @@ import (
 type ChatGateway interface {
 	CreateChatCompletion(context.Context, application.CreateChatCompletionCommand) (application.ChatResult, error)
 	StreamChat(context.Context, application.StreamChatCommand, application.ChatStreamTransport) error
+	CancelChatExecution(context.Context, application.CancelChatExecutionCommand) (application.ChatCancelResult, error)
 }
 
 type chatHandler struct {
@@ -34,6 +35,7 @@ func registerChatRoutes(mux *http.ServeMux, gateway ChatGateway, ids idGenerator
 	}
 	handler := chatHandler{gateway: gateway, ids: ids, clock: clk}
 	mux.HandleFunc("POST /v1/chat/completions", handler.completions)
+	mux.HandleFunc("POST /v1/chat/executions/{execution_id}/cancel", handler.cancelExecution)
 }
 
 func (handler chatHandler) newRequestID() domain.Identifier {
@@ -366,4 +368,39 @@ func toDomainMessages(messages []chatMessageReq) ([]domain.ChatMessage, bool) {
 		})
 	}
 	return out, true
+}
+
+// chatCancelResponseWire mirrors the published ChatCancelResponse schema
+// (additionalProperties: false). The fields are exactly the schema-declared
+// ones: no extra fields are added.
+type chatCancelResponseWire struct {
+	ExecutionID            string `json:"execution_id"`
+	CancelState            string `json:"cancel_state"`
+	UpstreamAbortAttempted bool   `json:"upstream_abort_attempted"`
+	UpstreamStopConfirmed  bool   `json:"upstream_stop_confirmed"`
+	RequestID              string `json:"request_id,omitempty"`
+}
+
+// cancelExecution handles POST /v1/chat/executions/{execution_id}/cancel.
+// It authenticates, resolves the in-flight execution under same-Tenant
+// ownership, signals it when possible, and returns the honest acknowledgement
+// (chat lifecycle §6.2).
+func (handler chatHandler) cancelExecution(writer http.ResponseWriter, request *http.Request) {
+	presented, _ := bearerMaterial(request)
+	result, err := handler.gateway.CancelChatExecution(request.Context(), application.CancelChatExecutionCommand{
+		RequestID:            handler.newRequestID(),
+		PresentedKeyMaterial: presented,
+		ExecutionID:          domain.Identifier(request.PathValue("execution_id")),
+	})
+	if err != nil {
+		writeGatewayError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, chatCancelResponseWire{
+		ExecutionID:            string(result.ExecutionID),
+		CancelState:            string(result.CancelState),
+		UpstreamAbortAttempted: result.UpstreamAbortAttempted,
+		UpstreamStopConfirmed:  result.UpstreamStopConfirmed,
+		RequestID:              string(result.RequestID),
+	})
 }
