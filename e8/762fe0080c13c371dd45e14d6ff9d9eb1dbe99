@@ -1,0 +1,23 @@
+apps/gateway/internal/contracttest/chat_residual_fault_test.go
+  s_aa5b256428944a::t_181cd8307420fe 1-179
+docs/stories/epics/E01-provider-gateway/GW-060-cancel-chat-and-reconcile-residual-execution/design.md
+  s_aa5b256428944a::t_11df7a62524e22 18-25
+docs/stories/epics/E01-provider-gateway/GW-060-cancel-chat-and-reconcile-residual-execution/execplan.md
+  s_aa5b256428944a::t_89128ff07b7ce4 23-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "e8762fe0080c13c371dd45e14d6ff9d9eb1dbe99",
+  "prompts": {},
+  "sessions": {
+    "s_aa5b256428944a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "606204b0-ad15-43f5-b8f8-f54364ac86ca",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
