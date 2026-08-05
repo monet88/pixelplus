@@ -75,7 +75,13 @@ func (store *limitAdmissionStore) Admit(_ context.Context, request ports.Admissi
 		nil
 }
 
-func (store *limitAdmissionStore) Reconcile(_ context.Context, _ ports.AdmissionReservation) error {
+// Reconcile releases the occupancy slot. It honors ctx for the same reason a
+// real ledger must: a canceled context means the write never reached the store,
+// so reporting success would let an occupancy leak pass as a clean settle.
+func (store *limitAdmissionStore) Reconcile(ctx context.Context, _ ports.AdmissionReservation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.reconcileCalls++

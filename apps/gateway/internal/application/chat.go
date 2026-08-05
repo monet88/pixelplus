@@ -3,7 +3,6 @@ package application
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -248,7 +247,7 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 		// and no new admission debit.
 		service.recordTelemetry(ctx, sc.operation, "", 200)
 		service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), 200, "ok", sc.start)
-		_ = service.chatAudit(ctx, sc, principal, decision.TerminalResult.ProviderAccountID, decision.TerminalResult.ExecutionID, "replayed")
+		_ = service.chatAudit(ctx, sc, principal, decision.TerminalResult.ProviderAccountID, decision.TerminalResult.ExecutionID, ports.AuditChatReplayed, "replayed")
 		return ChatResult{Completion: decision.TerminalResult, RequestID: sc.requestID}, nil
 	case ports.ReplayInProgress:
 		return ChatResult{}, service.fail(ctx, sc, domain.NewIdempotencyInProgress())
@@ -327,7 +326,7 @@ func (service *ChatService) CreateChatCompletion(ctx context.Context, command Cr
 	if command.Options.ConversationID != "" && policy.Affinity.Enabled {
 		_ = service.affinity.Record(ctx, domain.ChatAffinityScope{TenantID: principal.TenantID, Key: command.Options.ConversationID}, completion.ProviderAccountID)
 	}
-	if err := service.chatAudit(ctx, sc, principal, completion.ProviderAccountID, completion.ExecutionID, "completed"); err != nil {
+	if err := service.chatAudit(ctx, sc, principal, completion.ProviderAccountID, completion.ExecutionID, chatTerminalAuditAction(sc.operation), "completed"); err != nil {
 		return ChatResult{}, service.fail(ctx, sc, service.dependencyCanonical(err))
 	}
 	service.recordTelemetry(ctx, sc.operation, "", 200)
@@ -950,8 +949,21 @@ func admissionUsage(usage domain.ChatUsage) ports.AdmissionUsage {
 	}
 }
 
-func (service *ChatService) chatAudit(ctx context.Context, sc spineContext, principal domain.SecurityPrincipal, accountID domain.ProviderAccountID, executionID domain.Identifier, outcome string) error {
-	action := chatAuditAction(sc.operation, outcome)
+// chatAudit records one audit event. The action is passed explicitly rather
+// than inferred from the outcome string: the outcome is a free-form
+// human-readable label assembled at each call site, so deriving the action from
+// its text made the audit trail depend on string formatting in a distant file.
+// A typed parameter lets the compiler catch a mislabeled event instead of
+// silently routing it to the wrong action.
+func (service *ChatService) chatAudit(
+	ctx context.Context,
+	sc spineContext,
+	principal domain.SecurityPrincipal,
+	accountID domain.ProviderAccountID,
+	executionID domain.Identifier,
+	action ports.ChatAuditAction,
+	outcome string,
+) error {
 	return service.audit.Record(ctx, ports.ChatAuditEvent{
 		Action:            action,
 		TenantID:          principal.TenantID,
@@ -963,29 +975,16 @@ func (service *ChatService) chatAudit(ctx context.Context, sc spineContext, prin
 	})
 }
 
-// chatAuditAction maps the spine operation plus terminal outcome onto the
-// audit action. A streaming spine must never label its events with the
-// non-streaming action, otherwise the audit trail reports a stream terminal as
+// chatTerminalAuditAction is the audit action for a spine's own terminal
+// outcome. A streaming spine must never label its events with the non-streaming
+// action, otherwise the audit trail reports a stream terminal as
 // `chat_completion.completed` and the streaming actions never appear.
-func chatAuditAction(operation domain.OperationToken, outcome string) ports.ChatAuditAction {
-	// A replay is a replay on both spines: it re-delivers a durable record without
-	// a new Adapter call, so it must stay distinguishable from a live terminal.
-	// Checking the streaming operation first would label a streamed replay
-	// `stream_terminal`, making it indistinguishable from a fresh generation.
-	if outcome == "replayed" {
-		return ports.AuditChatReplayed
-	}
+//
+// It covers ONLY the terminal case; every other action (replayed, stream
+// opened, canceled, residual) is named directly at its call site.
+func chatTerminalAuditAction(operation domain.OperationToken) ports.ChatAuditAction {
 	if operation == domain.OperationChatCompletionStreaming {
-		switch {
-		case outcome == "stream_opened":
-			return ports.AuditChatStreamOpened
-		case strings.HasPrefix(outcome, string(ports.AuditChatCanceled)):
-			return ports.AuditChatCanceled
-		case strings.HasSuffix(outcome, "_accounting_fault"):
-			return ports.AuditChatResidual
-		default:
-			return ports.AuditChatStreamTerminal
-		}
+		return ports.AuditChatStreamTerminal
 	}
 	return ports.AuditChatCompleted
 }

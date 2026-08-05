@@ -95,8 +95,16 @@ func (store *stubAdmissionStore) Admit(_ context.Context, request ports.Admissio
 		nil
 }
 
-func (store *stubAdmissionStore) Reconcile(_ context.Context, reservation ports.AdmissionReservation) error {
+// Reconcile models a real quota/occupancy ledger, which reaches a datastore and
+// therefore CANNOT succeed on a canceled context. Honoring ctx here is what lets
+// the disconnect tests prove settlement really runs: a stub that ignored ctx
+// would report a successful settle for a Reconcile that a production store would
+// have rejected, hiding an occupancy leak (§6.5 rule 4).
+func (store *stubAdmissionStore) Reconcile(ctx context.Context, reservation ports.AdmissionReservation) error {
 	store.reconcileCalls.Add(1)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if store.settleErr != nil {
 		return store.settleErr
 	}
@@ -138,6 +146,7 @@ func (store *stubAdmissionStore) SettledUsage() []ports.AdmissionUsage {
 	defer store.mu.Unlock()
 	return append([]ports.AdmissionUsage(nil), store.settledUsage...)
 }
+
 // ReconcileCalls returns the total number of Reconcile calls (including
 // idempotent no-ops for the same SettlementKey).
 func (store *stubAdmissionStore) ReconcileCalls() int {

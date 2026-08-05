@@ -211,6 +211,16 @@ func (stream *lazyStream) deliveredContent() string {
 
 var _ domain.ChatSink = (*lazyStream)(nil)
 
+// chatSettlementBudget bounds the accounting work that runs AFTER the client
+// terminal (§6.5 rules 3-4). Because settlement is deliberately detached from
+// the request context so a disconnect cannot abort it, it needs its own ceiling:
+// without one, a hung residual drain would pin a goroutine and its retained
+// occupancy indefinitely. Reaching the budget is a legitimate outcome — it
+// yields unknown usage, which fails accounting closed rather than refunding
+// (§6.5 rule 3). The exact drain/recovery deadline is #17; this is the spine's
+// conservative default until that numeric lands.
+const chatSettlementBudget = 30 * time.Second
+
 // StreamChat runs the protected streaming chat spine. Phase order matches chat
 // lifecycle §3.1 with one structural rule: every pre-upstream gate (A0-A5,
 // X1-X3, lease) runs BEFORE the stream opens, so those rejections are returned
@@ -369,6 +379,16 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 
 	served, terminal, opened := service.runStream(execCtx, execution, account)
 
+	// Everything after the client terminal is ACCOUNTING work, and accounting
+	// must survive the client. A disconnect cancels the request context, so
+	// running settlement on `ctx` would hand an already-canceled context to
+	// Reconcile and leak the Tenant+key occupancy forever — exactly the
+	// untracked work §6.3 rule 2 forbids. Detaching cancellation (while keeping
+	// request-scoped values) and imposing our own bound is what makes X6
+	// reachable on the disconnect path (§6.5 rule 4).
+	settleCtx, settleCancel := context.WithTimeout(context.WithoutCancel(ctx), chatSettlementBudget)
+	defer settleCancel()
+
 	// X5/X6 settlement (§6.5). The terminal determines whether occupancy
 	// releases immediately at X5 (upstream stopped confirmed or authoritative
 	// non-commit) or is held for a bounded drain at X6 (upstream may survive).
@@ -383,7 +403,7 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 		// receive a canonical HTTP error. Release the claim when non-commit is
 		// authoritative; never release an uncertain claim (no steal).
 		if terminal.Error.Code != domain.ErrCodeExecutionPossiblyCommitted {
-			_ = service.abandon(ctx, identity)
+			_ = service.abandon(settleCtx, identity)
 		}
 		// For a pre-upstream rejection there is no stream to drain: settle
 		// immediately (X5 = X6). The reservation reconciles to whatever the
@@ -392,7 +412,7 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 		if terminalCarriesUsage(terminal.Event) {
 			reservation.Usage = admissionUsage(terminal.Usage)
 		}
-		if reconcileErr := service.admission.Reconcile(ctx, reservation); reconcileErr != nil {
+		if reconcileErr := service.admission.Reconcile(settleCtx, reservation); reconcileErr != nil {
 			return service.fail(ctx, sc, service.dependencyCanonical(reconcileErr))
 		}
 		return service.fail(ctx, sc, terminal.Error)
@@ -401,7 +421,7 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 	// For an opened stream, X5 may differ from X6 when the upstream may survive
 	// the client terminal (§6.5 rule 1). settleStream handles the coincide
 	// (release now) and split (hold + drain + release at X6) paths.
-	settleErr := service.settleStream(ctx, reservation, terminal, execution, served, identity)
+	settleErr := service.settleStream(settleCtx, reservation, terminal, execution, served)
 
 	// The stream was opened and its single terminal event has been delivered, so
 	// the client outcome is already final. Record durable state and observability
@@ -411,10 +431,14 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 	// stream really opened on `served`. Recording it before the Adapter ran would
 	// claim `stream_opened` for a fail-closed Adapter that never opened anything,
 	// and would emit one record per attempted account during a fallback walk.
-	_ = service.chatAudit(ctx, sc, principal, served.ID, executionID, "stream_opened")
-	service.recordStreamTerminalState(ctx, execution, served, terminal, identity, settleErr)
-	service.recordTelemetry(ctx, sc.operation, terminal.Error.Code, terminal.HTTPStatusHint())
-	service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), terminal.HTTPStatusHint(), terminal.logMessage(), sc.start)
+	//
+	// These are durable/observability writes on the same accounting side of the
+	// client terminal, so they run on settleCtx too: a disconnect must not lose
+	// the replay record or the audit trail.
+	_ = service.chatAudit(settleCtx, sc, principal, served.ID, executionID, ports.AuditChatStreamOpened, "stream_opened")
+	service.recordStreamTerminalState(settleCtx, execution, served, terminal, identity, settleErr)
+	service.recordTelemetry(settleCtx, sc.operation, terminal.Error.Code, terminal.HTTPStatusHint())
+	service.recordRequestLog(settleCtx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), terminal.HTTPStatusHint(), terminal.logMessage(), sc.start)
 	return nil
 }
 
@@ -435,17 +459,8 @@ func (service *ChatService) settleStream(
 	terminal ChatStreamTerminal,
 	execution chatStreamExecution,
 	served domain.ProviderAccount,
-	identity domain.ReplayIdentity,
 ) error {
-	// X5 and X6 coincide when upstream stopped confirmed or the attempt was
-	// authoritatively non-committed (nothing to drain). `completed` implies
-	// upstream stopped naturally; `canceled` with UpstreamStopConfirmed means
-	// the Adapter proved the stop; a non-commit `failed` never reached upstream.
-	upstreamStopped := terminal.Event == domain.ChatStreamCompleted ||
-		(terminal.Event == domain.ChatStreamCanceled && terminal.UpstreamStopConfirmed) ||
-		(terminal.Event == domain.ChatStreamFailed && terminal.Error.Code != domain.ErrCodeExecutionPossiblyCommitted && !terminal.UpstreamAbortAttempted)
-
-	if upstreamStopped {
+	if upstreamStopped(terminal) {
 		// X5 = X6: release occupancy and settle quota now (§6.5 rule 1).
 		if terminalCarriesUsage(terminal.Event) {
 			reservation.Usage = admissionUsage(terminal.Usage)
@@ -480,7 +495,6 @@ func (service *ChatService) settleStream(
 	// floor; a nil drain returns unknown immediately, so settlement fails closed.
 	finalUsage := terminal.Usage
 	usageKnown := terminalCarriesUsage(terminal.Event)
-	stopConfirmed := terminal.UpstreamStopConfirmed
 	finalConfirmed := false
 	if service.residualDrain != nil {
 		outcome, err := service.residualDrain.Drain(ctx, ports.ChatResidualDrainRequest{
@@ -489,13 +503,10 @@ func (service *ChatService) settleStream(
 			ObservedUsage:      terminal.Usage,
 			ObservedUsageKnown: usageKnown,
 		})
-		if err == nil {
-			if outcome.UsageKnown {
-				finalUsage = outcome.Usage
-				usageKnown = true
-				finalConfirmed = true
-			}
-			stopConfirmed = stopConfirmed || outcome.StopConfirmed
+		if err == nil && outcome.UsageKnown {
+			finalUsage = outcome.Usage
+			usageKnown = true
+			finalConfirmed = true
 		}
 		// A drain error or unknown usage leaves finalConfirmed false so
 		// settlement emits an accounting fault below.
@@ -526,6 +537,54 @@ func (service *ChatService) settleStream(
 		return errors.New("chat residual accounting fault: final usage unavailable after bounded drain")
 	}
 	return nil
+}
+
+// upstreamStopped reports whether X5 and X6 coincide: the upstream is known to
+// have stopped, so there is nothing left to drain and occupancy releases now
+// (§6.5 rule 1).
+//
+// It is deliberately conservative. Only three terminals qualify:
+//   - `completed`: the generation ended naturally.
+//   - `canceled` WITH an Adapter-proved stop. Cancellation alone is never proof
+//     (§6.2 rule 3), so a bare `canceled` falls through to the residual path.
+//   - `failed` whose canonical error proves the upstream never committed.
+//
+// The commit status is what decides the `failed` case, never the abort flag:
+// UpstreamAbortAttempted is only ever populated for `canceled` terminals, so
+// testing it here would classify every `failed` as stopped. That is how an
+// `upstream_timeout` — which §6.4 rule 2 says the Gateway MUST attempt to abort,
+// and §6.4 rule 3 says follows the same residual rules as cancel — would have
+// skipped the residual protocol entirely and settled as if upstream were dead.
+func upstreamStopped(terminal ChatStreamTerminal) bool {
+	switch terminal.Event {
+	case domain.ChatStreamCompleted:
+		return true
+	case domain.ChatStreamCanceled:
+		return terminal.UpstreamStopConfirmed
+	case domain.ChatStreamFailed:
+		return terminal.UpstreamStopConfirmed || authoritativeNonCommit(terminal.Error.Code)
+	default:
+		return false
+	}
+}
+
+// authoritativeNonCommit reports whether a canonical error proves the upstream
+// never started a billable generation, so no residual work can survive.
+//
+// A timeout or a transport loss is NOT proof: the request may well have reached
+// the Provider and still be generating, which is precisely the surviving-upstream
+// case §6.5 exists to account for. Only a rejection the Gateway observed BEFORE
+// the upstream accepted work qualifies.
+func authoritativeNonCommit(code domain.ErrorCode) bool {
+	switch code {
+	case domain.ErrCodeUpstreamTimeout,
+		domain.ErrCodeUpstreamUnavailable,
+		domain.ErrCodeUpstreamProtocolDrift,
+		domain.ErrCodeExecutionPossiblyCommitted:
+		return false
+	default:
+		return true
+	}
 }
 
 // terminalCarriesUsage reports whether a terminal event carries authoritative
@@ -871,11 +930,17 @@ func (service *ChatService) recordStreamTerminalState(
 		_ = service.abandon(ctx, identity)
 	}
 
+	// A settlement failure is an ACCOUNTING outcome, not a client outcome, so it
+	// gets its own audit action rather than being folded into the stream
+	// terminal record. §6.5 rule 3 requires this fault to be operator-visible;
+	// an operator filtering on `chat_completion.residual_settled` must find it.
+	action := chatTerminalAuditAction(execution.sc.operation)
 	outcome := string(terminal.Event)
 	if settleErr != nil {
+		action = ports.AuditChatResidual
 		outcome = string(terminal.Event) + "_accounting_fault"
 	}
-	_ = service.chatAudit(ctx, execution.sc, execution.principal, account.ID, execution.executionID, outcome)
+	_ = service.chatAudit(ctx, execution.sc, execution.principal, account.ID, execution.executionID, action, outcome)
 }
 
 // streamReplay delivers a matching terminal replay through the canonical stream
@@ -918,7 +983,7 @@ func (service *ChatService) streamReplay(
 		FinishClass: finish,
 		Usage:       completion.Usage,
 	}
-	_ = service.chatAudit(ctx, sc, principal, completion.ProviderAccountID, completion.ExecutionID, "replayed")
+	_ = service.chatAudit(ctx, sc, principal, completion.ProviderAccountID, completion.ExecutionID, ports.AuditChatReplayed, "replayed")
 	_ = transport.Terminal(terminal)
 	service.recordTelemetry(ctx, sc.operation, "", 200)
 	service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, string(sc.operation), 200, "ok", sc.start)

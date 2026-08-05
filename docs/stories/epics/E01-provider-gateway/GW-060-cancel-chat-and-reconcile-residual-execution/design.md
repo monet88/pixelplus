@@ -42,15 +42,27 @@ cancels the Adapter context (§6.3 rule 1).
 
 ## X5/X6 settlement split
 
-`settleStream` determines whether X5 and X6 coincide or split:
+`settleStream` determines whether X5 and X6 coincide or split. `upstreamStopped`
+is the single predicate that decides:
 
 | Terminal | Upstream stopped? | Path |
 |---|---|---|
 | `completed` | Yes (natural) | X5 = X6: reconcile now |
 | `canceled` + `UpstreamStopConfirmed` | Yes (confirmed) | X5 = X6: reconcile now |
 | `canceled` without `UpstreamStopConfirmed` | Maybe | X5 != X6: hold + drain + settle |
-| `failed` non-commit | Yes (never reached) | X5 = X6: reconcile now |
-| `failed` possibly_committed | Maybe | X5 != X6: hold + drain + settle |
+| `failed` pre-upstream rejection | Yes (never reached) | X5 = X6: reconcile now |
+| `failed` `upstream_timeout` | Maybe | X5 != X6: hold + drain + settle |
+| `failed` `upstream_unavailable` | Maybe | X5 != X6: hold + drain + settle |
+| `failed` `upstream_protocol_drift` | Maybe | X5 != X6: hold + drain + settle |
+| `failed` `execution_possibly_committed` | Maybe | X5 != X6: hold + drain + settle |
+
+Commit status is what decides a `failed` terminal, never `UpstreamAbortAttempted`:
+that flag is only ever populated for `canceled` terminals, so testing it on a
+`failed` one classifies every failure as stopped. A timeout in particular MUST
+take the residual path — §6.4 rule 2 requires the Gateway to attempt an abort,
+and §6.4 rule 3 applies the same tracking and accounting rules as cancel. An
+Adapter-observed `UpstreamStopConfirmed` overrides the conservative default on
+any terminal.
 
 For the split path:
 
@@ -74,13 +86,45 @@ For the pre-upstream rejection (`!opened`): settle immediately. There is no
 stream to drain; the HTTP error is the client terminal and the accounting
 terminal in one.
 
+## Settlement context
+
+Everything after the client terminal is accounting work, and accounting must
+outlive the client. The request context is cancelled by a disconnect, so
+settlement runs on `context.WithTimeout(context.WithoutCancel(ctx),
+chatSettlementBudget)`:
+
+- `WithoutCancel` keeps request-scoped values while detaching cancellation, so a
+  disconnect cannot abort `Reconcile`. Running settlement on the request context
+  handed an already-cancelled context to every ledger write, which failed and
+  retained the Tenant+key occupancy forever — the untracked work §6.3 rule 2
+  forbids.
+- The timeout replaces the bound that cancellation used to provide: a detached
+  context with no ceiling would let a hung drain pin a goroutine and its
+  occupancy indefinitely. Reaching the budget yields unknown usage, which fails
+  accounting closed (§6.5 rule 3).
+
+The durable/observability writes on the same side of the client terminal —
+`chatAudit`, `recordStreamTerminalState`, telemetry, request log — run on the
+same detached context, so a disconnect loses neither the replay record nor the
+audit trail.
+
+`chatSettlementBudget` is the spine's conservative default until the #17
+drain/recovery deadline lands.
+
 ## Accounting fault
 
 When the drain returns unknown usage, `settleStream` returns a non-nil error.
-The caller folds it into the audit trail as an `_accounting_fault` suffix on
-the terminal outcome, matching the existing pattern in
-`recordStreamTerminalState`. The reservation is NOT reconciled to zero; the
-admission store's own fail-closed contract retains it (§6.5 rule 3).
+`recordStreamTerminalState` records that outcome under the
+`chat_completion.residual_settled` audit action with an `_accounting_fault`
+suffix on the outcome label, so an operator filtering on the action finds it
+(§6.5 rule 3). The reservation is NOT reconciled to zero; the admission store's
+own fail-closed contract retains it.
+
+Audit actions are passed to `chatAudit` as typed `ports.ChatAuditAction` values
+rather than inferred from the outcome string. The outcome is a free-form label
+assembled per call site, so deriving the action from its text made the audit
+trail depend on string formatting in a distant file; a typed parameter lets the
+compiler catch a mislabeled event.
 
 ## Remediation fix
 
@@ -94,3 +138,9 @@ is the distinct timeout remediation class §6.4 requires.
 `composition.Dependencies`. A nil store means no residual capacity is
 available (original state retained). A nil drain means unknown usage
 immediately (fail closed). The fixture `Options` gains the same two ports.
+
+Neither port is wired in `cmd/gateway` yet, so production runs both nil. That is
+the safe direction — retained occupancy plus a full reservation and an accounting
+fault, never an over-refund — but it means residual capacity is unusable and
+post-X5 tokens are not reconciled to actual usage until real implementations
+land. The bounded store needs the #17 `L-TENANT-CHAT-RESIDUAL` numeric.

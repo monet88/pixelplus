@@ -248,7 +248,7 @@ func (service *ChatService) CancelChatExecution(ctx context.Context, command Can
 		return ChatCancelResult{}, domain.NewResourceNotFound().WithRequestID(sc.requestID)
 	}
 
-	_ = service.chatAudit(ctx, sc, principal, "", command.ExecutionID, string(ports.AuditChatCanceled)+":"+string(cancelState))
+	_ = service.chatAudit(ctx, sc, principal, "", command.ExecutionID, ports.AuditChatCanceled, string(cancelState))
 	service.recordTelemetry(ctx, sc.operation, "", 200)
 	service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, "cancel_chat_execution", 200, "ok", sc.start)
 	return ChatCancelResult{
