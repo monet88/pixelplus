@@ -675,18 +675,142 @@ func TestTruncatedStreamIsNotReportedAsACleanStop(t *testing.T) {
 func TestDoneWithoutAFinishMarkerStillCompletes(t *testing.T) {
 	t.Parallel()
 
-	// The control for the test above. An image turn legitimately terminates with
-	// [DONE] and no message-status marker (see image_generate.sse), so requiring
-	// the marker would misclassify every image generation as truncated. [DONE]
-	// alone must be sufficient evidence that the body ended normally.
-	adapter := chatgptweb.New(conversationTransport(t, loadFixture(t, "image_generate.sse")))
+	// The control for the test above: `[DONE]` alone must be sufficient evidence
+	// that a body ended normally, so a turn carrying content and no message-status
+	// marker still commits rather than classifying as truncated.
+	//
+	// This uses a text transcript rather than image_generate.sse, because an image
+	// turn is UNKNOWN for an unrelated reason (this chat surface cannot carry an
+	// asset — see TestImageOnlyTurnIsNotReportedAsAnEmptySuccess), which would
+	// make the control pass or fail for the wrong reason.
+	transcript := "\"v1\"\n" +
+		`{"p":"/message/content/parts/0","o":"append","v":"a complete answer"}` + "\n" +
+		"[DONE]\n"
+	adapter := chatgptweb.New(conversationTransport(t, transcript))
 	sink := &recordingSink{}
 
-	outcome, err := adapter.Stream(t.Context(), streamCommand("gpt-image-fixture"), &staticCredential{material: fixturePlaceholder}, sink)
+	outcome, err := adapter.Stream(t.Context(), streamCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder}, sink)
 	if err != nil {
 		t.Fatalf("Stream() error = %v", err)
 	}
 	if outcome.Commit != domain.CommitCommitted {
 		t.Fatalf("commit = %s, want committed ([DONE] alone ends a turn normally)", outcome.Commit)
+	}
+	if outcome.FinishClass != domain.FinishStop {
+		t.Errorf("finish class = %s, want stop", outcome.FinishClass)
+	}
+}
+
+func TestImageOnlyTurnIsNotReportedAsAnEmptySuccess(t *testing.T) {
+	t.Parallel()
+
+	// An image turn decodes an asset pointer and no assistant text. The canonical
+	// chat vocabulary has no carrier for an asset (ChatChoice.Message and
+	// ChatDelta hold text only), so the pointer cannot be delivered.
+	//
+	// Committing would hand the caller a successful, EMPTY answer that is
+	// observably indistinguishable from "the model said nothing", while discarding
+	// the one piece of evidence that a generation happened. An authoritative
+	// not-committed is equally wrong: it would authorize the spine's fallback to
+	// re-attempt, paying for a second image the upstream already produced.
+	for _, fixture := range []string{"image_generate.sse", "image_edit.sse"} {
+		t.Run(fixture, func(t *testing.T) {
+			t.Parallel()
+
+			transcript := loadFixture(t, fixture)
+
+			outcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+				Run(t.Context(), chatCommand("gpt-image-fixture"), &staticCredential{material: fixturePlaceholder})
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if outcome.Commit != domain.CommitUnknown {
+				t.Errorf("commit = %s, want unknown (the asset cannot be delivered on the chat surface)", outcome.Commit)
+			}
+			if len(outcome.Completion.Choices) != 0 {
+				t.Errorf("returned %d choices for an image-only turn, want 0", len(outcome.Completion.Choices))
+			}
+
+			sink := &recordingSink{}
+			streamOutcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+				Stream(t.Context(), streamCommand("gpt-image-fixture"), &staticCredential{material: fixturePlaceholder}, sink)
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+			if streamOutcome.Commit != domain.CommitUnknown {
+				t.Errorf("stream commit = %s, want unknown", streamOutcome.Commit)
+			}
+			if streamOutcome.FinishClass == domain.FinishStop {
+				t.Error("image-only stream claimed a clean stop with zero deltas")
+			}
+			// The Provider-specific pointer must never surface downstream.
+			if joined := sink.joined(); strings.Contains(joined, "file-service://") || strings.Contains(joined, "sediment://") {
+				t.Errorf("asset pointer leaked into canonical deltas: %q", joined)
+			}
+		})
+	}
+}
+
+func TestAnEchoedUserMessageDoesNotFinishTheAssistantTurn(t *testing.T) {
+	t.Parallel()
+
+	// The upstream echoes the caller's own input message back into the stream
+	// carrying "status":"finished_successfully" (see image_edit.sse line 2). That
+	// status describes the echoed INPUT being complete and says nothing about the
+	// assistant's generation.
+	//
+	// Treating it as a finish marker silently disables the truncation check: the
+	// turn looks finished from its first event, so a body that drops mid-answer
+	// reports committed/stop and presents a cut-off answer as the model's chosen
+	// ending. This transcript is exactly that shape — user echo, one content
+	// delta, then the body ends with no [DONE].
+	transcript := "\"v1\"\n" +
+		`{"p":"","o":"add","v":{"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["hi"]},"status":"finished_successfully"},"conversation_id":"conv-fixture-0009"}}` + "\n" +
+		`{"p":"/message/content/parts/0","o":"append","v":"partial answer"}` + "\n"
+
+	outcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Run(t.Context(), chatCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitUnknown {
+		t.Errorf("commit = %s, want unknown (a user echo must not end the assistant turn)", outcome.Commit)
+	}
+
+	sink := &recordingSink{}
+	streamOutcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Stream(t.Context(), streamCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder}, sink)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if streamOutcome.Commit != domain.CommitUnknown {
+		t.Errorf("stream commit = %s, want unknown", streamOutcome.Commit)
+	}
+	if streamOutcome.FinishClass == domain.FinishStop {
+		t.Error("truncated stream behind a user echo claimed a clean stop")
+	}
+}
+
+func TestAnAssistantFinishMarkerStillEndsTheTurn(t *testing.T) {
+	t.Parallel()
+
+	// The control for the test above: the role check must not reject the real
+	// marker. An assistant message reporting finished_successfully ends the turn
+	// even though the body carries no [DONE], which is what keeps the fix from
+	// over-correcting every marker-terminated turn into unknown.
+	transcript := "\"v1\"\n" +
+		`{"p":"/message/content/parts/0","o":"append","v":"a complete answer"}` + "\n" +
+		`{"v":{"message":{"author":{"role":"assistant"},"status":"finished_successfully"},"conversation_id":"conv-fixture-0009"}}` + "\n"
+
+	outcome, err := chatgptweb.New(conversationTransport(t, transcript)).
+		Run(t.Context(), chatCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitCommitted {
+		t.Fatalf("commit = %s, want committed", outcome.Commit)
+	}
+	if got := outcome.Completion.Choices[0].Message.Content; got != "a complete answer" {
+		t.Errorf("content = %q, want the full answer", got)
 	}
 }

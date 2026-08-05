@@ -207,8 +207,28 @@ func messageFrom(value any) (map[string]any, bool) {
 	return nil, false
 }
 
-// messageFinished reports a message whose own status ends the turn.
+// messageFinished reports a message whose own status ends the ASSISTANT turn.
+//
+// The role check is load-bearing, not defensive. The upstream echoes the user's
+// own input message back into the stream carrying
+// `"status":"finished_successfully"` (see image_edit.sse, and evidence: role is
+// "常见 `system`、`user`、`assistant`、`tool`"). That status describes the echoed
+// input being complete — the user did finish typing — and says nothing about the
+// assistant's generation, which has not started yet.
+//
+// Accepting it for any role would make every turn that echoes its input look
+// finished from its first event, which silently disables the truncation check in
+// turnResult.truncated(): a connection dropped mid-answer would report
+// `committed`/`stop` and present a cut-off answer as the model's chosen ending.
 func messageFinished(message map[string]any) bool {
+	author, _ := message["author"].(map[string]any)
+	switch role, _ := author["role"].(string); role {
+	case "assistant", "tool":
+	default:
+		// Includes a missing/unknown author: a message that does not identify
+		// itself as the assistant cannot end the assistant's turn.
+		return false
+	}
 	if ended, _ := message["end_turn"].(bool); ended {
 		return true
 	}

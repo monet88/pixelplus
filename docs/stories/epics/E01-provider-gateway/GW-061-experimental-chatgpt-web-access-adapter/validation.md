@@ -180,10 +180,10 @@ the wrong place — so each was deliberately broken and confirmed to fail:
 
 Each mutation was reverted and the suite re-run green.
 
-### Four commit-classification bugs found and fixed during review
+### Six commit-classification bugs found and fixed during review
 
-All four were found by probing the decoder and the failure paths with
-transcripts no fixture covered, and all four were the same class of error: the
+All six were found by probing the decoder and the failure paths with
+transcripts no fixture covered, and all six were the same class of error: the
 Adapter reported a commit certainty the evidence did not support. That is the
 most damaging thing this Adapter can get wrong, because the spine treats
 `committed` as authoritative (stops the fallback walk, bills the caller) and
@@ -238,4 +238,63 @@ over-reject: content, moderation-block, and image turns still commit.
    misclassified every image generation as truncated. Regression:
    `TestTruncatedStreamIsNotReportedAsACleanStop` (both surfaces) with its
    control `TestDoneWithoutAFinishMarkerStillCompletes`.
+
+5. **An image-only turn committed an empty answer and discarded the asset
+   pointer.** Reported by the code review as its one open High finding, and
+   reproduced. `decodeObject` correctly applies the three-part rule and captures
+   the pointer, but `turnResult.imagePointer` was then read by nothing except the
+   `producedNothing()` emptiness check — no field of `domain.ChatCompletion` or
+   `domain.ChatDelta` can carry an asset, since both hold text only. So an image
+   request returned `committed`/`stop` with an empty message: observably
+   indistinguishable from "the model said nothing", while throwing away the one
+   piece of evidence that a generation happened.
+
+   Both ordinary classifications are wrong here, which is why the fix is a third
+   one. `committed` presents an empty success. `not_committed` is authoritative
+   no-commit proof, so it would authorize the spine's fallback to re-attempt and
+   pay for a second image the upstream already produced. `turnResult
+   .undeliverableImage()` therefore returns UNKNOWN /
+   `execution_possibly_committed`: something was committed upstream, this chat
+   surface cannot deliver it, and no replacement attempt is authorized. The
+   pointer itself is never returned — it is Provider-specific and
+   `domain.ChatCompletion` carries no raw Provider payload. Regression:
+   `TestImageOnlyTurnIsNotReportedAsAnEmptySuccess` over both image fixtures and
+   both surfaces, including an assertion that neither pointer scheme leaks into
+   the canonical deltas.
+
+   This also required correcting `TestDoneWithoutAFinishMarkerStillCompletes`,
+   which had used `image_generate.sse` to prove "`[DONE]` alone completes a
+   turn". That fixture is now UNKNOWN for an unrelated reason, so the control
+   would have passed or failed for the wrong reason; it now uses a text
+   transcript that carries content and `[DONE]` with no marker.
+
+6. **An echoed user input message ended the assistant turn, silently disabling
+   the truncation check from bug 4.** Found while verifying bug 5, not reported by
+   the review. The upstream echoes the caller's own input back into the stream
+   carrying `"status":"finished_successfully"` — visible on line 2 of
+   `image_edit.sse` — and `messageFinished` accepted that status from any author,
+   because the reference records `author.role` as "常见 `system`、`user`、
+   `assistant`、`tool`" while the finish rule was written as if only the
+   assistant ever appeared.
+
+   That status describes the echoed *input* being complete and says nothing about
+   the assistant's generation, which has not started yet. The consequence is that
+   `result.finished` was set from the turn's first event, so `truncated()` — the
+   fix for bug 4 — could never fire on any turn whose transcript echoes its
+   input: a connection dropped mid-answer reported `committed`/`stop` and
+   presented a cut-off answer as the model's chosen ending. Fixed by requiring
+   `author.role` to be `assistant` or `tool` (a missing or unknown author cannot
+   end the assistant's turn). Regression:
+   `TestAnEchoedUserMessageDoesNotFinishTheAssistantTurn` with its control
+   `TestAnAssistantFinishMarkerStillEndsTheTurn`, which exists because the role
+   check could otherwise have rejected the real marker and turned every
+   marker-terminated turn into UNKNOWN.
+
+Both new fixes were mutation-checked the same way as the absence proofs:
+reverting the role check fails
+`TestAnEchoedUserMessageDoesNotFinishTheAssistantTurn` with
+`commit = committed`, and stubbing `undeliverableImage()` to `false` fails
+`TestImageOnlyTurnIsNotReportedAsAnEmptySuccess` on both fixtures and both
+surfaces while leaving the `[DONE]` control green — confirming the control does
+not depend on the fix. Both mutations were reverted and the suite re-run green.
 

@@ -144,6 +144,30 @@ func (result turnResult) truncated() bool {
 	return result.sawContent && !result.finished && !result.blocked && !result.sawDone
 }
 
+// undeliverableImage reports a turn whose only product is an image asset.
+//
+// This Adapter serves the CHAT surface, and the canonical chat vocabulary has no
+// carrier for an asset: domain.ChatChoice.Message holds text and domain.ChatDelta
+// holds text, so a decoded asset pointer has nowhere to go. Image operations
+// belong to the render surface, which this Adapter does not implement.
+//
+// Neither ordinary classification is honest here:
+//
+//   - `committed` would return a successful, EMPTY answer — observably
+//     indistinguishable from "the model said nothing" — while discarding the one
+//     piece of evidence proving a generation happened.
+//   - `not_committed` is authoritative no-commit proof, which authorizes the
+//     spine's fallback to re-attempt. The upstream demonstrably produced (and
+//     likely billed) an image, so a re-attempt would pay for a second one.
+//
+// So the turn is UNKNOWN: something was committed upstream, this surface cannot
+// deliver it, and no replacement attempt is authorized. The pointer itself is
+// never returned — it is Provider-specific and domain.ChatCompletion carries no
+// raw Provider payload.
+func (result turnResult) undeliverableImage() bool {
+	return result.imagePointer != "" && !result.sawContent
+}
+
 // Run executes one non-streaming chat completion.
 //
 // The Web surface has no separate non-streaming endpoint: a non-stream response
@@ -177,6 +201,18 @@ func (adapter *Adapter) Run(ctx context.Context, command ports.ChatCommand, cred
 			Class:        domain.ChatOutcomeNotCommitted,
 			Commit:       domain.CommitNotCommitted,
 			FailureClass: domain.ErrCodeUpstreamProtocolDrift,
+		}, nil
+	}
+
+	if result.undeliverableImage() {
+		// The upstream produced an image asset and nothing this chat surface can
+		// carry. See turnResult.undeliverableImage: committing would return an
+		// empty success, and an authoritative no-commit would authorize paying for
+		// a second generation.
+		return domain.ChatOutcome{
+			Class:        domain.ChatOutcomeUnknown,
+			Commit:       domain.CommitUnknown,
+			FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
 		}, nil
 	}
 
@@ -247,6 +283,18 @@ func (adapter *Adapter) Stream(
 			Commit:       domain.CommitNotCommitted,
 			FailureClass: domain.ErrCodeUpstreamProtocolDrift,
 			Usage:        domain.ChatUsage{},
+		}, nil
+	}
+
+	if result.undeliverableImage() {
+		// Same rule as the non-streaming path. No delta reached the sink, but the
+		// upstream committed an image this surface cannot carry, so UNKNOWN both
+		// withholds a fabricated empty success and withholds permission to
+		// re-generate.
+		return domain.ChatStreamOutcome{
+			Class:        domain.ChatOutcomeUnknown,
+			Commit:       domain.CommitUnknown,
+			FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
 		}, nil
 	}
 

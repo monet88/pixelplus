@@ -35,6 +35,15 @@ func newExperimentalAdapters(config Config, dependencies Dependencies) experimen
 
 // none reports whether the lab profile enabled no Adapter at all, which is the
 // ordinary production state.
+//
+// There is deliberately no renderAdapter helper beside the four below. This
+// story's Adapter implements chat, stream, probe, and capability only, and the
+// canonical chat surface has no carrier for an image asset — so a ChatGPT Web
+// image request is refused by application/render.go's candidate gate, which
+// consults LabProfile.BlocksExperimental like every other gate site, rather than
+// by a registry. If a later story gives an experimental Adapter a real
+// ports.RenderAdapter, it must add the matching renderAdapter helper here;
+// nothing else forces that, so the omission is recorded rather than implied.
 func (enabled experimentalAdapters) none() bool {
 	return enabled.chatGPTWeb == nil
 }

@@ -128,9 +128,41 @@ Tradeoffs:
   their evidence document is normative here. Gemini and Grok snapshots stay
   unclamped until their own evidence lands.
 
+## An image-only turn is UNKNOWN, not committed and not not-committed
+
+The Adapter decodes the image asset pointer (the reference's three-part rule) but
+the canonical chat vocabulary has nowhere to put it: `domain.ChatChoice.Message`
+and `domain.ChatDelta` both hold text only, and this Adapter implements no
+`ports.RenderAdapter`. So an image-only turn has a real upstream generation and
+no deliverable result.
+
+Neither ordinary class is honest. `committed` returns a successful, empty answer
+— indistinguishable to the caller from "the model said nothing" — and discards
+the only evidence that a generation happened. `not_committed` is authoritative
+no-commit proof, which authorizes the spine's single fallback re-attempt, so it
+would pay for a second image the upstream already produced and likely billed.
+
+The turn is therefore classified UNKNOWN / `execution_possibly_committed`: it
+withholds the fabricated success and withholds permission to re-generate. The
+pointer is never returned, since `domain.ChatCompletion` carries no raw Provider
+payload.
+
+The alternative — adding an asset carrier to the canonical chat types — was
+rejected as out of scope. It changes a shared `domain` contract every Provider
+Adapter depends on, and image operations belong to the render surface, whose
+candidate gate already refuses this Auth Mode. Surfacing image results on the
+chat surface is a product decision for a later story, not an implementation
+detail of T18.
+
 ## Follow-Up
 
 - A Gemini Web Cookie baseline when that mode's capability evidence is written.
 - The numeric FG-5 / KS-2 challenge-rate and drift thresholds (#61 non-goal).
 - A real `chatgptweb.Transport` implementation, which is a separate authorized
   change and requires authorization for the exact account before any live probe.
+- Whether ChatGPT Web image results should be deliverable at all, and on which
+  surface. Until that is decided, an image-only chat turn is UNKNOWN rather than
+  a silently empty success.
+- A `renderAdapter` helper in `composition/experimental.go` if a later story
+  gives an experimental Adapter a real `ports.RenderAdapter`. Its absence is
+  currently intentional and recorded in a comment there.
