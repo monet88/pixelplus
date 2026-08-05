@@ -235,14 +235,16 @@ func TestChatCancelRequiresAuthentication(t *testing.T) {
 // reservation until the accounting terminal (X6). The settleStream split path
 // keeps the reservation alive when the upstream may survive. With a nil
 // residual drain (production default), FINAL usage cannot be confirmed, so the
-// settlement settles the Adapter's observed usage as a KNOWN conservative floor
-// (a debit no smaller than known usage) and records an operator-visible
-// accounting fault for the unknown remainder (§6.5 rule 3).
+// reservation is RETAINED IN FULL (§6.5 rule 3): Reconcile is handed an unknown
+// usage and fails closed rather than optimistically refunding the still-unknown
+// remainder of the surviving upstream. An operator-visible accounting fault is
+// also emitted (§6.5 rule 3).
 //
 // This test proves the X5/X6 split is wired through composition: a canceled
 // stream with UpstreamStopConfirmed=false triggers the residual path, the
-// admission store records exactly one settle (not zero, not two), and the
-// accounting-fault path is exercised (item 11).
+// admission store records exactly one settle (not zero, not two), the settled
+// usage is unknown (full reservation retained, never a debit-only-the-floor
+// refund), and the accounting-fault path is exercised (item 11).
 func TestChatCancelNonCancelableSettlesOnceConservatively(t *testing.T) {
 	t.Parallel()
 
@@ -274,32 +276,35 @@ func TestChatCancelNonCancelableSettlesOnceConservatively(t *testing.T) {
 		t.Fatalf("admission Reconcile calls = %d, want 1 (exactly one settle per execution)", got)
 	}
 
-	// The settled usage reflects the known tokens the Adapter already observed
-	// (a conservative debit no smaller than known usage), never zero and never
-	// an optimistic refund of the unknown remainder (§6.5 rule 3).
+	// §6.5 rule 3: with the drain unable to confirm FINAL usage, the reservation
+	// is retained in full. Reconcile is handed an UNKNOWN usage (zero + Known=false),
+	// so the ledger fails closed on the full reservation instead of optimistically
+	// returning the unknown remainder to the floor the Adapter observed.
 	settled := harness.admission.SettledUsage()
 	if len(settled) != 1 {
 		t.Fatalf("settled usage count = %d, want 1", len(settled))
 	}
-	if !settled[0].Known {
-		t.Fatalf("settled usage Known = false, want true: the Adapter observed usage on a committed canceled outcome (§6.2 rule 3)")
-	}
-	if settled[0].PromptTokens != 4 || settled[0].CompletionTokens != 3 {
-		t.Fatalf("settled usage = %d/%d, want 4/3", settled[0].PromptTokens, settled[0].CompletionTokens)
+	if settled[0].Known {
+		t.Fatalf("settled usage Known = true, want false: the drain could not confirm FINAL usage, so usage must stay UNKNOWN to retain the full reservation (§6.5 rule 3) — debiting the observed floor would over-refund the surviving upstream's unknown remainder")
 	}
 
 	// §10.2 item 11: final usage is missing after the bounded drain, so the
 	// conservative settlement must be operator-visible. The audit trail carries
-	// the residual accounting-fault action.
+	// the residual accounting-fault action with a distinct outcome (review
+	// finding 5): an accounting fault (usage unknown, reservation retained) must
+	// be distinguishable from a dependency fault (Reconcile itself failed).
 	audited := harness.chatAudit.snapshot()
-	var accountingFault bool
+	var sawAccountingFault bool
 	for _, event := range audited {
 		if event.Action == ports.AuditChatResidual {
-			accountingFault = true
+			if event.Outcome != "canceled_accounting_fault" {
+				t.Fatalf("residual audit outcome = %q, want canceled_accounting_fault: an unknown-FINAL-usage settlement must be recorded as an accounting fault, distinct from a ledger/dependency outage", event.Outcome)
+			}
+			sawAccountingFault = true
 			break
 		}
 	}
-	if !accountingFault {
+	if !sawAccountingFault {
 		t.Fatalf("no residual accounting-fault audit recorded; the conservative settlement was not operator-visible (len=%d)", len(audited))
 	}
 }

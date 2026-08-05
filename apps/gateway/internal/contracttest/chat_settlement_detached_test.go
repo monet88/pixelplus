@@ -174,3 +174,77 @@ func TestChatStreamDisconnectSettlesOnDetachedContext(t *testing.T) {
 		t.Fatalf("residual hold = %+v, want tenant_a bound to the serving account", hold)
 	}
 }
+
+// Review finding 1: the P2 hard lease release must survive the client just like
+// the rest of the accounting terminal. A disconnect cancels the request context;
+// if Release ran on `ctx`, a resilient lease store would reject the canceled-context
+// write and leak the account binding until its TTL — a Tenant+account could not
+// open a new stream in the meantime (§6.3 rule 2, §6.5 rule 4).
+func TestChatStreamDisconnectReleasesLeaseOnDetachedContext(t *testing.T) {
+	t.Parallel()
+
+	gate := newContextCancelGate()
+	admissionStore := newLimitAdmissionStore(1)
+	residualStore := &countingResidualStore{}
+	drain := newCtxRecordingResidualDrain(domain.ChatUsage{PromptTokens: 11, CompletionTokens: 7})
+
+	harness := newStreamHarnessWithResidual(t, admissionStore, residualStore, drain, func(h *streamHarness) {
+		h.seedStreamingAccount("tenant_a", "pa_lease_detached", domain.AuthModeChatGPTCodexOAuth, domain.StreamingReal)
+		h.stream.Script([]streamStep{
+			{delta: "before disconnect"},
+			{cancelGate: gate},
+			// Cancel WITHOUT a confirmed stop: upstream may survive, exercising the
+			// X5 != X6 split so settlement (and lease release) run after the client.
+			{outcome: ptrStreamOutcome(streamCanceledWithAbort(domain.ChatUsage{PromptTokens: 4, CompletionTokens: 2}))},
+		})
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, harness.fixture.URL()+"/v1/chat/completions", strings.NewReader(chatStreamBody))
+	if err != nil {
+		t.Fatalf("NewRequest error = %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+tenantAKey)
+	request.Header.Set("Idempotency-Key", "idem-lease-detached")
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := harness.fixture.Client().Do(request)
+	if err != nil {
+		t.Fatalf("stream Do error = %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		response.Body.Close()
+		t.Fatalf("stream status = %d, want 200", response.StatusCode)
+	}
+
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		response.Body.Close()
+		t.Fatalf("adapter never reached the cancellation gate")
+	}
+
+	// The client abandons the stream mid-generation.
+	response.Body.Close()
+	cancel()
+
+	select {
+	case <-drain.called:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("residual drain never ran after disconnect")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for admissionStore.occupiedCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if harness.leases.sawCanceledRelease() {
+		t.Errorf("lease release received an already-canceled context: the P2 lease is still attached to the request context, and a resilient lease store would reject the write and leak the binding (§6.3 rule 2)")
+	}
+	if got := admissionStore.occupiedCount(); got != 0 {
+		t.Fatalf("occupied = %d after disconnect, want 0: the accounting terminal leaked Tenant occupancy", got)
+	}
+}
+

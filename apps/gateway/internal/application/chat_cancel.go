@@ -76,7 +76,6 @@ func newChatExecutionRegistry(clock ports.Clock) *chatExecutionRegistry {
 // chatExecutionHandle is one in-flight execution's cancel handle.
 type chatExecutionHandle struct {
 	tenantID       domain.TenantID
-	keyID          domain.ClientAPIKeyID
 	cancel         context.CancelFunc
 	mu             sync.Mutex
 	terminal       bool
@@ -90,14 +89,12 @@ type chatExecutionHandle struct {
 // signal reaches it as context cancellation.
 func (registry *chatExecutionRegistry) register(
 	tenantID domain.TenantID,
-	keyID domain.ClientAPIKeyID,
 	executionID domain.Identifier,
 	cancel context.CancelFunc,
 ) {
 	registry.reap(registry.now())
 	handle := &chatExecutionHandle{
 		tenantID: tenantID,
-		keyID:    keyID,
 		cancel:   cancel,
 	}
 	registry.mu.Lock()
@@ -107,6 +104,14 @@ func (registry *chatExecutionRegistry) register(
 
 // markTerminal records the terminal state of an execution so a later cancel is
 // an idempotent no-op (§6.2 rule 5).
+//
+// abortAttempted and stopConfirmed are MERGED (OR) with any prior values: an
+// explicit cancel recorded abortAttempted=true on the running execution (see
+// cancel), and if the stream later terminates as genuinely non-aborted, the
+// recorded abort attempt is still true — never overwritten by the terminal.
+// Otherwise an idempotent retry cancel would answer
+// "upstream_abort_attempted:false" for an abort that really happened (§6.2
+// rule 4).
 func (registry *chatExecutionRegistry) markTerminal(
 	executionID domain.Identifier,
 	abortAttempted bool,
@@ -121,8 +126,8 @@ func (registry *chatExecutionRegistry) markTerminal(
 	handle.mu.Lock()
 	handle.terminal = true
 	handle.terminalAt = registry.now()
-	handle.abortAttempted = abortAttempted
-	handle.stopConfirmed = stopConfirmed
+	handle.abortAttempted = handle.abortAttempted || abortAttempted
+	handle.stopConfirmed = handle.stopConfirmed || stopConfirmed
 	handle.mu.Unlock()
 }
 
@@ -131,6 +136,28 @@ func (registry *chatExecutionRegistry) markTerminal(
 func (registry *chatExecutionRegistry) unregister(executionID domain.Identifier) {
 	registry.mu.Lock()
 	delete(registry.entries, executionID)
+	registry.mu.Unlock()
+}
+
+// unregisterIfNotTerminal removes an entry that never reached a terminal state.
+// It is the panic-safety backstop for the streaming spine: when runStream panics
+// before markTerminal runs, the entry would otherwise linger in the map forever
+// (the execCancel defer only cancels the context; it does not unregister). A
+// terminal entry is left in place so the post-terminal idempotent-cancel window
+// (§6.2 rule 5) still resolves within chatCancelRetention before reap evicts it.
+func (registry *chatExecutionRegistry) unregisterIfNotTerminal(executionID domain.Identifier) {
+	registry.mu.Lock()
+	handle, ok := registry.entries[executionID]
+	if !ok {
+		registry.mu.Unlock()
+		return
+	}
+	handle.mu.Lock()
+	terminal := handle.terminal
+	handle.mu.Unlock()
+	if !terminal {
+		delete(registry.entries, executionID)
+	}
 	registry.mu.Unlock()
 }
 
@@ -196,13 +223,18 @@ func (registry *chatExecutionRegistry) cancel(
 		handle.mu.Unlock()
 		return ChatCanceled, abort, stop, true
 	}
+	// Record the abort attempt BEFORE signaling. The cancel function itself is
+	// idempotent (context.CancelFunc), so re-signaling a second running cancel is
+	// a safe no-op; but the abort attempt observation must persist so that when
+	// the stream later terminates (markTerminal merges by OR, review finding 3),
+	// an idempotent retry cancel still reports upstream_abort_attempted=true.
+	handle.abortAttempted = true
 	handle.mu.Unlock()
 
-	// Signal the running execution. The cancel function is idempotent
-	// (context.CancelFunc), so a second cancel is a safe no-op.
+	// Signal the running execution. The Gateway attempted to abort by signaling;
+	// whether upstream actually stopped is NOT confirmed by this acknowledgement
+	// (§6.2 rule 3).
 	handle.cancel()
-	// The Gateway attempted to abort by signaling; whether upstream actually
-	// stopped is NOT confirmed by this acknowledgement (§6.2 rule 3).
 	return ChatCancelRequested, true, false, true
 }
 

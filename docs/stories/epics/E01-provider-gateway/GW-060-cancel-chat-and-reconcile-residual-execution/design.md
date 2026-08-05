@@ -76,11 +76,14 @@ For the split path:
    residual hold if acquired, release occupancy via `Reconcile`.
 
 Because the drain is the only source of FINAL usage, the terminal's observed
-usage is treated as a known conservative floor: when the drain cannot confirm
-final usage, the spine settles to the observed floor (a debit no smaller than
-known usage) and still emits an operator-visible accounting fault. When no
-observed floor exists, it retains the full reservation. Either way it never
-assumes zero (§6.5 rule 3).
+usage is never trustworthy for settlement of a surviving upstream: when the drain
+cannot confirm final usage, the spine RETAINS the full reservation (usage handed
+to Reconcile is unknown, `Known=false`) and emits an operator-visible accounting
+fault. This fail-closed choice never over-refunds the surviving upstream's unknown
+remainder. The audit outcome distinguishes an accounting fault (FINAL usage
+unknown, reservation retained) from a dependency fault (Reconcile itself failed),
+so operators can triage them apart (review finding 5). It never assumes zero
+(§6.5 rule 3).
 
 For the pre-upstream rejection (`!opened`): settle immediately. There is no
 stream to drain; the HTTP error is the client terminal and the accounting
