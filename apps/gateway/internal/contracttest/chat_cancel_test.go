@@ -1,65 +1,14 @@
 package contracttest_test
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
-
-// recordingResidualStore is a controlled ChatResidualStore that records
-// acquire/release calls and bounds per-Tenant capacity.
-type recordingResidualStore struct {
-	mu       sync.Mutex
-	limit    int
-	held     map[string]int
-	acquired []ports.ChatResidualHold
-	released []ports.ChatResidualHold
-}
-
-func newRecordingResidualStore(limit int) *recordingResidualStore {
-	return &recordingResidualStore{limit: limit, held: make(map[string]int)}
-}
-
-func (store *recordingResidualStore) Acquire(_ context.Context, hold ports.ChatResidualHold) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.held[string(hold.TenantID)] >= store.limit {
-		return ports.ErrChatResidualCapacityFull
-	}
-	store.held[string(hold.TenantID)]++
-	store.acquired = append(store.acquired, hold)
-	return nil
-}
-
-func (store *recordingResidualStore) Release(_ context.Context, hold ports.ChatResidualHold) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.held[string(hold.TenantID)] > 0 {
-		store.held[string(hold.TenantID)]--
-	}
-	store.released = append(store.released, hold)
-	return nil
-}
-
-func (store *recordingResidualStore) Acquired() []ports.ChatResidualHold {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	return append([]ports.ChatResidualHold(nil), store.acquired...)
-}
-
-func (store *recordingResidualStore) Released() []ports.ChatResidualHold {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	return append([]ports.ChatResidualHold(nil), store.released...)
-}
-
-var _ ports.ChatResidualStore = (*recordingResidualStore)(nil)
 
 // cancelResponseWire mirrors the published ChatCancelResponse schema.
 type cancelResponseWire struct {

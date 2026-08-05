@@ -20,9 +20,11 @@ In scope:
 - Composition wiring with nil-safe fail-closed defaults.
 - `domain.RemediationExecutionRecovery` and the `upstream_timeout`/
   `upstream_unavailable` remediation fix.
-- Contract tests for §10.2 items 6, 7, 8, 12, 13 (cancel idempotent,
-  non-cancelable settlement, foreign-Tenant non-enumeration, unknown 404,
-  auth).
+- Contract tests for §10.2 items 7, 8, 11, 12, 13 (non-cancelable settlement,
+  retained occupancy rejects a new A6, missing final usage settles
+  conservatively, cancel idempotent, Tenant A cancel leaves Tenant B unchanged)
+  and §10.5 items 26, 27 (foreign-Tenant non-enumeration / unknown 404, cancel
+  scope + auth).
 
 Out of scope:
 

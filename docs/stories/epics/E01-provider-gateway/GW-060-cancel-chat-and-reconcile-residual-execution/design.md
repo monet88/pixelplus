@@ -15,9 +15,14 @@ directly.
 
 `chatExecutionRegistry` is a process-local, mutex-guarded map of
 `execution_id` -> `chatExecutionHandle`. `StreamChat` registers the execution
-before the Adapter call and marks it terminal after settlement. The cancel
-route looks up by `execution_id` and checks same-Tenant ownership: a mismatch
-returns the same 404 as unknown (non-enumeration).
+before the Adapter call and marks it terminal once the stream terminal is
+known, BEFORE settlement runs. The ordering is deliberate: the client terminal
+is already delivered at that point, so a cancel arriving while the X6 drain is
+still running must see a terminal entry and answer the `canceled` idempotent
+no-op (§6.2 rule 5) rather than `cancel_requested` — there is no longer a
+running generation for it to signal. The cancel route looks up by
+`execution_id` and checks same-Tenant ownership: a mismatch returns the same
+404 as unknown (non-enumeration).
 
 The registry is intentionally NOT durable: a cancel can only target a live
 execution in this process. After terminal, the handle stays in the registry as

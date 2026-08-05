@@ -190,6 +190,13 @@ func TestChatStreamDisconnectReleasesLeaseOnDetachedContext(t *testing.T) {
 
 	harness := newStreamHarnessWithResidual(t, admissionStore, residualStore, drain, func(h *streamHarness) {
 		h.seedStreamingAccount("tenant_a", "pa_lease_detached", domain.AuthModeChatGPTCodexOAuth, domain.StreamingReal)
+		// The P2 hard lease is what this test is about, and the harness default
+		// leaves LeasePolicy disabled — without opting in, acquireStreamLease
+		// returns a nil lease, the release defer is never registered, and every
+		// assertion below would pass vacuously.
+		policy := chatRoutingPolicy([]domain.ProviderAccountID{"pa_lease_detached"}, nil)
+		policy.LeasePolicy = domain.LeasePolicy{Enabled: true, EligibleUnits: []domain.LeaseUnit{domain.LeaseUnitChatStream}}
+		h.routing.Seed("tenant_a", policy)
 		h.stream.Script([]streamStep{
 			{delta: "before disconnect"},
 			{cancelGate: gate},
@@ -235,13 +242,26 @@ func TestChatStreamDisconnectReleasesLeaseOnDetachedContext(t *testing.T) {
 		t.Fatalf("residual drain never ran after disconnect")
 	}
 
+	// Synchronize on the RELEASE itself, not on occupancy. Reconcile — which
+	// zeroes the slot — runs inside settleStream, whereas the lease release fires
+	// later, from a defer registered before runStream. Waiting on occupancy would
+	// let this guard read sawCanceledRelease() before Release had run at all, so
+	// it would still pass with the release re-attached to the canceled request
+	// context — exactly the regression it exists to catch.
 	deadline := time.Now().Add(5 * time.Second)
-	for admissionStore.occupiedCount() != 0 && time.Now().Before(deadline) {
+	for len(harness.leases.Releases()) == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
+	}
+	if got := len(harness.leases.Releases()); got != 1 {
+		t.Fatalf("lease releases = %d, want 1: the P2 lease was never released after the disconnect", got)
 	}
 
 	if harness.leases.sawCanceledRelease() {
 		t.Errorf("lease release received an already-canceled context: the P2 lease is still attached to the request context, and a resilient lease store would reject the write and leak the binding (§6.3 rule 2)")
+	}
+
+	for admissionStore.occupiedCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
 	if got := admissionStore.occupiedCount(); got != 0 {
 		t.Fatalf("occupied = %d after disconnect, want 0: the accounting terminal leaked Tenant occupancy", got)

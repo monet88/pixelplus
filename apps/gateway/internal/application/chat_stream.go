@@ -348,21 +348,20 @@ func (service *ChatService) StreamChat(ctx context.Context, command StreamChatCo
 	if !ok {
 		return service.failAfterRollback(ctx, sc, canonical, reservation, identity)
 	}
-	// settleCtx is created below, after the terminal is known. It is declared
-	// here so the lease-release defer (registered before runStream, for
-	// panic-safety) can prefer it over `ctx`.
-	var settleCtx context.Context
 	if lease != nil {
 		// The lease release must survive the client like the rest of accounting:
 		// a disconnect cancels `ctx`, and a resilient lease store rejects a
 		// canceled-context release, which would leak the account binding until its
-		// TTL. Releasing on settleCtx keeps the same guarantee we give Reconcile
-		// (§6.3 rule 2, §6.5 rule 4).
+		// TTL (§6.3 rule 2, §6.5 rule 4).
+		//
+		// It cannot borrow the settlement context created below: defers run LIFO,
+		// so that context's cancel — registered AFTER this defer — fires first and
+		// leaves it already canceled by the time this runs. Reusing `ctx` is no
+		// better, since a disconnect canceled it too. The release therefore
+		// detaches its own context, under the same bound settlement uses.
 		defer func() {
-			relCtx := ctx
-			if settleCtx != nil {
-				relCtx = settleCtx
-			}
+			relCtx, relCancel := context.WithTimeout(context.WithoutCancel(ctx), chatSettlementBudget)
+			defer relCancel()
 			_ = service.streamLeases.Release(relCtx, *lease)
 		}()
 	}
@@ -494,15 +493,29 @@ func (service *ChatService) settleStream(
 		AccountID:      served.ID,
 	}
 	residualAcquired := false
+	var residualAcquireErr error
 	if service.residualStore != nil {
-		if err := service.residualStore.Acquire(ctx, hold); err != nil {
+		switch err := service.residualStore.Acquire(ctx, hold); {
+		case err == nil:
+			residualAcquired = true
+		case errors.Is(err, ports.ErrChatResidualCapacityFull):
 			// Capacity full: retain the original request state. The spine keeps
 			// the original occupancy and reservation held; no transfer occurs
 			// (§6.5 rule 2 "If residual tracking is full, retain the original
 			// request state"). Neither path frees capacity for another A6 accept.
+			// This is a NORMAL bounded-capacity outcome, not a fault.
 			residualAcquired = false
-		} else {
-			residualAcquired = true
+		default:
+			// A store outage or a rejected hold is NOT capacity exhaustion. The
+			// difference matters: capacity-full means the bound did its job and
+			// the Tenant's surviving executions are still counted somewhere,
+			// whereas an outage means residual tracking has NO record of this
+			// surviving upstream at all. Treating the second as the first would
+			// let untracked work outlive the drain silently (§6.5 rule 2 requires
+			// the residual state to be tracked or the original state retained
+			// under an operator-visible fault, never dropped quietly).
+			residualAcquired = false
+			residualAcquireErr = err
 		}
 	}
 
@@ -539,13 +552,30 @@ func (service *ChatService) settleStream(
 	}
 	settleErr := service.admission.Reconcile(ctx, reservation)
 
-	// Release the residual hold if it was acquired.
-	if residualAcquired && service.residualStore != nil {
-		_ = service.residualStore.Release(ctx, hold)
+	// Release the residual hold ONLY when the accounting terminal actually
+	// completed. The hold is the sole record that this Tenant still has a
+	// surviving upstream; releasing it while the reservation is unsettled would
+	// hand that bounded slot to another execution even though the original work
+	// may still be running and still owes a debit (§6.5 rule 4 releases occupancy
+	// and residual tracking together, exactly once, AT the accounting terminal).
+	// A failed release is itself a fault: the slot stays consumed until an
+	// operator recovers it, so surface it rather than swallowing it.
+	if residualAcquired && service.residualStore != nil && settleErr == nil {
+		if releaseErr := service.residualStore.Release(ctx, hold); releaseErr != nil {
+			return releaseErr
+		}
 	}
 
 	if settleErr != nil {
 		return settleErr
+	}
+
+	// An Acquire outage leaves the surviving upstream untracked, so it is an
+	// operator-visible dependency fault even when the ledger settled cleanly. It
+	// is reported after the settle so a Reconcile failure — the more severe
+	// outcome — still takes precedence.
+	if residualAcquireErr != nil {
+		return residualAcquireErr
 	}
 
 	// If the drain could not confirm FINAL usage, emit the accounting fault
