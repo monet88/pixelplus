@@ -63,11 +63,11 @@ var _ ports.ChatResidualStore = (*recordingResidualStore)(nil)
 
 // cancelResponseWire mirrors the published ChatCancelResponse schema.
 type cancelResponseWire struct {
-	ExecutionID             string `json:"execution_id"`
-	CancelState             string `json:"cancel_state"`
-	UpstreamAbortAttempted  bool   `json:"upstream_abort_attempted"`
-	UpstreamStopConfirmed   bool   `json:"upstream_stop_confirmed"`
-	RequestID               string `json:"request_id,omitempty"`
+	ExecutionID            string `json:"execution_id"`
+	CancelState            string `json:"cancel_state"`
+	UpstreamAbortAttempted bool   `json:"upstream_abort_attempted"`
+	UpstreamStopConfirmed  bool   `json:"upstream_stop_confirmed"`
+	RequestID              string `json:"request_id,omitempty"`
 }
 
 func (harness *streamHarness) cancelExecution(t *testing.T, bearer, executionID string) (*http.Response, cancelResponseWire, []byte) {
@@ -231,16 +231,18 @@ func TestChatCancelRequiresAuthentication(t *testing.T) {
 	}
 }
 
-// §10.2 item 7: A non-cancelable canceled terminal holds occupancy and
+// §10.2 items 7 and 11: A non-cancelable canceled terminal holds occupancy and
 // reservation until the accounting terminal (X6). The settleStream split path
-// keeps the reservation alive (does not release it early) when the upstream
-// may survive. With a nil residual drain (production default), the settlement
-// fails closed: the reservation reconciles with unknown usage, and the
-// accounting fault is recorded in the audit trail.
+// keeps the reservation alive when the upstream may survive. With a nil
+// residual drain (production default), FINAL usage cannot be confirmed, so the
+// settlement settles the Adapter's observed usage as a KNOWN conservative floor
+// (a debit no smaller than known usage) and records an operator-visible
+// accounting fault for the unknown remainder (§6.5 rule 3).
 //
 // This test proves the X5/X6 split is wired through composition: a canceled
-// stream with UpstreamStopConfirmed=false triggers the residual path, and
-// the admission store records exactly one settle (not zero, not two).
+// stream with UpstreamStopConfirmed=false triggers the residual path, the
+// admission store records exactly one settle (not zero, not two), and the
+// accounting-fault path is exercised (item 11).
 func TestChatCancelNonCancelableSettlesOnceConservatively(t *testing.T) {
 	t.Parallel()
 
@@ -266,16 +268,15 @@ func TestChatCancelNonCancelableSettlesOnceConservatively(t *testing.T) {
 	}
 
 	// The non-cancelable terminal has UpstreamStopConfirmed=false, so the
-	// settleStream path holds the reservation and runs the (nil) drain. With
-	// nil drain, usage stays unknown, and the accounting fault is recorded.
-	// The key proof: admission settles exactly once (not zero, not twice).
+	// settleStream path holds the reservation and runs the (nil) drain. The key
+	// proof: admission settles exactly once (not zero, not twice).
 	if got := harness.admission.ReconcileCalls(); got != 1 {
 		t.Fatalf("admission Reconcile calls = %d, want 1 (exactly one settle per execution)", got)
 	}
 
-	// The settled usage must reflect the known tokens the Adapter observed,
-	// not zero. The non-cancelable outcome reports usage, so the settle carries
-	// that usage even though the drain returned unknown.
+	// The settled usage reflects the known tokens the Adapter already observed
+	// (a conservative debit no smaller than known usage), never zero and never
+	// an optimistic refund of the unknown remainder (§6.5 rule 3).
 	settled := harness.admission.SettledUsage()
 	if len(settled) != 1 {
 		t.Fatalf("settled usage count = %d, want 1", len(settled))
@@ -285,5 +286,20 @@ func TestChatCancelNonCancelableSettlesOnceConservatively(t *testing.T) {
 	}
 	if settled[0].PromptTokens != 4 || settled[0].CompletionTokens != 3 {
 		t.Fatalf("settled usage = %d/%d, want 4/3", settled[0].PromptTokens, settled[0].CompletionTokens)
+	}
+
+	// §10.2 item 11: final usage is missing after the bounded drain, so the
+	// conservative settlement must be operator-visible. The audit trail carries
+	// the residual accounting-fault action.
+	audited := harness.chatAudit.snapshot()
+	var accountingFault bool
+	for _, event := range audited {
+		if event.Action == ports.AuditChatResidual {
+			accountingFault = true
+			break
+		}
+	}
+	if !accountingFault {
+		t.Fatalf("no residual accounting-fault audit recorded; the conservative settlement was not operator-visible (len=%d)", len(audited))
 	}
 }

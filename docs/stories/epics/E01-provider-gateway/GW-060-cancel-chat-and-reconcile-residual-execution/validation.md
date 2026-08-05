@@ -4,10 +4,10 @@
 
 | AC | Status | Evidence |
 |---|---|---|
-| 1. Explicit cancel same-Tenant, idempotent, signals running, not stop proof | PASS | `TestChatCancelIsIdempotent`, `TestChatCancelForeignTenantReturns404`, `TestChatCancelUnknownExecutionReturns404`, `TestChatCancelRequiresAuthentication` |
-| 2. Disconnect = implicit cancel, timeout distinct cause | PARTIAL | Disconnect delivery-stop test exists (T16); timeout remediation `execution_recovery` fixed; timeout contract test deferred (needs timeout-enforcing Adapter) |
-| 3. Residual transitions atomically under original Tenant/key | PASS | `settleStream` X5/X6 split; `ports.ChatResidualStore` with `ErrChatResidualCapacityFull`; `TestChatCancelNonCancelableSettlesOnceConservatively` proves exactly one settle with known usage |
-| 4. Concurrency/quota release only at accounting terminal | PASS | `TestChatCancelNonCancelableSettlesOnceConservatively` proves `Reconcile` called exactly once |
+| 1. Explicit cancel same-Tenant, idempotent, signals running, not stop proof | PASS | `TestChatCancelSignalsRunningExecution` proves the cancel signal reaches the running Adapter context; `TestChatCancelIsIdempotent`, `TestChatCancelForeignTenantReturns404`, `TestChatCancelUnknownExecutionReturns404`, `TestChatCancelRequiresAuthentication` |
+| 2. Disconnect = implicit cancel, timeout distinct cause | PASS | `TestChatStreamDisconnectSettlesImplicitCancel` proves disconnect settles the implicit cancel; `TestChatStreamTimeoutYieldsDistinctFailureClass` proves `upstream_timeout` + `execution_recovery` |
+| 3. Residual transitions atomically under original Tenant/key/account lease | PASS | `settleStream` X5/X6 split; `ChatResidualHold` carries `AccountID`; `ports.ChatResidualStore` with `ErrChatResidualCapacityFull`; `TestChatCancelNonCancelableSettlesOnceConservatively` proves exactly one settle with a known conservative floor |
+| 4. Concurrency/quota release only at accounting terminal | PASS | `TestChatResidualExhaustedRetainsOccupancyAndRejectsNewA6` proves retained occupancy rejects a new A6 and releases exactly once at X6; `TestChatCancelNonCancelableSettlesOnceConservatively` proves `Reconcile` called exactly once |
 | 5. Cancel/disconnect/timeout cannot create replacement after commit | PASS | Registry marks terminal; cancel is idempotent; spine never re-runs on terminal |
 | 6. Client observes exactly one canonical terminal | PASS | `TestChatCancelIsIdempotent` asserts exactly one terminal; cancel response is separate (no second terminal) |
 
@@ -20,14 +20,14 @@
 | Tests | `go test ./... -count=1` | PASS (all packages) |
 | Race | `go test -race ./internal/contracttest/ -run TestChatCancel` | PASS |
 
+## Coverage notes
+
+- §10.2 item 8 (retained occupancy rejects new A6): `TestChatResidualExhaustedRetainsOccupancyAndRejectsNewA6`.
+- §10.2 item 9 (disconnect implicit-cancel accounting): `TestChatStreamDisconnectSettlesImplicitCancel`.
+- §10.2 item 10 (timeout distinct failure class): `TestChatStreamTimeoutYieldsDistinctFailureClass`.
+- §10.2 item 11 (missing final usage -> conservative + accounting fault): `TestChatCancelNonCancelableSettlesOnceConservatively` asserts the residual accounting-fault audit action.
+
 ## Deferred
 
-- §10.2 item 8: retained-occupancy-rejects-new-A6 test (needs concurrency-limit
-  enforcement in `stubAdmissionStore`; the infrastructure is present but the
-  specific test is deferred).
-- §10.2 item 9: disconnect mid-stream residual test (needs incremental SSE
-  reading from a blocked stream).
-- §10.2 item 10: timeout contract test (needs a timeout-enforcing Adapter).
-- §10.2 item 11: missing-usage accounting-fault test (needs a drain fake that
-  returns unknown usage with observable audit).
-- `golangci-lint` and `govulncheck` (run before PR publication).
+- Numeric timeout classes, drain windows, `L-TENANT-CHAT-RESIDUAL` value (#17).
+- `golangci-lint` and `govulncheck` were not installed in this environment.

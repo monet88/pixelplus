@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -174,9 +175,9 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 
 		authorizedStream: dependencies.AuthorizedStream,
 		streamLeases:     dependencies.StreamLeases,
-		executions:       newChatExecutionRegistry(),
-		residualStore:   dependencies.ResidualStore,
-		residualDrain:   dependencies.ResidualDrain,
+		executions:       newChatExecutionRegistry(dependencies.Clock),
+		residualStore:    dependencies.ResidualStore,
+		residualDrain:    dependencies.ResidualDrain,
 	}, nil
 }
 
@@ -975,10 +976,16 @@ func chatAuditAction(operation domain.OperationToken, outcome string) ports.Chat
 		return ports.AuditChatReplayed
 	}
 	if operation == domain.OperationChatCompletionStreaming {
-		if outcome == "stream_opened" {
+		switch {
+		case outcome == "stream_opened":
 			return ports.AuditChatStreamOpened
+		case strings.HasPrefix(outcome, string(ports.AuditChatCanceled)):
+			return ports.AuditChatCanceled
+		case strings.HasSuffix(outcome, "_accounting_fault"):
+			return ports.AuditChatResidual
+		default:
+			return ports.AuditChatStreamTerminal
 		}
-		return ports.AuditChatStreamTerminal
 	}
 	return ports.AuditChatCompleted
 }

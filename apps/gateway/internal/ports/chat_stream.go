@@ -112,6 +112,11 @@ type ChatResidualHold struct {
 	TenantID       domain.TenantID
 	ClientAPIKeyID domain.ClientAPIKeyID
 	ExecutionID    domain.Identifier
+	// AccountID is the account that served the surviving upstream. Residual work
+	// stays bound to the original account lease as well as the originating
+	// Tenant/key (chat lifecycle §5.3, AC3): recording it here prevents a
+	// later drain from losing or re-resolving the account binding.
+	AccountID domain.ProviderAccountID
 }
 
 // ChatResidualStore bounds how many of a Tenant's occupied executions are

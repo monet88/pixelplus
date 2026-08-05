@@ -398,7 +398,7 @@ func (handler chatHandler) cancelExecution(writer http.ResponseWriter, request *
 	}
 	writeJSON(writer, http.StatusOK, chatCancelResponseWire{
 		ExecutionID:            string(result.ExecutionID),
-		CancelState:            result.CancelState,
+		CancelState:            string(result.CancelState),
 		UpstreamAbortAttempted: result.UpstreamAbortAttempted,
 		UpstreamStopConfirmed:  result.UpstreamStopConfirmed,
 		RequestID:              string(result.RequestID),

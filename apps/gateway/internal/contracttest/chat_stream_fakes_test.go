@@ -35,6 +35,41 @@ type streamStep struct {
 	// blockOn holds the Adapter mid-stream until the test releases it, so a test
 	// can disconnect the client at a known point in the event sequence.
 	blockOn *deliveryGate
+	// cancelGate holds the Adapter until its CONTEXT is canceled. It proves the
+	// cancel/disconnect signal actually reached the Adapter (AC1 / §6.2, §6.3),
+	// which is impossible to infer from a mock that ignores its context.
+	cancelGate *contextCancelGate
+}
+
+// contextCancelGate blocks the Adapter until the request execution context is
+// canceled and records that it observed the cancellation. It models a real
+// Adapter body reader that returns promptly when the Gateway signals abort.
+type contextCancelGate struct {
+	entered  chan struct{}
+	canceled chan struct{}
+	once     sync.Once
+}
+
+func newContextCancelGate() *contextCancelGate {
+	return &contextCancelGate{
+		entered:  make(chan struct{}),
+		canceled: make(chan struct{}),
+	}
+}
+
+// wait blocks until ctx is canceled. It closes entered when it starts blocking
+// so a test can wait for the Adapter to be in-flight before issuing the cancel.
+func (gate *contextCancelGate) wait(ctx context.Context) {
+	gate.once.Do(func() { close(gate.entered) })
+	select {
+	case <-ctx.Done():
+		close(gate.canceled)
+	}
+}
+
+// Canceled returns a channel closed after the Adapter observed ctx cancellation.
+func (gate *contextCancelGate) Canceled() <-chan struct{} {
+	return gate.canceled
 }
 
 // rogueWriter coordinates an Adapter goroutine that attempts sink writes after
@@ -103,7 +138,7 @@ func (adapter *scriptedChatStreamAdapter) Script(scripts ...[]streamStep) {
 }
 
 func (adapter *scriptedChatStreamAdapter) Stream(
-	_ context.Context,
+	ctx context.Context,
 	command ports.ChatStreamCommand,
 	_ ports.CredentialInjection,
 	sink domain.ChatSink,
@@ -129,6 +164,8 @@ func (adapter *scriptedChatStreamAdapter) Stream(
 		switch {
 		case step.blockOn != nil:
 			step.blockOn.wait()
+		case step.cancelGate != nil:
+			step.cancelGate.wait(ctx)
 		case step.rogueAfter != nil:
 			// Leak a goroutine that keeps writing after this attempt returns.
 			rogue := step.rogueAfter

@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
@@ -21,11 +22,32 @@ type CancelChatExecutionCommand struct {
 // (OpenAPI ChatCancelResponse, chat lifecycle §6.2 rule 3).
 type ChatCancelResult struct {
 	ExecutionID            domain.Identifier
-	CancelState            string // "cancel_requested" | "canceled"
+	CancelState            ChatCancelState
 	UpstreamAbortAttempted bool
 	UpstreamStopConfirmed  bool
 	RequestID              domain.Identifier
 }
+
+// ChatCancelState is the typed acknowledgement state of an explicit cancel
+// (chat lifecycle §6.2). Using a named type keeps the two states from being
+// conflated with arbitrary strings at call sites, matching how the codebase
+// models ChatStreamEventType and FinishClass.
+type ChatCancelState string
+
+const (
+	// ChatCancelRequested reports that the running execution was signaled; it is
+	// never proof the upstream stopped (§6.2 rule 3).
+	ChatCancelRequested ChatCancelState = "cancel_requested"
+	// ChatCanceled reports the execution was already terminal, so the cancel was
+	// an idempotent no-op (§6.2 rule 5).
+	ChatCanceled ChatCancelState = "canceled"
+)
+
+// chatCancelRetention is how long a terminal execution stays resolvable for an
+// idempotent no-op cancel before the registry evicts it. The bound keeps the
+// process-local registry from growing without limit while still honoring the
+// post-terminal idempotent-cancel window (§6.2 rule 5).
+const chatCancelRetention = 60 * time.Second
 
 // chatExecutionRegistry tracks in-flight chat executions so an explicit cancel
 // (§6.2) or disconnect (§6.3) can resolve an execution_id to its running
@@ -41,20 +63,25 @@ type chatExecutionRegistry struct {
 	// entries maps execution_id -> handle. The handle carries the cancel
 	// function and terminal state.
 	entries map[domain.Identifier]*chatExecutionHandle
+	clock   ports.Clock
 }
 
-func newChatExecutionRegistry() *chatExecutionRegistry {
-	return &chatExecutionRegistry{entries: make(map[domain.Identifier]*chatExecutionHandle)}
+func newChatExecutionRegistry(clock ports.Clock) *chatExecutionRegistry {
+	return &chatExecutionRegistry{
+		entries: make(map[domain.Identifier]*chatExecutionHandle),
+		clock:   clock,
+	}
 }
 
 // chatExecutionHandle is one in-flight execution's cancel handle.
 type chatExecutionHandle struct {
-	tenantID      domain.TenantID
-	keyID         domain.ClientAPIKeyID
-	cancel        context.CancelFunc
-	mu            sync.Mutex
-	terminal      bool
-	stopConfirmed bool
+	tenantID       domain.TenantID
+	keyID          domain.ClientAPIKeyID
+	cancel         context.CancelFunc
+	mu             sync.Mutex
+	terminal       bool
+	terminalAt     time.Time
+	stopConfirmed  bool
 	abortAttempted bool
 }
 
@@ -67,6 +94,7 @@ func (registry *chatExecutionRegistry) register(
 	executionID domain.Identifier,
 	cancel context.CancelFunc,
 ) {
+	registry.reap(registry.now())
 	handle := &chatExecutionHandle{
 		tenantID: tenantID,
 		keyID:    keyID,
@@ -92,17 +120,46 @@ func (registry *chatExecutionRegistry) markTerminal(
 	}
 	handle.mu.Lock()
 	handle.terminal = true
+	handle.terminalAt = registry.now()
 	handle.abortAttempted = abortAttempted
 	handle.stopConfirmed = stopConfirmed
 	handle.mu.Unlock()
 }
 
-// unregister removes the in-flight entry after the spine fully settles. A
-// later cancel for this execution_id is a 404 (non-enumerating).
+// unregister removes an entry once its retention window has passed. A later
+// cancel for this execution_id is a 404 (non-enumerating).
 func (registry *chatExecutionRegistry) unregister(executionID domain.Identifier) {
 	registry.mu.Lock()
 	delete(registry.entries, executionID)
 	registry.mu.Unlock()
+}
+
+// reap evicts terminal entries whose retention window has expired. It runs on
+// register and cancel, so the registry stays bounded by chatCancelRetention
+// without a background goroutine: under continuous load the map only ever
+// holds executions from the last retention window.
+func (registry *chatExecutionRegistry) reap(now time.Time) {
+	var expired []domain.Identifier
+	registry.mu.Lock()
+	for id, handle := range registry.entries {
+		handle.mu.Lock()
+		expiredEntry := handle.terminal && now.Sub(handle.terminalAt) >= chatCancelRetention
+		handle.mu.Unlock()
+		if expiredEntry {
+			expired = append(expired, id)
+		}
+	}
+	registry.mu.Unlock()
+	for _, id := range expired {
+		registry.unregister(id)
+	}
+}
+
+func (registry *chatExecutionRegistry) now() time.Time {
+	if registry.clock != nil {
+		return registry.clock.Now()
+	}
+	return time.Now()
 }
 
 // cancel signals a running execution if it is still in-flight. It reports the
@@ -117,7 +174,8 @@ func (registry *chatExecutionRegistry) unregister(executionID domain.Identifier)
 func (registry *chatExecutionRegistry) cancel(
 	tenantID domain.TenantID,
 	executionID domain.Identifier,
-) (cancelState string, abortAttempted, stopConfirmed, ok bool) {
+) (cancelState ChatCancelState, abortAttempted, stopConfirmed, ok bool) {
+	registry.reap(registry.now())
 	registry.mu.Lock()
 	handle, exists := registry.entries[executionID]
 	registry.mu.Unlock()
@@ -136,7 +194,7 @@ func (registry *chatExecutionRegistry) cancel(
 		abort := handle.abortAttempted
 		stop := handle.stopConfirmed
 		handle.mu.Unlock()
-		return "canceled", abort, stop, true
+		return ChatCanceled, abort, stop, true
 	}
 	handle.mu.Unlock()
 
@@ -145,7 +203,7 @@ func (registry *chatExecutionRegistry) cancel(
 	handle.cancel()
 	// The Gateway attempted to abort by signaling; whether upstream actually
 	// stopped is NOT confirmed by this acknowledgement (§6.2 rule 3).
-	return "cancel_requested", true, false, true
+	return ChatCancelRequested, true, false, true
 }
 
 // CancelChatExecution handles an explicit same-Tenant cancel request. It
@@ -190,7 +248,7 @@ func (service *ChatService) CancelChatExecution(ctx context.Context, command Can
 		return ChatCancelResult{}, domain.NewResourceNotFound().WithRequestID(sc.requestID)
 	}
 
-	_ = service.chatAudit(ctx, sc, principal, "", command.ExecutionID, "cancel:"+cancelState)
+	_ = service.chatAudit(ctx, sc, principal, "", command.ExecutionID, string(ports.AuditChatCanceled)+":"+string(cancelState))
 	service.recordTelemetry(ctx, sc.operation, "", 200)
 	service.recordRequestLog(ctx, sc.requestID, principal.ClientAPIKeyID, "cancel_chat_execution", 200, "ok", sc.start)
 	return ChatCancelResult{
