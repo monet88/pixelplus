@@ -1,0 +1,36 @@
+{
+  "_fixture": "Sanitized quota/rate signals. Evidence §5 quota/rate-limit signals and openai_backend_api.py _extract_quota_and_restore_at.",
+  "image_quota_exhausted": {
+    "default_model_slug": "gpt-fixture-1",
+    "limits_progress": [
+      {
+        "feature_name": "image_gen",
+        "remaining": 0,
+        "reset_after": 1800
+      }
+    ]
+  },
+  "image_quota_available": {
+    "default_model_slug": "gpt-fixture-1",
+    "limits_progress": [
+      {
+        "feature_name": "image_gen",
+        "remaining": 5,
+        "reset_after": 900
+      }
+    ]
+  },
+  "no_image_row": {
+    "default_model_slug": "gpt-fixture-1",
+    "limits_progress": [
+      {
+        "feature_name": "deep_research",
+        "remaining": 0,
+        "reset_after": 60
+      }
+    ]
+  },
+  "rate_limited_body": {
+    "detail": "Too many requests in a short period."
+  }
+}

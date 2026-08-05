@@ -159,6 +159,10 @@ type RenderService struct {
 	// leaseTTL / heartbeatInterval bound worker fence renewals (tests inject short).
 	leaseTTL          time.Duration
 	heartbeatInterval time.Duration
+	// labProfile names the `experimental` Auth Modes this deployment deliberately
+	// enabled. The zero value enables nothing, so ordinary production keeps every
+	// experimental account out of the render candidate set (risk envelope §5.1).
+	labProfile domain.LabProfile
 }
 
 // RenderDependencies bundles the controlled ports this slice owns.
@@ -195,6 +199,9 @@ type RenderDependencies struct {
 	// HeartbeatInterval is how often RenewWorkerLease runs during Adapter
 	// (zero → leaseTTL/3). Tests inject short intervals for deterministic cancel.
 	HeartbeatInterval time.Duration
+	// LabProfile is optional and defaults to the closed zero value, which keeps
+	// every `experimental` Auth Mode out of the render candidate set.
+	LabProfile domain.LabProfile
 }
 
 // NewRenderService validates and wires the Render Job spine dependencies.
@@ -276,6 +283,7 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		ids:               dependencies.IDs,
 		leaseTTL:          leaseTTL,
 		heartbeatInterval: hb,
+		labProfile:        dependencies.LabProfile,
 	}, nil
 }
 
@@ -2213,8 +2221,9 @@ func (service *RenderService) candidateRejection(
 	model string,
 	now time.Time,
 ) (domain.CanonicalError, bool) {
-	// C3 risk / C2 usability
-	if account.AuthMode.Prohibited() || account.AuthMode.Experimental() {
+	// C3 risk / C2 usability. An experimental mode is a candidate only in a
+	// deployment that deliberately enabled it as a lab profile (§5.1, §6.1).
+	if account.AuthMode.Prohibited() || service.labProfile.BlocksExperimental(account.AuthMode) {
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if account.AuthMode.RequiresRiskAck() && !account.RiskAcknowledged {

@@ -158,6 +158,9 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	if h.heartbeatInterval > 0 {
 		opts.RenderHeartbeatInterval = h.heartbeatInterval
 	}
+	// Experimental lab profile (T18). Empty — the default — composes an ordinary
+	// production deployment where every experimental Auth Mode stays fail-closed.
+	opts.ExperimentalLabAuthModes = h.labAuthModes
 	fixture, err := contracttest.NewFixture(opts)
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)

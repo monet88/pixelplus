@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/monet88/pixelplus/apps/gateway/internal/adapters/chatgptweb"
 	"github.com/monet88/pixelplus/apps/gateway/internal/application"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/infrastructure/observability"
@@ -41,6 +42,23 @@ type Config struct {
 	// is nil. Production must leave this false so a missing durable chat digest
 	// key fails closed (FailClosedChatDigester).
 	AllowInMemoryChat bool
+	// ExperimentalLabAuthModes names the `experimental` Auth Modes this
+	// deployment deliberately enables as a lab profile. Empty — the production
+	// default — enables nothing, so ordinary composition never exposes or
+	// registers an experimental mode (risk envelope §2 status table, §5.1, §6.1).
+	//
+	// Naming a `prohibited` or `gated` mode here has no effect: domain.NewLabProfile
+	// accepts only experimental modes, so this cannot become a back door into
+	// Grok Web SSO or a way to skip a gated mode's own feature flag.
+	ExperimentalLabAuthModes []domain.AuthMode
+}
+
+// labProfile builds the deployment's experimental lab profile from config. An
+// empty ExperimentalLabAuthModes yields the closed zero value, so every service
+// wired by this composition keeps experimental modes fail-closed unless an
+// operator deliberately named one.
+func (config Config) labProfile() domain.LabProfile {
+	return domain.NewLabProfile(config.ExperimentalLabAuthModes...)
 }
 
 // Dependencies contains the controlled foundation ports owned by this slice.
@@ -169,6 +187,13 @@ type Dependencies struct {
 	// accounting fault. That is fail-closed and never over-refunds, but it also
 	// means post-X5 tokens are not yet reconciled to actual usage.
 	ResidualDrain ports.ChatResidualDrain
+	// ExperimentalChatGPTWebTransport supplies protocol egress for the
+	// experimental ChatGPT Web Access Adapter (#61 / T18). It is consulted only
+	// when the lab profile named that mode; ordinary production leaves it nil and
+	// never constructs the Adapter at all. A lab deployment that enables the mode
+	// but leaves this nil gets a registered Adapter that fails every surface
+	// closed, so enabling a mode is not the same as granting egress.
+	ExperimentalChatGPTWebTransport chatgptweb.Transport
 	// ChatAffinity stores the soft conversation→account preference (P3). A nil
 	// port substitutes the process-local memory store: affinity is a preference,
 	// never an authority, so process loss only degrades selection to P4 policy
@@ -345,7 +370,7 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		logger.Error("render job durability, authorizer, or usable digester not configured; readiness stays closed")
 	}
 
-	service, err := newProviderAccountService(dependencies)
+	service, err := newProviderAccountService(config, dependencies)
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +480,7 @@ func restoreRenderPorts(ctx context.Context, dependencies Dependencies) error {
 // Each nil port falls back to the fail-closed/foundation production
 // implementation so the real production composition constructor is safe by
 // default; contract tests override any subset through Dependencies.
-func newProviderAccountService(dependencies Dependencies) (*application.ProviderAccountService, error) {
+func newProviderAccountService(config Config, dependencies Dependencies) (*application.ProviderAccountService, error) {
 	principal := dependencies.Principal
 	if principal == nil {
 		principal = persistence.NewFailClosedPrincipalStore()
@@ -509,6 +534,12 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 	if capability == nil {
 		capability = vaultpkg.NewFailClosedCapabilityAdapter()
 	}
+	// Experimental lab registration (#61 / T18). With no lab profile these return
+	// the fail-closed foundations unchanged, so ordinary production composes no
+	// experimental Adapter at all.
+	experimental := newExperimentalAdapters(config, dependencies)
+	probe = experimental.probeAdapter(probe)
+	capability = experimental.capabilityAdapter(capability)
 	circuits := dependencies.Circuits
 	if circuits == nil {
 		circuits = persistence.NewClosedCircuitStore()
@@ -536,6 +567,7 @@ func newProviderAccountService(dependencies Dependencies) (*application.Provider
 		RequestLog:   requestLog,
 		Clock:        dependencies.Clock,
 		IDs:          dependencies.IDs,
+		LabProfile:   config.labProfile(),
 	})
 }
 
@@ -733,6 +765,7 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 		IDs:               dependencies.IDs,
 		WorkerLeaseTTL:    dependencies.RenderWorkerLeaseTTL,
 		HeartbeatInterval: dependencies.RenderHeartbeatInterval,
+		LabProfile:        config.labProfile(),
 	})
 }
 
@@ -838,12 +871,15 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 	if audit == nil {
 		audit = observability.NewSlogChatAuditRecorder(dependencies.Logger)
 	}
+	// Experimental lab registration (#61 / T18). Empty in ordinary production.
+	experimental := newExperimentalAdapters(config, dependencies)
 	authorized := dependencies.AuthorizedChat
 	if authorized == nil {
 		adapter := dependencies.ChatAdapter
 		if adapter == nil {
 			adapter = vaultpkg.NewFailClosedChatAdapter()
 		}
+		adapter = experimental.chatAdapter(adapter)
 		authorizer := dependencies.ChatCredentialAuthorizer
 		if authorizer == nil {
 			if config.AllowInMemoryChat {
@@ -865,6 +901,7 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 		if streamAdapter == nil {
 			streamAdapter = vaultpkg.NewFailClosedChatStreamAdapter()
 		}
+		streamAdapter = experimental.chatStreamAdapter(streamAdapter)
 		streamAuthorizer := dependencies.ChatCredentialAuthorizer
 		if streamAuthorizer == nil {
 			if config.AllowInMemoryChat {
@@ -917,6 +954,7 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 		StreamLeases:     streamLeases,
 		ResidualStore:    dependencies.ResidualStore,
 		ResidualDrain:    dependencies.ResidualDrain,
+		LabProfile:       config.labProfile(),
 	})
 }
 

@@ -232,6 +232,12 @@ func (service *ProviderAccountService) accountAllowsOffers(account domain.Provid
 	if account.AuthMode.Prohibited() {
 		return false
 	}
+	// An `experimental` mode this deployment did not enable must not appear in an
+	// ordinary production catalog (§6.1). /v1/models is exactly such a catalog,
+	// so a snapshot for a non-enabled experimental mode is never offerable.
+	if service.labProfile.BlocksExperimental(account.AuthMode) {
+		return false
+	}
 	if !account.Controls.AuthModeExecutionEnabled {
 		return false
 	}

@@ -221,6 +221,12 @@ func (service *ProviderAccountService) validatePolicyCandidates(ctx context.Cont
 					return domain.NewInvalidRequest(), false
 				}
 				if mode.Prohibited() || mode.Experimental() {
+					// Cross-mode fallback INTO an experimental mode stays refused
+					// even in a lab deployment that enabled it as a candidate.
+					// FG-2 and §6.3 forbid silent cross-mode replacement: a dead
+					// Codex OAuth account must never be answered by ChatGPT Web
+					// Access. A lab exercises the experimental mode by naming it
+					// directly, not by falling back onto it.
 					return domain.NewAuthModeUnavailable(), false
 				}
 			}
@@ -234,8 +240,10 @@ func (service *ProviderAccountService) validatePolicyCandidates(ctx context.Cont
 // gates for a same-Tenant, allowlist-permitted account. now is the request
 // start instant — freshness and pair offerability must not re-sample clock.
 func (service *ProviderAccountService) policyCandidateRejection(ctx context.Context, principal domain.SecurityPrincipal, account domain.ProviderAccount, now time.Time) (domain.CanonicalError, bool) {
-	// Production fail-closed: experimental modes have no lab profile.
-	if account.AuthMode.Experimental() {
+	// An `experimental` mode is only a routing candidate in a deployment that
+	// deliberately enabled it as a lab profile; ordinary production has none, so
+	// the zero-value profile keeps this fail-closed (§5.1, §6.1).
+	if service.labProfile.BlocksExperimental(account.AuthMode) {
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if canonical, ok := service.authModeGate(account); !ok {

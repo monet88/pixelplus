@@ -1197,14 +1197,27 @@ func (service *ProviderAccountService) probeCircuitSurface(
 	return surface, nil
 }
 
-// authModeGate rejects a prohibited Auth Mode, a disabled Auth Mode execution
+// authModeGate rejects a prohibited Auth Mode, an experimental mode this
+// deployment did not enable as a lab profile, a disabled Auth Mode execution
 // control, and a gated/experimental mode without the required Tenant risk
-// acknowledgement, in that order. A prohibited or execution-disabled mode is
-// auth_mode_unavailable; missing Tenant risk acknowledgement remains
-// account_not_usable/ack_risk (risk envelope §3.5, §5.5, §6.1; connection
-// lifecycle spec §4.2, §5.1).
+// acknowledgement, in that order. A prohibited, lab-disabled, or
+// execution-disabled mode is auth_mode_unavailable; missing Tenant risk
+// acknowledgement remains account_not_usable/ack_risk (risk envelope §3.5,
+// §5.1, §5.5, §6.1; connection lifecycle spec §4.2, §5.1).
+//
+// The order is load-bearing. This gate runs before the Vault is asked for
+// anything, so an Auth Mode kill (AuthModeExecutionEnabled false, §3.5.4) or a
+// disabled lab profile stops new Adapter use BEFORE any decrypt or Provider
+// call, rather than discarding a result that was already fetched.
+//
+// Enablement and disclosure are separate checks and both must pass: a lab
+// operator who enables the profile still cannot reach protected credential
+// material for a Tenant that has not acknowledged the residual risk.
 func (service *ProviderAccountService) authModeGate(account domain.ProviderAccount) (domain.CanonicalError, bool) {
 	if account.AuthMode.Prohibited() {
+		return domain.NewAuthModeUnavailable(), false
+	}
+	if service.labProfile.BlocksExperimental(account.AuthMode) {
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if !account.Controls.AuthModeExecutionEnabled {

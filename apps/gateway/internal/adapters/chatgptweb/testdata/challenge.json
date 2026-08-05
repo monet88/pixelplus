@@ -1,0 +1,28 @@
+{
+  "_fixture": "Sanitized sentinel chat-requirements demanding challenges this Adapter refuses to solve (OP-G6, KS-5). Evidence §6 challenge/PoW/captcha signals.",
+  "_placeholder": "fixture-not-a-real-token",
+  "proof_of_work_required": {
+    "token": "fixture-not-a-real-token",
+    "arkose": { "required": false },
+    "proofofwork": { "required": true, "seed": "fixture-seed", "difficulty": "0fffff" },
+    "turnstile": { "required": false }
+  },
+  "turnstile_required": {
+    "token": "fixture-not-a-real-token",
+    "arkose": { "required": false },
+    "proofofwork": { "required": false },
+    "turnstile": { "required": true, "dx": "fixture-dx" }
+  },
+  "arkose_required": {
+    "token": "fixture-not-a-real-token",
+    "arkose": { "required": true, "dx": "fixture-dx" },
+    "proofofwork": { "required": false },
+    "turnstile": { "required": false }
+  },
+  "no_challenge": {
+    "token": "fixture-not-a-real-token",
+    "arkose": { "required": false },
+    "proofofwork": { "required": false },
+    "turnstile": { "required": false }
+  }
+}
