@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
@@ -34,8 +35,15 @@ func conversationBody(model string, messages []domain.ChatMessage, stream bool) 
 }
 
 // turnResult accumulates what one SSE turn produced.
+//
+// text is a plain string rather than a strings.Builder because a turnResult is
+// copied by value on every return path and again by the caller. Copying a
+// non-zero Builder and then writing to the copy panics ("illegal use of non-zero
+// Builder copied by value") and go vet does not catch it, so the accumulating
+// Builder stays local to consumeStream and only its finished string is stored
+// here.
 type turnResult struct {
-	text         strings.Builder
+	text         string
 	finished     bool
 	blocked      bool
 	drifted      bool
@@ -60,6 +68,14 @@ func consumeStream(ctx context.Context, stream Stream, deliver func(string) erro
 	if stream == nil {
 		return result, ErrTransportUnavailable
 	}
+	// The Builder is local: turnResult is copied by value on every return below,
+	// and copying a non-zero Builder then writing to it panics. snapshot folds the
+	// accumulated text into the returned value so no caller ever holds a Builder.
+	var text strings.Builder
+	snapshot := func() turnResult {
+		result.text = text.String()
+		return result
+	}
 	defer func() { _ = stream.Close() }()
 
 	for {
@@ -67,29 +83,29 @@ func consumeStream(ctx context.Context, stream Stream, deliver func(string) erro
 		// context is the cancel/disconnect signal (chat lifecycle §6.2/§6.3), and
 		// stopping here is the only abort this surface can honestly perform.
 		if err := ctx.Err(); err != nil {
-			return result, err
+			return snapshot(), err
 		}
 		payload, ok, err := stream.Next()
 		if err != nil {
-			return result, err
+			return snapshot(), err
 		}
 		if !ok {
-			return result, nil
+			return snapshot(), nil
 		}
 		for _, event := range decodeStreamPayload(payload) {
 			switch event.kind {
 			case eventDone:
 				result.sawDone = true
-				return result, nil
+				return snapshot(), nil
 			case eventDelta:
 				if event.text == "" {
 					continue
 				}
 				result.sawContent = true
-				result.text.WriteString(event.text)
+				text.WriteString(event.text)
 				if deliver != nil {
 					if err := deliver(event.text); err != nil {
-						return result, err
+						return snapshot(), err
 					}
 				}
 			case eventFinished:
@@ -237,7 +253,7 @@ func (adapter *Adapter) Run(ctx context.Context, command ports.ChatCommand, cred
 			Model:  command.Model,
 			Choices: []domain.ChatChoice{{
 				Index:       0,
-				Message:     domain.ChatMessage{Role: domain.ChatRoleAssistant, Content: result.text.String()},
+				Message:     domain.ChatMessage{Role: domain.ChatRoleAssistant, Content: result.text},
 				FinishClass: result.finishClass(),
 			}},
 		},
@@ -345,7 +361,7 @@ func (adapter *Adapter) withConversation(
 		// solves them (OP-G6), and a refused turn that never reached generation is
 		// authoritatively not committed.
 		requirements, err := adapter.exchange(ctx, Request{
-			Method:  "POST",
+			Method:  http.MethodPost,
 			Path:    PathChatRequirements,
 			Body:    "{}",
 			Headers: headers,
@@ -369,7 +385,7 @@ func (adapter *Adapter) withConversation(
 		}
 
 		opened, err := adapter.exchange(ctx, Request{
-			Method:  "POST",
+			Method:  http.MethodPost,
 			Path:    PathConversation,
 			Body:    body,
 			Headers: headers,

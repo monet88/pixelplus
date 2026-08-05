@@ -541,14 +541,21 @@ func TestLabChatReachesTheAdapterBoundaryForTheEnabledMode(t *testing.T) {
 	}
 }
 
-// AC2 + AC6: the render (image) path refuses an experimental account in ordinary
-// production before the Adapter is entered.
+// AC2 + AC6: the render (image) path refuses an experimental account before the
+// Adapter is entered — in ordinary production AND inside an enabled lab profile.
 //
 // Render matters separately from chat because it is asynchronous: the Adapter
 // runs on a worker, not in the request. So a gate that only refused at request
 // time would still let a job be enqueued and spend the credential later. The
 // assertion is therefore that nothing was enqueued at all.
-func TestProductionRenderRefusesTheExperimentalModeBeforeEnqueue(t *testing.T) {
+//
+// Unlike every other gate site, the lab profile deliberately does NOT open this
+// surface. No experimental Adapter implements ports.RenderAdapter and composition
+// builds no render registry for one, so an accepted job could only reach the
+// fail-closed foundation. Accepting it would answer 202, durably enqueue, and
+// fail on the worker — converting a refusal the Gateway can make before any
+// durable side effect into a job that dies later.
+func TestRenderRefusesTheExperimentalModeInEveryComposition(t *testing.T) {
 	t.Parallel()
 
 	seed := func(h *renderHarness) {
@@ -594,8 +601,9 @@ func TestProductionRenderRefusesTheExperimentalModeBeforeEnqueue(t *testing.T) {
 		t.Fatalf("vault.Validate ran %d times, want 0", calls)
 	}
 
-	// Paired positive: the identical request is admitted once the operator
-	// enabled the mode, so the refusal above is the gate and not a bad fixture.
+	// Enabling the mode does not open the render surface: the SAME request must
+	// still be refused, and still without an enqueue, because no render Adapter
+	// exists for it in either composition.
 	lab := newRenderHarness(t, func(h *renderHarness) {
 		h.labAuthModes = labModes
 		seed(h)
@@ -607,8 +615,39 @@ func TestProductionRenderRefusesTheExperimentalModeBeforeEnqueue(t *testing.T) {
 		idemKey: "idem-web-render-lab",
 		body:    generateBody,
 	})
+	if response.StatusCode == http.StatusAccepted {
+		t.Fatalf("lab accepted a render job it has no Adapter to serve (body=%s)", payload)
+	}
+	if code := decodeError(t, payload)["code"]; code != "auth_mode_unavailable" {
+		t.Fatalf("lab code = %v, want auth_mode_unavailable (body=%s)", code, payload)
+	}
+	// The load-bearing half: a 4xx alone would also be produced by a broken
+	// fixture. Zero enqueues proves the refusal happened before any durable job
+	// existed, which is what stops a worker from spending the credential later.
+	if refs := lab.fixture.EnqueuedReferences(); len(refs) != 0 {
+		t.Fatalf("lab enqueued %d render jobs, want 0", len(refs))
+	}
+	if calls := lab.vault.validCalls.Load(); calls != 0 {
+		t.Fatalf("lab vault.Validate ran %d times, want 0", calls)
+	}
+
+	// Control in the opposite direction: without it, a fixture that refused EVERY
+	// render request would pass both halves above. A `gated` mode on the same
+	// harness shape is admitted, so the refusals are the experimental gate rather
+	// than a render path that never works.
+	control := newRenderHarness(t, func(h *renderHarness) {
+		h.labAuthModes = labModes
+		seedRoutableImageAccount(h, "pa_gated_render")
+	})
+	response, payload = control.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/images/generations",
+		bearer:  tenantAKey,
+		idemKey: "idem-gated-render",
+		body:    generateBody,
+	})
 	if response.StatusCode != http.StatusAccepted {
-		t.Fatalf("lab status = %d, want 202 (body=%s)", response.StatusCode, payload)
+		t.Fatalf("control status = %d, want 202 (body=%s)", response.StatusCode, payload)
 	}
 }
 

@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
-
-	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
 
 // signalClass is the Adapter's normalized classification of one upstream
@@ -25,16 +23,9 @@ const (
 	signalChallenged
 	// signalRateLimited is a Provider rate-limit/backoff signal (HTTP 429).
 	signalRateLimited
-	// signalQuotaExhausted is an entitlement/quota-reset signal, observed as
-	// image_gen remaining == 0 in conversation/init limits_progress.
-	signalQuotaExhausted
 	// signalUnavailable is a transient backend failure. It maps to
 	// ErrDependencyUnavailable so admission fails closed.
 	signalUnavailable
-	// signalDrift is a protocol shape this Adapter cannot parse. It is distinct
-	// from unavailable because it is a KS-5-relevant observation: repeated drift
-	// means the protocol moved, not that the backend is down (evidence §7).
-	signalDrift
 )
 
 // classifyStatus maps an upstream HTTP status onto a signal class.
@@ -124,20 +115,6 @@ func parseImageQuota(body string) imageQuota {
 		}
 	}
 	return imageQuota{}
-}
-
-// probeSignal maps a signal class onto the port's normalized probe signal.
-// Only the time-waitable rate/quota classes produce a signal; every other class
-// is either an ordinary success or is handled on the auth/dependency path.
-func probeSignal(class signalClass) ports.ProbeSignalClass {
-	switch class {
-	case signalRateLimited:
-		return ports.ProbeSignalRateLimited
-	case signalQuotaExhausted:
-		return ports.ProbeSignalQuotaExhausted
-	default:
-		return ports.ProbeSignalNone
-	}
 }
 
 // modelSlugs extracts the session-dependent model slugs from a /backend-api/models

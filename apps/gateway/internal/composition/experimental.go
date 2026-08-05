@@ -38,14 +38,33 @@ func newExperimentalAdapters(config Config, dependencies Dependencies) experimen
 //
 // There is deliberately no renderAdapter helper beside the four below. This
 // story's Adapter implements chat, stream, probe, and capability only, and the
-// canonical chat surface has no carrier for an image asset — so a ChatGPT Web
-// image request is refused by application/render.go's candidate gate, which
-// consults LabProfile.BlocksExperimental like every other gate site, rather than
-// by a registry. If a later story gives an experimental Adapter a real
-// ports.RenderAdapter, it must add the matching renderAdapter helper here;
-// nothing else forces that, so the omission is recorded rather than implied.
+// canonical chat surface has no carrier for an image asset. A ChatGPT Web image
+// request is therefore refused on the render surface itself: renderCandidate
+// keeps the mode out of the candidate set in EVERY composition, lab included,
+// because no registry here can serve it. If a later story gives an experimental
+// Adapter a real ports.RenderAdapter, it must add the matching renderAdapter
+// helper here AND relax that render gate together; nothing else forces that, so
+// the omission is recorded rather than implied.
 func (enabled experimentalAdapters) none() bool {
 	return enabled.chatGPTWeb == nil
+}
+
+// byMode collects the enabled Adapters keyed by Auth Mode, narrowed to whatever
+// port the caller asked for.
+//
+// The four helpers below differ only in their port type, so the shape lives here
+// once: an Adapter is registered for a mode when the profile enabled it and the
+// concrete Adapter satisfies that port. The `ok` check is not ceremony — it is
+// what makes an Adapter that does not implement a port absent from that port's
+// registry rather than a nil entry that would panic on dispatch.
+func experimentalByMode[T any](enabled experimentalAdapters) map[domain.AuthMode]T {
+	byMode := map[domain.AuthMode]T{}
+	if enabled.chatGPTWeb != nil {
+		if port, ok := any(enabled.chatGPTWeb).(T); ok {
+			byMode[domain.AuthModeChatGPTWebAccess] = port
+		}
+	}
+	return byMode
 }
 
 // chatAdapter returns fallback unchanged in production, or a registry that
@@ -54,11 +73,7 @@ func (enabled experimentalAdapters) chatAdapter(fallback ports.ChatAdapter) port
 	if enabled.none() {
 		return fallback
 	}
-	byMode := map[domain.AuthMode]ports.ChatAdapter{}
-	if enabled.chatGPTWeb != nil {
-		byMode[domain.AuthModeChatGPTWebAccess] = enabled.chatGPTWeb
-	}
-	return adapters.NewChatAdapterRegistry(fallback, byMode)
+	return adapters.NewChatAdapterRegistry(fallback, experimentalByMode[ports.ChatAdapter](enabled))
 }
 
 // chatStreamAdapter mirrors chatAdapter for the streaming surface.
@@ -66,11 +81,7 @@ func (enabled experimentalAdapters) chatStreamAdapter(fallback ports.ChatStreamA
 	if enabled.none() {
 		return fallback
 	}
-	byMode := map[domain.AuthMode]ports.ChatStreamAdapter{}
-	if enabled.chatGPTWeb != nil {
-		byMode[domain.AuthModeChatGPTWebAccess] = enabled.chatGPTWeb
-	}
-	return adapters.NewChatStreamAdapterRegistry(fallback, byMode)
+	return adapters.NewChatStreamAdapterRegistry(fallback, experimentalByMode[ports.ChatStreamAdapter](enabled))
 }
 
 // probeAdapter mirrors chatAdapter for credential probes.
@@ -78,11 +89,7 @@ func (enabled experimentalAdapters) probeAdapter(fallback ports.ProbeAdapter) po
 	if enabled.none() {
 		return fallback
 	}
-	byMode := map[domain.AuthMode]ports.ProbeAdapter{}
-	if enabled.chatGPTWeb != nil {
-		byMode[domain.AuthModeChatGPTWebAccess] = enabled.chatGPTWeb
-	}
-	return adapters.NewProbeAdapterRegistry(fallback, byMode)
+	return adapters.NewProbeAdapterRegistry(fallback, experimentalByMode[ports.ProbeAdapter](enabled))
 }
 
 // capabilityAdapter mirrors chatAdapter for capability observation.
@@ -90,9 +97,5 @@ func (enabled experimentalAdapters) capabilityAdapter(fallback ports.CapabilityA
 	if enabled.none() {
 		return fallback
 	}
-	byMode := map[domain.AuthMode]ports.CapabilityAdapter{}
-	if enabled.chatGPTWeb != nil {
-		byMode[domain.AuthModeChatGPTWebAccess] = enabled.chatGPTWeb
-	}
-	return adapters.NewCapabilityAdapterRegistry(fallback, byMode)
+	return adapters.NewCapabilityAdapterRegistry(fallback, experimentalByMode[ports.CapabilityAdapter](enabled))
 }

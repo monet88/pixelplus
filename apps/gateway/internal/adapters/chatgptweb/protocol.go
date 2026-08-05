@@ -37,8 +37,6 @@ type streamEvent struct {
 	text string
 	// pointer is the asset pointer for eventImage.
 	pointer string
-	// conversationID is carried when the payload disclosed one.
-	conversationID string
 }
 
 // decodeStreamPayload translates one raw SSE `data:` payload into a canonical
@@ -87,6 +85,11 @@ func decodeStreamPayload(payload string) []streamEvent {
 // decodeStreamPayload so a batch patch can recurse into its elements without
 // re-serializing them.
 func decodeObject(raw map[string]any) []streamEvent {
+	// The conversation id is read but never carried on a streamEvent: no consumer
+	// needs it (the affinity key is the client's own conversation_id from the
+	// request, not the Provider's), and it is Provider-specific. It stays local as
+	// the "this payload was at least a recognizable conversation event" signal
+	// used at the end of this function.
 	conversationID, _ := raw["conversation_id"].(string)
 
 	// Typed events first: they are self-describing and never patches.
@@ -94,21 +97,21 @@ func decodeObject(raw map[string]any) []streamEvent {
 		switch eventType {
 		case "moderation":
 			if moderationBlocked(raw) {
-				return []streamEvent{{kind: eventBlocked, conversationID: conversationID}}
+				return []streamEvent{{kind: eventBlocked}}
 			}
-			return []streamEvent{{kind: eventIgnored, conversationID: conversationID}}
+			return []streamEvent{{kind: eventIgnored}}
 		case "resume_conversation_token", "message_marker", "title_generation",
 			"server_ste_metadata", "input_message":
 			// Non-content events. The resume token in particular MUST NOT be
 			// exposed downstream (evidence: "token 不应该暴露给下游用户").
-			return []streamEvent{{kind: eventIgnored, conversationID: conversationID}}
+			return []streamEvent{{kind: eventIgnored}}
 		default:
 			// A typed event this Adapter has never seen is drift, NOT something to
 			// ignore. The Provider added a self-describing event we cannot
 			// interpret, which is precisely the KS-5-relevant observation (evidence
 			// §7). Ignoring it would let a moved protocol return an empty
 			// generation that still classified as committed.
-			return []streamEvent{{kind: eventDrift, conversationID: conversationID}}
+			return []streamEvent{{kind: eventDrift}}
 		}
 	}
 
@@ -139,21 +142,21 @@ func decodeObject(raw map[string]any) []streamEvent {
 		switch path {
 		case "/message/status":
 			if status, _ := raw["v"].(string); status == "finished_successfully" {
-				return []streamEvent{{kind: eventFinished, conversationID: conversationID}}
+				return []streamEvent{{kind: eventFinished}}
 			}
-			return []streamEvent{{kind: eventIgnored, conversationID: conversationID}}
+			return []streamEvent{{kind: eventIgnored}}
 		case "/message/end_turn":
 			if ended, _ := raw["v"].(bool); ended {
-				return []streamEvent{{kind: eventFinished, conversationID: conversationID}}
+				return []streamEvent{{kind: eventFinished}}
 			}
-			return []streamEvent{{kind: eventIgnored, conversationID: conversationID}}
+			return []streamEvent{{kind: eventIgnored}}
 		}
 	}
 
 	// Content append on the canonical text part.
 	if path == "/message/content/parts/0" && (operation == "append" || operation == "") {
 		if text, ok := raw["v"].(string); ok {
-			return []streamEvent{{kind: eventDelta, text: text, conversationID: conversationID}}
+			return []streamEvent{{kind: eventDelta, text: text}}
 		}
 		return []streamEvent{{kind: eventDrift}}
 	}
@@ -161,22 +164,22 @@ func decodeObject(raw map[string]any) []streamEvent {
 	// A full message value: either an image-tool output or a message shell.
 	if message, ok := messageFrom(raw["v"]); ok {
 		if pointer, ok := imageOutputPointer(message); ok {
-			return []streamEvent{{kind: eventImage, pointer: pointer, conversationID: conversationID}}
+			return []streamEvent{{kind: eventImage, pointer: pointer}}
 		}
 		if messageFinished(message) {
-			return []streamEvent{{kind: eventFinished, conversationID: conversationID}}
+			return []streamEvent{{kind: eventFinished}}
 		}
-		return []streamEvent{{kind: eventIgnored, conversationID: conversationID}}
+		return []streamEvent{{kind: eventIgnored}}
 	}
 
 	// Path-elided text delta: only `v` present and it is a string (evidence: "只有
 	// v 且 v 是字符串 | 可能是省略路径的文本增量").
 	if text, ok := raw["v"].(string); ok && path == "" {
-		return []streamEvent{{kind: eventDelta, text: text, conversationID: conversationID}}
+		return []streamEvent{{kind: eventDelta, text: text}}
 	}
 
 	if conversationID != "" {
-		return []streamEvent{{kind: eventIgnored, conversationID: conversationID}}
+		return []streamEvent{{kind: eventIgnored}}
 	}
 	return []streamEvent{{kind: eventDrift}}
 }

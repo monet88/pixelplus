@@ -14,8 +14,6 @@ const (
 	// PathConversationInit carries default model slug and limits_progress, which
 	// is where the image_gen quota and its reset live.
 	PathConversationInit = "/backend-api/conversation/init"
-	// PathAccountsCheck carries the plan type / entitlement view.
-	PathAccountsCheck = "/backend-api/accounts/check/v4-2023-04-27"
 	// PathChatRequirements is the sentinel pre-flight that declares whether a
 	// challenge (Arkose / proof-of-work / Turnstile) is required.
 	PathChatRequirements = "/backend-api/sentinel/chat-requirements"

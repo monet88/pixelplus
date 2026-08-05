@@ -29,7 +29,7 @@ type ChatAdapterRegistry struct {
 
 // NewChatAdapterRegistry builds a registry over a fail-closed fallback.
 func NewChatAdapterRegistry(fallback ports.ChatAdapter, byMode map[domain.AuthMode]ports.ChatAdapter) *ChatAdapterRegistry {
-	return &ChatAdapterRegistry{fallback: fallback, byMode: cloneChatAdapters(byMode)}
+	return &ChatAdapterRegistry{fallback: fallback, byMode: cloneByMode(byMode)}
 }
 
 // Run dispatches to the Auth Mode's Adapter, or the fallback.
@@ -53,7 +53,7 @@ type ChatStreamAdapterRegistry struct {
 
 // NewChatStreamAdapterRegistry builds a registry over a fail-closed fallback.
 func NewChatStreamAdapterRegistry(fallback ports.ChatStreamAdapter, byMode map[domain.AuthMode]ports.ChatStreamAdapter) *ChatStreamAdapterRegistry {
-	return &ChatStreamAdapterRegistry{fallback: fallback, byMode: cloneChatStreamAdapters(byMode)}
+	return &ChatStreamAdapterRegistry{fallback: fallback, byMode: cloneByMode(byMode)}
 }
 
 // Stream dispatches to the Auth Mode's Adapter, or the fallback. A missing
@@ -85,7 +85,7 @@ type ProbeAdapterRegistry struct {
 
 // NewProbeAdapterRegistry builds a registry over a fail-closed fallback.
 func NewProbeAdapterRegistry(fallback ports.ProbeAdapter, byMode map[domain.AuthMode]ports.ProbeAdapter) *ProbeAdapterRegistry {
-	return &ProbeAdapterRegistry{fallback: fallback, byMode: cloneProbeAdapters(byMode)}
+	return &ProbeAdapterRegistry{fallback: fallback, byMode: cloneByMode(byMode)}
 }
 
 // Probe dispatches to the Auth Mode's Adapter, or the fallback.
@@ -109,7 +109,7 @@ type CapabilityAdapterRegistry struct {
 
 // NewCapabilityAdapterRegistry builds a registry over a fail-closed fallback.
 func NewCapabilityAdapterRegistry(fallback ports.CapabilityAdapter, byMode map[domain.AuthMode]ports.CapabilityAdapter) *CapabilityAdapterRegistry {
-	return &CapabilityAdapterRegistry{fallback: fallback, byMode: cloneCapabilityAdapters(byMode)}
+	return &CapabilityAdapterRegistry{fallback: fallback, byMode: cloneByMode(byMode)}
 }
 
 // Observe dispatches to the Auth Mode's Adapter, or the fallback.
@@ -125,47 +125,18 @@ func (registry *CapabilityAdapterRegistry) Observe(ctx context.Context, command 
 	return ports.CapabilityObservation{}, ports.ErrDependencyUnavailable
 }
 
-// The clone helpers copy the caller's map so a later mutation of the argument
-// cannot silently add or remove an Auth Mode from a live registry.
-
-func cloneChatAdapters(source map[domain.AuthMode]ports.ChatAdapter) map[domain.AuthMode]ports.ChatAdapter {
+// cloneByMode copies the caller's map so a later mutation of the argument cannot
+// silently add or remove an Auth Mode from a live registry.
+//
+// An empty or nil source yields nil rather than an empty map, which keeps the
+// dispatch lookup on the fallback path unchanged: a nil map read returns the
+// zero value and `ok == false`, so a registry built with no modes behaves
+// exactly like the bare fallback.
+func cloneByMode[T any](source map[domain.AuthMode]T) map[domain.AuthMode]T {
 	if len(source) == 0 {
 		return nil
 	}
-	cloned := make(map[domain.AuthMode]ports.ChatAdapter, len(source))
-	for mode, adapter := range source {
-		cloned[mode] = adapter
-	}
-	return cloned
-}
-
-func cloneChatStreamAdapters(source map[domain.AuthMode]ports.ChatStreamAdapter) map[domain.AuthMode]ports.ChatStreamAdapter {
-	if len(source) == 0 {
-		return nil
-	}
-	cloned := make(map[domain.AuthMode]ports.ChatStreamAdapter, len(source))
-	for mode, adapter := range source {
-		cloned[mode] = adapter
-	}
-	return cloned
-}
-
-func cloneProbeAdapters(source map[domain.AuthMode]ports.ProbeAdapter) map[domain.AuthMode]ports.ProbeAdapter {
-	if len(source) == 0 {
-		return nil
-	}
-	cloned := make(map[domain.AuthMode]ports.ProbeAdapter, len(source))
-	for mode, adapter := range source {
-		cloned[mode] = adapter
-	}
-	return cloned
-}
-
-func cloneCapabilityAdapters(source map[domain.AuthMode]ports.CapabilityAdapter) map[domain.AuthMode]ports.CapabilityAdapter {
-	if len(source) == 0 {
-		return nil
-	}
-	cloned := make(map[domain.AuthMode]ports.CapabilityAdapter, len(source))
+	cloned := make(map[domain.AuthMode]T, len(source))
 	for mode, adapter := range source {
 		cloned[mode] = adapter
 	}

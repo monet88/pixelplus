@@ -159,10 +159,6 @@ type RenderService struct {
 	// leaseTTL / heartbeatInterval bound worker fence renewals (tests inject short).
 	leaseTTL          time.Duration
 	heartbeatInterval time.Duration
-	// labProfile names the `experimental` Auth Modes this deployment deliberately
-	// enabled. The zero value enables nothing, so ordinary production keeps every
-	// experimental account out of the render candidate set (risk envelope §5.1).
-	labProfile domain.LabProfile
 }
 
 // RenderDependencies bundles the controlled ports this slice owns.
@@ -198,10 +194,12 @@ type RenderDependencies struct {
 	WorkerLeaseTTL time.Duration
 	// HeartbeatInterval is how often RenewWorkerLease runs during Adapter
 	// (zero → leaseTTL/3). Tests inject short intervals for deterministic cancel.
+	//
+	// There is deliberately no LabProfile here. The render candidate gate refuses
+	// every `experimental` Auth Mode unconditionally because no experimental
+	// Adapter implements ports.RenderAdapter, so a profile would have nothing to
+	// unlock on this surface — see candidateRejection.
 	HeartbeatInterval time.Duration
-	// LabProfile is optional and defaults to the closed zero value, which keeps
-	// every `experimental` Auth Mode out of the render candidate set.
-	LabProfile domain.LabProfile
 }
 
 // NewRenderService validates and wires the Render Job spine dependencies.
@@ -283,7 +281,6 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		ids:               dependencies.IDs,
 		leaseTTL:          leaseTTL,
 		heartbeatInterval: hb,
-		labProfile:        dependencies.LabProfile,
 	}, nil
 }
 
@@ -2221,9 +2218,26 @@ func (service *RenderService) candidateRejection(
 	model string,
 	now time.Time,
 ) (domain.CanonicalError, bool) {
-	// C3 risk / C2 usability. An experimental mode is a candidate only in a
-	// deployment that deliberately enabled it as a lab profile (§5.1, §6.1).
-	if account.AuthMode.Prohibited() || service.labProfile.BlocksExperimental(account.AuthMode) {
+	// C3 risk / C2 usability.
+	//
+	// The experimental check is UNCONDITIONAL here, unlike every other gate site,
+	// and the lab profile deliberately does not relax it. No experimental Adapter
+	// implements ports.RenderAdapter, and composition builds no render registry
+	// for one (see composition/experimental.go), so the only render port an
+	// experimental account can reach is the fail-closed foundation.
+	//
+	// Cause and effect if this consulted the lab profile: an enabled deployment
+	// would answer POST /v1/images/generations with 202 Accepted, durably enqueue
+	// the Render Job, and the worker would then fail it against
+	// FailClosedRenderAdapter — turning a refusal the Gateway could make
+	// synchronously, before any durable side effect, into an accepted job that
+	// dies later. Refusing at candidate selection keeps the failure at
+	// declaration time.
+	//
+	// A later story that gives an experimental Adapter a real ports.RenderAdapter
+	// must relax this gate and add the render registry together; either alone is
+	// incoherent.
+	if account.AuthMode.Prohibited() || account.AuthMode.Experimental() {
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if account.AuthMode.RequiresRiskAck() && !account.RiskAcknowledged {

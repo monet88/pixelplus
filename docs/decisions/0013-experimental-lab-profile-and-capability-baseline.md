@@ -78,8 +78,35 @@ to reject an experimental mode even inside an enabled lab profile, because FG-2
 and §6.3 forbid silent cross-mode fallback regardless of enablement.
 `ValidateRoutingPolicyShape` was deliberately left untouched (upstream impact
 analysis: HIGH risk, 7 impacted symbols, 4 affected processes including the
-durable routing ledger). A lab policy names a single experimental account with
-`fallback_enabled: false`, so it needs no change there.
+durable routing ledger).
+
+It needs no change because the rule it enforces is *unconditional*, not because
+a lab policy happens to be shaped a particular way. The validator takes only
+`RoutingPolicy` and never receives a `LabProfile`, so it structurally cannot
+consult enablement — and must not, since FG-2 and §6.3 forbid cross-mode
+fallback into an experimental mode *regardless* of enablement. Its refusal is
+therefore correct in both compositions for the same reason.
+
+Two code paths make that exhaustive, and neither depends on how an operator
+writes a lab policy:
+
+- With `fallback_enabled: false`, declaring any `fallback_auth_modes` is already
+  a shape error (`fallback disabled with chain or modes`), so the per-mode loop
+  is never reached with an entry to inspect.
+- With `fallback_enabled: true`, the per-mode loop rejects any
+  `mode.Experimental()` outright with `ErrRoutingPolicyModeUnavailable`.
+
+`TestCrossModeFallbackIntoTheExperimentalModeStaysRefused` pins the second path
+from inside an *enabled* lab profile — the only case where a regression could
+hide — and also asserts `routing.Replace` ran zero times, so a refused shape is
+never persisted.
+
+An earlier draft of this record justified the omission by saying "a lab policy
+names a single experimental account with `fallback_enabled: false`". That
+reasoning was wrong even though the decision was right: it described a usage
+convention rather than an enforced invariant, and it would have implied the
+function becomes unsafe as soon as a lab policy enables fallback. It does not —
+the refusal above is unconditional.
 
 ## Alternatives Considered
 
@@ -149,10 +176,52 @@ payload.
 
 The alternative — adding an asset carrier to the canonical chat types — was
 rejected as out of scope. It changes a shared `domain` contract every Provider
-Adapter depends on, and image operations belong to the render surface, whose
-candidate gate already refuses this Auth Mode. Surfacing image results on the
-chat surface is a product decision for a later story, not an implementation
-detail of T18.
+Adapter depends on, and image operations belong to the render surface. Surfacing
+image results on the chat surface is a product decision for a later story, not an
+implementation detail of T18.
+
+## The render surface refuses an experimental mode in every composition
+
+The render candidate gate is the one gate site that does **not** consult
+`LabProfile`. `RenderService.candidateRejection` refuses
+`account.AuthMode.Experimental()` unconditionally, and `RenderDependencies`
+deliberately carries no `LabProfile` field.
+
+The reason is that enabling a mode and being able to serve it are different
+facts, and only on this surface do they come apart. `chatgptweb.Adapter`
+implements `ports.ChatAdapter`, `ChatStreamAdapter`, `ProbeAdapter`, and
+`CapabilityAdapter` — but not `ports.RenderAdapter` — and
+`composition/experimental.go` builds no render registry. So the only render port
+an experimental account can reach is `FailClosedRenderAdapter`, in the lab
+composition exactly as in production.
+
+Cause and effect if the gate consulted the profile instead: an enabled deployment
+answers `POST /v1/images/generations` with `202 Accepted`, durably enqueues the
+Render Job, returns to the caller — and the worker then fails it against the
+fail-closed foundation. That converts a refusal the Gateway can make
+synchronously, before any durable side effect, into an accepted job that dies
+later, which is precisely the asynchronous-spend risk AC6 exists to prevent.
+
+An earlier revision of this record justified the missing `renderAdapter` helper
+by saying the render "candidate gate already refuses this Auth Mode". That was
+true in production and false in the lab composition, which is the only case where
+it mattered: the gate consulted `BlocksExperimental`, so an enabled profile
+admitted the job. `TestRenderRefusesTheExperimentalModeInEveryComposition` now
+pins both compositions, asserts zero enqueues and zero Vault use in each, and
+carries a `gated`-mode control so a render path that refused everything could not
+pass it.
+
+A later story that gives an experimental Adapter a real `ports.RenderAdapter`
+must relax this gate and add the render registry **together**; either alone is
+incoherent.
+
+The Capability Snapshot is deliberately unaffected. `Adapter.Observe` keeps
+reporting the image operations as `conditionally_supported`, matching the
+capability spec's own baseline matrix (§4.3: ChatGPT Web Access is `cond` for
+`image_generation`, `image_edit`, and `inpaint`). A snapshot records what the
+**account** can do, not what this Gateway build can currently serve, so
+downgrading it to `unsupported` would misreport the evidence in order to describe
+a composition gap.
 
 ## Follow-Up
 
@@ -164,5 +233,17 @@ detail of T18.
   surface. Until that is decided, an image-only chat turn is UNKNOWN rather than
   a silently empty success.
 - A `renderAdapter` helper in `composition/experimental.go` if a later story
-  gives an experimental Adapter a real `ports.RenderAdapter`. Its absence is
-  currently intentional and recorded in a comment there.
+  gives an experimental Adapter a real `ports.RenderAdapter`, together with
+  relaxing the unconditional experimental refusal in
+  `RenderService.candidateRejection`. Its absence is currently intentional and
+  recorded in a comment at both sites.
+- An operator-facing way to enable the lab profile in the shipped binary (#96).
+  `cmd/gateway` parses no `ExperimentalLabAuthModes`, so only a test composition
+  can set one today. Deferred deliberately: adding the environment surface widens
+  the production attack surface and #61 authorized no live probe.
+- A distinguishable challenge outcome on the probe path (#97). `signalChallenged`
+  currently maps to `ports.ErrDependencyUnavailable`, so a bot interstitial is
+  indistinguishable from a 500 and the FG-5 / KS-2 challenge-rate counters cannot
+  be fed from it. `domain.HealthReasonChallengeDetected` already exists, but
+  `ports` has no challenge-class probe outcome, so this needs a port change and
+  is out of T18's scope.

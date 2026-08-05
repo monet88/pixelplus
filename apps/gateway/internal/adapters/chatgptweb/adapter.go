@@ -2,10 +2,28 @@ package chatgptweb
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
 )
+
+// dependencyUnavailable wraps a transport-layer failure so it still satisfies
+// errors.Is(err, ports.ErrDependencyUnavailable) — which the probe spine relies
+// on to fail admission closed — while preserving the underlying cause.
+//
+// Cause and effect: without the wrap, a nil-transport composition and a genuine
+// upstream timeout reach the spine as the same bare sentinel, so an operator who
+// enabled the lab profile but forgot to supply transport sees only "dependency
+// unavailable" with nothing to distinguish it from a Provider outage.
+//
+// The stage label is a fixed literal chosen by this package, never a Provider
+// body, header, or credential value (OP-G3), and the wrapped cause is always an
+// Adapter-internal or transport error for the same reason.
+func dependencyUnavailable(stage string, cause error) error {
+	return fmt.Errorf("chatgpt web %s: %w: %w", stage, ports.ErrDependencyUnavailable, cause)
+}
 
 // Adapter is the ChatGPT Web Access protocol Adapter. It is stateless: the only
 // field is the transport seam, so nothing observed on one request can influence
@@ -58,9 +76,9 @@ func (adapter *Adapter) Probe(ctx context.Context, command ports.ProbeCommand) (
 		return ports.ProbeOutcome{}, ports.ErrDependencyUnavailable
 	}
 
-	identity, err := adapter.exchange(ctx, Request{Method: "GET", Path: PathMe})
+	identity, err := adapter.exchange(ctx, Request{Method: http.MethodGet, Path: PathMe})
 	if err != nil {
-		return ports.ProbeOutcome{}, ports.ErrDependencyUnavailable
+		return ports.ProbeOutcome{}, dependencyUnavailable("probe identity", err)
 	}
 	switch classifyStatus(identity.Status) {
 	case signalAuthFailed:
@@ -84,9 +102,9 @@ func (adapter *Adapter) Probe(ctx context.Context, command ports.ProbeCommand) (
 		return ports.ProbeOutcome{}, ports.ErrDependencyUnavailable
 	}
 
-	initial, err := adapter.exchange(ctx, Request{Method: "POST", Path: PathConversationInit, Body: "{}"})
+	initial, err := adapter.exchange(ctx, Request{Method: http.MethodPost, Path: PathConversationInit, Body: "{}"})
 	if err != nil {
-		return ports.ProbeOutcome{}, ports.ErrDependencyUnavailable
+		return ports.ProbeOutcome{}, dependencyUnavailable("probe conversation init", err)
 	}
 	switch classifyStatus(initial.Status) {
 	case signalAuthFailed:
@@ -140,9 +158,9 @@ func (adapter *Adapter) Observe(ctx context.Context, command ports.CapabilityObs
 		return ports.CapabilityObservation{}, ports.ErrDependencyUnavailable
 	}
 
-	listed, err := adapter.exchange(ctx, Request{Method: "GET", Path: PathModels})
+	listed, err := adapter.exchange(ctx, Request{Method: http.MethodGet, Path: PathModels})
 	if err != nil {
-		return ports.CapabilityObservation{}, ports.ErrDependencyUnavailable
+		return ports.CapabilityObservation{}, dependencyUnavailable("observe models", err)
 	}
 	switch classifyStatus(listed.Status) {
 	case signalOK:

@@ -370,7 +370,13 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 		logger.Error("render job durability, authorizer, or usable digester not configured; readiness stays closed")
 	}
 
-	service, err := newProviderAccountService(config, dependencies)
+	// Built once and shared: the ProviderAccount and Chat services must observe
+	// the SAME experimental Adapter instances. Constructing per service happens to
+	// be harmless while the Adapter is stateless, but it would silently give the
+	// two spines separate objects the moment one gains state.
+	experimental := newExperimentalAdapters(config, dependencies)
+
+	service, err := newProviderAccountService(config, dependencies, experimental)
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +400,7 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	chatService, err := newChatService(config, dependencies)
+	chatService, err := newChatService(config, dependencies, experimental)
 	if err != nil {
 		return nil, err
 	}
@@ -480,7 +486,11 @@ func restoreRenderPorts(ctx context.Context, dependencies Dependencies) error {
 // Each nil port falls back to the fail-closed/foundation production
 // implementation so the real production composition constructor is safe by
 // default; contract tests override any subset through Dependencies.
-func newProviderAccountService(config Config, dependencies Dependencies) (*application.ProviderAccountService, error) {
+func newProviderAccountService(
+	config Config,
+	dependencies Dependencies,
+	experimental experimentalAdapters,
+) (*application.ProviderAccountService, error) {
 	principal := dependencies.Principal
 	if principal == nil {
 		principal = persistence.NewFailClosedPrincipalStore()
@@ -537,7 +547,6 @@ func newProviderAccountService(config Config, dependencies Dependencies) (*appli
 	// Experimental lab registration (#61 / T18). With no lab profile these return
 	// the fail-closed foundations unchanged, so ordinary production composes no
 	// experimental Adapter at all.
-	experimental := newExperimentalAdapters(config, dependencies)
 	probe = experimental.probeAdapter(probe)
 	capability = experimental.capabilityAdapter(capability)
 	circuits := dependencies.Circuits
@@ -765,7 +774,6 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 		IDs:               dependencies.IDs,
 		WorkerLeaseTTL:    dependencies.RenderWorkerLeaseTTL,
 		HeartbeatInterval: dependencies.RenderHeartbeatInterval,
-		LabProfile:        config.labProfile(),
 	})
 }
 
@@ -817,7 +825,11 @@ func NewControlledChatStreamLeaseStore() ports.ChatStreamLeaseStore {
 // newChatService wires the chat spine (non-streaming and streaming). Nil ports
 // fall back to fail-closed foundations so production composition is safe by
 // default; contract fixtures inject controlled fakes.
-func newChatService(config Config, dependencies Dependencies) (*application.ChatService, error) {
+func newChatService(
+	config Config,
+	dependencies Dependencies,
+	experimental experimentalAdapters,
+) (*application.ChatService, error) {
 	principal := dependencies.Principal
 	if principal == nil {
 		principal = persistence.NewFailClosedPrincipalStore()
@@ -871,8 +883,6 @@ func newChatService(config Config, dependencies Dependencies) (*application.Chat
 	if audit == nil {
 		audit = observability.NewSlogChatAuditRecorder(dependencies.Logger)
 	}
-	// Experimental lab registration (#61 / T18). Empty in ordinary production.
-	experimental := newExperimentalAdapters(config, dependencies)
 	authorized := dependencies.AuthorizedChat
 	if authorized == nil {
 		adapter := dependencies.ChatAdapter
