@@ -1,0 +1,39 @@
+apps/gateway/internal/application/chat_cancel.go
+  s_c9cf961dc642ff::t_1577003ac63c27 107-114,129-130,142-163,226-231,234-236
+apps/gateway/internal/application/chat_cancel_registry_test.go
+  s_c9cf961dc642ff::t_c909dd78894f12 4,31,45,54,65-180
+apps/gateway/internal/application/chat_stream.go
+  s_8472dfd59fb424::t_e9d41279176e41 351-354,356-360,362-366,388,391-394,532-537,554-555,557,562-582,618-625,628-664,666-669,1020-1024,1029-1033
+apps/gateway/internal/contracttest/chat_cancel_test.go
+  s_c9cf961dc642ff::t_a5a611f685fa94 238-241,245-247,279-282,287-288,293-295,297,300-303,307
+apps/gateway/internal/contracttest/chat_settlement_detached_test.go
+  s_c9cf961dc642ff::t_44b0d892f3aa60 177-250
+apps/gateway/internal/contracttest/chat_stream_fakes_test.go
+  s_c9cf961dc642ff::t_97c7289111bb9a 10,276-285,287-290,298-300,325-327,340-343
+apps/gateway/internal/contracttest/chat_usage_reconcile_test.go
+  s_c9cf961dc642ff::t_c1c3e5cfb1e714 172-175,183
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "2035539f23d9ea8a7575e6ece9befa4a26c824e5",
+  "prompts": {},
+  "sessions": {
+    "s_8472dfd59fb424": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "55719c10-ea62-427b-bc2c-c35c3624bec5",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_c9cf961dc642ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53861371-cfc6-4bf9-9ade-53b7f14fd1ad",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
