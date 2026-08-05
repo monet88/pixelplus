@@ -563,3 +563,130 @@ func TestNonStreamBreakBeforeAnyContentStaysAuthoritativeNoCommit(t *testing.T) 
 		t.Fatalf("commit = %s, want not_committed so fallback stays authorized", outcome.Commit)
 	}
 }
+
+func TestMetadataPatchesAreNonContentNotDrift(t *testing.T) {
+	t.Parallel()
+
+	// Real transcripts carry metadata replaces alongside content. These must stay
+	// non-content rather than drift: classifying them as drift would make every
+	// ordinary turn look like a moved protocol, and the FG-5/KS-2 drift counters
+	// would be useless. This pins the boundary opposite
+	// TestUnknownTypedEventIsDriftEvenWhenItCarriesAConversationID — an unknown
+	// `type` is drift, but a known-shaped patch on an uninteresting path is not.
+	transcript := `"v1"` + "\n" +
+		`{"p":"/message/metadata/model_slug","o":"replace","v":"gpt-fixture-1","conversation_id":"conv-fixture-0006"}` + "\n" +
+		`{"p":"/message/content/parts/0","o":"append","v":"Hi"}` + "\n" +
+		`{"p":"/message/metadata/finish_details","o":"replace","v":{"type":"stop"},"conversation_id":"conv-fixture-0006"}` + "\n" +
+		`{"p":"/message/status","o":"replace","v":"finished_successfully"}` + "\n" +
+		"[DONE]\n"
+
+	adapter := chatgptweb.New(conversationTransport(t, transcript))
+	sink := &recordingSink{}
+
+	outcome, err := adapter.Stream(t.Context(), streamCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder}, sink)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if outcome.FailureClass == domain.ErrCodeUpstreamProtocolDrift {
+		t.Fatal("metadata patches were classified as protocol drift")
+	}
+	if outcome.Commit != domain.CommitCommitted {
+		t.Errorf("commit = %s, want committed", outcome.Commit)
+	}
+	if got := sink.joined(); got != "Hi" {
+		t.Errorf("content = %q, want %q", got, "Hi")
+	}
+	// The metadata patches must not have produced deltas of their own.
+	if len(sink.content()) != 1 {
+		t.Errorf("delta count = %d, want 1", len(sink.content()))
+	}
+}
+
+// truncatedStream ends without [DONE] and without any finish marker, which is
+// what a connection drop mid-generation looks like on the wire.
+type truncatedStream struct {
+	payloads []string
+	cursor   int
+}
+
+func (stream *truncatedStream) Next() (string, bool, error) {
+	if stream.cursor >= len(stream.payloads) {
+		return "", false, nil
+	}
+	payload := stream.payloads[stream.cursor]
+	stream.cursor++
+	return payload, true, nil
+}
+
+func (stream *truncatedStream) Close() error { return nil }
+
+func TestTruncatedStreamIsNotReportedAsACleanStop(t *testing.T) {
+	t.Parallel()
+
+	// Content arrived, then the body ended with no finish marker and no [DONE].
+	//
+	// Regression: this returned committed with FinishClass `stop`, telling the
+	// caller the model chose to end there. It did not — the answer is cut off, and
+	// the upstream may have kept generating and billed the rest. A completed
+	// ChatGPT Web body always ends with [DONE], so its absence is the signal.
+	transcript := []string{
+		`"v1"`,
+		`{"p":"/message/content/parts/0","o":"append","v":"partial answer"}`,
+	}
+
+	build := func() *fixtureTransport {
+		return newFixtureTransport().
+			on(chatgptweb.PathChatRequirements, chatgptweb.Response{
+				Status: http.StatusOK,
+				Body:   loadFixtureSection(t, "challenge.json", "no_challenge"),
+			}).
+			on(chatgptweb.PathConversation, chatgptweb.Response{
+				Status: http.StatusOK,
+				Stream: &truncatedStream{payloads: transcript},
+			})
+	}
+
+	outcome, err := chatgptweb.New(build()).
+		Run(t.Context(), chatCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitUnknown {
+		t.Fatalf("commit = %s, want unknown for a truncated body", outcome.Commit)
+	}
+	// No partial answer may be presented as the completion.
+	if len(outcome.Completion.Choices) != 0 {
+		t.Errorf("returned %d choices from a truncated turn, want 0", len(outcome.Completion.Choices))
+	}
+
+	streamOutcome, err := chatgptweb.New(build()).
+		Stream(t.Context(), streamCommand("gpt-fixture-1"), &staticCredential{material: fixturePlaceholder}, &recordingSink{})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if streamOutcome.Commit != domain.CommitUnknown {
+		t.Errorf("stream commit = %s, want unknown", streamOutcome.Commit)
+	}
+	if streamOutcome.FinishClass == domain.FinishStop {
+		t.Error("truncated stream claimed a clean stop")
+	}
+}
+
+func TestDoneWithoutAFinishMarkerStillCompletes(t *testing.T) {
+	t.Parallel()
+
+	// The control for the test above. An image turn legitimately terminates with
+	// [DONE] and no message-status marker (see image_generate.sse), so requiring
+	// the marker would misclassify every image generation as truncated. [DONE]
+	// alone must be sufficient evidence that the body ended normally.
+	adapter := chatgptweb.New(conversationTransport(t, loadFixture(t, "image_generate.sse")))
+	sink := &recordingSink{}
+
+	outcome, err := adapter.Stream(t.Context(), streamCommand("gpt-image-fixture"), &staticCredential{material: fixturePlaceholder}, sink)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitCommitted {
+		t.Fatalf("commit = %s, want committed ([DONE] alone ends a turn normally)", outcome.Commit)
+	}
+}

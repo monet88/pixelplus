@@ -180,10 +180,10 @@ the wrong place — so each was deliberately broken and confirmed to fail:
 
 Each mutation was reverted and the suite re-run green.
 
-### Three commit-classification bugs found and fixed during self-review
+### Four commit-classification bugs found and fixed during review
 
-All three were found by probing the decoder and the failure paths with
-transcripts no fixture covered, and all three were the same class of error: the
+All four were found by probing the decoder and the failure paths with
+transcripts no fixture covered, and all four were the same class of error: the
 Adapter reported a commit certainty the evidence did not support. That is the
 most damaging thing this Adapter can get wrong, because the spine treats
 `committed` as authoritative (stops the fallback walk, bills the caller) and
@@ -223,4 +223,19 @@ treats `not_committed` as authorization to generate again.
 
 Fixes 1 and 2 were checked against the happy paths to confirm they do not
 over-reject: content, moderation-block, and image turns still commit.
+
+4. **A truncated stream was reported as a clean `stop`.** Found by the code
+   review. Content arrived and then the body ended with neither a finish marker
+   nor `[DONE]` — a connection drop mid-generation. The Adapter returned
+   `committed` with `FinishClass: stop`, telling the caller the model chose to end
+   there when the answer was actually cut off and the upstream may have kept
+   generating and billed the rest. Fixed with `turnResult.truncated()`, which
+   keys on the absence of `[DONE]` (`chat.go`).
+
+   The distinguisher matters: `[DONE]` alone is sufficient evidence of a normal
+   end, because an image turn legitimately terminates with `[DONE]` and no
+   message-status marker (`image_generate.sse`). Requiring the marker would have
+   misclassified every image generation as truncated. Regression:
+   `TestTruncatedStreamIsNotReportedAsACleanStop` (both surfaces) with its
+   control `TestDoneWithoutAFinishMarkerStillCompletes`.
 

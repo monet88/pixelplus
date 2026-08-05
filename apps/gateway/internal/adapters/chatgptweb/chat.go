@@ -41,6 +41,11 @@ type turnResult struct {
 	drifted      bool
 	imagePointer string
 	sawContent   bool
+	// sawDone records the `[DONE]` terminator. Its ABSENCE is the truncation
+	// signal: a real SSE body that ends without `[DONE]` ended prematurely, so a
+	// turn with content but neither `[DONE]` nor a finish marker was cut off
+	// mid-generation rather than completed.
+	sawDone bool
 }
 
 // consumeStream reads an SSE body to its end, applying each decoded event.
@@ -74,6 +79,7 @@ func consumeStream(ctx context.Context, stream Stream, deliver func(string) erro
 		for _, event := range decodeStreamPayload(payload) {
 			switch event.kind {
 			case eventDone:
+				result.sawDone = true
 				return result, nil
 			case eventDelta:
 				if event.text == "" {
@@ -123,6 +129,21 @@ func (result turnResult) producedNothing() bool {
 	return !result.sawContent && !result.finished && !result.blocked && result.imagePointer == ""
 }
 
+// truncated reports a turn whose body ended prematurely: content arrived but the
+// stream carried neither a finish marker nor the `[DONE]` terminator.
+//
+// A completed ChatGPT Web body always ends with `[DONE]`, so its absence means
+// the connection dropped mid-generation. Reporting `stop` for such a turn would
+// tell the caller the model chose to end there, when in fact the answer is cut
+// off — and the upstream may well have continued generating and billed the rest.
+//
+// `[DONE]` alone is enough to consider a turn complete: image turns legitimately
+// terminate with `[DONE]` and no message-status marker, so requiring the marker
+// would misclassify every image generation as truncated.
+func (result turnResult) truncated() bool {
+	return result.sawContent && !result.finished && !result.blocked && !result.sawDone
+}
+
 // Run executes one non-streaming chat completion.
 //
 // The Web surface has no separate non-streaming endpoint: a non-stream response
@@ -156,6 +177,19 @@ func (adapter *Adapter) Run(ctx context.Context, command ports.ChatCommand, cred
 			Class:        domain.ChatOutcomeNotCommitted,
 			Commit:       domain.CommitNotCommitted,
 			FailureClass: domain.ErrCodeUpstreamProtocolDrift,
+		}, nil
+	}
+
+	if result.truncated() {
+		// Content arrived but the body ended without `[DONE]` or a finish marker.
+		// The upstream may have kept generating and committed the full answer, so
+		// certainty is UNKNOWN and no fallback re-attempt is authorized — returning
+		// the partial text with a `stop` class would present a cut-off answer as a
+		// complete one.
+		return domain.ChatOutcome{
+			Class:        domain.ChatOutcomeUnknown,
+			Commit:       domain.CommitUnknown,
+			FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
 		}, nil
 	}
 
@@ -213,6 +247,17 @@ func (adapter *Adapter) Stream(
 			Commit:       domain.CommitNotCommitted,
 			FailureClass: domain.ErrCodeUpstreamProtocolDrift,
 			Usage:        domain.ChatUsage{},
+		}, nil
+	}
+
+	if result.truncated() {
+		// Deltas already reached the client, so the stream cannot be retried, and
+		// the upstream may hold a longer committed generation. UNKNOWN routes this
+		// onto the conservative residual-accounting path (§6.5).
+		return domain.ChatStreamOutcome{
+			Class:        domain.ChatOutcomeUnknown,
+			Commit:       domain.CommitUnknown,
+			FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
 		}, nil
 	}
 
