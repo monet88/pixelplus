@@ -267,4 +267,3 @@ func TestChatStreamDisconnectReleasesLeaseOnDetachedContext(t *testing.T) {
 		t.Fatalf("occupied = %d after disconnect, want 0: the accounting terminal leaked Tenant occupancy", got)
 	}
 }
-
