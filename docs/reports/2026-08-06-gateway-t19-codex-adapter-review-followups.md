@@ -103,6 +103,12 @@ Validation: `go build` / `go vet` / `go test ./...` / `go test -race` (4 package
 - Đã push: `origin/feature/issue-62-gateway-t19-chatgpt-codex-oauth-adapter` (`08589d2..c60ab52`).
 - Các issue follow-up trong §4 **chưa** được mở — cần người chủ trì xác nhận hoặc ủy quyền tạo.
 
+> **Cập nhật 2026-08-06 (sau lượt fix thứ hai):** dòng trên đã lỗi thời. F2/F10,
+> F6 và F11 không cần issue riêng nữa vì đã được xử lý thẳng trong code (§6).
+> F7 đã được tách thành issue **#112** `[Gateway T19b] Serve the gated ChatGPT
+> Codex render and masked image-edit surface`, và F9 đã xác nhận nằm trong
+> **#111** hiện hữu. Không còn issue nào trong §4 phải mở.
+
 ## 6. Cập nhật 2026-08-06 (lượt fix thứ hai) — cả 6 mục đã xử lý trong phạm vi T19
 
 Sau khi báo cáo trên được viết, cả 6 mục còn lại đã được xử lý trong 5 commit,
@@ -133,5 +139,14 @@ render. Hai việc vẫn còn mở ngoài phạm vi T19 — story F7 và blocker
 
 ### Còn lại
 
-- **F7 story render + image-edit** vẫn cần một story riêng (RenderAdapter + gated render registry + nới render candidate gate + mask `alpha_out = 255 - luminance_in`). Đây là feature mới, không phải gap chưa xử lý.
-- **#111** (probe/observe per-account credential binding) vẫn mở và vẫn là điều kiện chặn việc wire một Transport thật.
+- **F7 story render + image-edit** đã được tách thành **#112** `[Gateway T19b]
+  Serve the gated ChatGPT Codex render and masked image-edit surface` (RenderAdapter
+  + gated render registry + nới render candidate gate + mask
+  `alpha_out = 255 - luminance_in`). Đây là feature mới, không phải gap chưa xử
+  lý. #112 ghi rõ ràng buộc kế thừa từ T19: test posture accept-then-fail
+  (`TestEnabledGatedCodexRenderIsAcceptedThenFailsClosedAtExecution`) là lưới an
+  toàn không được phá — một render job `completed` mang theo output manifest, nên
+  nếu execution được làm cho "thành công" khi chưa có RenderAdapter thật thì
+  Tenant sẽ nhận asset bịa thay vì một lỗi sạch.
+- **#111** (probe/observe per-account credential binding) vẫn mở và vẫn là điều
+  kiện chặn việc wire một Transport thật.
