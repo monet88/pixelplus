@@ -59,7 +59,7 @@ func TestFileRenderStoresReconcileReplayCrashWindow(t *testing.T) {
 
 	jobsB := persistence.NewFileRenderJobStore(jobPath)
 	replayB := persistence.NewFileRenderReplayStore(replayPath)
-	compB, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true}, composition.Dependencies{
+	compB, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true, GatedAuthModes: []domain.AuthMode{domain.AuthModeChatGPTCodexOAuth}}, composition.Dependencies{
 		Runtime: jobs.New(), Clock: clockNow{t: base}, IDs: &rwSeqIDs{},
 		RenderJobs: jobsB, RenderReplay: replayB, RenderDigester: digester,
 	})
@@ -204,7 +204,7 @@ func TestFileRenderStoresRecoverPostPayloadCrashWithoutDuplicateProviderWork(t *
 	jobStoreA := persistence.NewFileRenderJobStore(jobLedgerPath)
 	replayStoreA := persistence.NewFileRenderReplayStore(replayLedgerPath)
 	crashAdapter := &crashAfterPayloadAuthorized{}
-	compA, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true}, composition.Dependencies{
+	compA, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true, GatedAuthModes: []domain.AuthMode{domain.AuthModeChatGPTCodexOAuth}}, composition.Dependencies{
 		Runtime:          jobs.New(),
 		Clock:            clockNow{t: base},
 		IDs:              &rwSeqIDs{},
@@ -262,7 +262,7 @@ func TestFileRenderStoresRecoverPostPayloadCrashWithoutDuplicateProviderWork(t *
 	jobStoreB := persistence.NewFileRenderJobStore(jobLedgerPath)
 	replayStoreB := persistence.NewFileRenderReplayStore(replayLedgerPath)
 	authB := &countingAuthorized{}
-	compB, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true}, composition.Dependencies{
+	compB, err := composition.New(composition.Config{AllowInMemoryRenderJobs: true, GatedAuthModes: []domain.AuthMode{domain.AuthModeChatGPTCodexOAuth}}, composition.Dependencies{
 		Runtime:          jobs.New(),
 		Clock:            clockNow{t: base.Add(10 * time.Minute)},
 		IDs:              &rwSeqIDs{},

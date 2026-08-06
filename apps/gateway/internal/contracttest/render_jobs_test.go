@@ -107,6 +107,11 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 			circuits:     newStubCircuitStore(log),
 			routing:      newCountingRoutingPolicyStore(),
 			clock:        &mutableTestClock{now: spineFixtureTime},
+			// The render candidate gate now refuses a `gated` mode the operator
+			// did not enable (BlocksGated, decision 0014 §5.2), so the standard
+			// Codex OAuth render accounts must be composed as enabled — matching
+			// the provider-account spine harness default.
+			gatedAuthModes: allGatedModes(),
 		},
 	}
 	if configure != nil {
@@ -161,6 +166,9 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	// Experimental lab profile (T18). Empty — the default — composes an ordinary
 	// production deployment where every experimental Auth Mode stays fail-closed.
 	opts.ExperimentalLabAuthModes = h.labAuthModes
+	// Gated profile (T19). Defaults to every gated mode so standard Codex render
+	// accounts pass the operator-flag gate; a refusal test overrides to empty.
+	opts.GatedAuthModes = h.gatedAuthModes
 	fixture, err := contracttest.NewFixture(opts)
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)

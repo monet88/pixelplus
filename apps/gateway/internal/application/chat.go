@@ -751,15 +751,19 @@ func (service *ChatService) candidateRejection(
 	// C3 risk / C2 usability. An experimental mode is a candidate only in a
 	// deployment that deliberately enabled it as a lab profile; the zero-value
 	// profile keeps ordinary production closed (risk envelope §5.1, §6.1).
-	if account.AuthMode.Prohibited() || service.labProfile.BlocksExperimental(account.AuthMode) {
-		// A `gated` mode is NOT refused here: the chat execution surface relies on
-		// composition-time registration (decision 0014). When the operator did not
-		// enable the gated profile, the gated chat registry is absent and the
-		// Codex Adapter is never built, so a Codex chat command dispatches to the
-		// fail-closed foundation (dependency_unavailable) — the use is rejected
-		// before any Provider call. The credential storage and /v1/models catalog
-		// gates check BlocksGated explicitly; the Tenant acknowledgement check
-		// below still applies on this surface.
+	if account.AuthMode.Prohibited() ||
+		service.labProfile.BlocksExperimental(account.AuthMode) ||
+		service.gatedProfile.BlocksGated(account.AuthMode) {
+		// A `gated` mode the operator did not enable is refused here TOO, so the
+		// operator flag is the first gate before any Vault decrypt or credential
+		// authorizer call — the same rule the credential-use and capability
+		// gates apply (decision 0014, §5.2, §6.2). Composition-time registration
+		// removes the Adapter from the graph when the profile is off, but it does
+		// not stop the spine's own pre-Vault candidate checks from running for an
+		// account that already exists; refusing here keeps the flag gate ahead of
+		// the Vault on every surface. Enablement stays necessary but not
+		// sufficient: the Tenant residual-risk acknowledgement check below still
+		// applies.
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if account.AuthMode.RequiresRiskAck() && !account.RiskAcknowledged {

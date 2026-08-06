@@ -81,6 +81,17 @@ Adapter that fails closed" for the gated code path; the nil-transport fail-close
 posture is still proved by the chatgptcodex package test TestNilTransportFailsClosed,
 so no property is lost.)
 
+**The chat execution gate ALSO calls `BlocksGated`, ahead of the Vault.**
+Registration removes the Adapter from the object graph when the profile is off,
+but it does not stop the spine's own pre-Vault candidate checks from running for
+an account that already exists. `ChatService.candidateRejection` therefore calls
+`gatedProfile.BlocksGated` explicitly, so a `gated` mode the operator did not
+enable is refused before any `vault.Validate` decrypt or credential
+authorizer mint — the same operator-flag-first rule the credential-use and
+capability gates apply (§5.2, §6.2). This closes the gap where a disabled gated
+account could still walk into the Vault on the chat surface even though a real
+Provider client was never reachable.
+
 **The Tenant acknowledgement stays a separate, already-enforced gate.**
 `RequiresRiskAck` + `RiskAcknowledged` runs at credential use, capability offer,
 and render candidate, after the operator flag and before any Vault decrypt or
@@ -100,20 +111,21 @@ T18 contract test TestCrossModeFallbackIntoTheExperimentalModeStaysRefused pins
 the Codex primary → Web fallback case from inside an *enabled* profile — the
 only place a regression could hide.
 
-**The render surface does NOT single out gated modes in T19.** The render
-candidate gate refuses `prohibited` and `experimental` modes (the 0013 rule for
-the experimental Web surface) and otherwise behaves like any mode without a
-`ports.RenderAdapter`: a gated Codex account can be a render candidate, and
-because the Codex Adapter implements chat, stream, probe, and capability — not
-`ports.RenderAdapter` — a render job for it fails closed at execution against
-the fail-closed foundation. That accept-then-fail posture is the same one that
-already applies to any mode lacking a RenderAdapter, so T19 introduces nothing
-new on the render surface. A later story that gives Codex a real
-`ports.RenderAdapter` must add the gated render registry (and may then tighten
-the candidate gate together with it). In T19 the Codex image capability is still
-reported in the Capability Snapshot (`conditionally_supported`), because a
-snapshot records what the account can do, not what this build can currently
-serve.
+**The render candidate gate refuses a `gated` mode the operator did not
+enable, ahead of the Vault.** The render candidate gate refuses `prohibited`
+and `experimental` modes (the 0013 rule for the experimental Web surface) and
+now also `service.gatedProfile.BlocksGated`: a `gated` mode the operator turned
+off must not reach the render job path's `vault.Validate` decrypt even for an
+account created while the profile was on (§5.2). An ENABLED gated mode still
+passes the candidate gate and then, because the Codex Adapter implements chat,
+stream, probe, and capability but not `ports.RenderAdapter`, fails closed at
+execution against the fail-closed foundation — the accept-then-fail posture
+that already applies to any mode lacking a RenderAdapter. A later story that
+gives Codex a real `ports.RenderAdapter` must add the gated render registry
+(and may then tighten the candidate gate together with it). In T19 the Codex
+image capability is still reported in the Capability Snapshot
+(`conditionally_supported`), because a snapshot records what the account can
+do, not what this build can currently serve.
 
 ## Alternatives Considered
 

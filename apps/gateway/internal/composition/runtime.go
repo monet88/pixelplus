@@ -807,6 +807,7 @@ func newRenderService(config Config, dependencies Dependencies) (*application.Re
 		RequestLog:        requestLog,
 		Clock:             dependencies.Clock,
 		IDs:               dependencies.IDs,
+		GatedProfile:      config.gatedProfile(),
 		WorkerLeaseTTL:    dependencies.RenderWorkerLeaseTTL,
 		HeartbeatInterval: dependencies.RenderHeartbeatInterval,
 	})

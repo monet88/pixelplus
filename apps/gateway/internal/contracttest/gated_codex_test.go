@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/monet88/pixelplus/apps/gateway/internal/contracttest"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 )
 
@@ -160,3 +161,37 @@ func TestGatedCodexCredentialUseRequiresExplicitTenantAck(t *testing.T) {
 	}
 }
 
+// AC1 (operator flag, chat execution): a chat request for a gated Codex account
+// in a deployment without the operator flag is refused BEFORE the Vault is
+// touched. candidateRejection now runs BlocksGated ahead of vault.Validate, so
+// the load-bearing assertion is a zero vault.Validate count and a zero Adapter
+// call (decision 0014 §5.2: the operator flag must be the first gate, ahead of
+// any credential decrypt or Provider call).
+func TestGatedCodexChatRefusedBeforeVaultWithoutFlag(t *testing.T) {
+	t.Parallel()
+
+	harness := newChatHarnessWithOptions(t, func(harness *chatHarness, options *contracttest.Options) {
+		options.GatedAuthModes = nil
+		harness.seedActive("tenant_a", "pa_chat_codex", domain.AuthModeChatGPTCodexOAuth)
+	})
+
+	response, payload := harness.do(t, requestSpec{
+		method:  http.MethodPost,
+		path:    "/v1/chat/completions",
+		bearer:  tenantAKey,
+		idemKey: "idem-chat-gated-refused",
+		body:    chatSuccessBody,
+	})
+	if response.StatusCode == http.StatusOK {
+		t.Fatalf("status = %d, want a non-200 refusal (body=%s)", response.StatusCode, payload)
+	}
+	if code := decodeError(t, payload)["code"]; code != "auth_mode_unavailable" {
+		t.Fatalf("code = %v, want auth_mode_unavailable", code)
+	}
+	if calls := harness.vault.validCalls.Load(); calls != 0 {
+		t.Fatalf("vault.Validate ran %d times, want 0 (BlocksGated must run before any Vault decrypt)", calls)
+	}
+	if calls := harness.adapter.CallCount(); calls != 0 {
+		t.Fatalf("chat Adapter ran %d times, want 0 (the operator flag gate precedes all Provider calls)", calls)
+	}
+}

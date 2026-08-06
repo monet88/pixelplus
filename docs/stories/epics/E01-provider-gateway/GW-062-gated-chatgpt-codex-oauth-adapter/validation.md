@@ -64,7 +64,10 @@ Verified green: `cd apps/gateway && go build ./... && go vet ./... && go test ./
 - [x] AC1: operator flag + Tenant ack reject before credential storage/use when
       absent — `TestGatedCodexCreateRefusedWithoutOperatorFlag`,
       `TestGatedCodexCredentialUseRefusedBeforeAnyVaultWriteWithoutFlag`,
-      `TestGatedCodexCredentialUseRequiresExplicitTenantAck`, and the control
+      `TestGatedCodexCredentialUseRequiresExplicitTenantAck`,
+      `TestGatedCodexChatRefusedBeforeVaultWithoutFlag` (the chat candidate gate
+      calls `BlocksGated` ahead of `vault.Validate`, asserted as a zero
+      vault.Validate count and a zero Adapter call), and the control
       `TestGatedCodexCreateAllowedWhenOperatorEnablesTheMode` (all public seam).
       Positive registration invariant:
       `TestGatedAdaptersRegisterOnlyWhenEnabledAndGivenATransport` (the Codex
