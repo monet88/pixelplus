@@ -238,6 +238,12 @@ func (service *ProviderAccountService) accountAllowsOffers(account domain.Provid
 	if service.labProfile.BlocksExperimental(account.AuthMode) {
 		return false
 	}
+	// A `gated` mode the operator did not enable is likewise non-offerable
+	// (decision 0014, §5.2): the operator feature flag is the first gate, and a
+	// catalog entry is a public advertisement that must not precede it.
+	if service.gatedProfile.BlocksGated(account.AuthMode) {
+		return false
+	}
 	if !account.Controls.AuthModeExecutionEnabled {
 		return false
 	}

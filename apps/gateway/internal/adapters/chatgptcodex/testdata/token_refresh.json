@@ -1,0 +1,25 @@
+{
+  "_fixture": "Sanitized Codex OAuth refresh exchange result. Evidence §3.2 refresh (auth.openai.com/oauth/token, grant_type=refresh_token, client_id app_EMoamEEZ73f0CkXaXp7hrann). No real secret material; the tokens below are fixed fixture strings.",
+  "_placeholder": "fixture-not-a-real-token",
+  "refresh_success": {
+    "access_token": "fixture-rotated-access-token",
+    "refresh_token": "fixture-rotated-refresh-token",
+    "id_token": "fixture-id-token",
+    "account_id": "fixture-account-id",
+    "expired": false
+  },
+  "refresh_reused": {
+    "error": "refresh_token_reused",
+    "error_description": "The refresh token has been used or revoked."
+  },
+  "models_listing": {
+    "models": [
+      {"slug": "gpt-fixture-codex-1"},
+      {"slug": "codex-gpt-fixture-image-2"}
+    ]
+  },
+  "identity_ok": {
+    "email": "fixture-tenant@example.com",
+    "account_id": "fixture-account-id"
+  }
+}

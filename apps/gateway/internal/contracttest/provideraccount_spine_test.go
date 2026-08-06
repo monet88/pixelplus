@@ -23,6 +23,18 @@ var spineFixtureTime = time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)
 
 // spineHarness bundles the controlled ports so a test can assert side-effect
 // counts and ordering after driving the real composed HTTP surface.
+// allGatedModes returns every gated Auth Mode. The provider-account spine
+// harness defaults gatedAuthModes to this so its standard Codex OAuth fixture
+// accounts pass the operator-flag gate (decision 0014); a test proving the
+// refusal posture overrides gatedAuthModes to empty.
+func allGatedModes() []domain.AuthMode {
+	return []domain.AuthMode{
+		domain.AuthModeChatGPTCodexOAuth,
+		domain.AuthModeGeminiAntigravityOAuth,
+		domain.AuthModeGrokXAIOAuth,
+	}
+}
+
 type spineHarness struct {
 	fixture      *contracttest.Fixture
 	log          *spineLog
@@ -46,6 +58,12 @@ type spineHarness struct {
 	// lab profile. Empty composes an ordinary production deployment, so a test
 	// that leaves it unset proves the production posture (T18).
 	labAuthModes []domain.AuthMode
+	// gatedAuthModes names the `gated` Auth Modes this harness composes as the
+	// operator feature flag (decision 0014). It defaults to every gated mode
+	// because the provider-account spine exercises Codex OAuth accounts as its
+	// standard fixture; a test that needs to prove a gated mode is REFUSED
+	// without the flag overrides it to empty (T19 AC1).
+	gatedAuthModes []domain.AuthMode
 }
 
 // mutableTestClock is a controlled clock for public composition proofs that
@@ -139,23 +157,24 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		},
 	}
 	harness := &spineHarness{
-		log:          log,
-		principal:    principal,
-		admission:    &stubAdmissionStore{log: log},
-		replay:       newStubReplayStore(log),
-		accounts:     newStubAccountStore(log),
-		health:       newStubHealthStore(),
-		audit:        &captureAudit{},
-		telemetry:    &captureTelemetry{},
-		reqLog:       &captureRequestLog{},
-		vault:        newStubCredentialVault(log),
-		probe:        newStubProbeAdapter(log),
-		oauth:        newStubOAuthExchangeAdapter(log),
-		capabilities: newStubCapabilityStore(log),
-		capability:   newStubCapabilityAdapter(log),
-		circuits:     newStubCircuitStore(log),
-		routing:      newCountingRoutingPolicyStore(),
-		clock:        &mutableTestClock{now: spineFixtureTime},
+		log:            log,
+		principal:      principal,
+		admission:      &stubAdmissionStore{log: log},
+		replay:         newStubReplayStore(log),
+		accounts:       newStubAccountStore(log),
+		health:         newStubHealthStore(),
+		audit:          &captureAudit{},
+		telemetry:      &captureTelemetry{},
+		reqLog:         &captureRequestLog{},
+		vault:          newStubCredentialVault(log),
+		probe:          newStubProbeAdapter(log),
+		oauth:          newStubOAuthExchangeAdapter(log),
+		capabilities:   newStubCapabilityStore(log),
+		capability:     newStubCapabilityAdapter(log),
+		circuits:       newStubCircuitStore(log),
+		routing:        newCountingRoutingPolicyStore(),
+		clock:          &mutableTestClock{now: spineFixtureTime},
+		gatedAuthModes: allGatedModes(),
 	}
 	if configure != nil {
 		configure(harness)
@@ -180,6 +199,7 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		Clock:        harness.clock,
 
 		ExperimentalLabAuthModes: harness.labAuthModes,
+		GatedAuthModes:           harness.gatedAuthModes,
 	})
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)

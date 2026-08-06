@@ -1,0 +1,9 @@
+{
+  "_fixture": "Sanitized Codex account attributes for plan/entitlement. Evidence §4 entitlement/plan gates and CLIProxyAPI isCodexFreePlanAuth. No real secret material.",
+  "_placeholder": "fixture-not-a-real-token",
+  "_note": "This records the shape of a future account-attributes exchange this Adapter does not make (Observe reads /backend-api/models only). It is NOT asserted on by any test; see signals.go's plan-entitlement comment and validation.md.",
+  "free_plan": {
+    "plan_type": "free",
+    "attributes": {"plan_type": "free"}
+  }
+}

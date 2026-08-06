@@ -156,6 +156,7 @@ type RenderService struct {
 	requestLog   ports.RequestLogRecorder
 	clock        ports.Clock
 	ids          ports.IDGenerator
+	gatedProfile domain.GatedProfile
 	// leaseTTL / heartbeatInterval bound worker fence renewals (tests inject short).
 	leaseTTL          time.Duration
 	heartbeatInterval time.Duration
@@ -199,6 +200,12 @@ type RenderDependencies struct {
 	// every `experimental` Auth Mode unconditionally because no experimental
 	// Adapter implements ports.RenderAdapter, so a profile would have nothing to
 	// unlock on this surface — see candidateRejection.
+	//
+	// GatedProfile mirrors the other services (decision 0014): a `gated` mode the
+	// operator did not enable must not reach a Vault decrypt here either. The
+	// Codex Adapter still implements no ports.RenderAdapter, so an ENABLED gated
+	// mode remains an accept-then-fail-closed candidate exactly as before.
+	GatedProfile      domain.GatedProfile
 	HeartbeatInterval time.Duration
 }
 
@@ -279,6 +286,7 @@ func NewRenderService(dependencies RenderDependencies) (*RenderService, error) {
 		requestLog:        dependencies.RequestLog,
 		clock:             dependencies.Clock,
 		ids:               dependencies.IDs,
+		gatedProfile:      dependencies.GatedProfile,
 		leaseTTL:          leaseTTL,
 		heartbeatInterval: hb,
 	}, nil
@@ -2237,7 +2245,14 @@ func (service *RenderService) candidateRejection(
 	// A later story that gives an experimental Adapter a real ports.RenderAdapter
 	// must relax this gate and add the render registry together; either alone is
 	// incoherent.
-	if account.AuthMode.Prohibited() || account.AuthMode.Experimental() {
+	if account.AuthMode.Prohibited() ||
+		account.AuthMode.Experimental() ||
+		service.gatedProfile.BlocksGated(account.AuthMode) {
+		// `gated` modes are refused via BlocksGated, not name checks: a mode the
+		// operator did not enable must not reach the Vault decrypt further down
+		// this path, even for an account that was created while the profile was on
+		// (decision 0014, §5.2). An ENABLED gated mode still passes here and then
+		// fails closed at execution for lack of a ports.RenderAdapter — unchanged.
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if account.AuthMode.RequiresRiskAck() && !account.RiskAcknowledged {

@@ -121,6 +121,12 @@ func newChatHarnessWithOptions(t *testing.T, configure func(*chatHarness, *contr
 		ChatReplay:   harness.replay,
 		ChatDigester: harness.digester,
 		ChatAudit:    harness.chatAudit,
+		// The chat candidate gate now refuses a `gated` mode the operator did not
+		// enable (BlocksGated in candidateRejection, decision 0014 §5.2), so the
+		// standard Codex OAuth fixture accounts must be composed as enabled —
+		// matching the provider-account spine harness default. A test proving the
+		// gated refusal posture overrides this to empty via its own Options.
+		GatedAuthModes: allGatedModes(),
 	}
 	if configure != nil {
 		configure(harness, &options)

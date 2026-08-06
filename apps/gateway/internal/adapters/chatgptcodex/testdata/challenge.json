@@ -1,0 +1,9 @@
+{
+  "_fixture": "Sanitized Cloudflare/bot-management block on a Codex image path (403 shape). Evidence §6 challenge signals: Codex carries no sentinel/PoW/Turnstile; a challenge-class signal here is a transport-layer block. No real secret material.",
+  "_placeholder": "fixture-not-a-real-token",
+  "cloudflare_block": {
+    "errors": [
+      {"code": "bot_check", "message": "Fixture bot-management challenge."}
+    ]
+  }
+}
