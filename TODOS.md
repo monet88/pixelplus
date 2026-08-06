@@ -1,20 +1,38 @@
-# Gateway Runtime Ticket Execution Playbook
+# PixelPlus Ticket Execution Playbook
 
-Tài liệu này là kế hoạch thực thi nhanh nhất cho 24 implementation tickets và
-ba support tickets thuộc
-[#42 - Build the Pure-Go Provider Gateway](https://github.com/monet88/pixelplus/issues/42):
-[#44](https://github.com/monet88/pixelplus/issues/44)-[#67](https://github.com/monet88/pixelplus/issues/67),
-[#68 - Docker live-probe sandbox](https://github.com/monet88/pixelplus/issues/68),
-[#69 - upstream reference drift](https://github.com/monet88/pixelplus/issues/69)
-và
-[#70 - changelog and versioned Docker releases](https://github.com/monet88/pixelplus/issues/70).
+- Cập nhật: 2026-08-06
+- Phạm vi: [#42 - Build the Pure-Go Provider Gateway](https://github.com/monet88/pixelplus/issues/42),
+  [#95 - Photoshop UXP Plugin](https://github.com/monet88/pixelplus/issues/95)
+  và lane enforcement ENF-01..ENF-07.
+
+Native GitHub `blocked by` và `sub-issue` relationships là nguồn chính xác cuối
+cùng. File này chỉ là execution guide và **không** phải nguồn trạng thái. Khi
+file này và GitHub bất đồng, GitHub đúng.
 
 Mục tiêu không phải tăng số ticket đang làm cùng lúc. Mục tiêu là rút ngắn
 critical path trong khi mỗi ticket vẫn được review độc lập, verify qua public
 seam, merge sạch, ghi Harness evidence và chỉ đóng sau khi proof đầy đủ.
 
-Native GitHub `blocked by` và `sub-issue` relationships là nguồn chính xác cuối
-cùng. Sơ đồ trong file này chỉ là execution guide.
+## Trạng thái hiện tại
+
+Gateway runtime spine đã xong. #44-#61 và #68 đã đóng, nghĩa là composition,
+Provider Account lifecycle, OAuth application layer, Capability, Health,
+Routing, Asset, Render và Chat đều đã merge, cùng Docker live-probe sandbox.
+
+Ba lane đang chạy song song, không lane nào chặn lane nào:
+
+| Lane | Nội dung | Frontier |
+|---|---|---|
+| Gateway adapters | #62-#67, #88, #111, #112, #121, #122 | #62, #63, #65 |
+| Plugin | #114-#120, #98-#110 | #114 |
+| Enforcement | #123-#129 | #123, #124, #126 |
+
+Enforcement lane nên chạy **trước** khi Plugin lane phình to. Trên clean HEAD
+hôm nay: `.github/workflows/` không có workflow nào được track,
+`gofmt -l apps/gateway` in ra hơn 10 file, và
+`node scripts/validate-provider-gateway-implementation-spec.mjs` fail vì
+fingerprint `CONTEXT.md` không khớp. Mỗi surface thêm vào lúc này là một surface
+mà enforcement chưa bảo vệ.
 
 ## Nguyên tắc tối ưu
 
@@ -37,9 +55,13 @@ cùng. Sơ đồ trong file này chỉ là execution guide.
 9. Không đóng issue chỉ vì code đã viết xong. Issue chỉ được đóng sau khi PR đã
    merge, review sạch, proof mới nhất pass và Harness trace đã ghi.
 10. Không mở deployment, SLO, canary, launch hoặc legacy migration work trước
-    khi #67 hoàn tất. Docker ở #68 chỉ là sandbox local dùng lại production
+    khi #67 hoàn tất. Docker ở #68 là sandbox local dùng lại production
     composition; #70 chỉ tạo release foundation, không tự chọn production
     topology hoặc tự publish stable release.
+11. #67 **không** chặn enforcement lane hay Plugin lane. Chờ full runtime
+    conformance mới bắt đầu chặn code chưa format, authority drift hoặc test
+    regression là đảo ngược thứ tự: enforcement càng muộn thì càng nhiều surface
+    phải bảo vệ ngược. #123, #124, #125, #126 đều runnable ngay.
 
 ## Mô hình nhân lực nhanh nhất
 
@@ -47,9 +69,9 @@ Với bốn agent/context hoạt động đồng thời:
 
 | Slot | Trách nhiệm |
 |---|---|
-| Builder A | Ticket critical-path đang runnable |
-| Builder B | Ticket runnable song song có downstream lớn nhất |
-| Builder C | Ticket runnable tiếp theo hoặc xử lý review findings |
+| Builder A | Gateway lane: adapter queue hoặc readiness gate |
+| Builder B | Plugin lane: #114, sau đó frontier Plugin |
+| Builder C | Enforcement lane, hoặc xử lý review findings |
 | Reviewer | Review draft/final PR, kiểm tra spec compliance và rerun proof |
 
 Reviewer không review code do chính mình viết. Khi không có PR chờ review,
@@ -61,149 +83,141 @@ Nếu chỉ có một agent, giữ nguyên thứ tự merge bên dưới và dù
 cho review sau khi implementation xong. Nếu có nhiều hơn bốn agent, không tăng
 WIP tùy ý: thêm reviewer/verification capacity trước, sau đó mới tăng builder.
 
-## Lịch thực thi nhanh nhất
+## Lịch thực thi
 
-### Đợt 0 - Composition spine và upstream ledger
+### Đã hoàn tất
 
-Bắt đầu ngay hai ticket độc lập:
+`#44` composition spine, `#45` protected request spine, `#46`-`#49` Provider
+Account lifecycle, `#47` server-owned OAuth application layer, `#50` Capability
+Snapshots, `#51` health/controls, `#52` Routing Policy, `#53` Tenant Assets,
+`#54`-`#57` Render, `#58`-`#60` Chat, `#61` ChatGPT Web Access Adapter, `#68`
+Docker live-probe sandbox.
 
-- Critical path: [#44 - Bootstrap Pure-Go composition and readiness](https://github.com/monet88/pixelplus/issues/44).
-- Parallel support: [#69 - Track upstream reference revisions and report drift](https://github.com/monet88/pixelplus/issues/69).
+Lưu ý về #47: nó cung cấp application-level start/poll/account lifecycle qua
+stable HTTP. Nó **không** chứng minh rằng một Provider-specific OAuth exchange
+đã được compose trong production. Khi `Dependencies.OAuth` là nil,
+`composition/runtime.go` vẫn thay bằng `NewFailClosedOAuthExchangeAdapter()`, và
+`ProductionDependencies()` không bao giờ set nó.
 
-#44 phải tạo composition constructor, deterministic test ports và reusable
-quick verification commands đủ tốt để các ticket sau không dựng test harness
-riêng. #69 khóa reviewed SHA, license, Auth Mode, watched paths và evidence docs
-cho từng upstream; workflow chỉ báo drift, không thực thi hoặc đồng bộ code
-upstream.
+### Lane A - Gateway adapters và readiness
 
-Ngay khi #44 merge, chạy song song:
+Adapter queue còn lại, lấy theo shared work queue chứ không chia wave cứng:
 
-- Critical path: [#45 - Create and read Provider Account drafts through the protected request spine](https://github.com/monet88/pixelplus/issues/45).
-- Parallel support: [#68 - Add a disposable Docker live-probe sandbox](https://github.com/monet88/pixelplus/issues/68).
-
-#45 phải hoàn thiện protected HTTP request spine thay vì chỉ làm ba Provider
-Account endpoints. #68 phải dùng chính production composition constructor của
-#44, bind localhost, chạy non-root/read-only và cleanup được; không chọn
-production topology hoặc tạo sandbox-only runtime path.
-
-Inner loop vẫn là `go test`/`go run` trực tiếp để có feedback nhanh nhất. Chỉ
-build/run Docker khi cần parity, isolation, startup/readiness smoke hoặc một
-live probe đã được ủy quyền. Không truyền Provider Credential qua CLI, image,
-Compose, `.env` hay log; credential chỉ đi qua Public API và Vault. Không mount
-Docker socket, home, `.ref/` hoặc repository credential vào container.
-Container không được dùng host network/privileged mode; phải drop toàn bộ Linux
-capabilities, bật no-new-privileges và giới hạn CPU, memory, process.
-
-### Đợt 1 - Mở account path và Asset path
-
-Sau khi #45 merge, chạy song song:
-
-- Critical path: [#46 - Activate a Provider Account with a direct credential](https://github.com/monet88/pixelplus/issues/46)
-- Parallel path: [#53 - Exchange immutable Tenant Assets](https://github.com/monet88/pixelplus/issues/53)
-
-Ưu tiên review và merge #46 trước vì nó mở cả #47 và #50. #53 có thể tiếp tục
-song song nhưng không được chiếm reviewer khi #46 đang chờ merge.
-
-### Đợt 2 - Tách OAuth và Capability
-
-Sau khi #46 merge, chạy song song:
-
-- [#47 - Connect a Provider Account through server-owned OAuth](https://github.com/monet88/pixelplus/issues/47)
-- [#50 - Publish Capability Snapshots and offerable models](https://github.com/monet88/pixelplus/issues/50)
-- Hoàn tất #53 nếu chưa merge.
-
-Sau #47, giữ Builder A trên critical path:
-
-1. [#48 - Reauthenticate and cut over Provider Credentials safely](https://github.com/monet88/pixelplus/issues/48)
-2. [#49 - Disable, re-enable, and delete Provider Accounts](https://github.com/monet88/pixelplus/issues/49)
-
-#50 phải merge trước hoặc cùng thời điểm #49 hoàn tất để mở #51 không bị idle.
-
-### Đợt 3 - Health và Routing
-
-Chạy tuần tự trên critical path:
-
-1. [#51 - Enforce scoped health and Provider Account controls](https://github.com/monet88/pixelplus/issues/51), sau #49 và #50.
-2. [#52 - Manage Tenant Routing Policy and controlled candidates](https://github.com/monet88/pixelplus/issues/52), sau #50 và #51.
-
-Đây là đoạn dễ tạo integration drift nhất. Không tách health, control và
-routing thành horizontal refactors ngoài phạm vi ticket. Mọi rejection phải có
-HTTP result và side-effect counter chứng minh protected boundary chưa bị gọi.
-
-### Đợt 4 - Render và Chat chạy song song
-
-Ngay khi #52 merge và #53 đã đóng, chạy hai nhánh song song:
-
-| Render branch | Chat branch |
-|---|---|
-| [#54 - Create and complete routed image-generation jobs](https://github.com/monet88/pixelplus/issues/54) | [#58 - Execute routed non-streaming chat](https://github.com/monet88/pixelplus/issues/58) |
-| Sau #54: #55 và #56 song song | Sau #58: #59 |
-| Sau #55 + #56: #57 | Sau #59: #60 |
-
-Render branch:
-
-- [#55 - Execute image edit and inpaint from Tenant Assets](https://github.com/monet88/pixelplus/issues/55)
-- [#56 - Recover Render Jobs without duplicate Provider work](https://github.com/monet88/pixelplus/issues/56)
-- [#57 - Cancel Render Jobs and retry outputs without re-rendering](https://github.com/monet88/pixelplus/issues/57)
-
-Chat branch:
-
-- [#59 - Stream chat with canonical terminal ordering](https://github.com/monet88/pixelplus/issues/59)
-- [#60 - Cancel chat and reconcile residual execution](https://github.com/monet88/pixelplus/issues/60)
-
-Với ba builder, lịch tối ưu sau #54 là: Builder A làm #55, Builder B làm #56,
-Builder C tiếp tục #59. Khi #55 và #56 merge, một slot làm #57 trong khi chat
-tiếp tục tới #60. Không để một branch chờ review trong khi reviewer đang rảnh.
-
-### Đợt 5 - Adapter work queue
-
-Sáu adapter tickets chỉ vào frontier sau khi #57, #60, #68 và #69 đều đóng:
-
-- [#61 - ChatGPT Web Access](https://github.com/monet88/pixelplus/issues/61)
-- [#62 - ChatGPT Codex OAuth](https://github.com/monet88/pixelplus/issues/62)
+- [#62 - ChatGPT Codex OAuth](https://github.com/monet88/pixelplus/issues/62) — chat/stream/probe/capability đã compose trên branch hiện tại; render đã defer sang #112
 - [#63 - Gemini Web Cookie](https://github.com/monet88/pixelplus/issues/63)
 - [#64 - Gemini Antigravity OAuth](https://github.com/monet88/pixelplus/issues/64)
 - [#65 - Prove Grok Web SSO remains prohibited](https://github.com/monet88/pixelplus/issues/65)
 - [#66 - Grok xAI OAuth](https://github.com/monet88/pixelplus/issues/66)
 
-Dùng một shared work queue, không chia wave cứng. Ba builder lấy ba ticket đầu;
-khi ticket nào merge thì lấy ticket chưa assign tiếp theo. Reviewer kiểm tra
-fixture hygiene, risk gate và capability-status inflation liên tục.
+Song song, không chặn adapter queue:
 
-Thứ tự lấy mặc định khi chưa có thông tin duration tốt hơn:
+- [#111 - Bind the probe and capability ports to a per-account credential](https://github.com/monet88/pixelplus/issues/111) — security blocker. Transport hiện là deployment-wide nên probe account B có thể đi trên session account A. Không wire real Transport cho gated mode nào trước khi cái này đóng.
+- [#112 - Serve the gated ChatGPT Codex render and masked image-edit surface](https://github.com/monet88/pixelplus/issues/112) — RenderAdapter, gated render registry và relaxation của render candidate gate, cả ba trong cùng một change theo decision 0014.
+- [#88 - Durable chat replay ledger](https://github.com/monet88/pixelplus/issues/88)
+- [#98 - Lock the canonical Mask Convention](https://github.com/monet88/pixelplus/issues/98) → [#121 - Reject non-PNG masks at asset ingest](https://github.com/monet88/pixelplus/issues/121)
+- [#99 - Publish the Auth Modes a deployment permits](https://github.com/monet88/pixelplus/issues/99) — cần điền bảng quyết định wire contract trước khi giao agent
 
-1. #61, #62, #63 vì protocol surface rộng.
-2. #64 và #66 ngay khi có slot trống.
-3. #65 dùng slot trống đầu tiên phù hợp; ticket này chủ yếu là negative product
-   composition proof nhưng vẫn cần independent review như adapter code.
+Hai gate cuối lane:
+
+1. [#122 - Gateway Image Readiness Gate](https://github.com/monet88/pixelplus/issues/122), sau #111 và #112. Đây là blocker thật của Plugin #106.
+2. [#67 - Prove full stable Public API runtime conformance](https://github.com/monet88/pixelplus/issues/67), sau khi #62-#66 merge và drift gate #69 vẫn xanh.
 
 Không dùng live credential trong fixture hoặc CI. Live probe chỉ chạy trong
 sandbox #68 khi có ủy quyền rõ ràng cho đúng Auth Mode, account và environment.
-Controlled fixture proof phải pass trước live probe. #68 chỉ cung cấp sandbox
-và controlled smoke; chính ticket Adapter sở hữu live-probe evidence để tránh
-dependency vòng. Grok Web SSO vẫn bị cấm và không có live probe.
+Controlled fixture proof phải pass trước live probe. Grok Web SSO vẫn bị cấm và
+không có live probe.
 
-### Đợt 6 - Full conformance gate
+### Lane B - Photoshop Plugin
 
-Sau khi #61-#66 đều merge và direct drift gate #69 vẫn xanh:
+Frontier duy nhất hiện tại là
+[#114 - P00 foundation](https://github.com/monet88/pixelplus/issues/114). Mọi
+ticket Plugin khác đều chờ nó, vì nếu không thì agent đầu tiên nhận việc sẽ mặc
+nhiên chọn framework, build system, state model, folder layout, OpenAPI
+generator và packaging thay cho cả team.
 
-- [#67 - Prove full stable Public API runtime conformance](https://github.com/monet88/pixelplus/issues/67)
+Sau #114, ba lane chạy song song:
 
-#67 là release-quality integration ticket, không phải nơi sửa hàng loạt thiếu
-sót của các ticket trước. Nếu #67 phát hiện regression thuộc một ticket đã
-merge, mở lại hoặc fix qua issue/PR có ownership rõ ràng, rerun affected proof,
-sau đó mới tiếp tục completion gate.
+```text
+#114 P00 Foundation
+├── #100 P01 Geometry
+├── #115 P02A Target Rect mapping + PNG mask codecs
+└── #103 P04 Secure Connection storage
 
-### Đợt 7 - Changelog và versioned Docker release foundation
+#100 + #115
+    -> #116 P02B Export Context Rect và capture selection
+    -> #117 P02C Place, mask, verify từ local fixture     <- local-fixture vertical proven
 
-Sau khi #67 và #68 đều đóng:
+#117 + #103 + một Direct Provider ĐÃ ĐƯỢC NÊU TÊN
+    -> #104 P05 Direct Path edit hoàn chỉnh
+    -> #105 P06 Phase, elapsed, cancel, recent runs       <- designer hoàn tất một edit không cần Gateway
 
-- [#70 - Establish changelog and versioned Docker releases](https://github.com/monet88/pixelplus/issues/70)
+#99 -> #108 P09 Connection catalogue
+#122 -> #106 P07 Gateway Path E2E -> #107 P08 Resume after reopen
+#108 + OAuth exchange thật + #111 -> #109 P10 Sign-in
 
-Hiện tại PixelPlus chưa có `CHANGELOG.md`, release workflow, Dockerfile/Compose,
-Git tag, GitHub Release hoặc published container image. `.ref/CLIProxyAPI` có
-pattern tag-driven release, generated notes, checksum và DockerHub multi-arch;
-#70 chỉ học các nguyên tắc hữu ích, không copy workflow nguyên trạng.
+Enhancements sau cùng: #118 variants, #119 reference images, #120 local data
+```
+
+Hai ticket **không** được giao agent cho tới khi điền xong quyết định sản phẩm
+trong chính issue body:
+
+- #104 cần bảng: Provider, credential class, operation, model, wire shape, mask
+  convention của surface đó, output format, cancel semantics, error classes.
+- #99 cần bảng: method/path, response shape, enum policy đóng hay mở, reason
+  khi Tenant chưa có Provider Account, scope, cache semantics.
+
+#101 là capability research cho ChatGPT Codex OAuth, không phải Plugin ticket,
+và **không** chặn #109. Nó chỉ gate việc offer `inpaint`/`image_edit` trên một
+account đã kết nối.
+
+#102 và #110 đã chuyển thành split parent; không implement từ chúng.
+
+### Lane C - Enforcement
+
+Chạy trước khi Plugin lane phình to:
+
+```text
+Wave 1
+├── #124 ENF-02 authority fingerprint reconciliation   <- cần người, không giao agent
+├── gofmt cleanup                                       <- commit riêng, trước #123
+└── #123 ENF-01 basic required CI
+
+Wave 2
+├── #126 ENF-04 canonical verify + pinned toolchain
+├── #125 ENF-03 sandbox lifecycle correction
+└── dependency consistency check giữa GitHub và Harness
+
+Wave 3
+├── #127 ENF-05 architecture và agent authority cleanup
+├── #128 ENF-06 mutation-suite optimization
+└── #129 ENF-07 governance
+```
+
+#124 và #127 cố ý không mang `ready-for-agent`. #124 đặc biệt nguy hiểm nếu giao
+agent: có sẵn `scripts/refresh-provider-gateway-implementation-spec-contract.mjs`
+làm validator xanh lại mà bỏ qua toàn bộ review, biến một authority gate thành
+con dấu.
+
+Mỗi gate phải có negative control chứng minh nó thật sự quan sát được failure.
+Job xanh không phải bằng chứng:
+
+```text
+format gate       -> cố ý làm lệch gofmt và thấy fail
+fingerprint gate  -> sửa authority không refresh và thấy fail
+sandbox gate      -> giữ marker ngoài opt-in và thấy fail
+readiness gate    -> gắn ready label khi blocker mở và thấy check fail
+```
+
+Mutation phải revert sau proof, không commit vào product branch.
+
+### Lane D - Release foundation
+
+[#70 - Establish changelog and versioned Docker releases](https://github.com/monet88/pixelplus/issues/70),
+sau khi #67 đóng. #68 đã đóng.
+
+Phạm vi #70 đã được thu hẹp: basic PR CI (`gofmt`, `go vet`, `go test`, Public
+API validator, authority validator) **không** thuộc #70 mà thuộc #123, và không
+được chờ #67. Chặn code chưa format không cần release pipeline.
 
 Thiết kế release cho PixelPlus:
 
@@ -276,6 +290,11 @@ Lane mặc định để giảm thời gian phân loại lặp lại:
   authorization, audit/security, public contract, durable data hoặc external
   Provider behavior, secret isolation, upstream provenance hoặc release supply
   chain.
+- Plugin tickets: #114 và #100/#115/#116/#117/#105/#118/#120 là `normal`;
+  #103, #104, #106, #107, #108, #109, #119 là `high-risk` vì chạm credential
+  storage, Provider egress, public contract hoặc durable local state.
+- Enforcement tickets: #123, #125, #126, #128, #129 là `normal`; #124 và #127 là
+  `high-risk docs/authority` và cần human authority review, không giao agent.
 - Implementation của semantics đã khóa không cần decision record mới. Chỉ tạo
   decision khi một deferred trigger thực sự mở hoặc behavior/architecture cần
   đổi nghĩa.
@@ -442,6 +461,9 @@ stable-alias rules. Publish test artifact chỉ khi maintainer phê duyệt.
 | #70 | Validated changelog fragments/SemVer; protected no-push PR path; multi-arch GHCR digest; scan/SBOM/provenance; pinned least-privilege release; stable/prerelease alias and rollback proof |
 | #61-#66 | Sanitized Adapter fixtures; production risk gate; exact-account capability evidence; no status inflation; no full-operation retry in Adapter |
 | #67 | All 26 operations; frozen `/v1` compatibility; complete negative gate matrix; secret scan; race and dependency-budget review |
+| #111, #112, #122 | Exact-account credential binding; pixel-level mask conversion cả hai chiều; masked edit để pixel ngoài mask byte-identical; failed render terminal `failed` với zero output entries; readiness state chạy được bằng một lệnh |
+| #114-#120 | Pure image seam (rects/bytes in, rects/bytes out); application/run-state seam với fake clock và substituted transport; client/contract seam cho drift, decoding, timeout, abort; Photoshop host layer verify trên host thật theo checklist |
+| #123-#129 | Negative control cho từng gate: mutation cố ý làm gate fail rồi revert. Job xanh không phải bằng chứng gate hoạt động |
 
 ## Merge và close checklist
 
@@ -471,8 +493,28 @@ Sau mỗi ticket:
 4. Chuyển reviewer sang PR gần merge nhất, không review theo thứ tự bắt đầu.
 5. Giữ WIP tối đa ba implementation tickets.
 
-Frontier ban đầu là [#44](https://github.com/monet88/pixelplus/issues/44) và
-[#69](https://github.com/monet88/pixelplus/issues/69). Sau khi #44 đóng, bắt đầu
-#45 và #68 song song. #68 và #69 không cần chặn core runtime, nhưng cả hai phải
-đóng trước khi lấy #61-#66 từ Adapter queue. Sau #67, hoàn tất #70 rồi mới đóng
-umbrella #42; actual stable release vẫn là maintainer-approved action.
+Frontier hiện tại, ba lane song song:
+
+| Lane | Lấy ngay | Lý do |
+|---|---|---|
+| Enforcement | #124, gofmt cleanup, rồi #123 | Chạy trước khi thêm surface mới; #124 cần người |
+| Plugin | #114 | Mọi ticket Plugin khác chờ nó |
+| Gateway | #62, #63, #65 từ adapter queue; #111 song song | #111 chặn real Transport cho mọi gated mode |
+
+Thứ tự mở gate còn lại:
+
+```text
+#111 + #112 -> #122 -> #106 -> #107
+#62..#66    -> #67  -> #70  -> đóng umbrella #42
+#114        -> Plugin lane
+```
+
+Actual stable release vẫn là maintainer-approved action, không tự động.
+
+## Giới hạn của file này
+
+Đây là execution guide, không phải nguồn trạng thái. Các dòng `Blocked by` trong
+issue body hiện vẫn chỉ là Markdown: GitHub API báo `blocked_by=0` cho toàn bộ
+#100-#110, nên scheduler không tự động tôn trọng thứ tự. Trước khi dựa vào
+dependency order, kiểm tra native relationships hoặc Harness story graph, đừng
+suy luận chỉ từ file này.
