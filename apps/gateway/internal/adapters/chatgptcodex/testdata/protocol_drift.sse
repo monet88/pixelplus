@@ -1,0 +1,5 @@
+{"type":"an_event_type_this_adapter_has_never_seen","payload":{"nested":true}}
+{"type":"another_unknown_event","payload":{"nested":true}}
+{"this is not valid json
+{"delta":12345}
+[DONE]

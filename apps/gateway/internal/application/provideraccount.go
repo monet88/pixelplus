@@ -151,6 +151,12 @@ type ProviderAccountService struct {
 	// composition that never sets it keeps every experimental mode closed
 	// (risk envelope §2 status table, §6.1).
 	labProfile domain.LabProfile
+	// gatedProfile names the `gated` Auth Modes this deployment deliberately
+	// enabled (decision 0014). The zero value enables nothing, so an ordinary
+	// production composition keeps every gated mode closed until an operator
+	// opts in (risk envelope §5.2, §6.1). It is the gated twin of labProfile;
+	// the Tenant residual-risk acknowledgement is enforced separately.
+	gatedProfile domain.GatedProfile
 }
 
 // ProviderAccountDependencies bundles the controlled ports this slice owns.
@@ -175,6 +181,11 @@ type ProviderAccountDependencies struct {
 	// LabProfile is optional and defaults to the closed zero value. It is a value
 	// rather than a port because it performs no I/O and has no failure mode.
 	LabProfile domain.LabProfile
+	// GatedProfile is optional and defaults to the closed zero value. It is the
+	// gated twin of LabProfile (decision 0014): a `gated` mode is enabled only
+	// when the operator named it here AND the Tenant acknowledged the residual
+	// risk (§5.2, §6.2).
+	GatedProfile domain.GatedProfile
 }
 
 // NewProviderAccountService validates and wires the request spine dependencies.
@@ -234,6 +245,7 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		clock:        dependencies.Clock,
 		ids:          dependencies.IDs,
 		labProfile:   dependencies.LabProfile,
+		gatedProfile: dependencies.GatedProfile,
 	}, nil
 }
 
@@ -389,7 +401,9 @@ func (service *ProviderAccountService) CreateProviderAccount(ctx context.Context
 	// the door — the Tenant residual-risk acknowledgement (RequiresRiskAck) is
 	// enforced separately before the stored credential becomes usable, so
 	// enablement never substitutes for disclosure.
-	if command.AuthMode.Prohibited() || service.labProfile.BlocksExperimental(command.AuthMode) {
+	if command.AuthMode.Prohibited() ||
+		service.labProfile.BlocksExperimental(command.AuthMode) ||
+		service.gatedProfile.BlocksGated(command.AuthMode) {
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAuthModeUnavailable())
 	}
 

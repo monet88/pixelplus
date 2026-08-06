@@ -1,0 +1,20 @@
+{
+  "_fixture": "Sanitized Codex account attributes for plan/entitlement. Evidence §4 entitlement/plan gates and CLIProxyAPI isCodexFreePlanAuth. No real secret material.",
+  "_placeholder": "fixture-not-a-real-token",
+  "free_plan": {
+    "plan_type": "free",
+    "attributes": {"plan_type": "free"}
+  },
+  "plus_plan": {
+    "plan_type": "plus",
+    "attributes": {"plan_type": "plus"}
+  },
+  "team_plan": {
+    "plan_type": "team",
+    "attributes": {"plan_type": "team"}
+  },
+  "pro_plan": {
+    "plan_type": "pro",
+    "attributes": {"plan_type": "pro"}
+  }
+}

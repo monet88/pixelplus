@@ -88,6 +88,11 @@ type ChatService struct {
 	// enabled. The zero value enables nothing, so ordinary production keeps every
 	// experimental account out of the candidate set (risk envelope §5.1, §6.1).
 	labProfile domain.LabProfile
+	// gatedProfile names the `gated` Auth Modes this deployment deliberately
+	// enabled (decision 0014). The zero value enables nothing, so a gated mode
+	// stays out of the candidate set until the operator opts in; the Tenant
+	// residual-risk acknowledgement is enforced separately below.
+	gatedProfile domain.GatedProfile
 }
 
 // ChatDependencies bundles the controlled ports the chat spine owns.
@@ -122,6 +127,10 @@ type ChatDependencies struct {
 	// LabProfile is optional and defaults to the closed zero value, which keeps
 	// every `experimental` Auth Mode out of the candidate set.
 	LabProfile domain.LabProfile
+	// GatedProfile is optional and defaults to the closed zero value, which keeps
+	// every `gated` Auth Mode out of the candidate set until the operator opts in
+	// (decision 0014, §5.2).
+	GatedProfile domain.GatedProfile
 }
 
 // NewChatService validates and wires the chat spine dependencies.
@@ -185,6 +194,7 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 		residualStore:    dependencies.ResidualStore,
 		residualDrain:    dependencies.ResidualDrain,
 		labProfile:       dependencies.LabProfile,
+		gatedProfile:     dependencies.GatedProfile,
 	}, nil
 }
 
@@ -742,6 +752,14 @@ func (service *ChatService) candidateRejection(
 	// deployment that deliberately enabled it as a lab profile; the zero-value
 	// profile keeps ordinary production closed (risk envelope §5.1, §6.1).
 	if account.AuthMode.Prohibited() || service.labProfile.BlocksExperimental(account.AuthMode) {
+		// A `gated` mode is NOT refused here: the chat execution surface relies on
+		// composition-time registration (decision 0014). When the operator did not
+		// enable the gated profile, the gated chat registry is absent and the
+		// Codex Adapter is never built, so a Codex chat command dispatches to the
+		// fail-closed foundation (dependency_unavailable) — the use is rejected
+		// before any Provider call. The credential storage and /v1/models catalog
+		// gates check BlocksGated explicitly; the Tenant acknowledgement check
+		// below still applies on this surface.
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if account.AuthMode.RequiresRiskAck() && !account.RiskAcknowledged {

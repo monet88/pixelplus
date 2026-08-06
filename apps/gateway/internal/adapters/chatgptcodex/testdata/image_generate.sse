@@ -1,0 +1,3 @@
+{"type":"response.created","response":{"id":"resp-fixture-img-0001"}}
+{"type":"response.image_generation.completed","image":"file-service://file_fixture_codex_gen"}
+[DONE]

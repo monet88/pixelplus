@@ -138,6 +138,12 @@ type Options struct {
 	// experimental mode stays fail-closed, so a fixture that does not set it
 	// proves the production posture.
 	ExperimentalLabAuthModes []domain.AuthMode
+	// GatedAuthModes names the `gated` Auth Modes this fixture's composition
+	// enables (T19, decision 0014, risk envelope §5.2). Empty — the default —
+	// composes an ordinary production deployment where every gated mode stays
+	// fail-closed, so a fixture that does not set it proves the production
+	// posture.
+	GatedAuthModes []domain.AuthMode
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -176,6 +182,7 @@ func NewFixture(options Options) (*Fixture, error) {
 		AllowInMemoryChat:       true,
 
 		ExperimentalLabAuthModes: options.ExperimentalLabAuthModes,
+		GatedAuthModes:           options.GatedAuthModes,
 	}, composition.Dependencies{
 		Runtime: jobs,
 		Clock:   clock,

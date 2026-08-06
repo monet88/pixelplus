@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/monet88/pixelplus/apps/gateway/internal/adapters/chatgptcodex"
 	"github.com/monet88/pixelplus/apps/gateway/internal/adapters/chatgptweb"
 	"github.com/monet88/pixelplus/apps/gateway/internal/application"
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
@@ -51,6 +52,14 @@ type Config struct {
 	// accepts only experimental modes, so this cannot become a back door into
 	// Grok Web SSO or a way to skip a gated mode's own feature flag.
 	ExperimentalLabAuthModes []domain.AuthMode
+	// GatedAuthModes names the `gated` Auth Modes this deployment deliberately
+	// enables (decision 0014). Empty — the production default — enables nothing,
+	// so ordinary composition never exposes or registers a gated mode (risk
+	// envelope §5.2, §6.1). Naming a `prohibited` or `experimental` mode here has
+	// no effect: domain.NewGatedProfile accepts only gated modes, so this cannot
+	// become a back door into Grok Web SSO or a way to skip an experimental
+	// mode's own lab profile.
+	GatedAuthModes []domain.AuthMode
 }
 
 // labProfile builds the deployment's experimental lab profile from config. An
@@ -59,6 +68,15 @@ type Config struct {
 // operator deliberately named one.
 func (config Config) labProfile() domain.LabProfile {
 	return domain.NewLabProfile(config.ExperimentalLabAuthModes...)
+}
+
+// gatedProfile builds the deployment's gated profile from config. An empty
+// GatedAuthModes yields the closed zero value, so every service wired by this
+// composition keeps gated modes fail-closed unless an operator deliberately
+// named one (decision 0014, §5.2). The Tenant residual-risk acknowledgement is
+// enforced separately inside each service.
+func (config Config) gatedProfile() domain.GatedProfile {
+	return domain.NewGatedProfile(config.GatedAuthModes...)
 }
 
 // Dependencies contains the controlled foundation ports owned by this slice.
@@ -194,6 +212,14 @@ type Dependencies struct {
 	// but leaves this nil gets a registered Adapter that fails every surface
 	// closed, so enabling a mode is not the same as granting egress.
 	ExperimentalChatGPTWebTransport chatgptweb.Transport
+	// GatedChatGPTCodexTransport supplies protocol egress for the gated ChatGPT
+	// Codex OAuth Adapter (#62 / T19). The gated Adapter is constructed ONLY
+	// when the gated profile named the mode AND this transport is non-nil
+	// (composition/gated.go). Ordinary production leaves both empty, so no gated
+	// Adapter is registered and Codex dispatch falls through to the fail-closed
+	// foundation. Supplying the transport grants egress as a second, deliberate
+	// operator decision.
+	GatedChatGPTCodexTransport chatgptcodex.Transport
 	// ChatAffinity stores the soft conversation→account preference (P3). A nil
 	// port substitutes the process-local memory store: affinity is a preference,
 	// never an authority, so process loss only degrades selection to P4 policy
@@ -375,8 +401,9 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	// be harmless while the Adapter is stateless, but it would silently give the
 	// two spines separate objects the moment one gains state.
 	experimental := newExperimentalAdapters(config, dependencies)
+	gated := newGatedAdapters(config, dependencies)
 
-	service, err := newProviderAccountService(config, dependencies, experimental)
+	service, err := newProviderAccountService(config, dependencies, experimental, gated)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +427,7 @@ func New(config Config, dependencies Dependencies) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	chatService, err := newChatService(config, dependencies, experimental)
+	chatService, err := newChatService(config, dependencies, experimental, gated)
 	if err != nil {
 		return nil, err
 	}
@@ -490,6 +517,7 @@ func newProviderAccountService(
 	config Config,
 	dependencies Dependencies,
 	experimental experimentalAdapters,
+	gated gatedAdapters,
 ) (*application.ProviderAccountService, error) {
 	principal := dependencies.Principal
 	if principal == nil {
@@ -549,6 +577,12 @@ func newProviderAccountService(
 	// experimental Adapter at all.
 	probe = experimental.probeAdapter(probe)
 	capability = experimental.capabilityAdapter(capability)
+	// Gated registration (#62 / T19). Applied after the experimental wrapper so
+	// a gated registry's fallback is the experimental registry (or the
+	// foundation), keeping every Auth Mode on one dispatch chain. With no gated
+	// profile these return the experimental-wrapped ports unchanged.
+	probe = gated.probeAdapter(probe)
+	capability = gated.capabilityAdapter(capability)
 	circuits := dependencies.Circuits
 	if circuits == nil {
 		circuits = persistence.NewClosedCircuitStore()
@@ -577,6 +611,7 @@ func newProviderAccountService(
 		Clock:        dependencies.Clock,
 		IDs:          dependencies.IDs,
 		LabProfile:   config.labProfile(),
+		GatedProfile: config.gatedProfile(),
 	})
 }
 
@@ -829,6 +864,7 @@ func newChatService(
 	config Config,
 	dependencies Dependencies,
 	experimental experimentalAdapters,
+	gated gatedAdapters,
 ) (*application.ChatService, error) {
 	principal := dependencies.Principal
 	if principal == nil {
@@ -890,6 +926,7 @@ func newChatService(
 			adapter = vaultpkg.NewFailClosedChatAdapter()
 		}
 		adapter = experimental.chatAdapter(adapter)
+		adapter = gated.chatAdapter(adapter)
 		authorizer := dependencies.ChatCredentialAuthorizer
 		if authorizer == nil {
 			if config.AllowInMemoryChat {
@@ -912,6 +949,7 @@ func newChatService(
 			streamAdapter = vaultpkg.NewFailClosedChatStreamAdapter()
 		}
 		streamAdapter = experimental.chatStreamAdapter(streamAdapter)
+		streamAdapter = gated.chatStreamAdapter(streamAdapter)
 		streamAuthorizer := dependencies.ChatCredentialAuthorizer
 		if streamAuthorizer == nil {
 			if config.AllowInMemoryChat {
@@ -965,6 +1003,7 @@ func newChatService(
 		ResidualStore:    dependencies.ResidualStore,
 		ResidualDrain:    dependencies.ResidualDrain,
 		LabProfile:       config.labProfile(),
+		GatedProfile:     config.gatedProfile(),
 	})
 }
 

@@ -1220,6 +1220,13 @@ func (service *ProviderAccountService) authModeGate(account domain.ProviderAccou
 	if service.labProfile.BlocksExperimental(account.AuthMode) {
 		return domain.NewAuthModeUnavailable(), false
 	}
+	if service.gatedProfile.BlocksGated(account.AuthMode) {
+		// A `gated` mode the operator did not enable is refused here too, before
+		// any Vault decrypt or Adapter call (decision 0014, §5.2). Enablement is
+		// necessary but not sufficient: the Tenant acknowledgement check below
+		// still applies.
+		return domain.NewAuthModeUnavailable(), false
+	}
 	if !account.Controls.AuthModeExecutionEnabled {
 		return domain.NewAuthModeUnavailable(), false
 	}

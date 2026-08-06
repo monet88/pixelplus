@@ -1,0 +1,5 @@
+{"type":"response.created","response":{"id":"resp-fixture-0001"}}
+{"type":"response.output_text.delta","delta":"Hello"}
+{"type":"response.output_text.delta","delta":" world"}
+{"type":"response.completed","response":{"id":"resp-fixture-0001"}}
+[DONE]
