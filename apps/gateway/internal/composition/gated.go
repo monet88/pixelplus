@@ -27,9 +27,10 @@ type gatedAdapters struct {
 // which is what §7 rule 1 requires.
 func newGatedAdapters(config Config, dependencies Dependencies) gatedAdapters {
 	profile := config.gatedProfile()
+	transport := gatedCodexTransportFrom(dependencies)
 
 	var enabled gatedAdapters
-	if profile.AllowsGated(domain.AuthModeChatGPTCodexOAuth) && dependencies.GatedChatGPTCodexTransport != nil {
+	if profile.AllowsGated(domain.AuthModeChatGPTCodexOAuth) && transport != nil {
 		// The Adapter is registered only when a transport is actually supplied.
 		// Enabling the mode is not the same as granting egress: an operator must
 		// deliberately supply transport too. With the profile on but no transport,
@@ -37,7 +38,7 @@ func newGatedAdapters(config Config, dependencies Dependencies) gatedAdapters {
 		// fallback — every surface stays closed without a Provider client
 		// (decision 0014; the nil-transport fail-closed posture is proved by the
 		// chatgptcodex.TestNilTransportFailsClosed package test).
-		enabled.chatGPTCodex = chatgptcodex.New(dependencies.GatedChatGPTCodexTransport)
+		enabled.chatGPTCodex = chatgptcodex.New(transport)
 	}
 	return enabled
 }

@@ -220,6 +220,13 @@ type Dependencies struct {
 	// foundation. Supplying the transport grants egress as a second, deliberate
 	// operator decision.
 	GatedChatGPTCodexTransport chatgptcodex.Transport
+	// GatedChatGPTCodexResponder is the adapter-free equivalent of the transport
+	// above, used only when GatedChatGPTCodexTransport is nil. It exists so a
+	// caller that may not import internal/adapters under the ADR 0009 dependency
+	// direction — contracttest — can still grant the gated Adapter egress and
+	// prove probe/chat/stream through the public HTTP seam (see
+	// gated_codex_seam.go). Production supplies the transport directly.
+	GatedChatGPTCodexResponder GatedCodexResponder
 	// ChatAffinity stores the soft conversation→account preference (P3). A nil
 	// port substitutes the process-local memory store: affinity is a preference,
 	// never an authority, so process loss only degrades selection to P4 policy
