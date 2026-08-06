@@ -91,9 +91,11 @@ type Stream interface {
 // first.
 //
 // Composition supplies ONE Transport for the whole deployment
-// (Dependencies.GatedChatGPTCodexTransport), so nothing here binds an exchange
-// to the account named in the command. Cause and effect if a real client shipped
-// against this seam as written:
+// (Dependencies.GatedChatGPTCodexTransport, or the adapter-free
+// Dependencies.GatedChatGPTCodexResponder that composition translates onto this
+// seam for contract proofs), so nothing here binds an exchange to the account
+// named in the command. Cause and effect if a real client shipped against this
+// seam as written:
 //
 //   - A Transport holding no session sends a probe unauthenticated, the upstream
 //     answers 401, and Probe faithfully reports Authenticated=false — moving a
@@ -103,10 +105,13 @@ type Stream interface {
 //     actually authenticating as account A, and Observe would mint account B a
 //     Capability Snapshot describing A's entitlements.
 //
-// Neither is reachable today: this story ships the field nil, so both methods
-// fail closed with ErrTransportUnavailable before any exchange. That is what
-// makes the gap latent rather than live. Binding the probe/observe surfaces to a
-// per-account credential requires a ports change and is tracked separately —
+// Neither is reachable in production: ProductionDependencies ships both egress
+// fields nil (proved by composition.TestProductionDependenciesGrantNoGatedCodexEgress),
+// so both methods fail closed with ErrTransportUnavailable before any exchange.
+// The contract seam supplies egress only inside controlled fixtures whose
+// responder answers one scripted account. That is what makes the gap latent
+// rather than live. Binding the probe/observe surfaces to a per-account
+// credential requires a ports change and is tracked separately —
 // see the Follow-Up in docs/decisions/0014-gated-auth-mode-operator-feature-flag.md
 // and docs/decisions/0013-experimental-lab-profile-and-capability-baseline.md.
 // A real Transport MUST NOT be wired before that is resolved (#111).
