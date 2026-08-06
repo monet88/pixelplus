@@ -2,6 +2,7 @@ package chatgptcodex_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -251,9 +252,71 @@ func TestNoRefreshWithoutRefreshToken(t *testing.T) {
 		t.Errorf("refresh exchanged %d times, want 0 (no refresh_token to use)", transport.refreshCalls)
 	}
 }
-
-// TestRunRejectsAnotherAuthMode asserts the chat surface fails closed for a
 // foreign Auth Mode rather than applying Codex framing to it.
+func TestRunNilTransportIsAuthoritativelyNotCommitted(t *testing.T) {
+	t.Parallel()
+
+	// A nil transport can never transmit, so the failure is authoritative
+	// no-commit: the spine may re-attempt on another account without risking a
+	// second generation (chat/stream lifecycle §7.2 rule 2).
+	outcome, err := chatgptcodex.New(nil).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitNotCommitted {
+		t.Fatalf("commit = %s, want not_committed (a nil transport never transmitted)", outcome.Commit)
+	}
+}
+
+// TestRunTransportErrorIsUnknown asserts a transport egress failure after the
+// POST is attempted is NOT reported authoritatively not-committed: the Gateway
+// cannot prove the payload never left the process, so the attempt is possibly
+// committed and a fallback re-attempt could bill a second generation (§7.2 rule 3).
+func TestRunTransportErrorIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	transport := &fixtureTransport{err: errors.New("transport egress failure")}
+
+	outcome, _ := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+	if outcome.Commit != domain.CommitUnknown {
+		t.Fatalf("commit = %s, want unknown (payload may have left the process)", outcome.Commit)
+	}
+	if outcome.FailureClass != domain.ErrCodeExecutionPossiblyCommitted {
+		t.Errorf("failure class = %q, want execution_possibly_committed", outcome.FailureClass)
+	}
+}
+
+// TestStreamTransportErrorIsUnknown mirrors TestRunTransportErrorIsUnknown on
+// the streaming surface: the shared classifier must not drift apart.
+func TestStreamTransportErrorIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	transport := &fixtureTransport{err: errors.New("transport egress failure")}
+
+	outcome, _ := chatgptcodex.New(transport).
+		Stream(t.Context(), streamCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()}, &recordingSink{})
+	if outcome.Commit != domain.CommitUnknown {
+		t.Fatalf("commit = %s, want unknown (payload may have left the process)", outcome.Commit)
+	}
+}
+
+// TestRunNonStreaming200ResponseIsUnknown asserts a 200 that carried no SSE
+// stream is UNKNOWN, not not-committed: the 200 proves the payload reached the
+// Provider, so the attempt is possibly committed (§7.2 rule 3).
+func TestRunNonStreaming200ResponseIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	transport := newFixtureTransport().on(chatgptcodex.PathCodexResponses, chatgptcodex.Response{Status: http.StatusOK})
+
+	outcome, _ := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+	if outcome.Commit != domain.CommitUnknown {
+		t.Fatalf("commit = %s, want unknown (a 200 was answered but no stream arrived)", outcome.Commit)
+	}
+}
+
 func TestRunRejectsAnotherAuthMode(t *testing.T) {
 	t.Parallel()
 

@@ -447,8 +447,10 @@ func (adapter *Adapter) withResponses(
 		if opened.Stream == nil {
 			// A 200 with no stream is a transport that cannot stream — fail
 			// closed rather than buffering silently and mistaking it for an
-			// empty generation.
-			return ErrTransportUnavailable
+			// empty generation. Unlike a nil transport (never transmitted), a
+			// 200 proves the payload DID reach the Provider, so this is a
+			// post-send-onset failure and commit certainty is forfeited.
+			return errNonStreamingResponse
 		}
 		return consume(opened.Stream)
 	})
@@ -518,6 +520,13 @@ var (
 	errUnavailable   = errors.New("chatgpt codex upstream unavailable")
 	errProtocolDrift = errors.New("chatgpt codex protocol drift")
 	errRefreshFailed = errors.New("chatgpt codex refresh failed")
+	// errNonStreamingResponse reports a 200 that carried no SSE stream. The
+	// request demonstrably reached the Provider (the 200 was answered), so the
+	// attempt is possibly committed and MUST NOT be reported authoritatively
+	// not-committed (chat/stream lifecycle §7.2 rule 3). It is distinct from
+	// ErrTransportUnavailable, which only ever means a nil transport never
+	// transmitted anything.
+	errNonStreamingResponse = errors.New("chatgpt codex non-streaming response")
 )
 
 // canonicalFailureClass maps an internal classification onto a canonical error
@@ -557,101 +566,123 @@ func canonicalFailureClass(err error) domain.ErrorCode {
 //   - Content already arrived from the upstream before the break. `Run` buffers,
 //     so the caller saw nothing — but the upstream demonstrably produced a
 //     generation and may have committed and billed it.
-func chatFailureOutcome(ctx context.Context, err error, result turnResult) domain.ChatOutcome {
-	if errors.Is(err, errQuota) {
-		// An in-stream usage_limit arrives after the open succeeded, so auth was
-		// proven. If no content reached the client, the turn is authoritatively
-		// not-committed with a quota failure class; if content arrived, UNKNOWN.
-		if ctx.Err() != nil || result.sawContent {
-			return domain.ChatOutcome{
-				Class:        domain.ChatOutcomeUnknown,
-				Commit:       domain.CommitUnknown,
-				FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
-			}
-		}
-		return domain.ChatOutcome{
-			Class:        domain.ChatOutcomeNotCommitted,
-			Commit:       domain.CommitNotCommitted,
-			FailureClass: domain.ErrCodeProviderQuotaExhausted,
-		}
-	}
-	if errors.Is(err, errRateLimited) {
-		if ctx.Err() != nil || result.sawContent {
-			return domain.ChatOutcome{
-				Class:        domain.ChatOutcomeUnknown,
-				Commit:       domain.CommitUnknown,
-				FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
-			}
-		}
-		return domain.ChatOutcome{
-			Class:        domain.ChatOutcomeNotCommitted,
-			Commit:       domain.CommitNotCommitted,
-			FailureClass: domain.ErrCodeProviderRateLimited,
-		}
-	}
-	if ctx.Err() != nil || result.sawContent {
-		return domain.ChatOutcome{
-			Class:        domain.ChatOutcomeUnknown,
-			Commit:       domain.CommitUnknown,
-			FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
-		}
-	}
-	return domain.ChatOutcome{
-		Class:        domain.ChatOutcomeNotCommitted,
-		Commit:       domain.CommitNotCommitted,
-		FailureClass: canonicalFailureClass(err),
+// failureDecision is the commit-certainty and failure-class decision shared by
+// the non-streaming and streaming failure classifiers. The two surfaces differ
+// only in the outcome struct they project onto; the commit question — the
+// proof-of-non-commit boundary in the chat/stream lifecycle §7.2 — is identical.
+type failureDecision struct {
+	class        domain.ChatOutcomeClass
+	commit       domain.CommitStatus
+	failureClass domain.ErrorCode
+}
+
+func unknownDecision() failureDecision {
+	return failureDecision{
+		class:        domain.ChatOutcomeUnknown,
+		commit:       domain.CommitUnknown,
+		failureClass: domain.ErrCodeExecutionPossiblyCommitted,
 	}
 }
 
-// streamFailureOutcome classifies a streaming failure. Once any delta reached
-// the sink the turn is committed as far as the client is concerned, so commit
-// certainty is UNKNOWN rather than not-committed.
+// classifyFailure maps a transport/stream failure onto the canonical commit
+// decision. It is the single owner of the §7.2 proof-of-non-commit boundary, so
+// the non-streaming and streaming surfaces cannot drift apart.
 //
-// UpstreamAbortAttempted stays false and UpstreamStopConfirmed stays false on
-// every path. Closing the local stream is not an upstream abort, and §6.2 rules
-// 3-4 forbid claiming either without proof. The evidence marks Codex
-// cancel/abort `conditionally supported` with upstream cooperative cancel
-// unverified (§2.2, §10.1), so this Adapter has nothing to prove with.
-func streamFailureOutcome(ctx context.Context, err error, result turnResult) domain.ChatStreamOutcome {
-	if errors.Is(err, errQuota) {
+// Authoritative not-committed is claimed only when the failure PROVES the
+// Provider never accepted a generation:
+//
+//   - the request never crossed the send boundary (a nil transport, or a body /
+//     bundle parse failure before the exchange);
+//   - the Provider answered with an explicit refusal that itself proves no
+//     generation was created or billed (a 401 auth failure, a 403 challenge, a
+//     usage_limit / rate refusal, or a refused refresh).
+//
+// Anything that crossed the send boundary without such proof — a raw transport
+// egress error, a stream interrupt once the upstream accepted, a 200 that
+// carried no stream, or an ambiguous 5xx — is possibly committed and MUST NOT
+// be reported not-committed: the spine's fallback walk treats NotCommitted as
+// authoritative no-commit proof, so doing so could re-attempt on another account
+// and bill a second generation (#62 AC4, §7.2 rule 3).
+func classifyFailure(ctx context.Context, err error, result turnResult) failureDecision {
+	// A clean quota or rate refusal is authoritative no-generation ONLY while
+	// nothing reached the client. Once content arrived or the context died, the
+	// upstream demonstrably began work and certainty is forfeited.
+	switch {
+	case errors.Is(err, errQuota):
 		if ctx.Err() != nil || result.sawContent {
-			return domain.ChatStreamOutcome{
-				Class:        domain.ChatOutcomeUnknown,
-				Commit:       domain.CommitUnknown,
-				FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
-			}
+			return unknownDecision()
 		}
-		return domain.ChatStreamOutcome{
-			Class:        domain.ChatOutcomeNotCommitted,
-			Commit:       domain.CommitNotCommitted,
-			FailureClass: domain.ErrCodeProviderQuotaExhausted,
+		return failureDecision{
+			class:        domain.ChatOutcomeNotCommitted,
+			commit:       domain.CommitNotCommitted,
+			failureClass: domain.ErrCodeProviderQuotaExhausted,
+		}
+	case errors.Is(err, errRateLimited):
+		if ctx.Err() != nil || result.sawContent {
+			return unknownDecision()
+		}
+		return failureDecision{
+			class:        domain.ChatOutcomeNotCommitted,
+			commit:       domain.CommitNotCommitted,
+			failureClass: domain.ErrCodeProviderRateLimited,
 		}
 	}
-	if errors.Is(err, errRateLimited) {
-		if ctx.Err() != nil || result.sawContent {
-			return domain.ChatStreamOutcome{
-				Class:        domain.ChatOutcomeUnknown,
-				Commit:       domain.CommitUnknown,
-				FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
-			}
-		}
-		return domain.ChatStreamOutcome{
-			Class:        domain.ChatOutcomeNotCommitted,
-			Commit:       domain.CommitNotCommitted,
-			FailureClass: domain.ErrCodeProviderRateLimited,
-		}
-	}
+
+	// Context cancellation or content already observed forfeits certainty
+	// (§6.2). The Codex surface has no documented cooperative cancel (§2.2 marks
+	// cancel/abort conditionally supported with upstream cooperative cancel
+	// unverified), so there is nothing to prove a stop with.
 	if ctx.Err() != nil || result.sawContent {
-		return domain.ChatStreamOutcome{
-			Class:        domain.ChatOutcomeUnknown,
-			Commit:       domain.CommitUnknown,
-			FailureClass: domain.ErrCodeExecutionPossiblyCommitted,
+		return unknownDecision()
+	}
+
+	// Authoritative no-commit proof, as defined above.
+	switch {
+	case errors.Is(err, ErrTransportUnavailable), // nil transport: never transmitted
+		errors.Is(err, errProtocolDrift),  // body/bundle failure before exchange
+		errors.Is(err, errAuthFailed),     // 401: not authorized, no generation
+		errors.Is(err, errChallenged),     // 403: refused before generation
+		errors.Is(err, errRefreshFailed):  // refresh refused, responses never re-sent
+		return failureDecision{
+			class:        domain.ChatOutcomeNotCommitted,
+			commit:       domain.CommitNotCommitted,
+			failureClass: canonicalFailureClass(err),
 		}
 	}
+
+	// Everything else — a raw transport egress error, a post-acceptance stream
+	// interrupt, errUnavailable from an ambiguous 5xx, or errNonStreamingResponse —
+	// crossed the send boundary without authoritative proof of non-commit.
+	return unknownDecision()
+}
+
+// chatFailureOutcome projects a failure onto the non-streaming outcome.
+func chatFailureOutcome(ctx context.Context, err error, result turnResult) domain.ChatOutcome {
+	decision := classifyFailure(ctx, err, result)
+	return domain.ChatOutcome{
+		Class:        decision.class,
+		Commit:       decision.commit,
+		FailureClass: decision.failureClass,
+	}
+}
+
+// streamFailureOutcome projects a failure onto the streaming outcome.
+//
+// Once any delta reached the sink the turn is committed as far as the client is
+// concerned, so commit certainty is UNKNOWN rather than not-committed — a
+// fallback re-attempt would deliver a second, contradictory answer on a stream
+// the client already partly consumed. UpstreamAbortAttempted stays false and
+// UpstreamStopConfirmed stays false on every path: closing the local stream is
+// not an upstream abort, and §6.2 rules 3-4 forbid claiming either without
+// proof. The evidence marks Codex cancel/abort `conditionally supported` with
+// upstream cooperative cancel unverified (§2.2, §10.1), so this Adapter has
+// nothing to prove with.
+func streamFailureOutcome(ctx context.Context, err error, result turnResult) domain.ChatStreamOutcome {
+	decision := classifyFailure(ctx, err, result)
 	return domain.ChatStreamOutcome{
-		Class:        domain.ChatOutcomeNotCommitted,
-		Commit:       domain.CommitNotCommitted,
-		FailureClass: canonicalFailureClass(err),
+		Class:        decision.class,
+		Commit:       decision.commit,
+		FailureClass: decision.failureClass,
 	}
 }
 
