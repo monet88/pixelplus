@@ -46,10 +46,16 @@ secrets):
   reference payload for the follow-up that adds that exchange.
 - `quota_rate.json` — `usage_limit_reached` + `rate_limit_error` bodies with
   `resets_in_seconds`. The probe surface parses the quota form
-  (`parseUsageLimit` → `ports.ProbeOutcome.RetryAfterSeconds`); the chat surface
-  classifies quota/rate but DROPS the `resets_in_seconds` hint, because
-  `domain.ChatOutcome`/`ChatStreamOutcome` carry no retry-after field. Threading
-  the hint onto the chat outcomes is a domain change tracked separately.
+  (`parseUsageLimit` → `ports.ProbeOutcome.RetryAfterSeconds`, which
+  `providerRetryNotBefore` turns into a durable cooldown). The chat surface
+  classifies quota/rate but carries no numeric hint, which is the spec'd shape:
+  canonical-errors §5.1 assigns the numeric duration to #17, and
+  provider-account-health §17.4/§17.8 define the client-visible value as a
+  computed ceiling over `retry_not_before` rather than a forwarded Provider
+  number. A retry-after field on `domain.ChatOutcome` would bypass the §7.4/§7.6
+  plausibility and backoff rules and is therefore NOT the fix. Feeding
+  chat-surface quota into a `CooldownObservation` is a #17 follow-up that applies
+  equally to the merged T18 web Adapter.
 - `challenge.json` — Cloudflare/bot block on an image path (403 shape).
 - `protocol_drift.sse` — an undecodable Responses event sequence.
 

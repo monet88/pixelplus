@@ -40,12 +40,14 @@ type streamEvent struct {
 	text string
 	// pointer is the asset pointer for eventImage.
 	pointer string
-	// There is deliberately no reset-hint field for eventQuota. The chat outcome
-	// vocabulary (domain.ChatOutcome / domain.ChatStreamOutcome) has no
-	// retry-after carrier, so a hint decoded here would be written and never
-	// read — see the eventQuota case in consumeStream. The probe surface, which
-	// DOES have ports.ProbeOutcome.RetryAfterSeconds, decodes its own hint via
-	// parseUsageLimit.
+	// There is deliberately no reset-hint field for eventQuota. The numeric
+	// retry-after duration is owned by #17, not by a chat outcome: the health
+	// spec §17.4 computes the client-visible value from retry_not_before rather
+	// than from the raw Provider number, and §17.8 forbids forwarding that number
+	// directly. See the eventQuota case in consumeStream for the full reasoning
+	// and the correct path (a CooldownObservation into the health store, as the
+	// probe surface does via parseUsageLimit →
+	// ports.ProbeOutcome.RetryAfterSeconds).
 }
 
 // decodeStreamPayload translates one raw SSE `data:` payload into a canonical

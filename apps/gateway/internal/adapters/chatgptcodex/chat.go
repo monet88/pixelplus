@@ -150,16 +150,25 @@ func consumeStream(ctx context.Context, stream Stream, deliver func(string) erro
 			case eventImage:
 				result.imagePointer = event.pointer
 			case eventQuota:
-				// The event's resetsAfterSeconds hint is deliberately DROPPED
-				// here rather than stored: domain.ChatOutcome and
-				// domain.ChatStreamOutcome carry no retry-after carrier, so a
-				// field on turnResult would be written and never read — asserting
-				// the hint survives to the spine when it cannot. The probe surface
-				// does carry one (ports.ProbeOutcome.RetryAfterSeconds, used in
-				// Probe), so quota cooldown IS observable for this account, just
-				// not through a chat turn. Threading the hint onto the chat
-				// outcomes is a domain change tracked separately, not something to
-				// imply with a dead field.
+				// The in-stream reset hint is deliberately NOT carried on the chat
+				// outcome, and that is the spec'd shape rather than a gap. Canonical
+				// errors §5.1 assigns the numeric duration to #17, and the health
+				// spec §17.4 defines the client-visible value as a ceiling computed
+				// from the latest retry_not_before among matching waitable gates —
+				// NOT the raw Provider number. Health spec §17.8 forbids forwarding
+				// a raw Provider timestamp directly, and §7.4/§7.6 require an
+				// implausible hint to become a malformed-hint observation rather
+				// than a wait the Tenant is told to honor.
+				//
+				// So a retry-after field on ChatOutcome would be the wrong carrier:
+				// it would route resets_in_seconds around the plausibility and
+				// backoff rules that make the number trustworthy. The right path is
+				// a CooldownObservation into the health store, which is how the
+				// probe surface already feeds its hint
+				// (ports.ProbeOutcome.RetryAfterSeconds → providerRetryNotBefore).
+				// Chat-surface quota does not yet feed that path on EITHER Adapter
+				// (this one or the T18 web Adapter), which is a #17 follow-up and
+				// not something a field here would fix.
 				return snapshot(), errQuota
 			case eventRateLimited:
 				return snapshot(), errRateLimited
