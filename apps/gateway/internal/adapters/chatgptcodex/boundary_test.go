@@ -36,6 +36,7 @@ var forbiddenImports = map[string]string{
 var forbiddenEgress = []string{
 	"Client",
 	"DefaultClient",
+	"DefaultTransport",
 	"NewRequest",
 	"NewRequestWithContext",
 	"Get",
@@ -43,6 +44,20 @@ var forbiddenEgress = []string{
 	"PostForm",
 	"Head",
 	"Do",
+	"RoundTrip",
+}
+
+// forbiddenEgressPackages names additional packages whose identifiers would
+// perform or configure a real network dial or TLS connection outside the
+// Transport seam. net.Dial/net.Dialer and crypto/tls are just as much a real
+// egress path as net/http.Client — a Transport seam guard that only inspected
+// net/http would miss an Adapter that opened its own socket underneath it.
+// Every selector on a locally-resolved import of one of these packages is
+// forbidden outright: this Adapter has no legitimate reason to reach for any
+// of their identifiers.
+var forbiddenEgressPackages = []string{
+	"net",
+	"crypto/tls",
 }
 
 // requiredFixtureFamilies enumerates the fixture coverage AC3 names. Keeping the
@@ -181,6 +196,44 @@ func TestAdapterPerformsNoHTTPEgressOfItsOwn(t *testing.T) {
 			}
 			return true
 		})
+	}
+}
+
+// TestAdapterPerformsNoRawSocketOrTLSEgressOfItsOwn widens the Transport-seam
+// guard beyond net/http: an Adapter that dialed net.Dial/net.Dialer directly,
+// or drove crypto/tls itself, would be performing the exact same real network
+// egress the net/http guard exists to catch, just underneath a different
+// package name. Any selector on a locally-resolved import of net or crypto/tls
+// is forbidden outright — this Adapter has no legitimate reason to reach for
+// either package.
+func TestAdapterPerformsNoRawSocketOrTLSEgressOfItsOwn(t *testing.T) {
+	t.Parallel()
+
+	for name, file := range packageFiles(t) {
+		for _, forbiddenPackage := range forbiddenEgressPackages {
+			local, dotImported, imported := resolveImportName(t, name, file, forbiddenPackage)
+			if !imported {
+				continue
+			}
+			if dotImported {
+				t.Errorf("%s dot-imports %s; egress identifiers become unqualified and unverifiable, "+
+					"so the Transport-seam guard cannot hold — import it with a qualifier", name, forbiddenPackage)
+				continue
+			}
+			ast.Inspect(file, func(node ast.Node) bool {
+				selector, ok := node.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				pkg, ok := selector.X.(*ast.Ident)
+				if !ok || pkg.Name != local {
+					return true
+				}
+				t.Errorf("%s uses %s.%s (%s imported as %q); egress must go through the Transport seam",
+					name, local, selector.Sel.Name, forbiddenPackage, local)
+				return true
+			})
+		}
 	}
 }
 

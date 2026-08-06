@@ -18,9 +18,6 @@ import (
 // opts in. The spineHarness defaults gatedAuthModes to every gated mode (matching
 // its standard Codex fixture accounts), so the refusal tests override it to empty.
 
-// codexCreateBody is a self-service create for the gated Codex OAuth mode.
-const codexCreateBody = `{"provider":"chatgpt","auth_mode":"chatgpt_codex_oauth","label":"primary"}`
-
 // newGatedRefusalHarness composes a deployment whose operator did NOT enable any
 // gated mode — an ordinary production deployment where every gated Auth Mode
 // stays fail-closed (decision 0014, §5.2).
@@ -58,7 +55,7 @@ func TestGatedCodexCreateRefusedWithoutOperatorFlag(t *testing.T) {
 		path:    "/v1/provider-accounts",
 		bearer:  tenantAKey,
 		idemKey: "idem-codex-create-refused",
-		body:    codexCreateBody,
+		body:    validCreateBody,
 	})
 	if response.StatusCode != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body=%s)", response.StatusCode, payload)
@@ -80,7 +77,7 @@ func TestGatedCodexCreateAllowedWhenOperatorEnablesTheMode(t *testing.T) {
 		path:    "/v1/provider-accounts",
 		bearer:  tenantAKey,
 		idemKey: "idem-codex-create-allowed",
-		body:    codexCreateBody,
+		body:    validCreateBody,
 	})
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body=%s)", response.StatusCode, payload)

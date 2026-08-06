@@ -2,6 +2,7 @@ package chatgptcodex_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -391,7 +392,9 @@ func TestNoRefreshWithoutRefreshToken(t *testing.T) {
 	}
 }
 
-// foreign Auth Mode rather than applying Codex framing to it.
+// TestRunNilTransportIsAuthoritativelyNotCommitted asserts a nil transport is
+// authoritatively not-committed: it can never transmit, so nothing was ever
+// sent to a Provider and the spine may safely re-attempt on another account.
 func TestRunNilTransportIsAuthoritativelyNotCommitted(t *testing.T) {
 	t.Parallel()
 
@@ -456,6 +459,8 @@ func TestRunNonStreaming200ResponseIsUnknown(t *testing.T) {
 	}
 }
 
+// TestRunRejectsAnotherAuthMode asserts Run refuses a command carrying a
+// foreign Auth Mode rather than applying Codex framing to it.
 func TestRunRejectsAnotherAuthMode(t *testing.T) {
 	t.Parallel()
 
@@ -466,5 +471,86 @@ func TestRunRejectsAnotherAuthMode(t *testing.T) {
 		Run(t.Context(), command, &staticCredential{material: codexBundleMaterial()})
 	if err == nil {
 		t.Fatal("Run() error = nil, want an unavailable error for a foreign Auth Mode")
+	}
+}
+
+// TestRunOutputTextDoneLifecycleMarkerCommits asserts a transcript of delta ->
+// response.output_text.done -> response.completed commits, rather than being
+// misclassified as protocol drift after content arrived. Before the fix,
+// response.output_text.done was not a recognized lifecycle marker, so it fell
+// through to eventDrift and the turn reported CommitUnknown / drift instead of
+// CommitCommitted.
+func TestRunOutputTextDoneLifecycleMarkerCommits(t *testing.T) {
+	t.Parallel()
+
+	transcript := strings.Join([]string{
+		`{"type":"response.output_text.delta","delta":"Hello world"}`,
+		`{"type":"response.output_text.done"}`,
+		`{"type":"response.completed"}`,
+	}, "\n")
+	transport := responsesTransport(t, transcript)
+
+	outcome, err := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if outcome.Commit != domain.CommitCommitted {
+		t.Fatalf("commit = %s, want committed (response.output_text.done is a recognized lifecycle marker)", outcome.Commit)
+	}
+	if got := outcome.Completion.Choices[0].Message.Content; got != "Hello world" {
+		t.Errorf("content = %q, want %q", got, "Hello world")
+	}
+}
+
+// TestRunModelAtCapacityIsClassifiedAsRateLimited asserts the
+// testdata/quota_rate.json "model_at_capacity" fixture — which carries no
+// `type` field on its error, only a message — is classified as a rate-limit
+// signal rather than falling through to generic drift. Evidence: CLIProxyAPI
+// codex_executor.go isCodexModelCapacityError / newCodexStatusErr treat
+// capacity as a retryable rate-limit condition.
+func TestRunModelAtCapacityIsClassifiedAsRateLimited(t *testing.T) {
+	t.Parallel()
+
+	// The fixture section is the raw Responses body shape
+	// ({"error":{"message":...}}); the in-stream event additionally carries
+	// the enclosing "type":"error" marker, so the fixture's own "error" field
+	// is spliced into that envelope rather than re-typed by hand.
+	section := loadFixtureSection(t, "quota_rate.json", "model_at_capacity")
+	var body struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(section), &body); err != nil {
+		t.Fatalf("decode model_at_capacity fixture section: %v", err)
+	}
+	transport := responsesTransport(t, compactJSON(t, `{"type":"error","error":`+string(body.Error)+`}`))
+
+	outcome, _ := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+	if outcome.Commit != domain.CommitNotCommitted {
+		t.Fatalf("commit = %s, want not_committed (capacity before any content)", outcome.Commit)
+	}
+	if outcome.FailureClass != domain.ErrCodeProviderRateLimited {
+		t.Errorf("failure class = %q, want provider_rate_limited", outcome.FailureClass)
+	}
+}
+
+// TestRunRateLimitedInStreamEventIsNotCommitted mirrors
+// TestRunQuotaMidStreamIsNotCommittedWhenNoContent for the in-stream
+// rate_limit_error shape, proving the currently-unused
+// testdata/quota_rate.json "rate_in_stream_event" section: a rate_limit_error
+// with no prior content is not-committed with a rate-limited failure class.
+func TestRunRateLimitedInStreamEventIsNotCommitted(t *testing.T) {
+	t.Parallel()
+
+	transport := responsesTransport(t, compactJSON(t, loadFixtureSection(t, "quota_rate.json", "rate_in_stream_event")))
+
+	outcome, _ := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+	if outcome.Commit != domain.CommitNotCommitted {
+		t.Fatalf("commit = %s, want not_committed (rate limit before any content)", outcome.Commit)
+	}
+	if outcome.FailureClass != domain.ErrCodeProviderRateLimited {
+		t.Errorf("failure class = %q, want provider_rate_limited", outcome.FailureClass)
 	}
 }

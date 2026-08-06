@@ -59,7 +59,9 @@ Access (FG-2 / §6.3).
   by #111 per-account credential binding; T19 ships the field nil, fixtures
   only).
 - `ports.RenderAdapter` for Codex and the gated render registry (coherent
-  second story; render refused at the candidate gate in the meantime).
+  second story; a Codex account whose operator flag is off is refused at the
+  render candidate gate, while an operator-enabled Codex account passes that
+  gate and fails closed at execution for lack of a `ports.RenderAdapter`).
 - The operator environment surface in `cmd/gateway` (`GatedAuthModes` parsing;
   deferred, mirrors the 0013 follow-up for `ExperimentalLabAuthModes`).
 - FG-5/KS-2 numeric challenge-rate thresholds and counters (#97).

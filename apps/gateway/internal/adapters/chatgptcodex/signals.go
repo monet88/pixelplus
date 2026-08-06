@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // signalClass is the Adapter's normalized classification of one upstream
@@ -76,11 +77,22 @@ type quotaSignal struct {
 // parseUsageLimit extracts a usage_limit_reached error from a Responses body.
 // Evidence: CLIProxyAPI codex_executor.go maps error.type usage_limit_reached
 // with resets_in_seconds / resets_at to a cooldown-worthy quota exhaustion.
-func parseUsageLimit(body string) quotaSignal {
+//
+// `now` is the reference time the absolute resets_at epoch is measured
+// against. It is a parameter rather than an inline time.Now() call so this
+// function stays deterministic and testable — the caller owns the clock
+// (mirrors CLIProxyAPI's parseCodexRetryAfter(statusCode, errorBody, now)).
+//
+// Precedence mirrors parseCodexRetryAfter: resets_at is preferred when present
+// AND still in the future; resets_in_seconds is the fallback. Both are
+// normalized onto the same relative-seconds carrier so callers never see which
+// field on the wire produced the hint.
+func parseUsageLimit(body string, now time.Time) quotaSignal {
 	var payload struct {
 		Error struct {
 			Type            string  `json:"type"`
 			ResetsInSeconds float64 `json:"resets_in_seconds"`
+			ResetsAt        int64   `json:"resets_at"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(body), &payload); err != nil {
@@ -89,30 +101,39 @@ func parseUsageLimit(body string) quotaSignal {
 	if payload.Error.Type != "usage_limit_reached" {
 		return quotaSignal{}
 	}
+	if payload.Error.ResetsAt > 0 {
+		resetAt := time.Unix(payload.Error.ResetsAt, 0)
+		if resetAt.After(now) {
+			return quotaSignal{
+				ResetsAfterSeconds: int(resetAt.Sub(now).Seconds()),
+				Present:            true,
+			}
+		}
+	}
 	return quotaSignal{
 		ResetsAfterSeconds: int(payload.Error.ResetsInSeconds),
 		Present:            true,
 	}
 }
 
-// Body-level rate/capacity and plan-entitlement parsers are deliberately ABSENT
-// here. Earlier drafts carried a rateLimitError / modelAtCapacity /
-// parsePlanEntitlement trio that nothing called, which read as though this
-// Adapter already classified those signals when it did not:
+// A plan-entitlement parser is deliberately ABSENT here. Earlier drafts
+// carried a parsePlanEntitlement helper that nothing called, which read as
+// though this Adapter already classified plan entitlement when it did not:
+// mapping a free plan onto an entitlement-missing image operation requires an
+// account-attributes exchange this story does not make (Observe reads
+// /backend-api/models only). Keeping a parser for a body the Adapter never
+// fetches asserted coverage that does not exist.
 //
-//   - Body-level rate signals: the live rate paths are the HTTP 429 in
-//     classifyStatus and the in-stream rate_limit_error event in
-//     decodeResponsesError. A third, uncalled body parser only obscured which of
-//     them is actually load-bearing.
-//   - Plan entitlement: mapping a free plan onto an entitlement-missing image
-//     operation requires an account-attributes exchange this story does not make
-//     (Observe reads /backend-api/models only). Keeping a parser for a body the
-//     Adapter never fetches asserted coverage that does not exist.
+// That is a gap to close with the exchange that needs it, not with a helper
+// that has no caller. testdata/entitlement_free.json is retained as the
+// recorded shape for that future exchange, and is not asserted on by any
+// test; validation.md states plainly that the entitlement family is fixture
+// shape rather than proved behavior.
 //
-// Both are gaps to close with the exchange that needs them, not with a helper
-// that has no caller. testdata/entitlement_free.json is retained as the recorded
-// shape for that future exchange; validation.md states plainly that the
-// entitlement family is fixture shape rather than proved behavior.
+// Body-level rate/capacity signals, by contrast, ARE live and load-bearing:
+// the HTTP 429 in classifyStatus, the in-stream rate_limit_error event, and
+// the in-stream model-at-capacity message (decoded in protocol.go's
+// decodeResponsesError) are the call sites that actually classify them.
 
 // modelSlugs extracts the session-dependent model slugs from a
 // /backend-api/models payload. The list is account and session dependent, so a

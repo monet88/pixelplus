@@ -58,16 +58,18 @@ The gate sites gain one predicate each, in the established order
 | Provider Account create | `application/provideraccount.go` | `BlocksGated(command.AuthMode)` |
 | Credential usability | `application/credential.go` | `BlocksGated(account.AuthMode)` |
 | `/v1/models` offer | `application/capability.go` | `BlocksGated(account.AuthMode)` |
-| Render candidate | `application/render.go` | unchanged for gated (refuses prohibited + experimental; a gated account without a RenderAdapter fails closed at execution — no T19 gate change) |
+| Render candidate | `application/render.go` | `BlocksGated(account.AuthMode)` added, alongside the existing prohibited + experimental refusal; two-tier for gated modes: an operator-disabled gated mode is refused here, while an operator-enabled gated account (Codex) passes this gate and fails closed later, at execution, for lack of a `ports.RenderAdapter` |
 | Routing fallback target | `application/routing.go` | no gate change in T19: the existing `mode.Experimental()` refusal already keeps ChatGPT Web Access out of any fallback chain (so Codex→Web stays refused, FG-2 / §6.3); a gated fallback target the operator did not enable is refused at candidate selection by `authModeGate` (`BlocksGated`) |
 
-The chat execution candidate gate (`application/chat.go`) deliberately does NOT
-check `BlocksGated`: the chat surface relies on composition-time registration.
-When the operator did not enable the gated profile and supply a transport, the
-gated chat registry is absent, so a Codex chat command dispatches to the
-fail-closed fallback (dependency_unavailable) before any Provider call — the use
-is rejected with the profile off, and the Tenant acknowledgement still applies
-on this surface.
+The chat execution candidate gate (`application/chat.go`) DOES check
+`BlocksGated`: `candidateRejection` calls it ahead of any Vault decrypt or
+Adapter call, so an operator-disabled gated mode (Codex) is rejected at the
+candidate gate itself, before credential use. Composition-time registration
+remains a second, independent line of defence: when the operator did not
+enable the gated profile and supply a transport, the gated chat registry is
+absent, so a Codex chat command that somehow reached dispatch would still fail
+closed (dependency_unavailable) before any Provider call. The Tenant
+acknowledgement still applies on this surface regardless.
 
 AC6 (kill recovery requires documented evidence, no silent fallback to ChatGPT
 Web Access) is enforced at the routing fallback gate: `fallback_auth_modes` may

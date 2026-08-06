@@ -101,11 +101,15 @@ Validation: `go build` / `go vet` / `go test ./...` / `go test -race` (4 package
 ## 5. Trạng thái
 
 - Đã push: `origin/feature/issue-62-gateway-t19-chatgpt-codex-oauth-adapter` (`08589d2..c60ab52`).
-- Các issue follow-up trong §4 **chưa** được mở — cần Đại Ca xác nhận hoặc ủy quyền tạo.
+- Các issue follow-up trong §4 **chưa** được mở — cần người chủ trì xác nhận hoặc ủy quyền tạo.
 
-## 6. Cập nhật 2026-08-06 (lượt fix thứ hai) — cả 6 mục đã xử lý
+## 6. Cập nhật 2026-08-06 (lượt fix thứ hai) — cả 6 mục đã xử lý trong phạm vi T19
 
-Sau khi báo cáo trên được viết, cả 6 mục còn lại đã được xử lý trong 5 commit. Không mục nào còn phải chờ issue follow-up để đóng phần thuộc trách nhiệm của T19.
+Sau khi báo cáo trên được viết, cả 6 mục còn lại đã được xử lý trong 5 commit,
+**trong phạm vi trách nhiệm của T19**. Bốn mục (F2/F10, F6, F9, F11) đóng trọn
+vẹn; F7 đóng ở mức chứng minh posture accept-then-fail chứ không implement
+render. Hai việc vẫn còn mở ngoài phạm vi T19 — story F7 và blocker #111 — xem
+§“Còn lại” bên dưới.
 
 | ID | Xử lý | Commit |
 | --- | --- | --- |

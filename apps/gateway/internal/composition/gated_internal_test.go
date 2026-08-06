@@ -57,3 +57,60 @@ func TestGatedAdaptersRegisterOnlyWhenEnabledAndGivenATransport(t *testing.T) {
 		}
 	})
 }
+
+// nilableGatedTransport is a chatgptcodex.Transport whose zero value is a nil
+// pointer, standing in for any concrete Transport implementation that can be
+// nil (a real *http.Client-backed Transport typically is one).
+type nilableGatedTransport struct{}
+
+func (*nilableGatedTransport) Exchange(context.Context, chatgptcodex.Request) (chatgptcodex.Response, error) {
+	return chatgptcodex.Response{Status: 500}, nil
+}
+
+// nilGatedCodexResponder is a GatedCodexResponder whose zero value is a nil
+// pointer, standing in for a fixture/production responder implementation that
+// can be nil.
+type nilGatedCodexResponder struct{}
+
+func (*nilGatedCodexResponder) Respond(context.Context, GatedCodexExchange) (GatedCodexReply, error) {
+	return GatedCodexReply{Status: 500}, nil
+}
+
+// TestGatedAdaptersTreatATypedNilTransportAsAbsent asserts a typed-nil
+// concrete value stored in the interface-typed
+// Dependencies.GatedChatGPTCodexTransport field does NOT pass the
+// registration guard. `dependencies.GatedChatGPTCodexTransport != nil` is true
+// for a typed nil (an interface holding a nil pointer compares non-nil), so
+// without the nil-aware check a typed-nil transport would register the Codex
+// Adapter over a Transport that panics on first use instead of failing closed
+// before registration.
+func TestGatedAdaptersTreatATypedNilTransportAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	mode := domain.AuthModeChatGPTCodexOAuth
+	var typedNilTransport *nilableGatedTransport
+
+	enabled := newGatedAdapters(Config{GatedAuthModes: []domain.AuthMode{mode}}, Dependencies{
+		GatedChatGPTCodexTransport: typedNilTransport,
+	})
+	if !enabled.none() {
+		t.Fatal("a gated adapter was registered over a typed-nil transport; a typed nil must be treated as absent")
+	}
+}
+
+// TestGatedAdaptersTreatATypedNilResponderAsAbsent mirrors
+// TestGatedAdaptersTreatATypedNilTransportAsAbsent for the adapter-free
+// GatedChatGPTCodexResponder seam.
+func TestGatedAdaptersTreatATypedNilResponderAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	mode := domain.AuthModeChatGPTCodexOAuth
+	var typedNilResponder *nilGatedCodexResponder
+
+	enabled := newGatedAdapters(Config{GatedAuthModes: []domain.AuthMode{mode}}, Dependencies{
+		GatedChatGPTCodexResponder: typedNilResponder,
+	})
+	if !enabled.none() {
+		t.Fatal("a gated adapter was registered over a typed-nil responder; a typed nil must be treated as absent")
+	}
+}

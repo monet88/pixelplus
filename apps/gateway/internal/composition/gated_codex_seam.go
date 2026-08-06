@@ -2,6 +2,7 @@ package composition
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/adapters/chatgptcodex"
 )
@@ -99,12 +100,41 @@ func (transport gatedCodexTransport) Exchange(
 // An explicit chatgptcodex.Transport wins; otherwise a supplied responder is
 // wrapped. Both absent yields nil, which keeps the gated Adapter unregistered —
 // enabling a mode is not granting egress (decision 0014).
+//
+// Both fields are checked with isNilInterface rather than a bare `!= nil`: a
+// caller that stores a typed-nil concrete value (e.g. a nil *someTransport) in
+// either interface-typed field would otherwise pass a `!= nil` guard — an
+// interface holding a nil pointer is itself non-nil — and reach
+// newGatedAdapters' registration guard, which would then register the Codex
+// Adapter over a transport that panics on first use instead of failing closed
+// before registration.
 func gatedCodexTransportFrom(dependencies Dependencies) chatgptcodex.Transport {
-	if dependencies.GatedChatGPTCodexTransport != nil {
+	if !isNilInterface(dependencies.GatedChatGPTCodexTransport) {
 		return dependencies.GatedChatGPTCodexTransport
 	}
-	if dependencies.GatedChatGPTCodexResponder != nil {
+	if !isNilInterface(dependencies.GatedChatGPTCodexResponder) {
 		return gatedCodexTransport{responder: dependencies.GatedChatGPTCodexResponder}
 	}
 	return nil
+}
+
+// isNilInterface reports whether an interface value is nil OR holds a
+// concrete value that is itself nil (a typed nil, e.g. a nil pointer or nil
+// map/slice/chan/func stored in the interface). A bare `value != nil` only
+// catches the first case: an interface holding a typed nil concrete value
+// compares non-nil in Go even though calling through it panics. reflect.Value
+// is used only for the Kind check that distinguishes a nil-able concrete kind
+// from one that cannot be nil (e.g. a struct value); it never inspects field
+// contents, so this stays a structural nil check and nothing else.
+func isNilInterface(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }

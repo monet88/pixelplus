@@ -136,11 +136,15 @@ func decodeResponsesError(raw json.RawMessage) []streamEvent {
 	if len(raw) == 0 {
 		return []streamEvent{{kind: eventDrift}}
 	}
-	// Only the error TYPE is decoded. The upstream `message` is a Provider
-	// string and must not travel further (OP-G3), and `resets_in_seconds` has no
-	// carrier on the chat outcomes — see the streamEvent comment above.
+	// The error TYPE is the primary signal. `message` is inspected ONLY to
+	// detect the model-at-capacity shape, which carries no `type` field
+	// (evidence: CLIProxyAPI codex_executor.go isCodexModelCapacityError). The
+	// message content itself is never retained or forwarded (OP-G3); it is used
+	// here strictly as a classification key, mirroring how `resets_in_seconds`
+	// has no carrier on the chat outcomes — see the streamEvent comment above.
 	var payload struct {
-		Type string `json:"type"`
+		Type    string `json:"type"`
+		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return []streamEvent{{kind: eventDrift}}
@@ -150,9 +154,29 @@ func decodeResponsesError(raw json.RawMessage) []streamEvent {
 		return []streamEvent{{kind: eventQuota}}
 	case "rate_limit_error", "rate_limit_exceeded":
 		return []streamEvent{{kind: eventRateLimited}}
-	default:
-		return []streamEvent{{kind: eventDrift}}
 	}
+	if isModelAtCapacityMessage(payload.Message) {
+		// A capacity exhaustion carries no `type`, so it would otherwise fall
+		// through to drift. Codex treats capacity as a retryable rate-limit
+		// condition (evidence: CLIProxyAPI newCodexStatusErr), not a generic
+		// upstream failure, so it is classified the same as an in-stream
+		// rate_limit_error.
+		return []streamEvent{{kind: eventRateLimited}}
+	}
+	return []streamEvent{{kind: eventDrift}}
+}
+
+// isModelAtCapacityMessage reports whether a Responses error message is the
+// model-at-capacity shape (evidence: CLIProxyAPI codex_executor.go
+// isCodexModelCapacityError). This has no `type` field, so it is detected by
+// message content rather than by the type switch above.
+func isModelAtCapacityMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "selected model is at capacity") ||
+		strings.Contains(lower, "model is at capacity. please try a different model")
 }
 
 // isResponsesLifecycleEvent reports whether a type is a known Responses
@@ -163,7 +187,7 @@ func isResponsesLifecycleEvent(eventType string) bool {
 	switch eventType {
 	case "response.created", "response.in_progress", "response.output_item.added",
 		"response.output_item.done", "response.content_part.added",
-		"response.content_part.done", "response.queued":
+		"response.content_part.done", "response.queued", "response.output_text.done":
 		return true
 	default:
 		return false

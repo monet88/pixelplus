@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
@@ -32,6 +33,13 @@ type codexBundle struct {
 // bundle is protocol drift rather than an auth failure: the Vault validated the
 // shape at storage time, so an undecodable bundle here means the credential
 // class is wrong for this Auth Mode, not that the credential is expired.
+//
+// AccountID is required, not optional, for the same reason AccessToken is: a
+// bundle without it would reach upstream with no Chatgpt-Account-Id binding
+// header, letting the Provider pick its own default account for the request
+// instead of the account the Vault selected (evidence §3.2 lifecycle example
+// step 3). Rejecting it here, before any exchange, keeps the failure
+// authoritatively not-committed rather than silently misrouting the request.
 func parseCodexBundle(secretMaterial string) (codexBundle, error) {
 	var bundle codexBundle
 	if err := json.Unmarshal([]byte(secretMaterial), &bundle); err != nil {
@@ -39,6 +47,32 @@ func parseCodexBundle(secretMaterial string) (codexBundle, error) {
 	}
 	if bundle.AccessToken == "" {
 		return codexBundle{}, errProtocolDrift
+	}
+	if bundle.AccountID == "" {
+		return codexBundle{}, errProtocolDrift
+	}
+	return bundle, nil
+}
+
+// rotatedCodexBundle decodes the OAuth token endpoint's rotated body the same
+// way parseCodexBundle does, except AccountID identity is not required to
+// come from the rotated body itself: a refresh grant rotates the access_token
+// (and refresh_token) but does not change which account they are bound to, and
+// the token endpoint does not reliably echo account_id (see .ref/CLIProxyAPI
+// internal/auth/codex/openai_auth.go, which re-derives it from id_token
+// claims). fallbackAccountID is the account_id already proven for this
+// exchange — the bundle's ORIGINAL AccountID before rotation — and is used
+// whenever the rotated body did not carry its own.
+func rotatedCodexBundle(secretMaterial, fallbackAccountID string) (codexBundle, error) {
+	var bundle codexBundle
+	if err := json.Unmarshal([]byte(secretMaterial), &bundle); err != nil {
+		return codexBundle{}, errProtocolDrift
+	}
+	if bundle.AccessToken == "" {
+		return codexBundle{}, errProtocolDrift
+	}
+	if bundle.AccountID == "" {
+		bundle.AccountID = fallbackAccountID
 	}
 	return bundle, nil
 }
@@ -450,7 +484,18 @@ func (adapter *Adapter) withResponses(
 					// The boundary has persisted and versioned the rotated set, so
 					// re-sending on it is safe: the material in play is the material
 					// the Vault holds.
-					rotatedBundle, parseErr := parseCodexBundle(rotated)
+					//
+					// The OAuth token endpoint body does not reliably carry account_id
+					// at top level (see .ref/CLIProxyAPI internal/auth/codex/openai_auth.go,
+					// which re-derives it from id_token claims rather than trusting the
+					// token response), so parseCodexBundle's AccountID requirement
+					// cannot be applied to the rotated body directly — doing so would
+					// fail closed on every rotation even though the account's identity
+					// did not change. rotatedCodexBundle decodes leniently and carries
+					// forward the ORIGINAL AccountID whenever the rotated body did not
+					// supply its own, because refreshing an access_token does not change
+					// which account it is bound to.
+					rotatedBundle, parseErr := rotatedCodexBundle(rotated, bundle.AccountID)
 					if parseErr != nil {
 						return parseErr
 					}
@@ -491,6 +536,14 @@ func (adapter *Adapter) withResponses(
 		case signalChallenged:
 			return errChallenged
 		case signalRateLimited:
+			// A 429 may carry either a transient rate_limit_error or a
+			// usage_limit_reached body (evidence §5), exactly like the probe
+			// surface's Probe path. Distinguishing them here keeps a quota
+			// exhaustion from being reported as a generic rate limit and losing
+			// its cooldown-worthy reset hint.
+			if quota := parseUsageLimit(opened.Body, time.Now()); quota.Present {
+				return errQuota
+			}
 			return errRateLimited
 		default:
 			return errUnavailable
@@ -539,13 +592,20 @@ func (adapter *Adapter) rotateCredential(ctx context.Context, refreshToken strin
 	}
 	switch classifyStatus(refreshed.Status) {
 	case signalOK:
+	case signalUnavailable:
+		// A transient 5xx from auth.openai.com/oauth/token is not proof the
+		// refresh_token is bad — the account may be perfectly healthy behind a
+		// backend outage. Reporting it as errRefreshFailed (which maps to
+		// ErrCodeProviderAuthExpired) would push a healthy account into
+		// reauthentication for a problem reauth cannot fix.
+		return "", errUnavailable
 	default:
 		// A 400/401 on the refresh endpoint is a reused or revoked refresh_token.
 		// Treat it as auth-failed so the account moves to reauth_required rather
 		// than retrying the refresh loop.
 		return "", errRefreshFailed
 	}
-	rotated, err := parseCodexBundle(refreshed.Body)
+	rotated, err := rotatedCodexBundle(refreshed.Body, "")
 	if err != nil {
 		return "", errRefreshFailed
 	}

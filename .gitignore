@@ -53,3 +53,5 @@ scripts/bin/harness-cli.exe
 # Local Harness backup snapshots
 .harness-backup/
 .harness/
+.pi/
+.pi-subagents/

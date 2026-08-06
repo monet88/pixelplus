@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 	"github.com/monet88/pixelplus/apps/gateway/internal/ports"
@@ -102,7 +103,7 @@ func (adapter *Adapter) Probe(ctx context.Context, command ports.ProbeCommand) (
 		// hint and is a cooldown-worthy exhaustion; the rate form is a
 		// transient backoff. Distinguishing them here keeps the scoped
 		// cooldown honest.
-		if quota := parseUsageLimit(identity.Body); quota.Present {
+		if quota := parseUsageLimit(identity.Body, time.Now()); quota.Present {
 			return ports.ProbeOutcome{
 				Authenticated:     true,
 				Signal:            ports.ProbeSignalQuotaExhausted,
@@ -122,7 +123,7 @@ func (adapter *Adapter) Probe(ctx context.Context, command ports.ProbeCommand) (
 		// as a scoped quota signal so the account activates (auth proven) with a
 		// durable cooldown overlay, exactly like the Web surface's image_gen
 		// quota.
-		if quota := parseUsageLimit(identity.Body); quota.Present {
+		if quota := parseUsageLimit(identity.Body, time.Now()); quota.Present {
 			return ports.ProbeOutcome{
 				Authenticated:     true,
 				Signal:            ports.ProbeSignalQuotaExhausted,
