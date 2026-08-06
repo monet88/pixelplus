@@ -48,12 +48,14 @@ func newGatedAdapters(config Config, dependencies Dependencies) gatedAdapters {
 //
 // There is deliberately no renderAdapter helper beside the four below, for the
 // same reason 0013 recorded for experimental: this story's gated Adapter
-// implements chat, stream, probe, and capability only, and the render candidate
-// gate refuses a gated mode in EVERY composition so an enabled deployment never
-// accepts a render job it cannot serve. A later story that gives a gated
-// Adapter a real ports.RenderAdapter must add the matching renderAdapter helper
-// here AND relax that render gate together; nothing else forces that, so the
-// omission is recorded rather than implied.
+// implements chat, stream, probe, and capability only. The render candidate
+// gate refuses a gated mode the operator did NOT enable; an operator-ENABLED
+// gated account still passes that gate, so its render job is accepted and then
+// fails closed at execution for lack of a ports.RenderAdapter (the accept-then-
+// fail posture proved by the gated render posture contract test). A later story
+// that gives a gated Adapter a real ports.RenderAdapter must add the matching
+// renderAdapter helper here so that accepted job can actually be served;
+// nothing else forces that, so the omission is recorded rather than implied.
 func (enabled gatedAdapters) none() bool {
 	return enabled.chatGPTCodex == nil
 }
