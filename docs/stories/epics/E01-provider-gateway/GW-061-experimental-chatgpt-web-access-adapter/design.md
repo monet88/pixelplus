@@ -32,7 +32,8 @@ A new value type in `internal/domain/labprofile.go`:
 type LabProfile struct { enabled map[AuthMode]struct{} }
 func NewLabProfile(modes ...AuthMode) LabProfile
 func (LabProfile) AllowsExperimental(AuthMode) bool
-// BlocksExperimental is the gate-site form and is what all six gate sites call:
+// BlocksExperimental is the gate-site form and is what the five profile-gated
+// gate sites call (render.go deliberately rejects experimental unconditionally):
 // mode.Experimental() && !AllowsExperimental(mode). Stating the refusal directly
 // keeps a gate from having to remember that a NON-experimental mode must not be
 // blocked by this control — negating AllowsExperimental alone would refuse every
