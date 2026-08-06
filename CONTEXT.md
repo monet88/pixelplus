@@ -1,5 +1,48 @@
 # InpaintKit Provider Gateway — Domain Glossary
 
+## Execution Path
+
+Cách một image/chat operation của Plugin đi tới Provider. Có đúng hai Execution Path và chúng phân nhánh theo **loại credential**, không theo loại người dùng:
+
+- **Direct Path**: user cung cấp API key của chính họ; Plugin gọi thẳng Provider từ máy user. Không có Tenant, Asset, Render Job hay Client API Key trong đường này. Credential nằm trên thiết bị.
+- **Gateway Path**: user dùng OAuth/account có sẵn của họ; Plugin gọi Public API bằng Client API Key và Gateway thực thi trên server. Credential nằm trong Credential Vault.
+
+Hai Path không được trộn trong một request. Cùng một model có thể chạy được trên cả hai Path (ví dụ `gpt-image-2` qua ChatGPT Account hoặc qua OpenAI API key), và việc chọn Path là quyết định tường minh của user, không phải fallback tự động. Plugin không bao giờ âm thầm chuyển một operation từ Path này sang Path kia.
+
+## Product License
+
+Chứng từ kích hoạt **sản phẩm Plugin** trên một thiết bị, mang định dạng `INPK-...`, có hạn dùng và giới hạn số device đồng thời. Product License không phải Client API Key và không phải Provider Credential: nó không cấp quyền gọi Public API và không chứng minh danh tính tại Provider nào. Product License tồn tại ở cả hai Execution Path, kể cả Direct Path nơi Gateway không tham gia.
+_Avoid_: license key, activation key (khi đang nói về Client API Key)
+
+## Connection
+
+Từ dùng trong UI của Plugin cho một cách kết nối tới Provider đã được user cấu hình. Trên Gateway Path, một Connection tương ứng đúng một Provider Account. Trên Direct Path, Connection chỉ là credential cục bộ trên thiết bị và **không** có Provider Account nào phía server.
+_Avoid_: account, provider (khi đang nói về Connection trong UI)
+
+## Target Rect
+
+Vùng người dùng chọn trong tài liệu Photoshop, tính bằng pixel toạ độ tài liệu. Đây là vùng người dùng muốn sửa và là vùng kết quả cuối cùng phải đặt vào — không phải vùng gửi cho model.
+
+## Context Rect
+
+Vùng đã nới rộng quanh Target Rect, dùng làm ảnh input gửi cho model. Nới ra vì model cần thấy khung cảnh xung quanh mới hoà được vùng sửa vào ảnh; gửi đúng Target Rect thì model không có ngữ cảnh. Context Rect luôn bị kẹp trong biên tài liệu, nên nó không đối xứng khi Target Rect nằm sát rìa.
+_Avoid_: source rect, padded bounds, expanded selection
+
+Mask gửi kèm mô tả Target Rect **theo toạ độ trong Context Rect**, không theo toạ độ tài liệu. Đây là chỗ dễ sai lặng lẽ nhất trong chuỗi: tính sai tỉ lệ quy đổi thì model sửa lệch chỗ mà không có lỗi nào báo.
+
+## Mask Convention
+
+Cách một ảnh mask mã hoá vùng cần sửa. Chỉ có đúng hai convention tồn tại trong thực tế: **luminance** (độ sáng mang nghĩa, trắng = sửa) và **alpha** (kênh alpha mang nghĩa, alpha=0 = sửa). Convention không phải thuộc tính của Provider mà là thoả thuận trên từng dây nối, nên một mask đúng ở nơi này là ngược ở nơi khác.
+
+Canonical Mask Convention của Plugin là **luminance, trắng = sửa, alpha=255**. Mọi mask do Plugin sinh ra đều ở dạng này. Phép đảo sang convention khác thuộc về thành phần trực tiếp nói chuyện với upstream: trên Direct Path là provider client trong Plugin, trên Gateway Path là Provider Adapter trong Gateway. Không thành phần nào khác được đảo mask.
+_Avoid_: mask polarity, invert mask (khi đang nói về convention)
+
+Mask là dữ liệu do Plugin sinh ra từ vùng chọn Photoshop, không phải file do user chọn, nên Plugin quyết định được format và mask luôn là PNG. Ảnh input thì ngược lại — nó bắt nguồn từ tài liệu của user và giữ được cả PNG, JPEG và WebP. Khác biệt này là lý do hai kind có ràng buộc format khác nhau chứ không phải một chính sách chung nới lỏng cho mask.
+
+## Image Engine
+
+Ràng buộc do user khai báo trong Plugin, gắn một model tới Connection sẽ chạy model đó. Image Engine là quyết định phía client và không phải Routing Policy: Routing Policy chỉ chọn giữa các Provider Account cùng Tenant trên Gateway Path, còn Image Engine còn được phép chọn cả Execution Path. Khi Connection đã chọn không khả dụng thì model đó dừng, không bao giờ âm thầm chạy sang Connection khác.
+
 ## Tenant
 
 Chủ thể sở hữu Client API Keys và Provider Accounts trong gateway. Dữ liệu và quyền sử dụng của một Tenant không được chia sẻ với Tenant khác.
@@ -96,6 +139,28 @@ Các Auth Mode ban đầu là:
 - **Grok xAI OAuth**: truy cập xAI surface bằng xAI OAuth credential.
 
 Trạng thái risk envelope (`allowed` / `prohibited` / `experimental` / `gated`), kill criteria và điều kiện phục hồi của từng Auth Mode nằm tại `docs/spec/auth-mode-risk-envelope-and-kill-criteria.md`. Risk status độc lập với Capability Snapshot.
+
+## Lab Profile
+
+Sự cho phép tường minh của operator cho các Auth Mode `experimental` trong **một deployment cụ thể**. Lab Profile là một domain value, không phải port: nó không làm I/O và không có failure mode, nên zero value của nó đã là trạng thái đóng. Ordinary production không đặt tên mode nào, nên mọi gate experimental fail-closed mặc định — đúng yêu cầu §2 status table (`experimental` mặc định "off everywhere ... unless an operator deliberately enables a lab profile"), §5.1 và §6.1.
+
+Lab Profile chỉ nhận Auth Mode `experimental`. Đặt tên một mode `prohibited` (Grok Web SSO) hoặc `gated` vào đây **không có tác dụng**: mode `prohibited` là hard off theo policy, còn mode `gated` được quản bởi feature flag riêng của nó cộng Tenant acknowledgement (§5.2, §5.4, §5.6). Đây là lý do Lab Profile không thể trở thành cửa sau vào một mode bị cấm hay cách bỏ qua gate của một mode gated.
+
+Enablement là **điều kiện cần nhưng không bao giờ đủ**. Operator bật đường đi, còn Tenant residual-risk acknowledgement mới bước qua nó; lifecycle, health và admission control vẫn áp dụng đầy đủ. Tách biệt nữa: bật một mode **không** đồng nghĩa cấp egress — Adapter transport là một dependency riêng operator phải cung cấp có chủ ý, nên một mode đã bật mà thiếu transport sẽ fail-closed trên mọi surface.
+
+Enablement cũng là **quyết định lúc composition**, không phải nhánh runtime: khi profile tắt, Adapter vắng mặt khỏi object graph đã compose chứ không phải có mặt rồi bị bỏ qua (§6.1, §7 rule 1). Chi tiết quyết định nằm tại `docs/decisions/0013-experimental-lab-profile-and-capability-baseline.md`.
+_Avoid_: feature flag, experimental flag, dev mode (khi đang nói về Lab Profile)
+
+## Capability Baseline
+
+Trần (**ceiling**) capability status mạnh nhất mà evidence đã được chấp nhận hỗ trợ cho một cặp Auth Mode + operation. Baseline sống trong domain nên có đúng một chỗ phải đọc lại khi evidence document đổi; nếu clamp nằm trong Adapter thì mỗi Adapter — hoặc một fixture adapter nói dối — đều có thể lách qua.
+
+Baseline là **trần, không phải sàn**. Quan sát `unsupported` hoặc `unverified` đi qua nguyên vẹn, nên "chúng ta đã thấy nó thất bại" vẫn được giữ; chỉ tuyên bố **mạnh hơn** evidence mới bị hạ xuống. Nguyên nhân–kết quả cụ thể: một lab probe trên account ChatGPT Web mới thành công và Adapter báo `verified` chat. Không có trần này, Capability Snapshot được mint sẽ công bố lời hứa mạnh hơn mọi evidence đã chấp nhận, chỉ vì một probe tình cờ chạy được.
+
+Vì vậy nâng một operation vượt trần đòi **thẩm quyền mới** — sửa evidence document — chứ không phải một probe may mắn hay một thay đổi code. Điều này giữ §2.2 (capability maturity độc lập với risk) và §7 rule 2 (snapshot không được hàm ý risk acceptance).
+
+Baseline hiện được ghi cho cả hai ChatGPT Auth Mode ở mức `conditionally_supported`, theo `docs/spec/research/chatgpt-auth-mode-capability-evidence.md` §2.1–§2.2 và §11 conclusion 2: cả năm operation chính trên hai mode đều là reference-learned, không operation nào `verified`. Auth Mode chưa có baseline được ghi thì **không bị clamp** — evidence document của Gemini và Grok là normative input riêng thuộc story Adapter của chúng, nên bịa một trần ở đây sẽ là quyết định sản phẩm không có căn cứ.
+_Avoid_: capability ceiling, max capability, capability cap (dùng "Capability Baseline")
 
 ## Grok xAI OAuth Operation Surface Policy
 

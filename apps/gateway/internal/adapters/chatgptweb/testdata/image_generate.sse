@@ -1,0 +1,4 @@
+"v1"
+{"v":{"message":{"author":{"role":"tool"},"content":{"content_type":"multimodal_text","parts":[{"asset_pointer":"file-service://file_fixture_gen_result"},{"asset_pointer":"sediment://file_fixture_gen_result"}]},"metadata":{"async_task_type":"image_gen"}},"conversation_id":"conv-fixture-0002"}}
+{"type":"server_ste_metadata","metadata":{"tool_invoked":true,"turn_use_case":"multimodal"}}
+[DONE]

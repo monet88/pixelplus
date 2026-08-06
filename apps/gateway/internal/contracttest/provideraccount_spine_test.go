@@ -42,6 +42,10 @@ type spineHarness struct {
 	circuits     *stubCircuitStore
 	routing      *countingRoutingPolicyStore
 	clock        *mutableTestClock
+	// labAuthModes names the `experimental` Auth Modes this harness composes as a
+	// lab profile. Empty composes an ordinary production deployment, so a test
+	// that leaves it unset proves the production posture (T18).
+	labAuthModes []domain.AuthMode
 }
 
 // mutableTestClock is a controlled clock for public composition proofs that
@@ -174,6 +178,8 @@ func newSpineHarness(t *testing.T, configure func(*spineHarness)) *spineHarness 
 		Circuits:     harness.circuits,
 		Routing:      harness.routing,
 		Clock:        harness.clock,
+
+		ExperimentalLabAuthModes: harness.labAuthModes,
 	})
 	if err != nil {
 		t.Fatalf("NewFixture() error = %v", err)

@@ -343,8 +343,19 @@ func TestOAuthStartGatesRejectBeforeAdapter(t *testing.T) {
 		}
 	}
 
+	// Production composition (no lab profile): an experimental Web mode is not
+	// connectable at all, so the Auth Mode gate fires before the "Web modes have
+	// no server-owned OAuth journey" shape rule (risk envelope §6.1).
 	run(t, "/v1/provider-accounts/pa_web/oauth-authorizations", func(h *spineHarness) {
 		h.seedAccount("tenant_a", usableDraft("pa_web", domain.AuthModeChatGPTWebAccess))
+	}, oauthStartBody("connect", "device"), "auth_mode_unavailable", http.StatusConflict)
+
+	// Lab composition with the mode enabled: the Auth Mode gate now passes, so
+	// the original rule is still what rejects the request. Enabling an
+	// experimental Web mode for lab use does not give it an OAuth journey.
+	run(t, "/v1/provider-accounts/pa_web_lab/oauth-authorizations", func(h *spineHarness) {
+		h.labAuthModes = []domain.AuthMode{domain.AuthModeChatGPTWebAccess}
+		h.seedAccount("tenant_a", usableDraft("pa_web_lab", domain.AuthModeChatGPTWebAccess))
 	}, oauthStartBody("connect", "device"), "invalid_request", http.StatusBadRequest)
 
 	run(t, "/v1/provider-accounts/pa_pending/oauth-authorizations", func(h *spineHarness) {

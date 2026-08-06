@@ -84,6 +84,10 @@ type ChatService struct {
 	// execution between X5 and X6 (§6.5 rules 3-4). A nil drain means the drain
 	// returns unknown usage immediately, so settlement fails closed.
 	residualDrain ports.ChatResidualDrain
+	// labProfile names the `experimental` Auth Modes this deployment deliberately
+	// enabled. The zero value enables nothing, so ordinary production keeps every
+	// experimental account out of the candidate set (risk envelope §5.1, §6.1).
+	labProfile domain.LabProfile
 }
 
 // ChatDependencies bundles the controlled ports the chat spine owns.
@@ -115,6 +119,9 @@ type ChatDependencies struct {
 	// ResidualDrain performs bounded drain/recovery of surviving upstream
 	// executions between X5 and X6 (§6.5 rules 3-4, T17).
 	ResidualDrain ports.ChatResidualDrain
+	// LabProfile is optional and defaults to the closed zero value, which keeps
+	// every `experimental` Auth Mode out of the candidate set.
+	LabProfile domain.LabProfile
 }
 
 // NewChatService validates and wires the chat spine dependencies.
@@ -177,6 +184,7 @@ func NewChatService(dependencies ChatDependencies) (*ChatService, error) {
 		executions:       newChatExecutionRegistry(dependencies.Clock),
 		residualStore:    dependencies.ResidualStore,
 		residualDrain:    dependencies.ResidualDrain,
+		labProfile:       dependencies.LabProfile,
 	}, nil
 }
 
@@ -730,8 +738,10 @@ func (service *ChatService) candidateRejection(
 	model string,
 	now time.Time,
 ) (domain.CanonicalError, bool) {
-	// C3 risk / C2 usability.
-	if account.AuthMode.Prohibited() || account.AuthMode.Experimental() {
+	// C3 risk / C2 usability. An experimental mode is a candidate only in a
+	// deployment that deliberately enabled it as a lab profile; the zero-value
+	// profile keeps ordinary production closed (risk envelope §5.1, §6.1).
+	if account.AuthMode.Prohibited() || service.labProfile.BlocksExperimental(account.AuthMode) {
 		return domain.NewAuthModeUnavailable(), false
 	}
 	if account.AuthMode.RequiresRiskAck() && !account.RiskAcknowledged {

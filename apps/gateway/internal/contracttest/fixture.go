@@ -131,6 +131,13 @@ type Options struct {
 	// 3-4). A nil drain means unknown usage immediately, so settlement fails
 	// closed.
 	ResidualDrain ports.ChatResidualDrain
+
+	// ExperimentalLabAuthModes names the `experimental` Auth Modes this fixture's
+	// composition enables as a lab profile (T18, risk envelope §5.1, §6.1). Empty
+	// — the default — composes an ordinary production deployment where every
+	// experimental mode stays fail-closed, so a fixture that does not set it
+	// proves the production posture.
+	ExperimentalLabAuthModes []domain.AuthMode
 }
 
 // Fixture wraps the real Runtime in a public HTTP server.
@@ -167,6 +174,8 @@ func NewFixture(options Options) (*Fixture, error) {
 		// durable state. Production composition leaves this false and fails closed.
 		AllowInMemoryRenderJobs: allowInMemory,
 		AllowInMemoryChat:       true,
+
+		ExperimentalLabAuthModes: options.ExperimentalLabAuthModes,
 	}, composition.Dependencies{
 		Runtime: jobs,
 		Clock:   clock,

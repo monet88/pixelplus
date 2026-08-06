@@ -1,0 +1,6 @@
+"v1"
+{"p":"/message/content/parts/0","o":"append","v":"I can't assist with that request."}
+{"type":"moderation","moderation_response":{"blocked":true},"conversation_id":"conv-fixture-0004"}
+{"type":"title_generation","title":"Request Denied","conversation_id":"conv-fixture-0004"}
+{"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"}]}
+[DONE]

@@ -228,6 +228,11 @@ func (snapshot CapabilitySnapshot) WithAccountOfferGate(allows bool) CapabilityS
 }
 
 // NewLiveProbeSnapshot builds a credential-version-bound snapshot from live probe evidence.
+//
+// Every observed status is clamped to the Auth Mode's canonical capability
+// baseline before it is recorded, so a successful probe can never mint a
+// stronger capability claim than the accepted evidence supports
+// (CanonicalCapabilityBaseline; risk envelope §2.2, §7 rule 2).
 func NewLiveProbeSnapshot(
 	accountID ProviderAccountID,
 	mode AuthMode,
@@ -248,11 +253,21 @@ func NewLiveProbeSnapshot(
 			}
 		}
 	}
+	for op, fact := range operations {
+		fact.Status = ClampToCanonicalBaseline(mode, op, fact.Status)
+		operations[op] = fact
+	}
 	// Model rows must always carry all five primary operation keys so wire
 	// serialization matches the frozen ModelCapability schema.
 	normalizedModels := cloneModelCapabilities(models)
 	for i := range normalizedModels {
 		normalizedModels[i].Operations = normalizeModelOperations(normalizedModels[i].Operations)
+		// A model row is a client-facing capability claim too, so the ceiling
+		// applies per row: clamping only the operation facts would let one model
+		// advertise `verified` under a `conditionally_supported` operation.
+		for op, status := range normalizedModels[i].Operations {
+			normalizedModels[i].Operations[op] = ClampToCanonicalBaseline(mode, op, status)
+		}
 	}
 	snapshot := CapabilitySnapshot{
 		ProviderAccountID: accountID,

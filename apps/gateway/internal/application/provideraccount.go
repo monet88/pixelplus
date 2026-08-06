@@ -146,6 +146,11 @@ type ProviderAccountService struct {
 	requestLog   ports.RequestLogRecorder
 	clock        ports.Clock
 	ids          ports.IDGenerator
+	// labProfile names the `experimental` Auth Modes this deployment deliberately
+	// enabled. The zero value enables nothing, so an ordinary production
+	// composition that never sets it keeps every experimental mode closed
+	// (risk envelope §2 status table, §6.1).
+	labProfile domain.LabProfile
 }
 
 // ProviderAccountDependencies bundles the controlled ports this slice owns.
@@ -167,6 +172,9 @@ type ProviderAccountDependencies struct {
 	RequestLog   ports.RequestLogRecorder
 	Clock        ports.Clock
 	IDs          ports.IDGenerator
+	// LabProfile is optional and defaults to the closed zero value. It is a value
+	// rather than a port because it performs no I/O and has no failure mode.
+	LabProfile domain.LabProfile
 }
 
 // NewProviderAccountService validates and wires the request spine dependencies.
@@ -225,6 +233,7 @@ func NewProviderAccountService(dependencies ProviderAccountDependencies) (*Provi
 		requestLog:   dependencies.RequestLog,
 		clock:        dependencies.Clock,
 		ids:          dependencies.IDs,
+		labProfile:   dependencies.LabProfile,
 	}, nil
 }
 
@@ -371,10 +380,16 @@ func (service *ProviderAccountService) CreateProviderAccount(ctx context.Context
 
 	// A prohibited Auth Mode is outside the product risk envelope and must fail
 	// closed before any replay claim or durable side effect. Only grok_web_sso
-	// is prohibited in this slice (auth-mode risk spec §4/§5.5). Gated and
-	// experimental gating (operator flag + Tenant acknowledgement) is owned by
-	// #7/#9 and is out of scope here.
-	if command.AuthMode.Prohibited() {
+	// is prohibited in this slice (auth-mode risk spec §4/§5.5).
+	//
+	// An `experimental` mode is refused here too unless this deployment
+	// deliberately enabled it as a lab profile: §6.1 forbids an experimental mode
+	// from appearing "in ordinary production Tenant self-serve catalogs", and a
+	// creatable draft is exactly such an appearance. The lab profile only opens
+	// the door — the Tenant residual-risk acknowledgement (RequiresRiskAck) is
+	// enforced separately before the stored credential becomes usable, so
+	// enablement never substitutes for disclosure.
+	if command.AuthMode.Prohibited() || service.labProfile.BlocksExperimental(command.AuthMode) {
 		return ProviderAccountResult{}, service.fail(ctx, sc, domain.NewAuthModeUnavailable())
 	}
 

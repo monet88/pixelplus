@@ -1,0 +1,7 @@
+"v1"
+{"type":"an_event_type_this_adapter_has_never_seen","payload":{"nested":true}}
+{"type":"another_unknown_event","conversation_id":"conv-fixture-0005","payload":{"nested":true}}
+{"p":"/message/content/parts/0","o":"append","v":12345}
+{"this is not valid json
+{"o":"patch","v":"not-an-array"}
+[DONE]
