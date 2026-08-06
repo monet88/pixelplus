@@ -49,13 +49,13 @@ var forbiddenEgress = []string{
 // list here rather than implicit in test names means dropping a family fails the
 // suite instead of silently shrinking coverage.
 var requiredFixtureFamilies = map[string][]string{
-	"refresh":           {"token_refresh.json"},
-	"chat and stream":   {"chat_stream.sse"},
-	"image operations":  {"image_generate.sse", "image_edit.sse"},
-	"entitlement":       {"entitlement_free.json"},
-	"quota and rate":    {"quota_rate.json"},
-	"challenge":         {"challenge.json"},
-	"protocol drift":    {"protocol_drift.sse"},
+	"refresh":          {"token_refresh.json"},
+	"chat and stream":  {"chat_stream.sse"},
+	"image operations": {"image_generate.sse", "image_edit.sse"},
+	"entitlement":      {"entitlement_free.json"},
+	"quota and rate":   {"quota_rate.json"},
+	"challenge":        {"challenge.json"},
+	"protocol drift":   {"protocol_drift.sse"},
 }
 
 // packageFiles parses every non-test source file in the Adapter package.

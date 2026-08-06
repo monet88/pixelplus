@@ -89,9 +89,6 @@ type turnResult struct {
 	// turn with content but neither `[DONE]` nor a finish marker was cut off
 	// mid-generation rather than completed.
 	sawDone bool
-	// quotaResetsAfter carries an in-stream usage_limit_reached reset hint. It
-	// is set only when consumeStream stops on an eventQuota.
-	quotaResetsAfter int
 }
 
 // consumeStream reads an SSE body to its end, applying each decoded event.
@@ -153,7 +150,16 @@ func consumeStream(ctx context.Context, stream Stream, deliver func(string) erro
 			case eventImage:
 				result.imagePointer = event.pointer
 			case eventQuota:
-				result.quotaResetsAfter = event.resetsAfterSeconds
+				// The event's resetsAfterSeconds hint is deliberately DROPPED
+				// here rather than stored: domain.ChatOutcome and
+				// domain.ChatStreamOutcome carry no retry-after carrier, so a
+				// field on turnResult would be written and never read — asserting
+				// the hint survives to the spine when it cannot. The probe surface
+				// does carry one (ports.ProbeOutcome.RetryAfterSeconds, used in
+				// Probe), so quota cooldown IS observable for this account, just
+				// not through a chat turn. Threading the hint onto the chat
+				// outcomes is a domain change tracked separately, not something to
+				// imply with a dead field.
 				return snapshot(), errQuota
 			case eventRateLimited:
 				return snapshot(), errRateLimited
@@ -615,6 +621,7 @@ func canonicalFailureClass(err error) domain.ErrorCode {
 //   - Content already arrived from the upstream before the break. `Run` buffers,
 //     so the caller saw nothing — but the upstream demonstrably produced a
 //     generation and may have committed and billed it.
+//
 // failureDecision is the commit-certainty and failure-class decision shared by
 // the non-streaming and streaming failure classifiers. The two surfaces differ
 // only in the outcome struct they project onto; the commit question — the
@@ -688,10 +695,10 @@ func classifyFailure(ctx context.Context, err error, result turnResult) failureD
 	// Authoritative no-commit proof, as defined above.
 	switch {
 	case errors.Is(err, ErrTransportUnavailable), // nil transport: never transmitted
-		errors.Is(err, errProtocolDrift),  // body/bundle failure before exchange
-		errors.Is(err, errAuthFailed),     // 401: not authorized, no generation
-		errors.Is(err, errChallenged),     // 403: refused before generation
-		errors.Is(err, errRefreshFailed):  // refresh refused, responses never re-sent
+		errors.Is(err, errProtocolDrift), // body/bundle failure before exchange
+		errors.Is(err, errAuthFailed),    // 401: not authorized, no generation
+		errors.Is(err, errChallenged),    // 403: refused before generation
+		errors.Is(err, errRefreshFailed): // refresh refused, responses never re-sent
 		return failureDecision{
 			class:        domain.ChatOutcomeNotCommitted,
 			commit:       domain.CommitNotCommitted,

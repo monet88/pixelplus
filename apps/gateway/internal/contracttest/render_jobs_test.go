@@ -124,7 +124,7 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	}
 
 	h.adapter = &countingRenderAdapter{harness: h}
-	opts := contracttest.Options{		Principal:     h.principal,
+	opts := contracttest.Options{Principal: h.principal,
 		Admission:     h.admission,
 		Replay:        h.replay,
 		Accounts:      h.accounts,

@@ -40,8 +40,12 @@ type streamEvent struct {
 	text string
 	// pointer is the asset pointer for eventImage.
 	pointer string
-	// resetsAfterSeconds is the relative reset hint for eventQuota.
-	resetsAfterSeconds int
+	// There is deliberately no reset-hint field for eventQuota. The chat outcome
+	// vocabulary (domain.ChatOutcome / domain.ChatStreamOutcome) has no
+	// retry-after carrier, so a hint decoded here would be written and never
+	// read — see the eventQuota case in consumeStream. The probe surface, which
+	// DOES have ports.ProbeOutcome.RetryAfterSeconds, decodes its own hint via
+	// parseUsageLimit.
 }
 
 // decodeStreamPayload translates one raw SSE `data:` payload into a canonical
@@ -130,17 +134,18 @@ func decodeResponsesError(raw json.RawMessage) []streamEvent {
 	if len(raw) == 0 {
 		return []streamEvent{{kind: eventDrift}}
 	}
+	// Only the error TYPE is decoded. The upstream `message` is a Provider
+	// string and must not travel further (OP-G3), and `resets_in_seconds` has no
+	// carrier on the chat outcomes — see the streamEvent comment above.
 	var payload struct {
-		Type           string  `json:"type"`
-		Message        string  `json:"message"`
-		ResetsInSeconds float64 `json:"resets_in_seconds"`
+		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return []streamEvent{{kind: eventDrift}}
 	}
 	switch payload.Type {
 	case "usage_limit_reached":
-		return []streamEvent{{kind: eventQuota, resetsAfterSeconds: int(payload.ResetsInSeconds)}}
+		return []streamEvent{{kind: eventQuota}}
 	case "rate_limit_error", "rate_limit_exceeded":
 		return []streamEvent{{kind: eventRateLimited}}
 	default:

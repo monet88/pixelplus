@@ -79,7 +79,7 @@ type quotaSignal struct {
 func parseUsageLimit(body string) quotaSignal {
 	var payload struct {
 		Error struct {
-			Type           string  `json:"type"`
+			Type            string  `json:"type"`
 			ResetsInSeconds float64 `json:"resets_in_seconds"`
 		} `json:"error"`
 	}
@@ -95,126 +95,25 @@ func parseUsageLimit(body string) quotaSignal {
 	}
 }
 
-// rateLimitError reports whether a Responses body carries a rate_limit_error /
-// rate_limit_exceeded signal, which is a transient per-minute style limit the
-// evidence treats as retry-worthy rather than a long cooldown.
-func rateLimitError(body string) bool {
-	var payload struct {
-		Error struct {
-			Type string `json:"type"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(body), &payload); err != nil {
-		return false
-	}
-	switch payload.Error.Type {
-	case "rate_limit_error", "rate_limit_exceeded":
-		return true
-	default:
-		return false
-	}
-}
+// Body-level rate/capacity and plan-entitlement parsers are deliberately ABSENT
+// here. Earlier drafts carried a rateLimitError / modelAtCapacity /
+// parsePlanEntitlement trio that nothing called, which read as though this
+// Adapter already classified those signals when it did not:
+//
+//   - Body-level rate signals: the live rate paths are the HTTP 429 in
+//     classifyStatus and the in-stream rate_limit_error event in
+//     decodeResponsesError. A third, uncalled body parser only obscured which of
+//     them is actually load-bearing.
+//   - Plan entitlement: mapping a free plan onto an entitlement-missing image
+//     operation requires an account-attributes exchange this story does not make
+//     (Observe reads /backend-api/models only). Keeping a parser for a body the
+//     Adapter never fetches asserted coverage that does not exist.
+//
+// Both are gaps to close with the exchange that needs them, not with a helper
+// that has no caller. testdata/entitlement_free.json is retained as the recorded
+// shape for that future exchange; validation.md states plainly that the
+// entitlement family is fixture shape rather than proved behavior.
 
-// modelAtCapacity reports whether a Responses body carries a "selected model is
-// at capacity" message, which the evidence maps toward 429-class handling.
-func modelAtCapacity(body string) bool {
-	var payload struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(body), &payload); err != nil {
-		return false
-	}
-	return containsFold(payload.Error.Message, "at capacity")
-}
-
-// planEntitlement is the normalized plan/entitlement view taken from a Codex
-// account-attributes or id_token-claims projection.
-type planEntitlement struct {
-	// PlanType is the observed plan class (free, plus, team, pro, business,
-	// enterprise). Empty when nothing was observed.
-	PlanType string
-	// ImageToolInjected reports whether the Codex image_generation tool is
-	// exposed for this plan. The evidence restricts Codex image exposure to
-	// Plus/Team/Pro; a free plan skips image tool injection
-	// (isCodexFreePlanAuth), so image operations are entitlement-missing on a
-	// free account rather than unsupported by the surface.
-	ImageToolInjected bool
-}
-
-// parsePlanEntitlement extracts the plan class from an account-attributes body.
-// Evidence: CLIProxyAPI isCodexFreePlanAuth; chatgpt2api plan filters.
-func parsePlanEntitlement(body string) planEntitlement {
-	var payload struct {
-		PlanType string `json:"plan_type"`
-		Attributes struct {
-			PlanType string `json:"plan_type"`
-		} `json:"attributes"`
-	}
-	if err := json.Unmarshal([]byte(body), &payload); err != nil {
-		return planEntitlement{}
-	}
-	plan := payload.PlanType
-	if plan == "" {
-		plan = payload.Attributes.PlanType
-	}
-	return planEntitlement{
-		PlanType:          plan,
-		ImageToolInjected: codexPlanInjectsImageTool(plan),
-	}
-}
-
-// codexPlanInjectsImageTool reports whether a plan exposes the Codex
-// image_generation tool. The evidence gates Codex image to Plus/Team/Pro
-// (chatgpt2api model exposure, CLIProxy isCodexFreePlanAuth); a free plan skips
-// image tool injection, so image operations are entitlement-missing there.
-func codexPlanInjectsImageTool(plan string) bool {
-	switch plan {
-	case "plus", "team", "pro", "business", "enterprise":
-		return true
-	default:
-		return false
-	}
-}
-
-// containsFold is a case-insensitive substring check used only for stable,
-// non-secret upstream message fragments (never for credential material).
-func containsFold(haystack, needle string) bool {
-	if len(needle) == 0 {
-		return true
-	}
-	if len(haystack) < len(needle) {
-		return false
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if equalFold(haystack[i:i+len(needle)], needle) {
-			return true
-		}
-	}
-	return false
-}
-
-// equalFold is an ASCII case-insensitive compare sufficient for the fixed
-// upstream message fragments this package inspects.
-func equalFold(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
-}
 // modelSlugs extracts the session-dependent model slugs from a
 // /backend-api/models payload. The list is account and session dependent, so a
 // Capability Snapshot must store what was observed rather than a static

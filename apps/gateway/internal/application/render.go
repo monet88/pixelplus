@@ -205,7 +205,7 @@ type RenderDependencies struct {
 	// operator did not enable must not reach a Vault decrypt here either. The
 	// Codex Adapter still implements no ports.RenderAdapter, so an ENABLED gated
 	// mode remains an accept-then-fail-closed candidate exactly as before.
-	GatedProfile domain.GatedProfile
+	GatedProfile      domain.GatedProfile
 	HeartbeatInterval time.Duration
 }
 

@@ -390,6 +390,7 @@ func TestNoRefreshWithoutRefreshToken(t *testing.T) {
 		t.Errorf("refresh exchanged %d times, want 0 (no refresh_token to use)", transport.refreshCalls)
 	}
 }
+
 // foreign Auth Mode rather than applying Codex framing to it.
 func TestRunNilTransportIsAuthoritativelyNotCommitted(t *testing.T) {
 	t.Parallel()

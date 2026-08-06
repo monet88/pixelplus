@@ -40,10 +40,16 @@ secrets):
   finish + `[DONE]`).
 - `image_generate.sse` — Codex `image_generation` tool `generate` event stream.
 - `image_edit.sse` — Codex `image_generation` tool `edit` event stream.
-- `entitlement_free.json` — free-plan account attributes (image tool not
-  injected → image operation `conditionally_supported`/entitlement-missing).
+- `entitlement_free.json` — free-plan account attributes. Recorded SHAPE only:
+  this story's `Observe` reads `/backend-api/models` and makes no
+  account-attributes exchange, so no code parses this body yet. It is the
+  reference payload for the follow-up that adds that exchange.
 - `quota_rate.json` — `usage_limit_reached` + `rate_limit_error` bodies with
-  `resets_in_seconds`.
+  `resets_in_seconds`. The probe surface parses the quota form
+  (`parseUsageLimit` → `ports.ProbeOutcome.RetryAfterSeconds`); the chat surface
+  classifies quota/rate but DROPS the `resets_in_seconds` hint, because
+  `domain.ChatOutcome`/`ChatStreamOutcome` carry no retry-after field. Threading
+  the hint onto the chat outcomes is a domain change tracked separately.
 - `challenge.json` — Cloudflare/bot block on an image path (403 shape).
 - `protocol_drift.sse` — an undecodable Responses event sequence.
 
@@ -81,8 +87,24 @@ Verified green: `cd apps/gateway && go build ./... && go vet ./... && go test ./
 - [x] AC3: fixtures cover refresh (token_refresh.json), chat/stream
       (chat_stream.sse), image operations (image_generate.sse, image_edit.sse),
       entitlement (entitlement_free.json), quota/rate (quota_rate.json),
-      challenge (challenge.json), protocol drift (protocol_drift.sse) — pinned by
-      `TestEveryRequiredFixtureFamilyIsPresent`.
+      challenge (challenge.json), protocol drift (protocol_drift.sse) — presence
+      pinned by `TestEveryRequiredFixtureFamilyIsPresent`.
+
+      Coverage is NOT uniform across the seven families, and the distinction
+      matters because a fixture that only exists proves nothing about behavior:
+
+      - Exercised through Adapter behavior: refresh
+        (`TestRefreshAndRetryOnAuthFailure`), chat/stream
+        (`TestRunCommitsACleanTurn` and the stream tests), image generate
+        (`TestRunImageOnlyTurnIsUnknown`), quota/rate (`TestProbe*` quota and
+        rate paths, plus the in-stream quota event test), challenge
+        (`TestProbeChallengeIsNotReportedAsAuthFailure`), protocol drift
+        (`TestRunDriftAfterEvidenceIsUnknown` and the drift fixture test).
+      - Shape recorded but NOT exercised: `entitlement_free.json` (no
+        account-attributes exchange exists in this story) and `image_edit.sse`
+        (edit is part of the deferred render/image-edit story per ADR 0014).
+        Both are asserted present so a future story cannot lose the recorded
+        payload, and neither is claimed as behavioral proof.
 - [x] AC4: Adapter does not retry a full chat/stream operation
       (`TestRunDoesNotRetryAFullOperation` asserts one Responses exchange; a
       401 triggers only a single in-boundary refresh+resend) and reports
