@@ -39,6 +39,11 @@ type renderHarness struct {
 	// cancel tests so the heartbeat poll observes a client cancel deterministically).
 	workerLeaseTTL    time.Duration
 	heartbeatInterval time.Duration
+	// omitRenderAdapter composes the deployment with NO ports.RenderAdapter, so
+	// execution meets the fail-closed foundation. It is what lets a test prove the
+	// accept-then-fail posture decision 0014 records for an ENABLED gated mode
+	// whose Adapter implements chat/stream/probe/capability but not render.
+	omitRenderAdapter bool
 }
 
 func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarness {
@@ -119,8 +124,7 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 	}
 
 	h.adapter = &countingRenderAdapter{harness: h}
-	opts := contracttest.Options{
-		Principal:     h.principal,
+	opts := contracttest.Options{		Principal:     h.principal,
 		Admission:     h.admission,
 		Replay:        h.replay,
 		Accounts:      h.accounts,
@@ -137,6 +141,11 @@ func newRenderHarness(t *testing.T, configure func(*renderHarness)) *renderHarne
 		Routing:       h.routing,
 		Clock:         h.clock,
 		RenderAdapter: h.adapter,
+	}
+	if h.omitRenderAdapter {
+		// A nil RenderAdapter leaves composition's fail-closed foundation in place,
+		// which is exactly the production posture for a mode with no render Adapter.
+		opts.RenderAdapter = nil
 	}
 	if h.enqueueFailTimes > 0 {
 		opts.EnqueueFailTimes = h.enqueueFailTimes
