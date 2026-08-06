@@ -20,6 +20,11 @@
 //   - Full-operation retry — a failed exchange is classified and returned; the
 //     spine decides whether another account is attempted (P5 fallback), which is
 //     the only place that can honor the authoritative-no-commit rule.
+//   - Credential rotation — the Adapter can run the Provider's refresh grant, but
+//     only when the credential boundary asks it to via ports.CredentialRotation.
+//     Persisting the rotated set, advancing credential_version, deduping
+//     concurrent rotations, and auditing all belong to that boundary, which is the
+//     only layer that can do them atomically.
 //
 // # Refusals
 //
@@ -32,9 +37,14 @@
 //
 // Credential material — including the OAuth refresh_token — is used only inside
 // a ports.CredentialInjection callback and never reaches a struct field, a log,
-// an error string, or a returned outcome (OP-G3). OAuth refresh is performed
-// inside that same callback when a 401 surfaces, so rotated token material
-// stays inside the Adapter/Vault boundary (§5.2 security impact, #62 AC2).
+// an error string, or a returned outcome (OP-G3). On a 401 the Adapter asks the
+// credential boundary to OWN one rotation (ports.CredentialRotation): it runs the
+// Provider grant inside that boundary's callback and hands the COMPLETE rotated
+// set back for persistence, so the rotated refresh_token is never spent and
+// discarded. Without such a boundary the 401 is terminal for the attempt — an
+// Adapter-local grant would rotate the Provider's material while leaving the
+// Vault holding the previous, now-dead token, stranding the account on its next
+// rotation (§5.2 security impact, #62 AC2).
 //
 // # Evidence
 //

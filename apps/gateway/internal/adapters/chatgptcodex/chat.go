@@ -365,12 +365,16 @@ func (adapter *Adapter) Stream(
 }
 
 // withResponses opens the Codex Responses stream inside the credential callback
-// and hands it to consume. On a 401 it performs an in-boundary OAuth refresh and
-// re-sends the SAME exchange once — the documented Codex "on 401
+// and hands it to consume. On a 401 it asks the credential boundary to own one
+// rotation and re-sends the SAME exchange once — the documented Codex "on 401
 // refresh-and-retry" behavior (evidence §3.2) — which is distinct from the
-// spine's full-operation fallback re-attempt on another account (#62 AC4). The
-// rotated access_token never leaves the callback: it is used only for the
-// re-send and then discarded (OP-G3, AC2).
+// spine's full-operation fallback re-attempt on another account (#62 AC4).
+//
+// The rotation is delegated rather than performed here: the Provider invalidates
+// the previous refresh material on a successful grant, so only the boundary that
+// can persist the rotated set, advance credential_version, dedupe concurrent
+// rotations, and audit may own it (ports.CredentialRotation). An injection that
+// does not offer that capability makes the 401 terminal for this attempt.
 //
 // Everything that needs the secret happens inside CredentialInjection.Use, so
 // credential material never lands in a field, a log, or a returned value
@@ -415,23 +419,55 @@ func (adapter *Adapter) withResponses(
 		// The rotated access_token is used only for this re-send and discarded
 		// (AC2, OP-G3).
 		if class == signalAuthFailed && bundle.RefreshToken != "" {
-			refreshed, refreshErr := adapter.refreshAccessToken(ctx, bundle.RefreshToken)
-			if refreshErr != nil {
+			rotator, rotatable := credential.(ports.CredentialRotation)
+			if !rotatable {
+				// No boundary owns rotation here, so there is nothing this Adapter
+				// may safely do: performing the grant itself would rotate the
+				// Provider's refresh material while leaving the Vault holding the
+				// now-dead previous set, so the NEXT refresh would fail and strand
+				// the account. Reporting the auth failure loses this live session
+				// but keeps stored credential state truthful.
 				return errAuthFailed
 			}
-			bundle.AccessToken = refreshed
-			headers = codexHeaders(bundle)
-			opened, err = adapter.exchange(ctx, Request{
-				Method:  http.MethodPost,
-				Path:    PathCodexResponses,
-				Body:    body,
-				Headers: headers,
-				Stream:  true,
-			})
-			if err != nil {
-				return err
+			rotateErr := rotator.Rotate(ctx,
+				func() (string, error) { return adapter.rotateCredential(ctx, bundle.RefreshToken) },
+				func(rotated string) error {
+					// The boundary has persisted and versioned the rotated set, so
+					// re-sending on it is safe: the material in play is the material
+					// the Vault holds.
+					rotatedBundle, parseErr := parseCodexBundle(rotated)
+					if parseErr != nil {
+						return parseErr
+					}
+					bundle = rotatedBundle
+					headers = codexHeaders(bundle)
+					opened, err = adapter.exchange(ctx, Request{
+						Method:  http.MethodPost,
+						Path:    PathCodexResponses,
+						Body:    body,
+						Headers: headers,
+						Stream:  true,
+					})
+					if err != nil {
+						return err
+					}
+					class = classifyStatus(opened.Status)
+					return nil
+				})
+			switch {
+			case rotateErr == nil:
+			case errors.Is(rotateErr, ports.ErrCredentialRotationUnsupported):
+				// The injection advertised rotation but its Vault has no rotation
+				// store. Same reasoning as the missing-capability path above: the
+				// responses exchange was never re-sent.
+				return errAuthFailed
+			default:
+				// Rotate surfaces both a refused grant and the re-sent exchange's
+				// own error. Returning it preserves the send-boundary distinction
+				// classifyFailure needs: a refused grant proves the retry never
+				// left, while a transport error from the re-send does not.
+				return rotateErr
 			}
-			class = classifyStatus(opened.Status)
 		}
 		switch class {
 		case signalOK:
@@ -456,14 +492,23 @@ func (adapter *Adapter) withResponses(
 	})
 }
 
-// refreshAccessToken performs one OAuth refresh inside the credential boundary.
-// It returns the rotated access_token; the refresh_token and any rotated token
-// material stay inside the caller's CredentialInjection.Use callback and are
-// never stored on a struct field or returned in an outcome (AC2, OP-G3).
+// rotateCredential performs one Provider-side OAuth refresh grant and returns
+// the COMPLETE rotated credential set for the boundary to persist. It is the
+// `exchange` half of ports.CredentialRotation: it talks to the Provider and
+// nothing else — it does not persist, version, dedupe, or audit, because those
+// are the boundary's to own (F2/F10).
+//
+// The returned document carries the rotated refresh_token, not just the rotated
+// access_token. That is the whole point: the Provider invalidates the previous
+// refresh material on a successful grant, so a caller that persisted only the
+// access token would leave the Vault holding a dead refresh token.
+//
+// Nothing here is retained: the material is produced inside the credential
+// boundary's callback and handed straight back to it (AC2, OP-G3).
 //
 // A refresh_token_reused / revoked response is an auth-class failure: the
-// account must reauthenticate, and this refresh MUST NOT loop.
-func (adapter *Adapter) refreshAccessToken(ctx context.Context, refreshToken string) (string, error) {
+// account must reauthenticate, and this grant MUST NOT loop.
+func (adapter *Adapter) rotateCredential(ctx context.Context, refreshToken string) (string, error) {
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("client_id", codexOAuthClientID)
@@ -485,13 +530,17 @@ func (adapter *Adapter) refreshAccessToken(ctx context.Context, refreshToken str
 		// than retrying the refresh loop.
 		return "", errRefreshFailed
 	}
-	var token struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.Unmarshal([]byte(refreshed.Body), &token); err != nil || token.AccessToken == "" {
+	rotated, err := parseCodexBundle(refreshed.Body)
+	if err != nil {
 		return "", errRefreshFailed
 	}
-	return token.AccessToken, nil
+	if rotated.RefreshToken == "" {
+		// A grant that rotated the access token but returned no refresh material
+		// leaves the next rotation with nothing to spend. Refusing here is honest:
+		// the boundary would otherwise persist a set it cannot rotate again.
+		return "", errRefreshFailed
+	}
+	return refreshed.Body, nil
 }
 
 // codexHeaders builds the protocol framing headers for one exchange from the

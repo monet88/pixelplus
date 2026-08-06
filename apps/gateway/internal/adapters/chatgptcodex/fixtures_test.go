@@ -188,6 +188,10 @@ func (transport *fixtureTransport) count(path string) int {
 
 // staticCredential is a controlled CredentialInjection that hands the Adapter a
 // placeholder secret inside a callback, exactly like the real vault boundary.
+//
+// It deliberately does NOT implement ports.CredentialRotation, so it is also the
+// fixture that proves the Adapter refuses to rotate credential material on its
+// own when no boundary owns rotation.
 type staticCredential struct {
 	material string
 	uses     atomic.Int32
@@ -196,6 +200,93 @@ type staticCredential struct {
 func (credential *staticCredential) Use(fn func(string) error) error {
 	credential.uses.Add(1)
 	return fn(credential.material)
+}
+
+// rotatingCredential is a controlled CredentialInjection that ALSO owns
+// rotation, standing in for the authorized Vault boundary. It records what a real
+// boundary must do and nothing the Adapter is allowed to do itself: it persists
+// the complete rotated set, advances the credential version, dedupes concurrent
+// rotations, and audits.
+type rotatingCredential struct {
+	mu       sync.Mutex
+	material string
+	version  int
+	// audits records one entry per persisted rotation, so a test can prove the
+	// Adapter asked the boundary exactly once rather than rotating in a loop. It
+	// carries no material.
+	audits []string
+	// persistErr, when non-nil, fails persistence so a test can prove the Adapter
+	// never re-sends on material the Vault does not hold.
+	persistErr error
+	// rotationUnsupported makes Rotate report ErrCredentialRotationUnsupported,
+	// standing in for a boundary whose Vault has no rotation store wired.
+	rotationUnsupported bool
+	uses                atomic.Int32
+}
+
+func (credential *rotatingCredential) Use(fn func(string) error) error {
+	credential.uses.Add(1)
+	credential.mu.Lock()
+	material := credential.material
+	credential.mu.Unlock()
+	return fn(material)
+}
+
+func (credential *rotatingCredential) Rotate(
+	_ context.Context,
+	exchange func() (string, error),
+	use func(string) error,
+) error {
+	if credential.rotationUnsupported {
+		return ports.ErrCredentialRotationUnsupported
+	}
+	// The lock is the fixture's stand-in for per-(tenant, account) dedupe: two
+	// racing rotations cannot each spend the same single-use refresh material.
+	credential.mu.Lock()
+	defer credential.mu.Unlock()
+
+	rotated, err := exchange()
+	if err != nil {
+		return err
+	}
+	if credential.persistErr != nil {
+		// Persistence failed, so `use` is never invoked: the Provider may have
+		// rotated but the Gateway did not, and re-sending would proceed on material
+		// the Vault does not hold.
+		return credential.persistErr
+	}
+	credential.material = rotated
+	credential.version++
+	credential.audits = append(credential.audits, "credential.rotated")
+	return use(rotated)
+}
+
+// rotatedRefreshTokenPersisted reports the refresh_token the boundary now holds,
+// which is what proves the rotated set — not merely the access token — survived
+// the rotation.
+func (credential *rotatingCredential) rotatedRefreshTokenPersisted(t *testing.T) string {
+	t.Helper()
+	credential.mu.Lock()
+	defer credential.mu.Unlock()
+	var bundle struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal([]byte(credential.material), &bundle); err != nil {
+		t.Fatalf("persisted material is not a decodable bundle: %v", err)
+	}
+	return bundle.RefreshToken
+}
+
+func (credential *rotatingCredential) rotationCount() int {
+	credential.mu.Lock()
+	defer credential.mu.Unlock()
+	return len(credential.audits)
+}
+
+func (credential *rotatingCredential) persistedVersion() int {
+	credential.mu.Lock()
+	defer credential.mu.Unlock()
+	return credential.version
 }
 
 // recordingSink captures canonical deltas the Adapter delivered.

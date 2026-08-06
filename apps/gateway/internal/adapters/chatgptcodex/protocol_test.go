@@ -152,9 +152,9 @@ func TestStreamCommitsAndDeliversDeltas(t *testing.T) {
 
 // refreshTransport scripts a 401 on the first Responses exchange, a successful
 // OAuth refresh, and a 200 stream on the second Responses exchange. It proves
-// the in-boundary refresh-and-retry path: the rotated access_token is used only
-// for the re-send and the Adapter does NOT re-run the whole operation from
-// scratch on a different account.
+// the boundary-owned rotate-and-retry path: the Adapter re-sends the SAME
+// exchange once on material the boundary persisted, and does NOT re-run the whole
+// operation from scratch on a different account.
 type refreshTransport struct {
 	responsesCalls int
 	refreshCalls   int
@@ -177,9 +177,15 @@ func (transport *refreshTransport) Exchange(_ context.Context, request chatgptco
 	return chatgptcodex.Response{Status: 500}, nil
 }
 
-// TestRefreshAndRetryOnAuthFailure asserts a 401 triggers one in-boundary
-// refresh and a single re-send of the same exchange, after which the turn
+// TestRefreshAndRetryOnAuthFailure asserts a 401 triggers one BOUNDARY-OWNED
+// rotation and a single re-send of the same exchange, after which the turn
 // commits (evidence §3.2 "on 401 refresh-and-retry").
+//
+// The assertions that matter for F2/F10 are the persistence ones: the boundary
+// must end up holding the ROTATED refresh_token and a bumped credential version.
+// Before the fix the Adapter used the rotated access_token for the re-send and
+// discarded the rotated refresh_token, so the Vault kept material the Provider
+// had already invalidated and the next rotation would fail.
 func TestRefreshAndRetryOnAuthFailure(t *testing.T) {
 	t.Parallel()
 
@@ -187,14 +193,15 @@ func TestRefreshAndRetryOnAuthFailure(t *testing.T) {
 		stream:      newSSEStream(loadFixture(t, "chat_stream.sse")),
 		refreshBody: loadFixtureSection(t, "token_refresh.json", "refresh_success"),
 	}
+	credential := &rotatingCredential{material: codexBundleMaterial()}
 
 	outcome, err := chatgptcodex.New(transport).
-		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), credential)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	if outcome.Commit != domain.CommitCommitted {
-		t.Fatalf("commit = %s, want committed after refresh-and-retry", outcome.Commit)
+		t.Fatalf("commit = %s, want committed after rotate-and-retry", outcome.Commit)
 	}
 	if transport.refreshCalls != 1 {
 		t.Errorf("refresh exchanged %d times, want 1", transport.refreshCalls)
@@ -202,9 +209,110 @@ func TestRefreshAndRetryOnAuthFailure(t *testing.T) {
 	if transport.responsesCalls != 2 {
 		t.Errorf("Responses exchanged %d times, want 2 (initial 401 + one re-send)", transport.responsesCalls)
 	}
+	if got := credential.rotationCount(); got != 1 {
+		t.Errorf("boundary persisted %d rotations, want exactly 1", got)
+	}
+	if got := credential.rotatedRefreshTokenPersisted(t); got != "fixture-rotated-refresh-token" {
+		t.Errorf("persisted refresh_token = %q, want the ROTATED one; the previous token is dead upstream", got)
+	}
+	if got := credential.persistedVersion(); got != 1 {
+		t.Errorf("credential version advanced to %d, want 1", got)
+	}
 }
 
-// TestRefreshFailureIsAuthExpired asserts a failed refresh (reused/revoked
+// TestRotationRefusedWithoutABoundaryThatOwnsIt asserts the Adapter does NOT
+// perform the refresh grant itself when the injection cannot own the rotation.
+//
+// Cause and effect: an Adapter-local grant would make the Provider rotate while
+// the Vault kept the previous refresh_token, so the account's NEXT rotation would
+// fail and push it to reauthentication anyway — after silently spending the one
+// single-use token. Refusing here loses this live session and keeps stored
+// credential state truthful.
+func TestRotationRefusedWithoutABoundaryThatOwnsIt(t *testing.T) {
+	t.Parallel()
+
+	transport := &refreshTransport{
+		stream:      newSSEStream(loadFixture(t, "chat_stream.sse")),
+		refreshBody: loadFixtureSection(t, "token_refresh.json", "refresh_success"),
+	}
+
+	// staticCredential deliberately does not implement ports.CredentialRotation.
+	outcome, _ := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+
+	if transport.refreshCalls != 0 {
+		t.Errorf("refresh grant exchanged %d times, want 0 — the Adapter must not rotate credential material itself", transport.refreshCalls)
+	}
+	if transport.responsesCalls != 1 {
+		t.Errorf("Responses exchanged %d times, want 1 (no re-send without an owned rotation)", transport.responsesCalls)
+	}
+	if outcome.FailureClass != domain.ErrCodeProviderAuthExpired {
+		t.Errorf("failure class = %q, want provider_auth_expired", outcome.FailureClass)
+	}
+	if outcome.Commit != domain.CommitNotCommitted {
+		t.Errorf("commit = %s, want not_committed (a refused 401 generates nothing)", outcome.Commit)
+	}
+}
+
+// TestRotationUnsupportedByTheBoundaryIsAuthExpired asserts an injection that
+// advertises rotation but whose Vault has no rotation store fails closed the same
+// way, rather than falling back to an Adapter-local grant.
+func TestRotationUnsupportedByTheBoundaryIsAuthExpired(t *testing.T) {
+	t.Parallel()
+
+	transport := &refreshTransport{
+		stream:      newSSEStream(loadFixture(t, "chat_stream.sse")),
+		refreshBody: loadFixtureSection(t, "token_refresh.json", "refresh_success"),
+	}
+	credential := &rotatingCredential{material: codexBundleMaterial(), rotationUnsupported: true}
+
+	outcome, _ := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), credential)
+
+	if transport.refreshCalls != 0 {
+		t.Errorf("refresh grant exchanged %d times, want 0", transport.refreshCalls)
+	}
+	if outcome.Commit != domain.CommitNotCommitted {
+		t.Errorf("commit = %s, want not_committed", outcome.Commit)
+	}
+	if outcome.FailureClass != domain.ErrCodeProviderAuthExpired {
+		t.Errorf("failure class = %q, want provider_auth_expired", outcome.FailureClass)
+	}
+}
+
+// TestRotationThatCannotPersistNeverReSends asserts the Adapter does not re-send
+// the exchange when the boundary failed to persist the rotated set. Re-sending
+// would proceed on material the Vault does not hold, so a later request would use
+// the dead previous token.
+func TestRotationThatCannotPersistNeverReSends(t *testing.T) {
+	t.Parallel()
+
+	transport := &refreshTransport{
+		stream:      newSSEStream(loadFixture(t, "chat_stream.sse")),
+		refreshBody: loadFixtureSection(t, "token_refresh.json", "refresh_success"),
+	}
+	credential := &rotatingCredential{
+		material:   codexBundleMaterial(),
+		persistErr: errors.New("fixture: rotation store unavailable"),
+	}
+
+	outcome, _ := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), credential)
+
+	if transport.responsesCalls != 1 {
+		t.Errorf("Responses exchanged %d times, want 1 (no re-send after a failed persist)", transport.responsesCalls)
+	}
+	if got := credential.rotationCount(); got != 0 {
+		t.Errorf("boundary recorded %d rotations, want 0 when persistence failed", got)
+	}
+	// Persistence failed AFTER the grant was spent upstream, so the attempt has no
+	// authoritative proof of non-commit for the credential state it left behind.
+	if outcome.Commit == domain.CommitCommitted {
+		t.Errorf("commit = %s, want a non-committed class", outcome.Commit)
+	}
+}
+
+// TestRefreshFailureIsAuthExpired asserts a refused grant (reused/revoked
 // refresh_token) classifies as auth-expired and does not loop.
 func TestRefreshFailureIsAuthExpired(t *testing.T) {
 	t.Parallel()
@@ -212,13 +320,14 @@ func TestRefreshFailureIsAuthExpired(t *testing.T) {
 	transport := &refreshTransport{
 		stream: newSSEStream(loadFixture(t, "chat_stream.sse")),
 		// A reused/revoked refresh_token returns 200 with an error body and no
-		// access_token; refreshAccessToken treats the unparseable token as a
-		// refresh failure rather than looping.
+		// access_token; rotateCredential treats the undecodable set as a refresh
+		// failure rather than looping.
 		refreshBody: `{"error":"refresh_token_reused","error_description":"revoked"}`,
 	}
+	credential := &rotatingCredential{material: codexBundleMaterial()}
 
 	outcome, _ := chatgptcodex.New(transport).
-		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), &staticCredential{material: codexBundleMaterial()})
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), credential)
 	if outcome.Commit != domain.CommitNotCommitted {
 		t.Fatalf("commit = %s, want not_committed (a failed refresh generates nothing)", outcome.Commit)
 	}
@@ -227,6 +336,35 @@ func TestRefreshFailureIsAuthExpired(t *testing.T) {
 	}
 	if transport.refreshCalls != 1 {
 		t.Errorf("refresh exchanged %d times, want 1 (no refresh loop)", transport.refreshCalls)
+	}
+	if got := credential.rotationCount(); got != 0 {
+		t.Errorf("boundary persisted %d rotations, want 0 on a refused grant", got)
+	}
+}
+
+// TestRotationWithoutRotatedRefreshMaterialIsRefused asserts a grant that
+// rotated only the access_token is refused rather than persisted. Persisting it
+// would leave the boundary with nothing to spend on the NEXT rotation.
+func TestRotationWithoutRotatedRefreshMaterialIsRefused(t *testing.T) {
+	t.Parallel()
+
+	transport := &refreshTransport{
+		stream:      newSSEStream(loadFixture(t, "chat_stream.sse")),
+		refreshBody: `{"access_token":"fixture-rotated-access-token"}`,
+	}
+	credential := &rotatingCredential{material: codexBundleMaterial()}
+
+	outcome, _ := chatgptcodex.New(transport).
+		Run(t.Context(), chatCommand("gpt-fixture-codex-1"), credential)
+
+	if got := credential.rotationCount(); got != 0 {
+		t.Errorf("boundary persisted %d rotations, want 0 for a set with no rotated refresh material", got)
+	}
+	if transport.responsesCalls != 1 {
+		t.Errorf("Responses exchanged %d times, want 1 (no re-send)", transport.responsesCalls)
+	}
+	if outcome.FailureClass != domain.ErrCodeProviderAuthExpired {
+		t.Errorf("failure class = %q, want provider_auth_expired", outcome.FailureClass)
 	}
 }
 
