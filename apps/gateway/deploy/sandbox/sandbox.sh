@@ -38,14 +38,18 @@ set -euo pipefail
 export MSYS2_ARG_CONV_EXCL="PROVIDER_ACCOUNT_STORE_PATH=;PIXELPLUS_GATEWAY_ADDR=;/var/lib;/tmp"
 
 IMAGE="pixelplus/gateway-sandbox:local"
-NAME="pixelplus-gateway-sandbox"
+# NAME and STATE_VOLUME may be overridden by the environment so a consumer
+# (e.g. verify-sandbox-semantics.sh) can run an isolated sandbox under its own
+# names without ever touching a live sandbox's container or retained volume.
+# Defaults are the canonical names.
+NAME="${PIXELPLUS_SANDBOX_NAME:-pixelplus-gateway-sandbox}"
 HOST_ADDR="127.0.0.1"
 HOST_PORT="8080"
 CONTAINER_PORT="8080"
 # Named durable state volume, mounted at /var/lib/pixelplus. Its lifecycle is
 # the subject of the ephemeral/persistent distinction below (#125): the name is
 # declared once here so the mount site and both teardown paths cannot drift.
-STATE_VOLUME="pixelplus-gateway-state"
+STATE_VOLUME="${PIXELPLUS_SANDBOX_VOLUME:-pixelplus-gateway-state}"
 
 # The build context is the gateway module directory only. The repo root,
 # `.ref/`, secrets/, credentials/, and auths/ are outside this context and

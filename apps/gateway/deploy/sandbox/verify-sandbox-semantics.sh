@@ -22,15 +22,42 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SANDBOX="${SCRIPT_DIR}/sandbox.sh"
 MARKER_FILE="sandbox-ephemeral-test-marker"
 MARKER_VALUE="ephemeral-test-$(date +%s)"
-VOLUME="pixelplus-gateway-state"
+# The verifier runs an ISOLATED sandbox: its own container and volume names,
+# suffixed with its own PID. A manual or concurrent invocation therefore cannot
+# destroy a live sandbox's container or a restart-test's retained state, and
+# two verifiers cannot collide (PR #133 review P1). The sandbox script's
+# canonical names are only the defaults; this verifier never touches them.
+SANDBOX_CONTAINER="pixelplus-gateway-sandbox-verify-$$"
+VOLUME="pixelplus-gateway-state-verify-$$"
 HELPER_IMAGE="alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e"
 
 pass()  { printf '  PASS %s\n' "$*"; }
 fail() { printf '  FAIL %s\n' "$*" >&2; exit 1; }
 
+# Teardown on every exit path (PR #133 review P2): a failed build, a failed
+# marker assertion, or an interrupt must not leave this verifier's isolated
+# container or volume behind. The trap runs the ephemeral teardown directly
+# (not via sandbox.sh, which would use the canonical name) and re-raises the
+# original status so a teardown failure does not mask a test failure.
+cleanup_verify() {
+  local status=$?
+  docker rm -f "${SANDBOX_CONTAINER}" >/dev/null 2>&1 || true
+  docker volume rm -f "${VOLUME}" >/dev/null 2>&1 || true
+  exit "${status}"
+}
+trap cleanup_verify EXIT
+
 require_docker() {
   command -v docker >/dev/null 2>&1 || { echo "SKIP: docker not found"; exit 0; }
   docker info >/dev/null 2>&1 || { echo "SKIP: docker daemon not reachable"; exit 0; }
+}
+
+# sandbox_cmd runs sandbox.sh against THIS verifier's isolated names, so the
+# script's canonical-name defaults are never used from here.
+sandbox_cmd() {
+  PIXELPLUS_SANDBOX_NAME="${SANDBOX_CONTAINER}" \
+  PIXELPLUS_SANDBOX_VOLUME="${VOLUME}" \
+    bash "${SANDBOX}" "$@"
 }
 
 # -- helpers that operate on the named volume, not the container ------------
@@ -56,13 +83,13 @@ read_marker() {
 test_ephemeral_stop_removes_volume() {
   echo "--- Ephemeral: marker must NOT survive stop ---"
 
-  # Clean slate
-  docker rm -f pixelplus-gateway-sandbox >/dev/null 2>&1 || true
+  # Clean slate (this verifier's own names only)
+  docker rm -f "${SANDBOX_CONTAINER}" >/dev/null 2>&1 || true
   docker volume rm -f "${VOLUME}" >/dev/null 2>&1 || true
 
   # Build and start (creates the volume)
-  bash "${SANDBOX}" build >/dev/null 2>&1 || fail "build failed"
-  bash "${SANDBOX}" start >/dev/null 2>&1 || fail "start failed"
+  sandbox_cmd build >/dev/null 2>&1 || fail "build failed"
+  sandbox_cmd start >/dev/null 2>&1 || fail "start failed"
 
   # Write a marker into the named volume
   write_marker
@@ -72,7 +99,7 @@ test_ephemeral_stop_removes_volume() {
   pass "marker written to volume before stop"
 
   # Ephemeral stop (default — no --keep-state)
-  bash "${SANDBOX}" stop >/dev/null 2>&1 || fail "stop failed"
+  sandbox_cmd stop >/dev/null 2>&1 || fail "stop failed"
 
   # Volume must be gone
   if docker volume ls --format '{{.Name}}' | grep -qx "${VOLUME}"; then
@@ -81,7 +108,7 @@ test_ephemeral_stop_removes_volume() {
   pass "volume removed after ephemeral stop"
 
   # Start again (creates fresh volume)
-  bash "${SANDBOX}" start >/dev/null 2>&1 || fail "second start failed"
+  sandbox_cmd start >/dev/null 2>&1 || fail "second start failed"
 
   # Marker must be absent from fresh volume
   local after
@@ -92,7 +119,7 @@ test_ephemeral_stop_removes_volume() {
   pass "marker absent after ephemeral restart"
 
   # Clean up
-  bash "${SANDBOX}" stop >/dev/null 2>&1 || true
+  sandbox_cmd stop >/dev/null 2>&1 || true
   echo "  Ephemeral test: PASSED"
 }
 
@@ -100,12 +127,12 @@ test_persistent_stop_retains_volume() {
   echo "--- Persistent: marker MUST survive --keep-state stop ---"
 
   # Clean slate
-  docker rm -f pixelplus-gateway-sandbox >/dev/null 2>&1 || true
+  docker rm -f "${SANDBOX_CONTAINER}" >/dev/null 2>&1 || true
   docker volume rm -f "${VOLUME}" >/dev/null 2>&1 || true
 
   # Build and start
-  bash "${SANDBOX}" build >/dev/null 2>&1 || fail "build failed"
-  bash "${SANDBOX}" start >/dev/null 2>&1 || fail "start failed"
+  sandbox_cmd build >/dev/null 2>&1 || fail "build failed"
+  sandbox_cmd start >/dev/null 2>&1 || fail "start failed"
 
   # Write a marker
   write_marker
@@ -115,7 +142,7 @@ test_persistent_stop_retains_volume() {
   pass "marker written to volume before persistent stop"
 
   # Persistent stop (--keep-state)
-  bash "${SANDBOX}" stop --keep-state >/dev/null 2>&1 || fail "stop --keep-state failed"
+  sandbox_cmd stop --keep-state >/dev/null 2>&1 || fail "stop --keep-state failed"
 
   # Volume must still exist
   if ! docker volume ls --format '{{.Name}}' | grep -qx "${VOLUME}"; then
@@ -124,7 +151,7 @@ test_persistent_stop_retains_volume() {
   pass "volume retained after persistent stop"
 
   # Start again — reuses the persistent volume
-  bash "${SANDBOX}" start >/dev/null 2>&1 || fail "second start failed"
+  sandbox_cmd start >/dev/null 2>&1 || fail "second start failed"
 
   # Marker MUST survive
   local after
@@ -135,50 +162,57 @@ test_persistent_stop_retains_volume() {
   pass "marker survived persistent restart"
 
   # Clean up
-  bash "${SANDBOX}" stop >/dev/null 2>&1 || true
+  sandbox_cmd stop >/dev/null 2>&1 || true
   echo "  Persistent test: PASSED"
 }
 
 test_negative_control() {
   echo "--- Negative control: the ephemeral assertion must FAIL on retained state ---"
 
-  # A test that only ever passes proves nothing. Test 1 asserts the marker is
-  # absent after an ephemeral stop; this control proves that assertion actually
-  # discriminates, by running it against a teardown that deliberately retains
-  # state — which is precisely the #125 bug (`stop` kept the volume while
-  # logging "no state retained"). `stop --keep-state` reproduces that behaviour
-  # exactly, so it stands in for the pre-fix code without editing the script
-  # and reverting. If the marker-absence check still reported PASS here, it
-  # would be vacuous and every other result in this file would be worthless.
+  # This control is a vacuity guard. Test 1's ephemeral assertion fails when
+  # the marker IS present after a stop ([ -n "${after}" ] — the leak is
+  # detected). The negative control runs the same read_marker machinery against
+  # a deliberately-retaining teardown (`stop --keep-state`, which stands in for
+  # the pre-fix `stop` that kept the volume while logging "no state retained")
+  # and asserts the marker IS still there. It proves the leak-detection
+  # machinery actually observes retained state rather than always reading
+  # empty — if read_marker were broken and always returned nothing, this
+  # control would catch it and every PASS above would be vacuous.
+  #
+  # Note the asymmetry on purpose: this control PASSES when it sees the
+  # retained marker, because it is checking that the *detector* can see state,
+  # not that the ephemeral assertion discriminates — test 1 already proves the
+  # latter by failing on retained state.
 
   # Clean slate
-  docker rm -f pixelplus-gateway-sandbox >/dev/null 2>&1 || true
+  docker rm -f "${SANDBOX_CONTAINER}" >/dev/null 2>&1 || true
   docker volume rm -f "${VOLUME}" >/dev/null 2>&1 || true
 
-  bash "${SANDBOX}" build >/dev/null 2>&1 || fail "build failed"
-  bash "${SANDBOX}" start >/dev/null 2>&1 || fail "start failed"
+  sandbox_cmd build >/dev/null 2>&1 || fail "build failed"
+  sandbox_cmd start >/dev/null 2>&1 || fail "start failed"
 
   write_marker
   local planted
   planted="$(read_marker)"
   [ "${planted}" = "${MARKER_VALUE}" ] || fail "marker plant failed: expected '${MARKER_VALUE}', got '${planted}'"
-  pass "marker written before the deliberately-broken teardown"
+  pass "marker written before the deliberately-retaining teardown"
 
   # The injected defect: teardown that retains state, i.e. the pre-fix `stop`.
-  bash "${SANDBOX}" stop --keep-state >/dev/null 2>&1 || fail "stop --keep-state failed"
-  bash "${SANDBOX}" start >/dev/null 2>&1 || fail "restart failed"
+  sandbox_cmd stop --keep-state >/dev/null 2>&1 || fail "stop --keep-state failed"
+  sandbox_cmd start >/dev/null 2>&1 || fail "restart failed"
 
-  # Now apply test 1's assertion verbatim. It MUST report a violation.
+  # The detector MUST see the retained marker. If it cannot, read_marker is
+  # broken and every "marker absent" PASS above is vacuous.
   local after
   after="$(read_marker)"
   if [ -z "${after}" ]; then
-    fail "NEGATIVE CONTROL BROKEN: state was retained, yet the marker-absence assertion saw no marker. The ephemeral test cannot detect leaked state and its PASS is vacuous."
+    fail "NEGATIVE CONTROL BROKEN: state was retained, yet read_marker saw no marker. The leak-detection machinery cannot observe leaked state and the ephemeral gate's PASS is vacuous."
   fi
-  pass "assertion correctly observed the retained marker ('${after}') — the ephemeral gate has teeth"
+  pass "detector correctly observed the retained marker ('${after}') — the ephemeral gate has teeth"
 
   # Revert the injected defect: return to the ephemeral default and confirm the
-  # same assertion now reports clean, so this control leaves no state behind.
-  bash "${SANDBOX}" stop >/dev/null 2>&1 || fail "reverting stop failed"
+  # same volume is now removed, so this control leaves no state behind.
+  sandbox_cmd stop >/dev/null 2>&1 || fail "reverting stop failed"
   if docker volume ls --format '{{.Name}}' | grep -qx "${VOLUME}"; then
     fail "volume ${VOLUME} survived the reverting ephemeral stop"
   fi
