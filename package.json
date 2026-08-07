@@ -1,6 +1,16 @@
 {
+  "packageManager": "npm@11.17.0",
+  "engines": {
+    "node": ">=24.14.0",
+    "npm": ">=11.17.0"
+  },
+  "scripts": {
+    "verify": "node scripts/verify-repository.mjs --fast",
+    "verify:fast": "node scripts/verify-repository.mjs --fast",
+    "verify:full": "node scripts/verify-repository.mjs --full",
+    "verify:release": "node scripts/verify-repository.mjs --release"
+  },
   "devDependencies": {
-    "@ai-hero/sandcastle": "^0.12.0",
     "@redocly/cli": "2.39.0"
   }
 }

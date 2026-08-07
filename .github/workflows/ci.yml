@@ -1,0 +1,155 @@
+# Required pull-request CI foundation (issue #123).
+#
+# Scope boundary: this workflow owns the PR gate only. Release, changelog,
+# versioned Docker publishing, GHCR, SBOM and provenance stay with #70.
+#
+# Two rules shape everything below:
+#
+#   1. CI validates and fails. It never regenerates a derived artifact to go
+#      green, because then the reviewed commit is not the verified artifact.
+#   2. A missing tool is a failure, not a skip. The orchestration lives in
+#      scripts/verify-repository.mjs (#126) so local runs and CI execute the
+#      same gates instead of two drifting definitions.
+#
+# Third-party Actions are pinned to a full commit SHA; a tag is mutable and a
+# pinned tag is not a pin.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege by default. No job below needs more than reading the tree,
+# and no publish credential is exposed to a pull request or a fork.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in step with .tool-versions / mise.toml. The verify entrypoint prints
+  # the resolved versions, so a drifting runner image is visible in the log.
+  GO_VERSION: "1.25.5"
+  NODE_VERSION: "24.14.0"
+  PYTHON_VERSION: "3.13.12"
+
+jobs:
+  repository-hygiene:
+    name: repository-hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: apps/gateway/go.sum
+
+      - name: gofmt
+        # `gofmt -l` exits 0 even when it lists unformatted files, so the
+        # listing itself has to be treated as the failure.
+        run: |
+          unformatted="$(gofmt -l apps/gateway)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files. Run 'gofmt -w apps/gateway' and commit."
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: git diff --check
+        run: git diff --check
+
+  gateway-unit-and-contract:
+    name: gateway-unit-and-contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: apps/gateway/go.sum
+
+      - name: resolved toolchain
+        run: go version
+
+      - name: go vet
+        run: go -C apps/gateway vet ./...
+
+      - name: go test
+        run: go -C apps/gateway test ./...
+
+      - name: go test -race
+        run: go -C apps/gateway test -race ./...
+
+  public-api-contract:
+    name: public-api-contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: install pinned dependencies
+        run: |
+          npm ci
+          python -m pip install -r requirements-validation.txt
+
+      - name: resolved toolchain
+        run: |
+          node --version
+          npm --version
+          python --version
+          python -c "import importlib.metadata as m; print('jsonschema', m.version('jsonschema'))"
+
+      - name: stable Public API contract
+        run: node scripts/validate-public-api-contract.mjs
+
+      - name: Public API validator mutation suite
+        # Proves the validator observes real failure rather than passing
+        # because it inspects nothing.
+        run: node scripts/test-public-api-contract-validator.mjs
+
+  authority-consistency:
+    name: authority-consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: install pinned dependencies
+        run: |
+          npm ci
+          python -m pip install -r requirements-validation.txt
+
+      - name: implementation-spec authority fingerprint
+        # Validates the recorded fingerprint. It must never be refreshed here:
+        # regenerating an authority artifact in CI turns a drift signal into a
+        # green check.
+        run: node scripts/validate-provider-gateway-implementation-spec.mjs
+
+      - name: implementation-spec validator suite
+        run: node --test scripts/test-provider-gateway-implementation-spec-validator.mjs
+
+      - name: chat stream wire
+        run: python scripts/check-chat-stream-wire.py
+
+      - name: dependency direction
+        run: node scripts/check-dependency-direction.mjs
+
+      - name: verify entrypoint self-test
+        run: node scripts/test-verify-repository.mjs

@@ -36,6 +36,14 @@ coverage.out
 node_modules/
 coverage/
 *.log
+# Node/UXP artifacts
+node_modules/
+coverage/
+*.log
+
+# Python (virtualenv created by mise.toml)
+.venv/
+__pycache__/
 
 # Editors and OS
 .idea/
