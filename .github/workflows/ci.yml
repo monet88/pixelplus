@@ -46,6 +46,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The hygiene gate screens the introduced commit (HEAD^..HEAD), which
+          # the default depth-1 checkout does not contain.
+          fetch-depth: 2
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -76,8 +80,21 @@ jobs:
   public-api-contract:
     name: public-api-contract
     runs-on: ubuntu-latest
+    # The compatibility oracle is the baseline blob read from an immutable
+    # commit, never the PR's own worktree copy — a candidate that also edits the
+    # baseline could otherwise approve its own breaking change. On a pull
+    # request that commit is the base SHA; on a push to main it is the previous
+    # tip. The validator rejects a mutable ref and fails closed when neither is
+    # available, so this must be a real 40-hex SHA.
+    env:
+      PIXELPLUS_PUBLIC_API_BASELINE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `git show <base-sha>:<path>` needs that commit's objects present. A
+          # depth-1 checkout fetches only the merge commit, so the baseline read
+          # would fail for lack of history rather than for a real contract break.
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -102,13 +119,31 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: npm
 
-      - name: install pinned dependencies
-        run: npm ci
+      # No `npm ci`: this slice's validator has no package dependencies, so
+      # installing them would add a network dependency and a failure point to
+      # the gate path for tools it never invokes. Each slice resolves only what
+      # it runs.
 
       # Validates the recorded authority fingerprint. It must never be
       # refreshed here: regenerating an authority artifact in CI turns a drift
       # signal into a green check.
       - name: verify
         run: node scripts/verify-repository.mjs --fast --job=authority-consistency
+
+  # The guarantee that ci.yml cannot restate a command, mis-slice a mode, or
+  # leave a gate uncounted is enforced by scripts/test-verify-repository.mjs.
+  # That test is a `--full` step, and the PR gate above is made of `--fast`
+  # slices only, so without this job the assertion that registers ci.yml drift
+  # would never run on a pull request — the exact drift #126 exists to prevent.
+  verify-entrypoint-self-test:
+    name: verify-entrypoint-self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: self-test
+        run: node scripts/test-verify-repository.mjs

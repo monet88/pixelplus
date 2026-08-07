@@ -123,7 +123,8 @@ The proof was reverted, as required.
 ## 7. Residual risk
 
 The acceptance criterion "CI validates and never refreshes" is only half-satisfiable here.
-The refresh script is absent from every workflow, but the repository currently has no
-`.github/workflows` at all — CI does not yet exist. The guarantee that CI validates and
-never refreshes must be enforced when the PR CI foundation lands under #123; this
-reconciliation cannot close that half by itself.
+The refresh script is absent from every workflow, but at the time of this reconciliation
+(2026-08-06, before #123 landed) the repository had no `.github/workflows` at all — CI did
+not yet exist. The guarantee that CI validates and never refreshes had to be enforced when
+the PR CI foundation landed under #123; this reconciliation could not close that half by
+itself.
