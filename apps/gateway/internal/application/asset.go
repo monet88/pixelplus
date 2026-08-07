@@ -466,6 +466,8 @@ func contentCanonical(err error) domain.CanonicalError {
 	switch {
 	case errors.Is(err, domain.ErrMaskFormatRejected):
 		return domain.NewInvalidMaskFormat()
+	case errors.Is(err, domain.ErrMaskOpacityRejected):
+		return domain.NewInvalidMaskOpacity()
 	case errors.Is(err, domain.ErrUnsupportedFormat):
 		return domain.NewUnsupportedFormat()
 	case errors.Is(err, domain.ErrInvalidDimensions):

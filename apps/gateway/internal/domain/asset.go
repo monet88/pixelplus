@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"image"
+	"image/color"
 	"image/jpeg"
 	"image/png"
 	"time"
@@ -99,6 +101,12 @@ var (
 	// format is not PNG. The canonical Mask Convention requires masks to be
 	// opaque PNG so mask edges are exact and never lossy (#98, #121, ADR 0003).
 	ErrMaskFormatRejected = errors.New("mask asset format must be PNG")
+	// ErrMaskOpacityRejected reports a mask upload that is PNG but not opaque:
+	// some pixel carries alpha != 0xFF. The canonical Mask Convention requires
+	// opaque PNG so mask edges are exact (#98, #121, ADR 0003); a translucent
+	// mask would let a Provider surface read the alpha channel as the edit
+	// region, the same silent failure as a lossy format.
+	ErrMaskOpacityRejected = errors.New("mask asset must be opaque PNG (alpha = 255 on every pixel)")
 )
 
 // ImageFacts is the canonical decoded description of an uploaded image. It is a
@@ -320,16 +328,113 @@ func decodeWebPDimensions(data []byte) (int, int, bool) {
 	}
 }
 
-// ValidateMaskFormat checks that an uploaded mask Asset's content is PNG. The
-// canonical Mask Convention requires opaque PNG: mask edges must be exact, and
-// JPEG/WebP compression introduces mid-grey ringing around mask boundaries
-// that some surfaces interpret as partial edit (#98, #121, ADR 0003). The
-// check is driven by sniffed bytes, not by declared content type or filename,
-// so a JPEG announced as image/png is still refused.
+// ValidateMaskFormat checks that an uploaded mask Asset's content is an opaque
+// PNG. The canonical Mask Convention requires opaque PNG: mask edges must be
+// exact, and JPEG/WebP compression introduces mid-grey ringing around mask
+// boundaries that some surfaces interpret as partial edit (#98, #121, ADR
+// 0003). The check is driven by sniffed bytes, not by declared content type or
+// filename, so a JPEG announced as image/png is still refused. "opaque" is
+// enforced, not assumed: a PNG that decodes with an alpha channel is scanned
+// and refused if any pixel has alpha != 0xFF, so a translucent mask cannot
+// claim the canonical shape.
+//
+// A byte stream that sniffs as PNG but fails to decode is deliberately NOT
+// refused here: it returns nil and lets InspectImageContent report it as
+// invalid_image, keeping "wrong format" (invalid_mask) distinct from "broken
+// image" (invalid_image) — the pairwise-distinctness contract of #121.
 func ValidateMaskFormat(data []byte) error {
 	actual := sniffImageType(data)
 	if actual != ContentTypePNG {
 		return ErrMaskFormatRejected
 	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		// Sniffs as PNG but is not decodable; leave it to InspectImageContent
+		// to report invalid_image rather than claiming a format problem.
+		return nil
+	}
+	if !maskIsOpaque(img) {
+		return ErrMaskOpacityRejected
+	}
 	return nil
 }
+
+// maskIsOpaque reports whether every pixel of the decoded image is fully
+// opaque. Images without an alpha channel (gray, gray16) are opaque by
+// construction. Images with alpha (RGBA, NRGBA, and paletted images whose
+// palette carries alpha) are scanned and refused on the first translucent
+// pixel.
+func maskIsOpaque(img image.Image) bool {
+	bounds := img.Bounds()
+	switch src := img.(type) {
+	case *image.Gray, *image.Gray16:
+		return true
+	case *image.Paletted:
+		for _, p := range src.Palette {
+			_, _, _, a := p.RGBA()
+			if a != 0xffff {
+				return false
+			}
+		}
+		return true
+	default:
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				_, _, _, a := img.At(x, y).RGBA()
+				if a != 0xffff {
+					return false
+				}
+			}
+		}
+		return true
+	}
+}
+
+// AlphaMaskFromCanonical converts a canonical mask into the alpha convention
+// the ChatGPT-family image paths consume.
+//
+// The canonical Mask Convention (ADR 0003) is luminance, white = edit, opaque
+// PNG. The ChatGPT family consumes the opposite: alpha 0 marks the editable
+// region and non-transparent pixels are protected context. So the transform is
+// alpha_out = 255 - luminance_in: canonical white (255) becomes alpha 0, the
+// editable region; canonical black (0) becomes alpha 255, protected context.
+// This is not only a bit inversion, it changes the image type from an opaque
+// grayscale/palette PNG to an RGBA PNG, which is why this encodes through a
+// fresh non-premultiplied image rather than rewriting a channel in place.
+//
+// The output is NRGBA, not RGBA, deliberately. Go's color.RGBA is
+// alpha-premultiplied, so a light pixel that must become fully transparent has
+// no valid premultiplied representation (R > A is not a legal RGBA color) and
+// the value would not survive an encode/decode round trip. NRGBA stores the
+// alpha channel independently, which is what the wire format needs.
+//
+// The transform is defined once here so a convention drift cannot silently fork
+// the Adapters that share it. The decision to invert remains with each Provider
+// Adapter (ADR 0003) — this package provides the pure byte transform that
+// decision invokes.
+func AlphaMaskFromCanonical(canonical []byte) ([]byte, error) {
+	source, err := png.Decode(bytes.NewReader(canonical))
+	if err != nil {
+		return nil, ErrMaskNotPNG
+	}
+
+	bounds := source.Bounds()
+	inverted := image.NewNRGBA(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			luminance := color.GrayModel.Convert(source.At(x, y)).(color.Gray).Y
+			inverted.SetNRGBA(x, y, color.NRGBA{A: 255 - luminance})
+		}
+	}
+
+	encoded := &bytes.Buffer{}
+	if err := png.Encode(encoded, inverted); err != nil {
+		return nil, err
+	}
+	return encoded.Bytes(), nil
+}
+
+// ErrMaskNotPNG reports a mask that did not decode as PNG. Asset ingest already
+// refuses a non-PNG mask (ValidateMaskFormat), so reaching this in an Adapter
+// is a Gateway-internal inconsistency rather than a client mistake.
+var ErrMaskNotPNG = errors.New("mask asset did not decode as PNG")

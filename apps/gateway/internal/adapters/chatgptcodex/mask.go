@@ -1,11 +1,9 @@
 package chatgptcodex
 
 import (
-	"bytes"
 	"errors"
-	"image"
-	"image/color"
-	"image/png"
+
+	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 )
 
 // errMaskNotPNG reports a mask that did not decode as PNG. Asset ingest already
@@ -25,41 +23,14 @@ var errMaskNotPNG = errors.New("chatgptcodex: mask asset did not decode as PNG")
 // `rgba[o+3] = 255 - selected` at app.js:8221 and by
 // `.ref/CLIProxyAPI/.../codex_openai_images.go:739,799`).
 //
-// So the transform is alpha_out = 255 - luminance_in: canonical white (255)
-// becomes alpha 0, the editable region; canonical black (0) becomes alpha 255,
-// protected context. This is not only a bit inversion, it changes the image type
-// from an opaque grayscale/palette PNG to an RGBA PNG, which is why this encodes
-// through a fresh non-premultiplied image rather than rewriting a channel in
-// place.
-//
-// The output is NRGBA, not RGBA, deliberately. Go's color.RGBA is
-// alpha-premultiplied, so a light pixel that must become fully transparent has
-// no valid premultiplied representation (R > A is not a legal RGBA color) and
-// the value would not survive an encode/decode round trip. NRGBA stores the
-// alpha channel independently, which is what the wire format needs.
-//
-// This is the only place the Codex Adapter inverts a mask. ADR 0003 puts the
-// inversion in the component that talks to upstream precisely so no call site
-// re-decides the convention: the failure mode being avoided is not one wrong
-// inversion but a codebase with two contradictory ones.
+// The mechanical transform (alpha_out = 255 - luminance_in, NRGBA encoding) is
+// shared with the sibling chatgptweb Adapter via domain.AlphaMaskFromCanonical
+// so a convention drift cannot silently fork the two Adapters; the decision to
+// invert belongs here, per ADR 0003, at the component that talks to upstream.
 func alphaMaskFromCanonical(canonical []byte) ([]byte, error) {
-	source, err := png.Decode(bytes.NewReader(canonical))
+	encoded, err := domain.AlphaMaskFromCanonical(canonical)
 	if err != nil {
 		return nil, errMaskNotPNG
 	}
-
-	bounds := source.Bounds()
-	inverted := image.NewNRGBA(bounds)
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			luminance := color.GrayModel.Convert(source.At(x, y)).(color.Gray).Y
-			inverted.SetNRGBA(x, y, color.NRGBA{A: 255 - luminance})
-		}
-	}
-
-	encoded := &bytes.Buffer{}
-	if err := png.Encode(encoded, inverted); err != nil {
-		return nil, err
-	}
-	return encoded.Bytes(), nil
+	return encoded, nil
 }

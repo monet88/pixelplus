@@ -1,7 +1,11 @@
 package contracttest_test
 
 import (
+	"bytes"
 	"encoding/binary"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"testing"
 
@@ -315,5 +319,47 @@ func TestNonPNGDeclaredTypeOnMaskPathIsInvalidMask(t *testing.T) {
 	}
 	if body["failure_stage"] != "asset" {
 		t.Fatalf("failure_stage = %v, want asset (body=%s)", body["failure_stage"], payload)
+	}
+}
+
+// translucentPNGBytes encodes an RGBA PNG whose first pixel is not fully
+// opaque. It is valid PNG with correct dimensions and format — exactly the
+// shape that slips through a format-only gate and still reads as a partial
+// edit region on a Provider surface (#98 review P2, ADR 0003 "opaque PNG").
+func translucentPNGBytes(t *testing.T, width, height int) []byte {
+	t.Helper()
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	img.Set(0, 0, color.RGBA{R: 10, G: 20, B: 30, A: 128})
+	buffer := &bytes.Buffer{}
+	if err := png.Encode(buffer, img); err != nil {
+		t.Fatalf("encode translucent png: %v", err)
+	}
+	return buffer.Bytes()
+}
+
+// TestCreateMaskAssetRejectsTranslucentPNG locks the "opaque" half of "opaque
+// PNG" through the public HTTP seam: a mask that is genuinely PNG but carries a
+// translucent pixel is refused with invalid_mask, because a Provider surface
+// would read the alpha channel as the edit region and produce a partial edit
+// nobody asked for (#98 review P2, ADR 0003).
+func TestCreateMaskAssetRejectsTranslucentPNG(t *testing.T) {
+	t.Parallel()
+
+	harness := newAssetHarness(t, assetHarnessConfig{})
+	response, payload := harness.upload(t, uploadSpec{
+		bearer:   assetWriteKey,
+		idemKey:  "idem-mask-translucent",
+		kind:     "mask",
+		partType: "image/png",
+		fileName: "selection-mask.png",
+		content:  translucentPNGBytes(t, 64, 64),
+	})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", response.StatusCode, payload)
+	}
+	body := decodeAssetError(t, payload)
+	if body["code"] != "invalid_mask" {
+		t.Fatalf("code = %v, want invalid_mask (body=%s)", body["code"], payload)
 	}
 }
