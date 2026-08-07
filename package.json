@@ -11,6 +11,6 @@
     "verify:release": "node scripts/verify-repository.mjs --release"
   },
   "devDependencies": {
-    "@redocly/cli": "2.39.0"
+    "@redocly/cli": "2.43.3"
   }
 }
