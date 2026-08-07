@@ -65,15 +65,20 @@ jobs:
           # base or head object makes `git diff` exit nonzero and print nothing
           # useful; if that status is swallowed, the empty loop below leaves
           # `sensitive=0` and a security-sensitive PR is accepted — a guard
-          # that reads green on a broken range. Failing closed (exit 1) is the
-          # only safe response when the range cannot be inspected.
+          # that reads green on a broken range.
           changed="$(git diff --name-only \
             "${{ github.event.pull_request.base.sha }}" \
             "${{ github.event.pull_request.head.sha }}" 2>&1)" || {
-              echo "::error::git diff failed between base ${{ github.event.pull_request.base.sha }} and head ${{ github.event.pull_request.head.sha }}; the security-sensitive range could not be inspected. Failing closed."
+              echo "::error::git diff failed between base ${{ github.event.pull_request.base.sha }} and head ${{ github.event.pull_request.head.sha }}; the security-sensitive range could not be inspected. Treating the change as security-sensitive."
+              echo "range_ok=0" >> "$GITHUB_OUTPUT"
               echo "sensitive=1" >> "$GITHUB_OUTPUT"
-              exit 1
+              # NOT exit: this job must continue to the block step below, which
+              # force-disables auto-merge and fails the PR. Exiting here would
+              # skip that cleanup and leave an enabled bot auto-merge running on
+              # a PR whose range we could not inspect (review #136 P2).
+              exit 0
           }
+          echo "range_ok=1" >> "$GITHUB_OUTPUT"
           # Process substitution, not a pipe: a `git ... | while read` pipeline
           # runs the loop in a subshell, so `sensitive` set inside it would be
           # lost and this step would always read 0 — a guard that reads green.
@@ -112,9 +117,15 @@ jobs:
         # `labels.*.name` is a GitHub expression over the PR's label objects;
         # it is evaluated by GitHub, not the shell, so there is no quoting or
         # jq dependency in the run step.
+        #
+        # Blocked when EITHER the change is security-sensitive AND unreviewed,
+        # OR the diff range could not be inspected (range_ok=0). An uninspectable
+        # range stays blocked even with the security-reviewed label present: the
+        # label cannot validate a diff the guard never saw (review #136 P2).
         if: >-
-          steps.detect.outputs.sensitive == '1' &&
-          !contains(github.event.pull_request.labels.*.name, 'security-reviewed')
+          ( steps.detect.outputs.sensitive == '1' &&
+            !contains(github.event.pull_request.labels.*.name, 'security-reviewed') )
+          || steps.detect.outputs.range_ok == '0'
         run: |
           number="${{ github.event.pull_request.number }}"
           echo "This dependabot PR touches a security-sensitive surface"
