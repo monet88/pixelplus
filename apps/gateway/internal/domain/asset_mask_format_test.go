@@ -86,20 +86,17 @@ func TestAlphaMaskFromCanonicalInvertsLuminanceToAlpha(t *testing.T) {
 	}
 }
 
-// TestAlphaMaskFromCanonicalSurvivesRoundTrip is the regression guard for the
-// premultiplied-alpha trap. Go's color.RGBA is alpha-premultiplied, so a fully
-// transparent pixel that also carries a light colour has no legal premultiplied
-// representation and silently loses its value through an encode/decode cycle.
-// The editable region of every mask is exactly that pixel, so getting this
-// wrong produces a mask that inverts correctly in memory and arrives at the
-// Provider as an all-opaque image that edits nothing.
-//
-// A mid-grey pixel is used rather than an all-white one deliberately: a fully
-// white pixel (luminance 255 -> alpha 0) round-trips identically in both NRGBA
-// and RGBA, so it cannot tell the two apart. A mid-grey (luminance 128 ->
-// alpha 127) is the discriminating case — and the whole pixel color is
-// asserted, not just the alpha channel, so a copy-into-RGBA regression that
-// premultiplies the RGB channels is caught rather than absorbed (#98 review P3).
+// TestAlphaMaskFromCanonicalSurvivesRoundTrip locks the alpha channel through
+// an encode/decode cycle for a genuinely translucent result. The transform
+// emits pixels as NRGBA with the inverted luminance in the alpha channel and
+// RGB always zero (the canonical mask carries no colour); because RGB is zero,
+// premultiplication by alpha is a no-op there, so this test cannot by itself
+// tell NRGBA from premultiplied RGBA — the byte-stable golden digest and the
+// NRGBA-construction assertion in TestAlphaMaskFromCanonicalOutputIsByteStable
+// are what actually pin the representation. What this test does lock is that
+// a mid-grey luminance (alpha 127, not the degenerate all-or-nothing 0/255)
+// survives the encode/decode round trip, so a future change that clamps or
+// rounds the alpha channel fails here (#98 review P3).
 func TestAlphaMaskFromCanonicalSurvivesRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -121,11 +118,8 @@ func TestAlphaMaskFromCanonicalSurvivesRoundTrip(t *testing.T) {
 		t.Fatalf("decode inverted mask: %v", err)
 	}
 
-	r, g, b, a := decoded.At(0, 0).RGBA()
+	_, _, _, a := decoded.At(0, 0).RGBA()
 	// RGBA() reports 16-bit channels; compare on the 8-bit scale.
-	if r>>8 != 0 || g>>8 != 0 || b>>8 != 0 {
-		t.Fatalf("mid-grey canonical mask -> RGB(%d,%d,%d) after round trip, want (0,0,0) (non-zero RGB is premultiplied corruption)", r>>8, g>>8, b>>8)
-	}
 	if a>>8 != 127 {
 		t.Fatalf("mid-grey canonical mask -> alpha %d after round trip, want 127", a>>8)
 	}
@@ -241,6 +235,41 @@ func TestValidateMaskFormatRejectsTranslucentPNG(t *testing.T) {
 	err := domain.ValidateMaskFormat(maskFormatTranslucentPNG(t))
 	if !errors.Is(err, domain.ErrMaskOpacityRejected) {
 		t.Fatalf("ValidateMaskFormat(translucent png) error = %v, want ErrMaskOpacityRejected", err)
+	}
+}
+
+// maskFormatPalettedWithUnusedTransparent builds an indexed PNG whose palette
+// carries a transparent entry that NO pixel references. Every actual pixel is
+// opaque; only the unused palette slot has alpha 0.
+func maskFormatPalettedWithUnusedTransparent(t *testing.T) []byte {
+	t.Helper()
+
+	palette := []color.Color{
+		color.RGBA{R: 255, G: 255, B: 255, A: 255}, // index 0: opaque white, used
+		color.RGBA{A: 0}, // index 1: transparent, UNUSED
+	}
+	img := image.NewPaletted(image.Rect(0, 0, 8, 8), palette)
+	for i := range img.Pix {
+		img.Pix[i] = 0
+	}
+	encoded := &bytes.Buffer{}
+	if err := png.Encode(encoded, img); err != nil {
+		t.Fatalf("encode paletted png: %v", err)
+	}
+	return encoded.Bytes()
+}
+
+// TestValidateMaskFormatAcceptsPalettedWithUnusedTransparent asserts the opacity
+// gate judges pixels actually referenced, not the whole palette. An indexed PNG
+// whose palette has an unused transparent slot is fully opaque in practice and
+// must be accepted — refusing it would reject a legitimate mask for a palette
+// artifact the image never uses (#134 review P2).
+func TestValidateMaskFormatAcceptsPalettedWithUnusedTransparent(t *testing.T) {
+	t.Parallel()
+
+	err := domain.ValidateMaskFormat(maskFormatPalettedWithUnusedTransparent(t))
+	if err != nil {
+		t.Fatalf("ValidateMaskFormat(paletted with unused transparent) error = %v, want nil", err)
 	}
 }
 

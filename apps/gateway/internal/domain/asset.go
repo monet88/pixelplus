@@ -361,23 +361,17 @@ func ValidateMaskFormat(data []byte) error {
 
 // maskIsOpaque reports whether every pixel of the decoded image is fully
 // opaque. Images without an alpha channel (gray, gray16) are opaque by
-// construction. Images with alpha (RGBA, NRGBA, and paletted images whose
-// palette carries alpha) are scanned and refused on the first translucent
-// pixel.
+// construction. Images with alpha are scanned pixel-by-pixel through At(), so
+// a paletted image is judged on the pixels it actually references, not on its
+// whole palette — an indexed PNG whose palette carries an unused transparent
+// entry still passes (review #134 P2), while a referenced translucent entry is
+// refused on first sight.
 func maskIsOpaque(img image.Image) bool {
-	bounds := img.Bounds()
-	switch src := img.(type) {
+	switch img.(type) {
 	case *image.Gray, *image.Gray16:
 		return true
-	case *image.Paletted:
-		for _, p := range src.Palette {
-			_, _, _, a := p.RGBA()
-			if a != 0xffff {
-				return false
-			}
-		}
-		return true
 	default:
+		bounds := img.Bounds()
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 			for x := bounds.Min.X; x < bounds.Max.X; x++ {
 				_, _, _, a := img.At(x, y).RGBA()

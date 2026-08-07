@@ -362,4 +362,7 @@ func TestCreateMaskAssetRejectsTranslucentPNG(t *testing.T) {
 	if body["code"] != "invalid_mask" {
 		t.Fatalf("code = %v, want invalid_mask (body=%s)", body["code"], payload)
 	}
+	if body["failure_stage"] != "asset" {
+		t.Fatalf("failure_stage = %v, want asset (body=%s)", body["failure_stage"], payload)
+	}
 }
