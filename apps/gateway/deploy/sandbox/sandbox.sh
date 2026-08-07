@@ -17,11 +17,24 @@
 # Usage:
 #   ./sandbox.sh build     # reproducible image build from tracked sources
 #   ./sandbox.sh start      # start the hardened, disposable container
-#   ./sandbox.sh probe      # wait for /readyz then run a controlled HTTP smoke
+#   ./sandbox.sh probe      # wait for /healthz then run a controlled HTTP smoke
 #   ./sandbox.sh stop       # stop and remove the container (disposable)
 #   ./sandbox.sh up         # build + start + probe (then leaves it running)
 #   ./sandbox.sh smoke      # build + start + probe + stop (full disposable run)
 set -euo pipefail
+
+# Git Bash / MSYS on Windows rewrites any argument that looks like a Unix path
+# into a Windows one before the process sees it, so
+# `--env PROVIDER_ACCOUNT_STORE_PATH=/var/lib/pixelplus/...` reaches the
+# container as `C:/Program Files/Git/var/lib/...`. The gateway then tries to
+# `mkdir C:` on a read-only root filesystem and startup recovery fails — a
+# platform artifact that reads as a real container failure.
+#
+# The exclusion is deliberately selective, not `*`: the build context path DOES
+# need converting (`/f/CodeBase/...` -> `F:\CodeBase\...`), so a blanket
+# exclusion breaks `docker build` instead. Only the container-side paths are
+# exempted. No-op on macOS, Linux and CI, where MSYS is not involved.
+export MSYS2_ARG_CONV_EXCL="PROVIDER_ACCOUNT_STORE_PATH=;PIXELPLUS_GATEWAY_ADDR=;/var/lib;/tmp"
 
 IMAGE="pixelplus/gateway-sandbox:local"
 NAME="pixelplus-gateway-sandbox"
@@ -91,28 +104,38 @@ cmd_start() {
 cmd_probe() {
   require_docker
   local base="http://${HOST_ADDR}:${HOST_PORT}"
-  log "waiting for readiness at ${base}/readyz"
-  local ready="" attempt
+  # Wait on /healthz (liveness), not /readyz. Since the render durability gate
+  # (ADR 0009 / P1-C in internal/composition/runtime.go), a production
+  # composition without durable render ports, a credential authorizer and a
+  # usable digester keeps readiness CLOSED on purpose. The sandbox injects no
+  # such production dependencies, so /readyz 503 is the specified fail-closed
+  # behaviour, not a startup failure — waiting on it can only ever time out.
+  log "waiting for liveness at ${base}/healthz"
+  local live="" attempt
   for attempt in $(seq 1 60); do
-    if curl -fsS -o /dev/null "${base}/readyz" 2>/dev/null; then
-      ready="yes"
+    if curl -fsS -o /dev/null "${base}/healthz" 2>/dev/null; then
+      live="yes"
       break
     fi
     sleep 0.5
   done
-  [ -n "${ready}" ] || { docker logs "${NAME}" 2>&1 | tail -n 40; die "gateway did not become ready"; }
+  [ -n "${live}" ] || { docker logs "${NAME}" 2>&1 | tail -n 40; die "gateway did not become live"; }
 
   # Controlled, non-secret HTTP smoke through the production composition.
-  log "readiness OK; running controlled HTTP smoke (no Provider secrets)"
+  log "liveness OK; running controlled HTTP smoke (no Provider secrets)"
 
-  # 1) Health and readiness probes answer.
-  curl -fsS "${base}/healthz" >/dev/null || die "healthz failed"
-  curl -fsS "${base}/readyz" >/dev/null || die "readyz failed"
+  local code
+
+  # 1) Readiness answers, and answers CLOSED. Asserting the exact 503 keeps this
+  #    a real check: a future composition that opened readiness without the
+  #    durable render ports would be a regression this smoke must catch, and a
+  #    mere "responds" assertion would absorb it.
+  code="$(curl -s -o /dev/null -w '%{http_code}' "${base}/readyz")"
+  [ "${code}" = "503" ] || die "expected 503 fail-closed readiness without durable render ports, got ${code}"
 
   # 2) A product operation is reachable and fails CLOSED without a Client API
   #    Key: the fail-closed foundation principal store returns 401. This proves
   #    the /v1 spine is wired without provisioning or transmitting any secret.
-  local code
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST "${base}/v1/provider-accounts" \
     -H 'Idempotency-Key: sandbox-smoke' \
@@ -120,7 +143,7 @@ cmd_probe() {
     --data '{"provider":"chatgpt","auth_mode":"chatgpt_codex_oauth","label":"smoke"}')"
   [ "${code}" = "401" ] || die "expected 401 authentication_failed from fail-closed spine, got ${code}"
 
-  log "smoke passed: probes answer and /v1 spine is wired and fail-closed (401)"
+  log "smoke passed: live, readiness fail-closed (503), /v1 spine wired and fail-closed (401)"
 }
 
 cmd_stop() {
