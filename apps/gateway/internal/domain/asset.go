@@ -189,6 +189,15 @@ func (asset Asset) Retrievable(now time.Time) bool {
 	return now.Before(asset.ExpiresAt.Time())
 }
 
+// dimensionsWithinBounds reports whether pixel dimensions fall inside the
+// canonical bounds (#13 section 4.2). The bounds are #17/#18-tunable policy;
+// InspectImageContent and ValidateMaskFormat must always agree on them, so the
+// comparison lives here once (code-review #142 P3).
+func dimensionsWithinBounds(width, height int) bool {
+	return width >= AssetMinDimension && height >= AssetMinDimension &&
+		width <= AssetMaxDimension && height <= AssetMaxDimension
+}
+
 // InspectImageContent validates a declared media type against the actual
 // decoded bytes and returns the canonical image facts. It rejects an
 // unsupported type, an undecodable or type-mismatched payload (smuggling
@@ -213,8 +222,7 @@ func InspectImageContent(declaredContentType string, data []byte) (ImageFacts, e
 	if !ok {
 		return ImageFacts{}, ErrInvalidImage
 	}
-	if width < AssetMinDimension || height < AssetMinDimension ||
-		width > AssetMaxDimension || height > AssetMaxDimension {
+	if !dimensionsWithinBounds(width, height) {
 		return ImageFacts{}, ErrInvalidDimensions
 	}
 	return ImageFacts{ContentType: actual, Width: width, Height: height}, nil
@@ -361,8 +369,7 @@ func ValidateMaskFormat(data []byte) error {
 	if !ok {
 		return nil // undecodable -> InspectImageContent reports invalid_image
 	}
-	if width < AssetMinDimension || height < AssetMinDimension ||
-		width > AssetMaxDimension || height > AssetMaxDimension {
+	if !dimensionsWithinBounds(width, height) {
 		return nil // oversize -> InspectImageContent reports invalid_dimensions
 	}
 	img, err := png.Decode(bytes.NewReader(data))
