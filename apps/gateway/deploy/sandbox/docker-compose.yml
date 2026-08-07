@@ -49,8 +49,15 @@ services:
       - no-new-privileges:true
 
     # Named volume retains Provider Account + health state across ordinary
-    # restart/recreate. Explicit `down -v` / cleanup may remove it. No host
-    # path is bind-mounted. A narrow tmpfs remains for process temp only.
+    # restart/recreate. No host path is bind-mounted. A narrow tmpfs remains
+    # for process temp only.
+    #
+    # Teardown for this disposable profile is `docker compose down -v` (#125).
+    # A bare `down` keeps this volume, so the next run would start on top of the
+    # previous run's data: a live probe that passes on a leftover row proves
+    # nothing. Retaining state is a deliberate choice for restart/recovery
+    # tests, and must be named as such — `down` without `-v`, or
+    # `sandbox.sh stop --keep-state`.
     volumes:
       - pixelplus-gateway-state:/var/lib/pixelplus
     tmpfs:

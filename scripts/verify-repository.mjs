@@ -281,6 +281,23 @@ const FULL_STEPS = [
     skipNotice:
       "the Docker daemon is unavailable, so the sandbox smoke did NOT run. This mode's result is weaker than a full pass.",
   },
+  {
+    // The smoke above proves the container comes up and answers; it says nothing
+    // about what the teardown discards. #125 was exactly that gap: `stop` logged
+    // "no state retained" while keeping the named volume, so a probe could pass
+    // on a leftover row from an earlier run. This gate pins the two lifecycle
+    // modes — ephemeral by default, persistence only via an explicit
+    // --keep-state — and carries its own negative control, so a regression that
+    // silently starts retaining state fails here instead of being absorbed.
+    name: "sandbox state semantics",
+    command: ["bash", "apps/gateway/deploy/sandbox/verify-sandbox-semantics.sh"],
+    artifact: "apps/gateway/deploy/sandbox/verify-sandbox-semantics.sh",
+    optional: true,
+    requires: "docker",
+    job: "gateway-unit-and-contract",
+    skipNotice:
+      "the Docker daemon is unavailable, so the sandbox state semantics proof did NOT run. Ephemeral teardown is unverified in this mode.",
+  },
 ];
 
 /** Depth added by --release: supply chain proofs. Version/tag consistency is

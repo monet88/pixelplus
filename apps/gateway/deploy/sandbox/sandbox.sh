@@ -15,12 +15,13 @@
 #     only authorized credential path is Public API -> Vault -> Adapter.
 #
 # Usage:
-#   ./sandbox.sh build     # reproducible image build from tracked sources
-#   ./sandbox.sh start      # start the hardened, disposable container
-#   ./sandbox.sh probe      # wait for /healthz then run a controlled HTTP smoke
-#   ./sandbox.sh stop       # stop and remove the container (disposable)
-#   ./sandbox.sh up         # build + start + probe (then leaves it running)
-#   ./sandbox.sh smoke      # build + start + probe + stop (full disposable run)
+#   ./sandbox.sh build             # reproducible image build from tracked sources
+#   ./sandbox.sh start              # start the hardened, disposable container
+#   ./sandbox.sh probe              # wait for /healthz then run a controlled HTTP smoke
+#   ./sandbox.sh stop               # stop + remove container AND named volume (ephemeral)
+#   ./sandbox.sh stop --keep-state  # stop + remove container; volume survives (persistent)
+#   ./sandbox.sh up                 # build + start + probe (then leaves it running)
+#   ./sandbox.sh smoke              # build + start + probe + stop (full disposable run)
 set -euo pipefail
 
 # Git Bash / MSYS on Windows rewrites any argument that looks like a Unix path
@@ -37,10 +38,21 @@ set -euo pipefail
 export MSYS2_ARG_CONV_EXCL="PROVIDER_ACCOUNT_STORE_PATH=;PIXELPLUS_GATEWAY_ADDR=;/var/lib;/tmp"
 
 IMAGE="pixelplus/gateway-sandbox:local"
-NAME="pixelplus-gateway-sandbox"
+# NAME and STATE_VOLUME may be overridden by the environment so a consumer
+# (e.g. verify-sandbox-semantics.sh) can run an isolated sandbox under its own
+# names and host port without ever touching a live sandbox's container, port,
+# or retained volume. Defaults are the canonical names and port.
+NAME="${PIXELPLUS_SANDBOX_NAME:-pixelplus-gateway-sandbox}"
 HOST_ADDR="127.0.0.1"
-HOST_PORT="8080"
+# Host port override: the default 8080 is used by a live sandbox, so any
+# concurrent/isolated consumer must assign its own loopback port or the two
+# sandboxes collide on the same bind (#133 review P2).
+HOST_PORT="${PIXELPLUS_SANDBOX_PORT:-8080}"
 CONTAINER_PORT="8080"
+# Named durable state volume, mounted at /var/lib/pixelplus. Its lifecycle is
+# the subject of the ephemeral/persistent distinction below (#125): the name is
+# declared once here so the mount site and both teardown paths cannot drift.
+STATE_VOLUME="${PIXELPLUS_SANDBOX_VOLUME:-pixelplus-gateway-state}"
 
 # The build context is the gateway module directory only. The repo root,
 # `.ref/`, secrets/, credentials/, and auths/ are outside this context and
@@ -74,10 +86,11 @@ cmd_start() {
   #   --cap-drop ALL            drop every Linux capability
   #   --security-opt no-new-privileges  block privilege escalation
   #   --tmpfs /tmp              single narrow, non-exec, size-bounded writable dir
-  #   --volume named state      durable /var/lib/pixelplus (survives restart)
+  #   --volume named state      durable /var/lib/pixelplus (survives restart; its
+  #                             teardown is the ephemeral/persistent choice, #125)
   #   --pids-limit/--memory/--cpus  bounded resources
   # No --privileged, no --network host, no host-path bind mount, no docker socket.
-  docker volume create pixelplus-gateway-state >/dev/null 2>&1 || true
+  docker volume create "${STATE_VOLUME}" >/dev/null 2>&1 || true
   docker run -d \
     --name "${NAME}" \
     --publish "${HOST_ADDR}:${HOST_PORT}:${CONTAINER_PORT}" \
@@ -89,7 +102,7 @@ cmd_start() {
     --read-only \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    --volume pixelplus-gateway-state:/var/lib/pixelplus \
+    --volume "${STATE_VOLUME}":/var/lib/pixelplus \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
     --pids-limit 128 \
     --memory 256m \
@@ -148,13 +161,41 @@ cmd_probe() {
 
 cmd_stop() {
   require_docker
-  log "stopping and removing ${NAME} (disposable; no state retained)"
+  # Persistence is opt-in and must be named at the call site. An unrecognized
+  # argument is rejected rather than defaulted: silently reading a typo like
+  # `--keep_state` as "ephemeral" would destroy the very state the operator
+  # asked to keep, which is the failure mode of the old always-keep behaviour
+  # in reverse.
+  local keep_state="no"
+  case "${1:-}" in
+    "")             keep_state="no" ;;
+    --keep-state)   keep_state="yes" ;;
+    *)              die "unknown stop option '${1}' (expected no argument, or --keep-state)" ;;
+  esac
+
+  if [ "${keep_state}" = "yes" ]; then
+    log "stopping and removing ${NAME}; retaining volume ${STATE_VOLUME} (persistent, --keep-state)"
+  else
+    log "stopping and removing ${NAME} and volume ${STATE_VOLUME} (ephemeral; no state retained)"
+  fi
+
   # Graceful, deterministic shutdown: `docker stop` sends SIGTERM and honors the
   # container's --stop-timeout 15 grace window so the gateway signal handlers run
   # their ordered shutdown before removal. `docker rm -f` would send an immediate
   # SIGKILL and skip that ordered path (#68 deterministic shutdown).
   docker stop "${NAME}" >/dev/null 2>&1 || true
   docker rm "${NAME}" >/dev/null 2>&1 || true
+
+  # The volume is removed only after the container is gone; Docker refuses to
+  # remove a volume still referenced by a container, so ordering is load-bearing.
+  # A failure here must not be swallowed: the whole point of the ephemeral
+  # default is that the log stops claiming a teardown it did not perform.
+  if [ "${keep_state}" = "no" ]; then
+    if docker volume inspect "${STATE_VOLUME}" >/dev/null 2>&1; then
+      docker volume rm "${STATE_VOLUME}" >/dev/null \
+        || die "failed to remove state volume ${STATE_VOLUME}; state was NOT discarded"
+    fi
+  fi
 }
 
 cmd_up() {
@@ -166,8 +207,16 @@ cmd_up() {
 cmd_smoke() {
   cmd_build
   cmd_start
-  # Ensure teardown even if the probe fails.
-  trap cmd_stop EXIT
+  # Teardown must run on EVERY exit path, not just the happy one: a run that
+  # died in readiness or in the probe is exactly the run whose leftover state
+  # would let the NEXT run pass on a stale row (#125). The trap is installed
+  # after `cmd_start` because there is nothing to tear down before it.
+  #
+  # `cmd_stop` with no argument is the ephemeral path, so the failure case
+  # discards state too. The trap also re-raises the original exit status: a bare
+  # `trap cmd_stop EXIT` would let the teardown's own success become the
+  # function's exit code and report a failed probe as a passing smoke.
+  trap 'status=$?; cmd_stop; exit "${status}"' EXIT
   cmd_probe
   log "full disposable smoke complete"
 }
@@ -178,7 +227,7 @@ main() {
     build) cmd_build ;;
     start) cmd_start ;;
     probe) cmd_probe ;;
-    stop)  cmd_stop ;;
+    stop)  shift; cmd_stop "$@" ;;
     up)    cmd_up ;;
     smoke) cmd_smoke ;;
     *) die "usage: $0 {build|start|probe|stop|up|smoke}" ;;

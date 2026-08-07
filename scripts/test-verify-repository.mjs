@@ -59,6 +59,7 @@ const FULL_ADDITIONS = [
   "management API contract",
   "dependency direction",
   "docker sandbox smoke",
+  "sandbox state semantics",
 ];
 const RELEASE_ADDITIONS = [
   "dependency install determinism",
@@ -285,6 +286,22 @@ assert.ok(
 
 const requirements = readFileSync(resolve(root, "requirements-validation.txt"), "utf8");
 assert.match(requirements, /^jsonschema==\d/m, "python jsonschema must be pinned exactly");
+
+// Container base images: version AND digest (#125). A mutable tag makes
+// `docker build --pull` resolve to whatever the registry serves today, so
+// calling that build reproducible is a claim the Dockerfile does not support.
+// Asserting per-FROM rather than over the whole file, so adding a new
+// unpinned stage cannot hide behind the pinned ones.
+const dockerfile = readFileSync(resolve(root, "apps/gateway/Dockerfile"), "utf8");
+const fromLines = dockerfile.split(/\r?\n/).filter((line) => /^FROM\s/.test(line));
+assert.ok(fromLines.length >= 3, "the gateway Dockerfile must declare its build, statedir and runtime stages");
+for (const line of fromLines) {
+  assert.match(
+    line,
+    /^FROM\s+\S+:\S+@sha256:[0-9a-f]{64}(?:\s+AS\s+\S+)?$/,
+    `every base image must pin version and digest, but got "${line}"`,
+  );
+}
 
 // --- the entrypoint is real and self-describing ----------------------------
 
