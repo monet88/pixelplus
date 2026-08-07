@@ -7,7 +7,10 @@
  *
  *   node scripts/verify-repository.mjs --fast      PR gate
  *   node scripts/verify-repository.mjs --full      fast + race, mutation, architecture, docker
- *   node scripts/verify-repository.mjs --release   full + supply chain and version consistency
+ *   node scripts/verify-repository.mjs --release   full + supply chain checks
+ *
+ * `--release` deliberately claims only what it proves. Version/tag consistency
+ * is NOT verified here; that invariant belongs to the release workflow (#70).
  *
  * CI does not restate the command list. It runs this entrypoint once per
  * required check with `--job=<name>`, so the PR gate and a local run cannot
@@ -79,6 +82,16 @@ export const REQUIRED_TOOLS = [
     ],
     remedy: "python -m pip install -r requirements-validation.txt",
   },
+  {
+    name: "git",
+    command: ["git", "--version"],
+    remedy: "install git; the repository-hygiene gate inspects the commit with it",
+  },
+  {
+    name: "npm",
+    command: ["npm", "--version"],
+    remedy: "install the npm version pinned in package.json#packageManager",
+  },
 ];
 
 /**
@@ -94,10 +107,13 @@ export function requiredToolsFor(plan) {
     const [command] = step.command;
     if (command === "go" || command === "gofmt") needed.add("go");
     if (command === node) needed.add("node");
-    if (command === "python") {
-      needed.add("python");
-      needed.add("python jsonschema");
-    }
+    if (command === "git") needed.add("git");
+    if (command === "npm") needed.add("npm");
+    // Only the steps that actually validate against a schema declare
+    // `needs: ["python jsonschema"]`. A plain Python script (the chat stream
+    // wire check) must not be able to fail preflight over a library it never
+    // imports.
+    if (command === "python") needed.add("python");
     for (const extra of step.needs ?? []) needed.add(extra);
   }
   return REQUIRED_TOOLS.filter((tool) => needed.has(tool.name));
@@ -167,6 +183,18 @@ const FAST_STEPS = [
     hint: "remove trailing whitespace and conflict markers",
     job: "repository-hygiene",
   },
+  {
+    // `git diff --check` alone compares the worktree to the index, so after a
+    // CI checkout it has nothing to inspect and always reads green. The
+    // introduced commit range is what CI must actually screen, so screen it.
+    // On a pull request the checkout is a merge commit, making HEAD^..HEAD
+    // exactly the PR's changes; on a push it is the pushed commit.
+    name: "git diff --check (introduced commit)",
+    command: ["git", "diff", "--check", "HEAD^", "HEAD"],
+    artifact: "HEAD",
+    hint: "remove trailing whitespace and conflict markers from the commit",
+    job: "repository-hygiene",
+  },
 ];
 
 /** Depth added by --full: slower proofs and the historical/retained validators. */
@@ -221,19 +249,14 @@ const FULL_STEPS = [
     job: "gateway-unit-and-contract",
   },
   {
-    // Validates the tracked sandbox composition (#68) rather than merely
-    // pinging the daemon: config resolution catches drift between the compose
-    // file and the Dockerfile it builds.
+    // #68 ships a disposable sandbox controller that builds the image, starts
+    // the hardened container, probes it and tears it down. A Compose `config`
+    // parse would only prove the YAML is well formed, so a broken Dockerfile or
+    // a container that never becomes ready would still pass --full. Run the
+    // real smoke flow instead.
     name: "docker sandbox smoke",
-    command: [
-      "docker",
-      "compose",
-      "-f",
-      "apps/gateway/deploy/sandbox/docker-compose.yml",
-      "config",
-      "--quiet",
-    ],
-    artifact: "apps/gateway/deploy/sandbox/docker-compose.yml",
+    command: ["bash", "apps/gateway/deploy/sandbox/sandbox.sh", "smoke"],
+    artifact: "apps/gateway/deploy/sandbox/sandbox.sh",
     optional: true,
     requires: "docker",
     job: "gateway-unit-and-contract",
@@ -242,7 +265,8 @@ const FULL_STEPS = [
   },
 ];
 
-/** Depth added by --release: supply chain and version/tag consistency. */
+/** Depth added by --release: supply chain proofs. Version/tag consistency is
+ * intentionally not claimed here — see the header note. */
 const RELEASE_STEPS = [
   {
     name: "dependency install determinism",
@@ -435,7 +459,7 @@ function usage() {
 Usage:
   node scripts/verify-repository.mjs --fast      PR gate: format, vet, test, contracts, hygiene
   node scripts/verify-repository.mjs --full      fast + race, mutation suites, architecture, docker smoke
-  node scripts/verify-repository.mjs --release   full + supply chain, container build, version consistency
+  node scripts/verify-repository.mjs --release   full + supply chain, container build
 
 Options:
   --job=<name>   run only the steps owned by one CI job. CI uses this so the

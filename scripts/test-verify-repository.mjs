@@ -13,15 +13,18 @@
 
 import assert from "node:assert/strict";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const entrypoint = resolve(root, "scripts/verify-repository.mjs");
 
+// `pathToFileURL`, not string concatenation: a Windows drive-letter path is not
+// a valid URL path, so `file://${path}` makes this cross-platform test
+// unloadable on the one platform the entrypoint exists to keep consistent.
 const { buildPlan, renderSummary, requiredToolsFor, MODES, JOBS, REQUIRED_TOOLS } = await import(
-  `file://${entrypoint.replaceAll("\\", "/")}`
+  pathToFileURL(entrypoint).href
 );
 
 const names = (mode) => buildPlan(mode).map((step) => step.name);
@@ -34,16 +37,43 @@ const fast = names("fast");
 const full = names("full");
 const release = names("release");
 
-for (const required of [
+// The exact gate set of each depth, not merely a subset and a count. Asserting
+// only "contains these four" plus "is longer than fast" would let a plan drop a
+// named gate and substitute an arbitrary step while this file still passed.
+const FAST_STEPS = [
   "gofmt",
   "go vet",
   "go test",
   "public API contract",
   "implementation-spec authority",
   "git diff --check",
-]) {
-  assert.ok(fast.includes(required), `--fast must include the ${required} gate`);
-}
+  "git diff --check (introduced commit)",
+];
+const FULL_ADDITIONS = [
+  "go test -race",
+  "public API validator mutation suite",
+  "implementation-spec validator suite",
+  "verify entrypoint self-test",
+  "chat stream wire",
+  "historical public API contract",
+  "management API contract",
+  "dependency direction",
+  "docker sandbox smoke",
+];
+const RELEASE_ADDITIONS = [
+  "dependency install determinism",
+  "npm vulnerability audit",
+  "go vulnerability scan",
+  "container build",
+];
+
+assert.deepEqual(fast, FAST_STEPS, "--fast must be exactly the declared PR gate set");
+assert.deepEqual(full, [...FAST_STEPS, ...FULL_ADDITIONS], "--full must be exactly fast + its depth");
+assert.deepEqual(
+  release,
+  [...FAST_STEPS, ...FULL_ADDITIONS, ...RELEASE_ADDITIONS],
+  "--release must be exactly full + its depth",
+);
 
 // Depth is cumulative: a deeper mode never drops a shallower mode's gate,
 // otherwise "release passed" would be weaker than "fast passed".
@@ -56,15 +86,6 @@ for (const step of full) {
 
 assert.ok(full.length > fast.length, "--full must add depth over --fast");
 assert.ok(release.length > full.length, "--release must add depth over --full");
-
-for (const required of [
-  "go test -race",
-  "public API validator mutation suite",
-  "chat stream wire",
-  "dependency direction",
-]) {
-  assert.ok(full.includes(required), `--full must include the ${required} gate`);
-}
 
 assert.throws(() => buildPlan("nope"), /unknown mode/i, "an unknown mode must fail loudly");
 
@@ -89,15 +110,36 @@ for (const mode of MODES) {
 
 assert.throws(() => buildPlan("fast", "nope"), /unknown job/i, "an unknown job must fail loudly");
 
-// The four PR-gate jobs from #123 must each own at least one --fast check,
-// otherwise a required check would pass by running nothing.
-for (const job of [
+// The four PR-gate jobs from #123. `release-supply-chain` is deliberately not
+// one of them.
+const PR_JOBS = [
   "repository-hygiene",
   "gateway-unit-and-contract",
   "public-api-contract",
   "authority-consistency",
-]) {
+];
+
+// Each PR job must own at least one --fast check, otherwise a required check
+// would pass by running nothing.
+for (const job of PR_JOBS) {
   assert.ok(buildPlan("fast", job).length > 0, `--fast --job=${job} must run real checks`);
+}
+
+// And the four PR jobs must cover --fast *by themselves*. Checking the full
+// JOBS list here would let a fast gate be owned by `release-supply-chain` —
+// a job no PR runs — so it would be omitted from every required check while
+// the partition assertion still passed.
+const prSliced = PR_JOBS.flatMap((job) => buildPlan("fast", job).map((step) => step.name));
+assert.deepEqual(
+  [...prSliced].sort(),
+  fast.slice().sort(),
+  "the four PR jobs must cover every --fast check; a fast gate owned by a non-PR job never runs on a PR",
+);
+for (const step of buildPlan("fast")) {
+  assert.ok(
+    PR_JOBS.includes(step.job),
+    `${step.name} is a fast gate, so it must be owned by a PR job, not ${step.job}`,
+  );
 }
 
 // --- preflight scope --------------------------------------------------------
@@ -121,11 +163,41 @@ assert.ok(
   "the public API job validates with python jsonschema, so preflight must check it",
 );
 
-// A whole-mode run still resolves everything.
+// A whole-mode run still resolves everything. --release is the mode that
+// exercises every declared tool (it is the only one that invokes npm), so a
+// tool a release step shells out to cannot go undeclared and be discovered
+// only when a runner tries to spawn it.
 assert.deepEqual(
-  requiredToolsFor(buildPlan("full")).map((tool) => tool.name).sort(),
+  requiredToolsFor(buildPlan("release")).map((tool) => tool.name).sort(),
   REQUIRED_TOOLS.map((tool) => tool.name).sort(),
-  "--full exercises every declared tool, so preflight must resolve all of them",
+  "--release exercises every declared tool, so preflight must resolve all of them",
+);
+
+const releaseToolNames = requiredToolsFor(buildPlan("release", "release-supply-chain")).map(
+  (tool) => tool.name,
+);
+for (const tool of ["npm", "go"]) {
+  assert.ok(releaseToolNames.includes(tool), `the release supply-chain job invokes ${tool}`);
+}
+
+// The hygiene job shells out to git, so preflight must state that requirement
+// with a remedy instead of surfacing a terse spawn error mid-run.
+assert.ok(
+  requiredToolsFor(buildPlan("fast", "repository-hygiene"))
+    .map((tool) => tool.name)
+    .includes("git"),
+  "the hygiene job runs git, so preflight must resolve it",
+);
+
+// The chat stream wire check is plain Python and imports no schema library, so
+// its slice must not be able to fail preflight over jsonschema.
+const wireToolNames = requiredToolsFor(
+  buildPlan("full", "authority-consistency").filter((step) => step.name === "chat stream wire"),
+).map((tool) => tool.name);
+assert.ok(wireToolNames.includes("python"), "the chat stream wire check needs a Python interpreter");
+assert.ok(
+  !wireToolNames.includes("python jsonschema"),
+  "the chat stream wire check must not demand jsonschema; it never imports it",
 );
 
 // --- the silent-skip failure mode ------------------------------------------
@@ -182,7 +254,14 @@ for (const tool of ["go", "node", "python"]) {
 }
 
 const pkg = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
-assert.ok(pkg.packageManager?.startsWith("npm@"), "packageManager must pin npm");
+// An exact version, not a tag or a range: `npm@latest` and `npm@^11` both
+// satisfy `startsWith("npm@")` while letting the resolved npm drift build to
+// build, which is the opposite of pinning.
+assert.match(
+  pkg.packageManager ?? "",
+  /^npm@\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/,
+  "packageManager must pin npm to an exact version, not a tag or range",
+);
 assert.ok(pkg.engines?.node, "engines.node must be declared");
 assert.ok(
   !JSON.stringify(pkg.dependencies ?? {}).includes("sandcastle") &&
@@ -207,6 +286,22 @@ const bogusJob = spawnSync(process.execPath, [entrypoint, "--fast", "--job=wat"]
 });
 assert.notEqual(bogusJob.status, 0, "an unknown --job must be a non-zero exit, not an empty pass");
 
+// The empty-slice case is distinct from the unknown-job case and is the one
+// that can read green: `release-supply-chain` is a *declared* job that owns no
+// --fast check, so without the guard the run would exit 0 having verified
+// nothing. That is exactly the silent-skip failure #126 exists to prevent.
+assert.equal(buildPlan("fast", "release-supply-chain").length, 0, "precondition: the slice is empty");
+const emptySlice = spawnSync(
+  process.execPath,
+  [entrypoint, "--fast", "--job=release-supply-chain"],
+  { encoding: "utf8" },
+);
+assert.equal(
+  emptySlice.status,
+  2,
+  "a declared job with no checks in the mode must exit 2, not pass green having run nothing",
+);
+
 // --- CI must call the entrypoint, not reimplement it ------------------------
 
 // This is the assertion that keeps #126's "only implementation" claim honest.
@@ -214,6 +309,28 @@ assert.notEqual(bogusJob.status, 0, "an unknown --job must be a non-zero exit, n
 // moment one inlines `gofmt` or `go test` again, the PR gate and a local run are
 // two definitions of "verified" and the comment at the top of ci.yml is a lie.
 const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
+
+// The public API gate compares against a baseline blob read from an immutable
+// commit. Without `PIXELPLUS_PUBLIC_API_BASELINE_REF` the validator fails
+// closed under CI, and without full history `git show <sha>:<path>` cannot read
+// that blob — so a checkout narrowed back to depth 1, or a dropped env, turns a
+// real compatibility oracle into a red gate for the wrong reason.
+assert.match(
+  workflow,
+  /PIXELPLUS_PUBLIC_API_BASELINE_REF:\s*\$\{\{\s*github\.event\.pull_request\.base\.sha\s*\|\|\s*github\.event\.before\s*\}\}/,
+  "the public-api-contract job must supply the immutable baseline SHA; the validator fails closed without it",
+);
+assert.match(
+  workflow,
+  /fetch-depth:\s*0/,
+  "reading the baseline blob from the base commit requires full history",
+);
+assert.match(
+  workflow,
+  /fetch-depth:\s*2/,
+  "the hygiene gate screens HEAD^..HEAD, which a depth-1 checkout does not contain",
+);
+
 for (const job of [
   "repository-hygiene",
   "gateway-unit-and-contract",
@@ -226,18 +343,46 @@ for (const job of [
     `ci.yml must run the verify entrypoint for ${job} rather than restating its commands`,
   );
 }
-for (const inlined of [
-  "gofmt -l",
-  "go -C apps/gateway vet",
-  "go -C apps/gateway test",
-  "node scripts/validate-",
-  "node scripts/test-",
-  "node scripts/check-",
-  "python scripts/",
-]) {
+// Rather than denylisting a handful of current command spellings — which a
+// second verification definition can simply avoid — parse every shell line CI
+// actually runs and allow only the two categories the workflow is permitted to
+// contain: the verify entrypoint, and pinned dependency installation.
+const runLines = [];
+{
+  const lines = workflow.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const inline = lines[index].match(/^\s*run:\s*(?!\|)(\S.*)$/);
+    if (inline) {
+      runLines.push(inline[1].trim());
+      continue;
+    }
+    const block = lines[index].match(/^(\s*)run:\s*\|\s*$/);
+    if (!block) continue;
+    const indent = block[1].length;
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor];
+      if (line.trim() === "") continue;
+      const lineIndent = line.length - line.trimStart().length;
+      if (lineIndent <= indent) break;
+      runLines.push(line.trim());
+    }
+  }
+}
+
+assert.ok(runLines.length > 0, "the workflow must contain run steps for this check to mean anything");
+
+// The verify entrypoint, and nothing else that verifies.
+const ALLOWED_RUN = [
+  /^node scripts\/verify-repository\.mjs --fast --job=[a-z-]+$/,
+  /^node scripts\/test-verify-repository\.mjs$/,
+  /^npm ci$/,
+  /^python -m pip install -r requirements-validation\.txt$/,
+];
+for (const line of runLines) {
   assert.ok(
-    !workflow.includes(inlined),
-    `ci.yml must not inline "${inlined}"; it belongs to the verify entrypoint`,
+    ALLOWED_RUN.some((pattern) => pattern.test(line)),
+    `ci.yml runs "${line}", which is neither the verify entrypoint nor a pinned dependency install; ` +
+      "a second definition of \"verified\" is exactly what #126 forbids",
   );
 }
 

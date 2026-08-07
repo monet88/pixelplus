@@ -19,11 +19,36 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const MODULE = "github.com/monet88/pixelplus/apps/gateway";
+
+/**
+ * Read the module path rather than duplicating it. A hardcoded literal makes
+ * this gate fail OPEN on a fork or a module rename: the prefix filter would
+ * match nothing, every internal dependency would be dropped, and the check
+ * would print PASS while inspecting an empty list.
+ */
+function gatewayModulePath() {
+  const goMod = resolve(root, "apps/gateway/go.mod");
+  let text;
+  try {
+    text = readFileSync(goMod, "utf8");
+  } catch (error) {
+    console.error(`FAIL: cannot read ${goMod}: ${error.message}`);
+    process.exit(1);
+  }
+  const match = text.match(/^\s*module\s+(\S+)\s*$/m);
+  if (!match) {
+    console.error(`FAIL: no module directive in ${goMod}; cannot scope the dependency check`);
+    process.exit(1);
+  }
+  return match[1];
+}
+
+const MODULE = gatewayModulePath();
 
 /** Inner layer -> the only internal packages it may reach. */
 const RULES = [
@@ -36,7 +61,19 @@ const failures = [];
 for (const { layer, allows } of RULES) {
   const result = spawnSync(
     "go",
-    ["-C", "apps/gateway", "list", "-deps", "-f", "{{.ImportPath}}", `./internal/${layer}/...`],
+    [
+      "-C",
+      "apps/gateway",
+      "list",
+      // Without `-test`, go list follows only the default production graph, so
+      // a forbidden inner-layer import that lives in a `_test.go` file is
+      // silently omitted and this gate fails open.
+      "-test",
+      "-deps",
+      "-f",
+      "{{.ImportPath}}",
+      `./internal/${layer}/...`,
+    ],
     // No `shell: true`: it concatenates rather than escapes arguments, and the
     // `-f {{.ImportPath}}` template contains braces the shell would mangle.
     { cwd: root, encoding: "utf8" },
@@ -55,8 +92,18 @@ for (const { layer, allows } of RULES) {
   const internalDeps = result.stdout
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line.startsWith(MODULE))
+    // `go list -test` emits synthetic entries: `pkg.test` (the generated test
+    // binary) and `pkg [pkg.test]` (the test-augmented variant of a package).
+    // Strip the bracketed suffix so the variant is judged as its real package,
+    // and drop the generated binary, which is not a source dependency.
+    .map((line) => line.replace(/\s+\[.*\]$/, ""))
+    .filter((line) => line.length > 0 && !line.endsWith(".test"))
+    .filter((line) => line === MODULE || line.startsWith(`${MODULE}/`))
     .map((line) => line.slice(MODULE.length + 1))
+    // An external test package (`package foo_test` in internal/foo) is listed
+    // as `internal/foo_test`. It is the same layer's own test surface, not a
+    // dependency on an outer package, so judge it as its real package.
+    .map((pkg) => pkg.replace(/_test$/, ""))
     .filter((pkg) => pkg.startsWith("internal/"));
 
   for (const dep of internalDeps) {
