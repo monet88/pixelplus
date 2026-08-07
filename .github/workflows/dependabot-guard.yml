@@ -42,8 +42,14 @@ jobs:
     name: security-sensitive update guard
     runs-on: ubuntu-latest
     # Dependabot PRs are branches on this repository, never forks. Only the
-    # dependabot actor is guarded; ordinary PRs are not this workflow's job.
-    if: github.actor == 'dependabot[bot]'
+    # dependabot author is guarded; ordinary PRs are not this workflow's job.
+    #
+    # The filter is on the PR AUTHOR, not the event actor. When a maintainer
+    # adds the `security-reviewed` label to re-run this guard, the event actor
+    # is that maintainer — filtering on the actor would skip the re-run and the
+    # guard would never turn green. The PR author is stable across every event
+    # that triggers this workflow (opened/reopened/synchronize/labeled).
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,6 +61,19 @@ jobs:
         id: detect
         run: |
           sensitive=0
+          # Capture the diff command's output and status explicitly. A missing
+          # base or head object makes `git diff` exit nonzero and print nothing
+          # useful; if that status is swallowed, the empty loop below leaves
+          # `sensitive=0` and a security-sensitive PR is accepted — a guard
+          # that reads green on a broken range. Failing closed (exit 1) is the
+          # only safe response when the range cannot be inspected.
+          changed="$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" 2>&1)" || {
+              echo "::error::git diff failed between base ${{ github.event.pull_request.base.sha }} and head ${{ github.event.pull_request.head.sha }}; the security-sensitive range could not be inspected. Failing closed."
+              echo "sensitive=1" >> "$GITHUB_OUTPUT"
+              exit 1
+          }
           # Process substitution, not a pipe: a `git ... | while read` pipeline
           # runs the loop in a subshell, so `sensitive` set inside it would be
           # lost and this step would always read 0 — a guard that reads green.
@@ -86,9 +105,7 @@ jobs:
                 echo "  sensitive: GitHub Actions pin update ($p)"
                 ;;
             esac
-          done < <(git diff --name-only \
-            "${{ github.event.pull_request.base.sha }}" \
-            "${{ github.event.pull_request.head.sha }}")
+          done <<< "$changed"
           echo "sensitive=$sensitive" >> "$GITHUB_OUTPUT"
 
       - name: Block bot merge until human security review
