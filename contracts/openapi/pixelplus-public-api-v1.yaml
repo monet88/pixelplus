@@ -4885,7 +4885,8 @@
             "type": "string"
           },
           "mask_asset_id": {
-            "type": "string"
+            "type": "string",
+            "description": "Asset with kind=mask. Canonical Mask Convention (ADR 0003): luminance, white = edit, black = keep, alpha 255 (opaque), PNG only, dimensions equal to input_asset_id. Clients always send this canonical form; the Provider Adapter inverts it when a Provider expects the alpha convention, so no client ever pre-inverts a mask."
           },
           "n": {
             "type": "integer",
@@ -4895,7 +4896,7 @@
             "$ref": "#/components/schemas/ChatXPixelPlus"
           }
         },
-        "description": "Inpaint requires mask_asset_id. Mask is never silently dropped to degrade to image_edit.",
+        "description": "Inpaint requires mask_asset_id. Mask is never silently dropped to degrade to image_edit. The canonical Mask Convention (ADR 0003) is luminance, white = edit, black = keep, opaque PNG, same dimensions as input. Inversion belongs to the Provider Adapter and to no other component.",
         "examples": [
           {
             "model": "gpt-image-1",
