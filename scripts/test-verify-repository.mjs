@@ -20,7 +20,7 @@ import { spawnSync } from "node:child_process";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const entrypoint = resolve(root, "scripts/verify-repository.mjs");
 
-const { buildPlan, renderSummary, MODES, REQUIRED_TOOLS } = await import(
+const { buildPlan, renderSummary, requiredToolsFor, MODES, JOBS, REQUIRED_TOOLS } = await import(
   `file://${entrypoint.replaceAll("\\", "/")}`
 );
 
@@ -67,6 +67,66 @@ for (const required of [
 }
 
 assert.throws(() => buildPlan("nope"), /unknown mode/i, "an unknown mode must fail loudly");
+
+// --- CI slices come from this plan, not a second command list ---------------
+
+// #126 requires this entrypoint to be the only implementation. The workflow
+// selects slices with `--job=`, so every step must name a real job and the
+// slices must partition the mode exactly: a step owned by no job would be a
+// gate that runs locally and silently never runs in CI.
+for (const mode of MODES) {
+  const plan = buildPlan(mode);
+  for (const step of plan) {
+    assert.ok(JOBS.includes(step.job), `${step.name} must be owned by a declared CI job`);
+  }
+  const sliced = JOBS.flatMap((job) => buildPlan(mode, job).map((step) => step.name));
+  assert.deepEqual(
+    [...sliced].sort(),
+    plan.map((step) => step.name).sort(),
+    `the --job slices of --${mode} must cover it exactly, with no step counted twice`,
+  );
+}
+
+assert.throws(() => buildPlan("fast", "nope"), /unknown job/i, "an unknown job must fail loudly");
+
+// The four PR-gate jobs from #123 must each own at least one --fast check,
+// otherwise a required check would pass by running nothing.
+for (const job of [
+  "repository-hygiene",
+  "gateway-unit-and-contract",
+  "public-api-contract",
+  "authority-consistency",
+]) {
+  assert.ok(buildPlan("fast", job).length > 0, `--fast --job=${job} must run real checks`);
+}
+
+// --- preflight scope --------------------------------------------------------
+
+// A single job slice must not demand a toolchain it never invokes: requiring a
+// Python interpreter from the Go job would push CI to install one just to
+// satisfy preflight.
+const goToolNames = requiredToolsFor(buildPlan("fast", "gateway-unit-and-contract")).map(
+  (tool) => tool.name,
+);
+assert.ok(goToolNames.includes("go"), "the gateway job needs the Go toolchain");
+assert.ok(!goToolNames.includes("python"), "the gateway job must not require Python");
+
+// The public API validator shells out to python jsonschema, so preflight has to
+// resolve it even though the step's own command is a Node one.
+const apiToolNames = requiredToolsFor(buildPlan("fast", "public-api-contract")).map(
+  (tool) => tool.name,
+);
+assert.ok(
+  apiToolNames.includes("python jsonschema"),
+  "the public API job validates with python jsonschema, so preflight must check it",
+);
+
+// A whole-mode run still resolves everything.
+assert.deepEqual(
+  requiredToolsFor(buildPlan("full")).map((tool) => tool.name).sort(),
+  REQUIRED_TOOLS.map((tool) => tool.name).sort(),
+  "--full exercises every declared tool, so preflight must resolve all of them",
+);
 
 // --- the silent-skip failure mode ------------------------------------------
 
@@ -141,5 +201,44 @@ assert.match(help.stdout, /--fast/, "--help must document the modes");
 
 const bogus = spawnSync(process.execPath, [entrypoint, "--wat"], { encoding: "utf8" });
 assert.notEqual(bogus.status, 0, "an unknown flag must be a non-zero exit, not a default run");
+
+const bogusJob = spawnSync(process.execPath, [entrypoint, "--fast", "--job=wat"], {
+  encoding: "utf8",
+});
+assert.notEqual(bogusJob.status, 0, "an unknown --job must be a non-zero exit, not an empty pass");
+
+// --- CI must call the entrypoint, not reimplement it ------------------------
+
+// This is the assertion that keeps #126's "only implementation" claim honest.
+// Every job in the workflow has to reach the gates through this script; the
+// moment one inlines `gofmt` or `go test` again, the PR gate and a local run are
+// two definitions of "verified" and the comment at the top of ci.yml is a lie.
+const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
+for (const job of [
+  "repository-hygiene",
+  "gateway-unit-and-contract",
+  "public-api-contract",
+  "authority-consistency",
+]) {
+  assert.match(
+    workflow,
+    new RegExp(`verify-repository\\.mjs --fast --job=${job}`),
+    `ci.yml must run the verify entrypoint for ${job} rather than restating its commands`,
+  );
+}
+for (const inlined of [
+  "gofmt -l",
+  "go -C apps/gateway vet",
+  "go -C apps/gateway test",
+  "node scripts/validate-",
+  "node scripts/test-",
+  "node scripts/check-",
+  "python scripts/",
+]) {
+  assert.ok(
+    !workflow.includes(inlined),
+    `ci.yml must not inline "${inlined}"; it belongs to the verify entrypoint`,
+  );
+}
 
 console.log("PASS: verify-repository orchestrator (modes, skip policy, summary, pinning)");

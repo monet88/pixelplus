@@ -49,26 +49,62 @@ the API, which retired the stale workflow entry; `actions/workflows` now reports
 `total_count: 0`, and the only workflow that will register from here is the tracked
 `ci.yml`.
 
-## 4. Negative controls
+## 4. One implementation, sliced by CI job
 
-Each gate was proved to observe real failure. Both mutations were reverted and confirmed
-byte-identical to `HEAD` afterwards; neither was committed.
+#126 requires a single verification implementation. A workflow that lists `gofmt`, `go vet`
+and each validator itself would satisfy the letter of #123 while making that claim false:
+the PR gate and a local run would be two definitions of "verified", free to drift apart
+silently.
 
-### 4.1 Formatting mutation
+So the workflow does not restate anything. Every step in the entrypoint declares which CI
+job owns it, and each job in `ci.yml` runs exactly one command:
 
-Appended `func  badlyFormatted( ) {}` to `apps/gateway/internal/domain/asset.go`:
+```yaml
+- name: verify
+  run: node scripts/verify-repository.mjs --fast --job=repository-hygiene
+```
+
+The `--job` filter narrows a mode's plan without changing which mode a step belongs to, so
+the four PR-gate jobs partition `--fast` exactly — 2 + 2 + 1 + 1 = the 6 checks a developer
+gets from a bare `--fast`. Three consequences are enforced by
+`scripts/test-verify-repository.mjs` rather than by convention:
+
+- Every step must name a declared job. A step owned by none would run locally and silently
+  never run in CI.
+- The slices must cover each mode exactly, with nothing counted twice.
+- `ci.yml` must invoke the entrypoint per job and must not contain an inlined `gofmt -l`,
+  `go -C apps/gateway test`, `node scripts/validate-…` or `python scripts/…` command.
+
+A `--job` that matches no step exits 2 rather than 0, because a workflow typo that produced
+an empty green required check is the precise failure this entrypoint exists to prevent.
+
+Preflight is narrowed the same way: `requiredToolsFor(plan)` resolves only the tools a slice
+actually invokes, so the Go job does not demand a Python interpreter and CI is not pushed to
+install one just to satisfy a check. Indirect dependencies are declared explicitly —
+`validate-public-api-contract.mjs` shells out to `python jsonschema` even though its own
+command is a Node one, so its steps carry `needs: ["python", "python jsonschema"]`.
+
+## 5. Negative controls
+
+Each gate was proved to observe real failure. Every mutation was reverted and confirmed
+byte-identical to `HEAD` afterwards; none was committed.
+
+### 5.1 Formatting mutation
+
+Appended `func  badlyFormatted( ) {}` to `apps/gateway/internal/ports/capability.go` and ran the
+hygiene slice (`--fast --job=repository-hygiene`):
 
 ```text
-FAIL     gofmt                                     67ms  exit=0
+FAIL     gofmt                                     66ms  exit=0
            artifact: apps/gateway
            remedy:   run `gofmt -w apps/gateway` and commit the result
-FAIL: gofmt failed after 67ms (5 later check(s) never ran)
+FAIL: gofmt failed after 66ms (1 later check(s) never ran)
 ```
 
 Note `exit=0` in that line: the underlying command *succeeded*, and the gate failed anyway.
 That is precisely the trap being defended against.
 
-### 4.2 Breaking OpenAPI mutation
+### 5.2 Breaking OpenAPI mutation
 
 Removed the `/assets` path from `contracts/openapi/pixelplus-public-api-v1.yaml`:
 
@@ -85,7 +121,22 @@ its `.yaml` extension) and the validator passed. That pass was **vacuous** — i
 regex was wrong, not that the artifact was sound. It is recorded here because a vacuous
 green is the exact failure mode this report is meant to catch.
 
-## 5. Two real defects found by building the entrypoint
+### 5.3 Drift mutation
+
+The claim that this entrypoint is the *only* implementation is only worth as much as the
+test that observes it breaking. `ci.yml`'s hygiene job was mutated to call the underlying
+command directly (`run: gofmt -l apps/gateway`) instead of the entrypoint:
+
+```text
+ci.yml must run the verify entrypoint for repository-hygiene rather than restating its commands
+EXIT=1
+```
+
+Restored from backup and re-run: PASS. Without this control the anti-drift assertion in
+`scripts/test-verify-repository.mjs` would be indistinguishable from an assertion that
+inspects nothing.
+
+## 6. Two real defects found by building the entrypoint
 
 Both were found by running the orchestrator, not by review:
 
@@ -97,7 +148,7 @@ Both were found by running the orchestrator, not by review:
    with the daemon down, so it cannot decide whether a Docker gate can run. The probe is
    now `docker info`, which requires a reachable daemon.
 
-## 6. Scope deviation: the architecture check
+## 7. Scope deviation: the architecture check
 
 #126 lists "architecture and dependency-direction checks" under `--full`. No such rule is
 documented anywhere in this repository — there is no ADR, and `CONTEXT.md` states no import
@@ -116,7 +167,7 @@ internal/ports   imports at most internal/domain
 The outer layers are deliberately not gated. Widening this should follow a documented
 decision, not a script.
 
-## 7. Toolchain pinning
+## 8. Toolchain pinning
 
 | File | Pins |
 | --- | --- |
@@ -138,7 +189,7 @@ SKIPPED  docker sandbox smoke                       0ms  exit=-
 NOTE: 1 check(s) were skipped. This run is not a full pass.
 ```
 
-## 8. Verification
+## 9. Verification
 
 ```text
 node scripts/test-verify-repository.mjs     PASS
@@ -146,12 +197,24 @@ node scripts/verify-repository.mjs --fast   PASS (6 checks)
 node scripts/verify-repository.mjs --full   PASS (15 checks, docker smoke skipped)
 ```
 
+Each PR-gate slice was also run on its own, and the counts add up to the whole gate rather
+than to some subset of it:
+
+```text
+--fast --job=repository-hygiene          PASS (2 checks)
+--fast --job=gateway-unit-and-contract   PASS (2 checks)
+--fast --job=public-api-contract         PASS (1 check)
+--fast --job=authority-consistency       PASS (1 check)
+                                         ----------------
+                                         6 = the --fast gate
+```
+
 `--release` was not run to completion locally: it requires a reachable Docker daemon for
 the container build, and `govulncheck` downloads a module at run time. Its steps are
 declared but are **unproven locally** and should be treated as such until a release run
 exercises them in CI.
 
-## 9. Outstanding — branch protection
+## 10. Outstanding — branch protection
 
 The branch-protection criteria in #123 (required checks on the latest head, dismiss stale
 approvals, no force-push or deletion, conversation resolution, audited admin bypass) are

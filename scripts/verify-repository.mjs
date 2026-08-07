@@ -9,6 +9,10 @@
  *   node scripts/verify-repository.mjs --full      fast + race, mutation, architecture, docker
  *   node scripts/verify-repository.mjs --release   full + supply chain and version consistency
  *
+ * CI does not restate the command list. It runs this entrypoint once per
+ * required check with `--job=<name>`, so the PR gate and a local run cannot
+ * drift into two definitions of "verified".
+ *
  * Design rules that follow directly from the ticket:
  *
  *   - A missing tool is a FAILURE with a stated remedy. A required check is
@@ -29,6 +33,21 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export const MODES = ["fast", "full", "release"];
+
+/**
+ * CI job names, from issue #123. A step declares which job owns it so the
+ * workflow can select a slice with `--job=<name>` instead of restating the
+ * commands. `release-supply-chain` is not a PR gate; it exists so the release
+ * steps still carry an owner rather than a null one.
+ */
+export const JOBS = [
+  "repository-hygiene",
+  "gateway-unit-and-contract",
+  "public-api-contract",
+  "authority-consistency",
+  "release-supply-chain",
+];
+
 
 /**
  * Tools every mode needs before any gate runs. Preflight resolves and prints
@@ -62,6 +81,28 @@ export const REQUIRED_TOOLS = [
   },
 ];
 
+/**
+ * Which tools a plan actually needs. A whole-mode run needs all of them, but a
+ * single `--job` slice does not: making the Go job prove a Python interpreter
+ * would be theatre, and installing one just to satisfy preflight is worse.
+ * Derived from the commands themselves plus any `needs` a step declares for a
+ * tool it shells out to indirectly.
+ */
+export function requiredToolsFor(plan) {
+  const needed = new Set();
+  for (const step of plan) {
+    const [command] = step.command;
+    if (command === "go" || command === "gofmt") needed.add("go");
+    if (command === node) needed.add("node");
+    if (command === "python") {
+      needed.add("python");
+      needed.add("python jsonschema");
+    }
+    for (const extra of step.needs ?? []) needed.add(extra);
+  }
+  return REQUIRED_TOOLS.filter((tool) => needed.has(tool.name));
+}
+
 const node = process.execPath;
 
 /**
@@ -90,32 +131,41 @@ const FAST_STEPS = [
     failOnStdout: true,
     artifact: "apps/gateway",
     hint: "run `gofmt -w apps/gateway` and commit the result",
+    job: "repository-hygiene",
   },
   {
     name: "go vet",
     command: ["go", "-C", "apps/gateway", "vet", "./..."],
     artifact: "apps/gateway",
+    job: "gateway-unit-and-contract",
   },
   {
     name: "go test",
     command: ["go", "-C", "apps/gateway", "test", "./..."],
     artifact: "apps/gateway",
+    job: "gateway-unit-and-contract",
   },
   {
     name: "public API contract",
     command: [node, "scripts/validate-public-api-contract.mjs"],
     artifact: "contracts/openapi/pixelplus-public-api-v1.yaml",
+    job: "public-api-contract",
+    // The validator shells out to python jsonschema, so preflight must resolve
+    // it even though the command above is a Node one.
+    needs: ["python", "python jsonschema"],
   },
   {
     name: "implementation-spec authority",
     command: [node, "scripts/validate-provider-gateway-implementation-spec.mjs"],
     artifact: "docs/spec/provider-gateway-implementation-ready-specification.md",
+    job: "authority-consistency",
   },
   {
     name: "git diff --check",
     command: ["git", "diff", "--check"],
     artifact: "working tree",
     hint: "remove trailing whitespace and conflict markers",
+    job: "repository-hygiene",
   },
 ];
 
@@ -125,41 +175,50 @@ const FULL_STEPS = [
     name: "go test -race",
     command: ["go", "-C", "apps/gateway", "test", "-race", "./..."],
     artifact: "apps/gateway",
+    job: "gateway-unit-and-contract",
   },
   {
     name: "public API validator mutation suite",
     command: [node, "scripts/test-public-api-contract-validator.mjs"],
     artifact: "scripts/validate-public-api-contract.mjs",
+    job: "public-api-contract",
+    needs: ["python", "python jsonschema"],
   },
   {
     name: "implementation-spec validator suite",
     command: [node, "--test", "scripts/test-provider-gateway-implementation-spec-validator.mjs"],
     artifact: "scripts/validate-provider-gateway-implementation-spec.mjs",
+    job: "authority-consistency",
   },
   {
     name: "verify entrypoint self-test",
     command: [node, "scripts/test-verify-repository.mjs"],
     artifact: "scripts/verify-repository.mjs",
+    job: "authority-consistency",
   },
   {
     name: "chat stream wire",
     command: ["python", "scripts/check-chat-stream-wire.py"],
     artifact: "apps/gateway/internal/transport",
+    job: "authority-consistency",
   },
   {
     name: "historical public API contract",
     command: [node, "scripts/validate-openapi-contract.mjs", "contracts/openapi/pixelplus-public-api-v0alpha.yaml"],
     artifact: "contracts/openapi/pixelplus-public-api-v0alpha.yaml",
+    job: "public-api-contract",
   },
   {
     name: "management API contract",
     command: [node, "scripts/prototype-management-contract.mjs"],
     artifact: "contracts/openapi/pixelplus-management-api-v0alpha.yaml",
+    job: "public-api-contract",
   },
   {
     name: "dependency direction",
     command: [node, "scripts/check-dependency-direction.mjs"],
     artifact: "apps/gateway/internal",
+    job: "gateway-unit-and-contract",
   },
   {
     // Validates the tracked sandbox composition (#68) rather than merely
@@ -177,6 +236,7 @@ const FULL_STEPS = [
     artifact: "apps/gateway/deploy/sandbox/docker-compose.yml",
     optional: true,
     requires: "docker",
+    job: "gateway-unit-and-contract",
     skipNotice:
       "the Docker daemon is unavailable, so the sandbox smoke did NOT run. This mode's result is weaker than a full pass.",
   },
@@ -189,16 +249,19 @@ const RELEASE_STEPS = [
     command: ["npm", "ci", "--dry-run"],
     artifact: "package-lock.json",
     hint: "the lockfile must satisfy package.json without resolution",
+    job: "release-supply-chain",
   },
   {
     name: "npm vulnerability audit",
     command: ["npm", "audit", "--audit-level=high"],
     artifact: "package-lock.json",
+    job: "release-supply-chain",
   },
   {
     name: "go vulnerability scan",
     command: ["go", "-C", "apps/gateway", "run", "golang.org/x/vuln/cmd/govulncheck@latest", "./..."],
     artifact: "apps/gateway/go.sum",
+    job: "release-supply-chain",
   },
   {
     name: "container build",
@@ -206,6 +269,7 @@ const RELEASE_STEPS = [
     artifact: "apps/gateway/Dockerfile",
     optional: true,
     requires: "docker",
+    job: "release-supply-chain",
     skipNotice:
       "the Docker daemon is unavailable, so the container build did NOT run. Do not treat this as a release-ready result.",
   },
@@ -215,15 +279,22 @@ const RELEASE_STEPS = [
  * Compose the plan for a mode. Depth is strictly cumulative: a deeper mode
  * never drops a shallower mode's gate, so "release passed" is always a
  * stronger statement than "fast passed".
+ *
+ * `job` narrows the plan to one CI job's slice without changing which mode a
+ * step belongs to, so a workflow selects from the same list a developer runs
+ * rather than maintaining a parallel one.
  */
-export function buildPlan(mode) {
+export function buildPlan(mode, job = null) {
   if (!MODES.includes(mode)) {
     throw new Error(`unknown mode "${mode}" (expected one of: ${MODES.join(", ")})`);
+  }
+  if (job !== null && !JOBS.includes(job)) {
+    throw new Error(`unknown job "${job}" (expected one of: ${JOBS.join(", ")})`);
   }
   const plan = [...FAST_STEPS];
   if (mode === "full" || mode === "release") plan.push(...FULL_STEPS);
   if (mode === "release") plan.push(...RELEASE_STEPS);
-  return plan.map((step) => ({ ...step }));
+  return plan.filter((step) => job === null || step.job === job).map((step) => ({ ...step }));
 }
 
 function formatDuration(ms) {
@@ -259,28 +330,46 @@ export function renderSummary(results) {
   return lines.join("\n");
 }
 
-function toolAvailable(name) {
-  // `docker --version` reports the CLI and succeeds even when the daemon is
-  // down, so it cannot decide whether a Docker gate can run. `docker info`
-  // requires an actually reachable daemon.
-  const args = name === "docker" ? ["info"] : ["--version"];
-  const probe = spawnSync(resolveCommand(name), args, { encoding: "utf8", stdio: "ignore" });
-  return !probe.error && probe.status === 0;
+/**
+ * One probe policy for every tool question this script asks, so a change here
+ * (a timeout, an environment tweak) cannot land on the preflight path while
+ * missing the conditional-gate path.
+ *
+ * `docker --version` reports the CLI and succeeds even when the daemon is down,
+ * so it cannot decide whether a Docker gate can run. `docker info` requires an
+ * actually reachable daemon.
+ */
+const PROBE_ARGS = { docker: ["info"] };
+
+function probeTool(command, args) {
+  const probeArgs = args ?? PROBE_ARGS[command] ?? ["--version"];
+  const result = spawnSync(resolveCommand(command), probeArgs, {
+    encoding: "utf8",
+    stdio: args ? "pipe" : "ignore",
+  });
+  return {
+    ok: !result.error && result.status === 0,
+    version: (result.stdout ?? "").trim().split("\n")[0],
+  };
 }
 
-function preflight() {
+function toolAvailable(name) {
+  return probeTool(name).ok;
+}
+
+function preflight(tools) {
   console.log("resolved toolchain");
   console.log("-".repeat(72));
   const missing = [];
-  for (const tool of REQUIRED_TOOLS) {
+  for (const tool of tools) {
     const [command, ...args] = tool.command;
-    const probe = spawnSync(resolveCommand(command), args, { encoding: "utf8" });
-    if (probe.error || probe.status !== 0) {
+    const probe = probeTool(command, args);
+    if (!probe.ok) {
       missing.push(tool);
       console.log(`  ${tool.name.padEnd(20)} MISSING`);
       continue;
     }
-    console.log(`  ${tool.name.padEnd(20)} ${probe.stdout.trim().split("\n")[0]}`);
+    console.log(`  ${tool.name.padEnd(20)} ${probe.version}`);
   }
   if (missing.length > 0) {
     console.error("\nFAIL: required tooling is missing. A missing tool is a failure, not a skip.");
@@ -349,7 +438,10 @@ Usage:
   node scripts/verify-repository.mjs --release   full + supply chain, container build, version consistency
 
 Options:
-  --help    show this message
+  --job=<name>   run only the steps owned by one CI job. CI uses this so the
+                 workflow never restates the command list.
+                 Jobs: ${JOBS.join(", ")}
+  --help         show this message
 
 A missing tool is a failure with a stated remedy, never a silent skip.
 Docker-dependent checks are the only permitted conditional, and they announce it.`);
@@ -363,8 +455,11 @@ function main() {
     process.exit(0);
   }
 
-  const selected = args.filter((arg) => MODES.includes(arg.replace(/^--/, "")));
-  const unknown = args.filter((arg) => !MODES.includes(arg.replace(/^--/, "")));
+  const jobArgs = args.filter((arg) => arg.startsWith("--job="));
+  const rest = args.filter((arg) => !arg.startsWith("--job="));
+
+  const selected = rest.filter((arg) => MODES.includes(arg.replace(/^--/, "")));
+  const unknown = rest.filter((arg) => !MODES.includes(arg.replace(/^--/, "")));
 
   if (unknown.length > 0) {
     console.error(`FAIL: unknown argument(s): ${unknown.join(", ")}`);
@@ -376,13 +471,34 @@ function main() {
     usage();
     process.exit(2);
   }
+  if (jobArgs.length > 1) {
+    console.error("FAIL: at most one --job= may be given");
+    usage();
+    process.exit(2);
+  }
+
+  const job = jobArgs.length === 1 ? jobArgs[0].slice("--job=".length) : null;
+  if (job !== null && !JOBS.includes(job)) {
+    console.error(`FAIL: unknown job "${job}" (expected one of: ${JOBS.join(", ")})`);
+    usage();
+    process.exit(2);
+  }
 
   const mode = selected[0].replace(/^--/, "");
-  console.log(`verify-repository --${mode}\n`);
+  console.log(`verify-repository --${mode}${job ? ` --job=${job}` : ""}\n`);
 
-  preflight();
+  const plan = buildPlan(mode, job);
 
-  const plan = buildPlan(mode);
+  // A `--job` slice that matches nothing is a workflow bug, and silently
+  // exiting 0 would turn it into a green required check — the exact failure
+  // mode this entrypoint exists to prevent.
+  if (plan.length === 0) {
+    console.error(`FAIL: no checks are owned by job "${job}" in --${mode}`);
+    process.exit(2);
+  }
+
+  preflight(requiredToolsFor(plan));
+
   const results = [];
   let failure = null;
 
@@ -412,7 +528,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log(`\nPASS: verify-repository --${mode} (${results.length} checks)`);
+  console.log(`\nPASS: verify-repository --${mode}${job ? ` --job=${job}` : ""} (${results.length} checks)`);
 }
 
 const invokedDirectly =
