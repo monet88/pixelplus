@@ -91,12 +91,13 @@ func TestAlphaMaskFromCanonicalInvertsLuminanceToAlpha(t *testing.T) {
 // emits pixels as NRGBA with the inverted luminance in the alpha channel and
 // RGB always zero (the canonical mask carries no colour); because RGB is zero,
 // premultiplication by alpha is a no-op there, so this test cannot by itself
-// tell NRGBA from premultiplied RGBA — the byte-stable golden digest and the
-// NRGBA-construction assertion in TestAlphaMaskFromCanonicalOutputIsByteStable
-// are what actually pin the representation. What this test does lock is that
-// a mid-grey luminance (alpha 127, not the degenerate all-or-nothing 0/255)
-// survives the encode/decode round trip, so a future change that clamps or
-// rounds the alpha channel fails here (#98 review P3).
+// tell NRGBA from premultiplied RGBA — the golden digest in
+// TestAlphaMaskFromCanonicalOutputIsByteStable pins the emitted bytes, and the
+// SetNRGBA construction lives in AlphaMaskFromCanonical in domain/asset.go.
+// What this test does lock is that a mid-grey luminance (alpha 127, not the
+// degenerate all-or-nothing 0/255) survives the encode/decode round trip, so a
+// future change that clamps or rounds the alpha channel fails here (#98 review
+// P3).
 func TestAlphaMaskFromCanonicalSurvivesRoundTrip(t *testing.T) {
 	t.Parallel()
 
