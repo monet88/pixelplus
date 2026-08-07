@@ -1,0 +1,123 @@
+# Dependabot merge guard (issue #129).
+#
+# Dependency automation opens PRs and auto-merges nothing, but "nothing" has to
+# be ENFORCED, not stated. The ticket's rule: security-sensitive updates —
+# contracts, Provider adapters, vault code, Docker base-image/digest, and
+# GitHub Actions pins — must explicitly be prevented from bot-merge, because a
+# digest or SHA-pin bump is a code change with the reviewability of a version
+# string.
+#
+# How this is enforced:
+#   - No auto-merge is configured anywhere in the repository. This workflow is
+#     the second, explicit layer for the sensitive surfaces.
+#   - For any dependabot PR that touches a sensitive path, this check FAILS
+#     (red, blocking) and any enabled auto-merge is force-disabled until a
+#     maintainer reviews and adds the `security-reviewed` label. The label
+#     re-triggers the workflow, which then passes and unblocks the PR.
+#   - Human review is still required on top of this: every dependabot PR is
+#     routed to the code owner in `.github/CODEOWNERS`, and CODEOWNERS review
+#     is enforced by branch protection.
+#
+# Scope boundary: this is a merge guard, not a verifier. It does not restate
+# any verify command and never touches the `.github/workflows/ci.yml`
+# contract enforced by scripts/test-verify-repository.mjs.
+
+name: dependabot-guard
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: dependabot-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: security-sensitive update guard
+    runs-on: ubuntu-latest
+    # Dependabot PRs are branches on this repository, never forks. Only the
+    # dependabot actor is guarded; ordinary PRs are not this workflow's job.
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The diff below compares base SHA to head SHA directly; both commits
+          # must be present.
+          fetch-depth: 0
+
+      - name: Detect security-sensitive changes
+        id: detect
+        run: |
+          sensitive=0
+          # Process substitution, not a pipe: a `git ... | while read` pipeline
+          # runs the loop in a subshell, so `sensitive` set inside it would be
+          # lost and this step would always read 0 — a guard that reads green.
+          while IFS= read -r p; do
+            [ -z "$p" ] && continue
+            case "$p" in
+              contracts/*)
+                sensitive=1
+                echo "  sensitive: contracts update ($p)"
+                ;;
+              apps/gateway/internal/adapters/*)
+                sensitive=1
+                echo "  sensitive: Provider adapter update ($p)"
+                ;;
+              apps/gateway/internal/infrastructure/vault/*)
+                sensitive=1
+                echo "  sensitive: vault/credential code update ($p)"
+                ;;
+              apps/gateway/internal/application/credential.go|apps/gateway/internal/application/oauth.go|apps/gateway/internal/application/provideraccount*.go)
+                sensitive=1
+                echo "  sensitive: credential/account code update ($p)"
+                ;;
+              apps/gateway/Dockerfile|apps/gateway/Dockerfile.*)
+                sensitive=1
+                echo "  sensitive: Docker base image / digest update ($p)"
+                ;;
+              .github/workflows/*)
+                sensitive=1
+                echo "  sensitive: GitHub Actions pin update ($p)"
+                ;;
+            esac
+          done < <(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          echo "sensitive=$sensitive" >> "$GITHUB_OUTPUT"
+
+      - name: Block bot merge until human security review
+        # `labels.*.name` is a GitHub expression over the PR's label objects;
+        # it is evaluated by GitHub, not the shell, so there is no quoting or
+        # jq dependency in the run step.
+        if: >-
+          steps.detect.outputs.sensitive == '1' &&
+          !contains(github.event.pull_request.labels.*.name, 'security-reviewed')
+        run: |
+          number="${{ github.event.pull_request.number }}"
+          echo "This dependabot PR touches a security-sensitive surface"
+          echo "(contracts, Provider adapters, vault/credential code, a Docker"
+          echo "digest, or a GitHub Actions pin). Bot-merge is blocked."
+          echo
+          echo "A maintainer must review the diff and add the 'security-reviewed'"
+          echo "label; that label re-runs this check and turns it green."
+          echo
+          # Force-disable GitHub auto-merge on this PR (no-op if never enabled).
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/pulls/$number/auto-merge" \
+            >/dev/null 2>&1 || echo "(auto-merge was not enabled; nothing to disable)"
+          # Flag the PR so the state is visible without opening the logs. If the
+          # token cannot add labels this is still not fatal; the failing check
+          # is the blocker, not the label.
+          gh label create needs-security-review \
+            --repo "$GITHUB_REPOSITORY" \
+            --description "Dependabot update touching a security-sensitive surface; bot-merge blocked until reviewed" \
+            --force >/dev/null 2>&1 || true
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$number/labels" \
+            -f labels[]="needs-security-review" >/dev/null 2>&1 || true
+          echo "::error::Bot-merge blocked: security-sensitive dependabot update requires human review (add the 'security-reviewed' label)."
+          exit 1
