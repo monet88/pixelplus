@@ -1,15 +1,10 @@
 package chatgptweb
 
 import (
-	"errors"
+	"fmt"
 
 	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 )
-
-// errMaskNotPNG reports a mask that did not decode as PNG. Asset ingest already
-// refuses a non-PNG mask (domain.ValidateMaskFormat), so reaching this here is a
-// Gateway-internal inconsistency rather than a client mistake.
-var errMaskNotPNG = errors.New("chatgptweb: mask asset did not decode as PNG")
 
 // alphaMaskFromCanonical converts a canonical mask into the alpha convention the
 // ChatGPT Web image path consumes.
@@ -28,10 +23,14 @@ var errMaskNotPNG = errors.New("chatgptweb: mask asset did not decode as PNG")
 // shared with the sibling chatgptcodex Adapter via domain.AlphaMaskFromCanonical
 // so a convention drift cannot silently fork the two Adapters; the decision to
 // invert belongs here, per ADR 0003, at the component that talks to upstream.
+//
+// The error is wrapped, not re-created: callers match on the single
+// domain.ErrMaskNotPNG sentinel (via errors.Is), while the wrap adds the
+// Adapter name to the message for operator triage.
 func alphaMaskFromCanonical(canonical []byte) ([]byte, error) {
 	encoded, err := domain.AlphaMaskFromCanonical(canonical)
 	if err != nil {
-		return nil, errMaskNotPNG
+		return nil, fmt.Errorf("chatgptweb: %w", err)
 	}
 	return encoded, nil
 }

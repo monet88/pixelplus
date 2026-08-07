@@ -189,6 +189,15 @@ func (asset Asset) Retrievable(now time.Time) bool {
 	return now.Before(asset.ExpiresAt.Time())
 }
 
+// dimensionsWithinBounds reports whether pixel dimensions fall inside the
+// canonical bounds (#13 section 4.2). The bounds are #17/#18-tunable policy;
+// InspectImageContent and ValidateMaskFormat must always agree on them, so the
+// comparison lives here once (code-review #142 P3).
+func dimensionsWithinBounds(width, height int) bool {
+	return width >= AssetMinDimension && height >= AssetMinDimension &&
+		width <= AssetMaxDimension && height <= AssetMaxDimension
+}
+
 // InspectImageContent validates a declared media type against the actual
 // decoded bytes and returns the canonical image facts. It rejects an
 // unsupported type, an undecodable or type-mismatched payload (smuggling
@@ -213,8 +222,7 @@ func InspectImageContent(declaredContentType string, data []byte) (ImageFacts, e
 	if !ok {
 		return ImageFacts{}, ErrInvalidImage
 	}
-	if width < AssetMinDimension || height < AssetMinDimension ||
-		width > AssetMaxDimension || height > AssetMaxDimension {
+	if !dimensionsWithinBounds(width, height) {
 		return ImageFacts{}, ErrInvalidDimensions
 	}
 	return ImageFacts{ContentType: actual, Width: width, Height: height}, nil
@@ -338,6 +346,14 @@ func decodeWebPDimensions(data []byte) (int, int, bool) {
 // and refused if any pixel has alpha != 0xFF, so a translucent mask cannot
 // claim the canonical shape.
 //
+// Dimension ordering is deliberate: the full decode and opacity scan below
+// happen ONLY after a cheap header-only dimension check has confirmed the
+// image is within the canonical bounds. Without that guard a tiny PNG declaring
+// huge dimensions would be fully decoded on every kind=mask upload before the
+// cheap check rejected it (code-review decode-bomb finding). An oversize mask
+// returns nil here and lets InspectImageContent report it as
+// invalid_dimensions, preserving the pairwise-distinctness contract of #121.
+//
 // A byte stream that sniffs as PNG but fails to decode is deliberately NOT
 // refused here: it returns nil and lets InspectImageContent report it as
 // invalid_image, keeping "wrong format" (invalid_mask) distinct from "broken
@@ -346,6 +362,15 @@ func ValidateMaskFormat(data []byte) error {
 	actual := sniffImageType(data)
 	if actual != ContentTypePNG {
 		return ErrMaskFormatRejected
+	}
+	// Cheap dimension gate first (header-only, no full decode): an oversize
+	// mask is left for InspectImageContent to reject as invalid_dimensions.
+	width, height, ok := decodeDimensions(actual, data)
+	if !ok {
+		return nil // undecodable -> InspectImageContent reports invalid_image
+	}
+	if !dimensionsWithinBounds(width, height) {
+		return nil // oversize -> InspectImageContent reports invalid_dimensions
 	}
 	img, err := png.Decode(bytes.NewReader(data))
 	if err != nil {

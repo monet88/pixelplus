@@ -7,6 +7,8 @@ import (
 	"image/color"
 	"image/png"
 	"testing"
+
+	"github.com/monet88/pixelplus/apps/gateway/internal/domain"
 )
 
 // maskFixturePNG builds the same canonical mask shape the shared
@@ -68,11 +70,12 @@ func TestAlphaMaskFromCanonicalInvertsToAlpha(t *testing.T) {
 }
 
 // TestAlphaMaskFromCanonicalRejectsNonPNG asserts the Adapter refuses bytes it
-// cannot decode as PNG.
+// cannot decode as PNG, matching on the shared domain sentinel through the
+// wrapper's error wrap.
 func TestAlphaMaskFromCanonicalRejectsNonPNG(t *testing.T) {
 	t.Parallel()
 
-	if _, err := alphaMaskFromCanonical([]byte("not a png")); !errors.Is(err, errMaskNotPNG) {
-		t.Fatalf("alphaMaskFromCanonical(non-PNG) error = %v, want errMaskNotPNG", err)
+	if _, err := alphaMaskFromCanonical([]byte("not a png")); !errors.Is(err, domain.ErrMaskNotPNG) {
+		t.Fatalf("alphaMaskFromCanonical(non-PNG) error = %v, want domain.ErrMaskNotPNG", err)
 	}
 }
