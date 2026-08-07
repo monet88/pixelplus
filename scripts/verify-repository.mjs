@@ -92,6 +92,16 @@ export const REQUIRED_TOOLS = [
     command: ["npm", "--version"],
     remedy: "install the npm version pinned in package.json#packageManager",
   },
+  {
+    name: "bash",
+    command: ["bash", "--version"],
+    remedy: "install bash; the sandbox smoke controller is a bash script",
+  },
+  {
+    name: "curl",
+    command: ["curl", "--version"],
+    remedy: "install curl; the sandbox smoke probes the container's HTTP surface with it",
+  },
 ];
 
 /**
@@ -104,11 +114,18 @@ export const REQUIRED_TOOLS = [
 export function requiredToolsFor(plan) {
   const needed = new Set();
   for (const step of plan) {
+    // Deliberately environment-independent: this returns what the plan *needs*,
+    // never what the current machine *has*. Probing `requires` here to drop a
+    // skipped step's helpers would make the answer differ between machines and
+    // make the self-test's coverage assertion unprovable. A conditional step's
+    // helpers therefore fail CLOSED (too strict, never too lax), which is the
+    // policy direction #126 requires.
     const [command] = step.command;
     if (command === "go" || command === "gofmt") needed.add("go");
     if (command === node) needed.add("node");
     if (command === "git") needed.add("git");
     if (command === "npm") needed.add("npm");
+    if (command === "bash") needed.add("bash");
     // Only the steps that actually validate against a schema declare
     // `needs: ["python jsonschema"]`. A plain Python script (the chat stream
     // wire check) must not be able to fail preflight over a library it never
@@ -259,6 +276,7 @@ const FULL_STEPS = [
     artifact: "apps/gateway/deploy/sandbox/sandbox.sh",
     optional: true,
     requires: "docker",
+    needs: ["curl"],
     job: "gateway-unit-and-contract",
     skipNotice:
       "the Docker daemon is unavailable, so the sandbox smoke did NOT run. This mode's result is weaker than a full pass.",

@@ -200,6 +200,20 @@ assert.ok(
   "the chat stream wire check must not demand jsonschema; it never imports it",
 );
 
+// The sandbox smoke is a bash script that probes the container with curl. Both
+// were previously undeclared, so on a runner without them the gate died with a
+// raw spawn error instead of preflight's stated remedy — the failure shape #126
+// exists to eliminate.
+const smokeToolNames = requiredToolsFor(
+  buildPlan("full", "gateway-unit-and-contract").filter((step) => step.name === "docker sandbox smoke"),
+).map((tool) => tool.name);
+for (const tool of ["bash", "curl"]) {
+  assert.ok(
+    smokeToolNames.includes(tool),
+    `the sandbox smoke shells out to ${tool}, so preflight must state that requirement`,
+  );
+}
+
 // --- the silent-skip failure mode ------------------------------------------
 
 // This is the single most important assertion in the file. #126 exists because
