@@ -40,11 +40,14 @@ export MSYS2_ARG_CONV_EXCL="PROVIDER_ACCOUNT_STORE_PATH=;PIXELPLUS_GATEWAY_ADDR=
 IMAGE="pixelplus/gateway-sandbox:local"
 # NAME and STATE_VOLUME may be overridden by the environment so a consumer
 # (e.g. verify-sandbox-semantics.sh) can run an isolated sandbox under its own
-# names without ever touching a live sandbox's container or retained volume.
-# Defaults are the canonical names.
+# names and host port without ever touching a live sandbox's container, port,
+# or retained volume. Defaults are the canonical names and port.
 NAME="${PIXELPLUS_SANDBOX_NAME:-pixelplus-gateway-sandbox}"
 HOST_ADDR="127.0.0.1"
-HOST_PORT="8080"
+# Host port override: the default 8080 is used by a live sandbox, so any
+# concurrent/isolated consumer must assign its own loopback port or the two
+# sandboxes collide on the same bind (#133 review P2).
+HOST_PORT="${PIXELPLUS_SANDBOX_PORT:-8080}"
 CONTAINER_PORT="8080"
 # Named durable state volume, mounted at /var/lib/pixelplus. Its lifecycle is
 # the subject of the ephemeral/persistent distinction below (#125): the name is

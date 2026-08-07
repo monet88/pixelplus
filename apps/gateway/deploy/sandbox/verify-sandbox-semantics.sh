@@ -23,12 +23,18 @@ SANDBOX="${SCRIPT_DIR}/sandbox.sh"
 MARKER_FILE="sandbox-ephemeral-test-marker"
 MARKER_VALUE="ephemeral-test-$(date +%s)"
 # The verifier runs an ISOLATED sandbox: its own container and volume names,
-# suffixed with its own PID. A manual or concurrent invocation therefore cannot
-# destroy a live sandbox's container or a restart-test's retained state, and
-# two verifiers cannot collide (PR #133 review P1). The sandbox script's
-# canonical names are only the defaults; this verifier never touches them.
+# suffixed with its own PID, and its own loopback host port so a concurrent or
+# live sandbox is never disturbed. A manual or concurrent invocation therefore
+# cannot destroy a live sandbox's container, collide on its port, or erase a
+# restart-test's retained state, and two verifiers cannot collide (PR #133
+# review P1/P2). The sandbox script's canonical names are only the defaults;
+# this verifier never touches them.
 SANDBOX_CONTAINER="pixelplus-gateway-sandbox-verify-$$"
 VOLUME="pixelplus-gateway-state-verify-$$"
+# Derive a distinct loopback port from the PID so concurrent verifier runs bind
+# different ports. 20000-39999 keeps clear of the live sandbox's default 8080
+# and of common service ranges.
+SANDBOX_PORT=$(( 20000 + ($$ % 20000) ))
 HELPER_IMAGE="alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e"
 
 pass()  { printf '  PASS %s\n' "$*"; }
@@ -39,10 +45,21 @@ fail() { printf '  FAIL %s\n' "$*" >&2; exit 1; }
 # container or volume behind. The trap runs the ephemeral teardown directly
 # (not via sandbox.sh, which would use the canonical name) and re-raises the
 # original status so a teardown failure does not mask a test failure.
+#
+# Cleanup distinguishes "already absent" (fine) from "removal failed" (report
+# it): `docker rm -f` / `volume rm -f` on a nonexistent resource exit nonzero
+# just because the resource is gone, so a bare `|| true` would silently absorb
+# a real removal error and let failed runs accumulate containers or volumes.
 cleanup_verify() {
   local status=$?
-  docker rm -f "${SANDBOX_CONTAINER}" >/dev/null 2>&1 || true
-  docker volume rm -f "${VOLUME}" >/dev/null 2>&1 || true
+  if ! docker rm -f "${SANDBOX_CONTAINER}" >/dev/null 2>&1; then
+    docker inspect "${SANDBOX_CONTAINER}" >/dev/null 2>&1 \
+      && echo "  WARN: failed to remove container ${SANDBOX_CONTAINER}" >&2
+  fi
+  if ! docker volume rm -f "${VOLUME}" >/dev/null 2>&1; then
+    docker volume inspect "${VOLUME}" >/dev/null 2>&1 \
+      && echo "  WARN: failed to remove volume ${VOLUME}" >&2
+  fi
   exit "${status}"
 }
 trap cleanup_verify EXIT
@@ -52,11 +69,12 @@ require_docker() {
   docker info >/dev/null 2>&1 || { echo "SKIP: docker daemon not reachable"; exit 0; }
 }
 
-# sandbox_cmd runs sandbox.sh against THIS verifier's isolated names, so the
-# script's canonical-name defaults are never used from here.
+# sandbox_cmd runs sandbox.sh against THIS verifier's isolated names and port,
+# so the script's canonical defaults are never used from here.
 sandbox_cmd() {
   PIXELPLUS_SANDBOX_NAME="${SANDBOX_CONTAINER}" \
   PIXELPLUS_SANDBOX_VOLUME="${VOLUME}" \
+  PIXELPLUS_SANDBOX_PORT="${SANDBOX_PORT}" \
     bash "${SANDBOX}" "$@"
 }
 
