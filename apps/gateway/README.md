@@ -82,18 +82,44 @@ path. Artifacts live under [`deploy/sandbox/`](deploy/sandbox) plus the module
 
 ```bash
 # From apps/gateway/deploy/sandbox (requires a running Docker daemon):
-./sandbox.sh build   # reproducible image build from tracked module sources
-./sandbox.sh start   # start the hardened, disposable container
-./sandbox.sh probe   # wait for /readyz, then run the controlled HTTP smoke
-./sandbox.sh stop    # stop and remove the container (no state retained)
-./sandbox.sh smoke   # build + start + probe + stop in one disposable run
+./sandbox.sh build              # reproducible image build from tracked module sources
+./sandbox.sh start              # start the hardened, disposable container
+./sandbox.sh probe              # wait for /healthz, then run the controlled HTTP smoke
+./sandbox.sh stop               # ephemeral: remove the container AND the state volume
+./sandbox.sh stop --keep-state  # persistent: keep the volume for restart/recovery tests
+./sandbox.sh smoke              # build + start + probe + ephemeral stop in one run
 ```
 
-Compose is also provided for the same profile:
+### State lifecycle
+
+Durable Provider Account and health state lives on the named volume
+`pixelplus-gateway-state`, mounted at `/var/lib/pixelplus`. Teardown has two
+modes and the safe one is the default (#125):
+
+| Mode | Invocation | Volume after stop |
+| --- | --- | --- |
+| ephemeral | `./sandbox.sh stop` | removed |
+| persistent | `./sandbox.sh stop --keep-state` | retained |
+
+Ephemeral is the default because a live probe that passes on a leftover row from
+an earlier run proves nothing, and nothing in the log would reveal it. Retaining
+state is therefore an explicit, named opt-in visible at the call site. `smoke`
+tears down ephemerally on **every** exit path, so a run that fails readiness or
+the probe leaves no state for the next run to pass on. An unrecognized `stop`
+option is rejected rather than treated as ephemeral, so a typo cannot destroy
+state the operator asked to keep.
+
+`bash deploy/sandbox/verify-sandbox-semantics.sh` proves both modes with a
+marker file plus a negative control, and runs as the `sandbox state semantics`
+gate in `node scripts/verify-repository.mjs --full`.
+
+Compose is also provided for the same profile. Use `down -v` to match the
+ephemeral default; plain `down` keeps the volume:
 
 ```bash
 docker compose -f deploy/sandbox/docker-compose.yml up --build -d
-docker compose -f deploy/sandbox/docker-compose.yml down
+docker compose -f deploy/sandbox/docker-compose.yml down -v   # ephemeral
+docker compose -f deploy/sandbox/docker-compose.yml down       # keeps state
 ```
 
 Security envelope (enforced by both the script flags and the Compose file):

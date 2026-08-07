@@ -11,7 +11,7 @@
 # --- Build stage -------------------------------------------------------------
 # Compile from tracked sources with the CGO-free, zero-third-party dependency
 # budget locked in docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md.
-FROM golang:1.25.5-alpine AS build
+FROM golang:1.25.5-alpine@sha256:301db1784c200c7ec221a84672d0bd3ffdcf6c873bc9806482bbe730910924fb AS build
 WORKDIR /src
 
 # Module manifest first for a cached, reproducible resolution step. The gateway
@@ -33,14 +33,14 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 
 # Prepare the durable state directory owned by the distroless nonroot uid
 # (65532). Distroless has no shell, so the directory is created here and copied.
-FROM alpine:3.20 AS statedir
+FROM alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e AS statedir
 RUN mkdir -p /var/lib/pixelplus && chown -R 65532:65532 /var/lib/pixelplus
 
 # --- Runtime stage -----------------------------------------------------------
 # Distroless static nonroot: no shell, no package manager, and a non-root user
 # (uid 65532) by default so the sandbox runs unprivileged on a read-only root
 # filesystem.
-FROM gcr.io/distroless/static:nonroot AS runtime
+FROM gcr.io/distroless/static:nonroot@sha256:23795be0fe67b7d47d1ee62b19c7db750152db627d5bbfa31307e892a7575bec AS runtime
 
 COPY --from=build /out/gateway /gateway
 COPY --from=statedir --chown=65532:65532 /var/lib/pixelplus /var/lib/pixelplus
