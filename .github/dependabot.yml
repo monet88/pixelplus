@@ -1,0 +1,73 @@
+# Dependabot configuration (issue #129).
+#
+# Policy:
+#   - Updates are opened as pull requests and auto-merge NOTHING. No auto-merge
+#     is enabled anywhere in this repository.
+#   - Every update is routed to the code owner in `.github/CODEOWNERS` as a
+#     required reviewer, so "a reviewed PR" means "a human-reviewed PR".
+#   - Updates are deliberately NOT grouped: a grouped PR makes a Docker-digest
+#     or Actions-pin bump read as routine, and the ticket's rule is that those
+#     updates are a code change with the reviewability of a version string.
+#     Each update gets its own PR so a security-sensitive change cannot hide.
+#   - Security-sensitive updates (Docker digests, GitHub Actions pins, and any
+#     dependabot PR touching contracts, adapters, or vault code) are ALSO
+#     blocked from automated merge by `.github/workflows/dependabot-guard.yml`,
+#     which disables GitHub auto-merge and fails the guard check until a
+#     maintainer adds the `security-reviewed` label.
+
+version: 2
+updates:
+  # npm — the repository root manifest (package.json / package-lock.json).
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:17"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+    reviewers:
+      - "monet88"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+
+  # Docker — the gateway base image and its digest. A digest bump is a code
+  # change with the reviewability of a version string, so it is always routed
+  # to the code owner and the guard blocks any automated merge.
+  - package-ecosystem: "docker"
+    directory: "/apps/gateway"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:17"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "docker"
+    reviewers:
+      - "monet88"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+
+  # GitHub Actions — the pinned third-party actions in .github/workflows/.
+  # CI pins every action to a full commit SHA (see ci.yml), and those pins are
+  # exactly the updates that must never merge without human review.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:17"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    reviewers:
+      - "monet88"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"

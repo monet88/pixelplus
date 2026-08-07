@@ -1,0 +1,67 @@
+# Repository ownership (issue #129).
+#
+# Rules governing this file:
+#   - Ownership is per-path, most specific match wins. Review by the owning
+#     team is REQUIRED on every PR that touches a covered path once branch
+#     protection requires code-owner review (see note at the bottom).
+#   - The four surfaces below are the places where a wrong merge is expensive:
+#     contracts, security and vault code, Provider adapters, and the release
+#     workflow. Their owners are separated deliberately so a change cannot land
+#     under a vague global owner.
+#   - Security-sensitive dependency updates (contracts, adapters, Docker
+#     digests, Actions pins) are ALSO excluded from bot merging in
+#     .github/dependabot.yml; ownership here is the human-review half of the
+#     same guarantee.
+#
+# Default owner for everything else. Sole maintainer today; expand this line
+# before adding contributors so nothing silently lands unowned.
+*                                       @monet88
+
+# ---- 1. Contracts (issue #20) ---------------------------------------------
+# The stable Public API, its frozen compatibility baselines, the management
+# tracer, and the contract tests. A wrong merge here breaks every client.
+contracts/                             @monet88
+contracts/openapi/                     @monet88
+
+# ---- 2. Security and vault code -------------------------------------------
+# Vault, credential handling, tenant isolation, and the authorization
+# invariants. A wrong merge here leaks tenants.
+apps/gateway/internal/infrastructure/vault/          @monet88
+apps/gateway/internal/application/credential.go      @monet88
+apps/gateway/internal/application/oauth.go           @monet88
+apps/gateway/internal/application/provideraccount*.go @monet88
+docs/spec/credential-vault-and-sensitive-data-lifecycle.md     @monet88
+docs/spec/provider-account-connection-and-credential-lifecycle.md @monet88
+docs/spec/tenant-ownership-authorization-invariants.md         @monet88
+docs/spec/tenant-scoped-routing-fallback-affinity-leases.md    @monet88
+docs/spec/auth-mode-risk-envelope-and-kill-criteria.md         @monet88
+docs/spec/client-api-key-lifecycle-and-admission-controls.md   @monet88
+
+# ---- 3. Provider adapters --------------------------------------------------
+# BYOK connectors that hold provider credentials and speak external
+# protocols. A wrong merge here is a credential-handling or protocol bug in
+# production.
+apps/gateway/internal/adapters/        @monet88
+
+# ---- 4. Release workflow (issue #70) ---------------------------------------
+# Release, changelog, versioned Docker publishing, GHCR, SBOM, provenance.
+# #70 is not merged yet; these patterns are declared now so the release
+# workflow cannot land unowned when it does.
+/.github/workflows/*release*.yml       @monet88
+apps/gateway/Dockerfile                @monet88
+apps/gateway/deploy/sandbox/           @monet88
+
+# ---- Meta ----------------------------------------------------------------
+# The governance files themselves are owned so a change to ownership or to the
+# security policy cannot slip through without review.
+/.github/CODEOWNERS                    @monet88
+/.github/pull_request_template.md      @monet88
+/.github/dependabot.yml                @monet88
+/SECURITY.md                           @monet88
+/LICENSE                               @monet88
+/CONTRIBUTING.md                       @monet88
+
+# NOTE: CODEOWNERS records who must review. GitHub enforces the review once
+# branch protection on `main` requires "Require review from Code Owners" and
+# "Require status checks to pass before merging". That toggle is a repository
+# settings step (issue #129 follow-up), not something a commit can carry.
