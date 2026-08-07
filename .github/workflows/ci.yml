@@ -1,0 +1,149 @@
+# Required pull-request CI foundation (issue #123).
+#
+# Scope boundary: this workflow owns the PR gate only. Release, changelog,
+# versioned Docker publishing, GHCR, SBOM and provenance stay with #70.
+#
+# Three rules shape everything below:
+#
+#   1. CI validates and fails. It never regenerates a derived artifact to go
+#      green, because then the reviewed commit is not the verified artifact.
+#   2. A missing tool is a failure, not a skip.
+#   3. This workflow does not restate the command list. The orchestration lives
+#      in scripts/verify-repository.mjs (#126) and each job below invokes it
+#      with `--fast --job=<name>`, so a local run and the PR gate cannot drift
+#      into two definitions of "verified". Depth beyond the PR gate (`--full`,
+#      `--release`) is the same entrypoint with a different flag.
+#
+# Third-party Actions are pinned to a full commit SHA; a tag is mutable and a
+# pinned tag is not a pin.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege by default. No job below needs more than reading the tree,
+# and no publish credential is exposed to a pull request or a fork.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in step with .tool-versions / mise.toml. The verify entrypoint prints
+  # the resolved versions, so a drifting runner image is visible in the log.
+  GO_VERSION: "1.25.5"
+  NODE_VERSION: "24.14.0"
+  PYTHON_VERSION: "3.13.12"
+
+jobs:
+  repository-hygiene:
+    name: repository-hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The hygiene gate screens the introduced commit (HEAD^..HEAD), which
+          # the default depth-1 checkout does not contain.
+          fetch-depth: 2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: apps/gateway/go.sum
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: verify
+        run: node scripts/verify-repository.mjs --fast --job=repository-hygiene
+
+  gateway-unit-and-contract:
+    name: gateway-unit-and-contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: apps/gateway/go.sum
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: verify
+        run: node scripts/verify-repository.mjs --fast --job=gateway-unit-and-contract
+
+  public-api-contract:
+    name: public-api-contract
+    runs-on: ubuntu-latest
+    # The compatibility oracle is the baseline blob read from an immutable
+    # commit, never the PR's own worktree copy — a candidate that also edits the
+    # baseline could otherwise approve its own breaking change. On a pull
+    # request that commit is the base SHA; on a push to main it is the previous
+    # tip. The validator rejects a mutable ref and fails closed when neither is
+    # available, so this must be a real 40-hex SHA.
+    env:
+      PIXELPLUS_PUBLIC_API_BASELINE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `git show <base-sha>:<path>` needs that commit's objects present. A
+          # depth-1 checkout fetches only the merge commit, so the baseline read
+          # would fail for lack of history rather than for a real contract break.
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: install pinned dependencies
+        run: |
+          npm ci
+          python -m pip install -r requirements-validation.txt
+
+      - name: verify
+        run: node scripts/verify-repository.mjs --fast --job=public-api-contract
+
+  authority-consistency:
+    name: authority-consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # No `npm ci`: this slice's validator has no package dependencies, so
+      # installing them would add a network dependency and a failure point to
+      # the gate path for tools it never invokes. Each slice resolves only what
+      # it runs.
+
+      # Validates the recorded authority fingerprint. It must never be
+      # refreshed here: regenerating an authority artifact in CI turns a drift
+      # signal into a green check.
+      - name: verify
+        run: node scripts/verify-repository.mjs --fast --job=authority-consistency
+
+  # The guarantee that ci.yml cannot restate a command, mis-slice a mode, or
+  # leave a gate uncounted is enforced by scripts/test-verify-repository.mjs.
+  # That test is a `--full` step, and the PR gate above is made of `--fast`
+  # slices only, so without this job the assertion that registers ci.yml drift
+  # would never run on a pull request — the exact drift #126 exists to prevent.
+  verify-entrypoint-self-test:
+    name: verify-entrypoint-self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: self-test
+        run: node scripts/test-verify-repository.mjs

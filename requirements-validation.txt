@@ -1,0 +1,9 @@
+# Python dependencies required by the repository validators (issue #126).
+#
+# The OpenAPI contract validators shell out to python to run Draft 2020-12
+# validation, so an unpinned jsonschema means the contract gate can drift
+# without a tracked change. Install with:
+#
+#   python -m pip install -r requirements-validation.txt
+
+jsonschema==4.26.0

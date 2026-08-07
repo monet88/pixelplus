@@ -1,0 +1,17 @@
+# Toolchain pins for the PixelPlus repository (issue #126).
+#
+# The same versions are used locally, in CI, and in the Docker build, so
+# "the validator passed on my machine" is a statement about the repository
+# rather than about one machine. `.tool-versions` carries the same pins for
+# asdf users; keep the two files in sync.
+#
+# Install everything with: mise install
+
+[tools]
+go = "1.25.5"
+node = "24.14.0"
+python = "3.13.12"
+
+[env]
+# Validators shell out to `python`, so the pinned interpreter must win.
+_.python.venv = { path = ".venv", create = true }
