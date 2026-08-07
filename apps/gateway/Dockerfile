@@ -11,7 +11,7 @@
 # --- Build stage -------------------------------------------------------------
 # Compile from tracked sources with the CGO-free, zero-third-party dependency
 # budget locked in docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md.
-FROM golang:1.25.5-alpine@sha256:301db1784c200c7ec221a84672d0bd3ffdcf6c873bc9806482bbe730910924fb AS build
+FROM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
 WORKDIR /src
 
 # Module manifest first for a cached, reproducible resolution step. The gateway
