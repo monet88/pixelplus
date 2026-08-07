@@ -1,4 +1,18 @@
+---
+status: historical-research
+canonical: false
+superseded_by:
+  - CONTEXT.md
+  - docs/adr/0002-two-execution-paths-and-uxp-network-allowlist.md
+  - docs/adr/0003-canonical-mask-convention.md
+  - GitHub issue #95
+---
+
 # NOTES — Photoshop UXP Plugin Research (2026-08-05)
+
+> **Historical research log.** The front matter above marks this file as
+> historical research, not authority. Live product truth lives in `CONTEXT.md`,
+> the ADRs, and GitHub; do not read conclusions here as current state.
 
 Ghi chép phiên nghiên cứu chọn hướng xây `apps/photoshop-plugin` cho PixelPlus
 Gateway. Tài liệu này là **research log**, không phải spec. Mọi kết luận ở đây

@@ -1,4 +1,20 @@
+---
+status: historical-research
+canonical: false
+superseded_by:
+  - GitHub issue tracker (native `blocked by` / `sub-issue` relationships)
+  - docs/ARCHITECTURE.md
+  - CONTEXT.md
+---
+
 # PixelPlus Ticket Execution Playbook
+
+> **Historical execution playbook.** The front matter above marks this file as
+> a historical record of how Gateway runtime tickets #44-#70 and later lanes
+> were executed. It is **not** live state: GitHub is the authoritative tracker,
+> and `docs/ARCHITECTURE.md` + `CONTEXT.md` are the authority for system shape.
+> The snapshots below describe what was true at the time of writing (2026-08-06)
+> and must not be read as current.
 
 - Cập nhật: 2026-08-06
 - Phạm vi: [#42 - Build the Pure-Go Provider Gateway](https://github.com/monet88/pixelplus/issues/42),
@@ -13,13 +29,15 @@ Mục tiêu không phải tăng số ticket đang làm cùng lúc. Mục tiêu l
 critical path trong khi mỗi ticket vẫn được review độc lập, verify qua public
 seam, merge sạch, ghi Harness evidence và chỉ đóng sau khi proof đầy đủ.
 
-## Trạng thái hiện tại
+## Trạng thái tại thời điểm viết (snapshot 2026-08-06)
 
-Gateway runtime spine đã xong. #44-#61 và #68 đã đóng, nghĩa là composition,
-Provider Account lifecycle, OAuth application layer, Capability, Health,
-Routing, Asset, Render và Chat đều đã merge, cùng Docker live-probe sandbox.
+Tại thời điểm snapshot: Gateway runtime spine đã xong — #44-#61 và #68 đã đóng,
+nghĩa là composition, Provider Account lifecycle, OAuth application layer,
+Capability, Health, Routing, Asset, Render và Chat đều đã merge, cùng Docker
+live-probe sandbox. Các câu sau là snapshot lịch sử, không phải trạng thái hiện
+tại: kiểm tra GitHub để biết frontier và trạng thái thật.
 
-Ba lane đang chạy song song, không lane nào chặn lane nào:
+Ba lane đang chạy song song tại thời điểm đó, không lane nào chặn lane nào:
 
 | Lane | Nội dung | Frontier |
 |---|---|---|
@@ -27,11 +45,11 @@ Ba lane đang chạy song song, không lane nào chặn lane nào:
 | Plugin | #114-#120, #98-#110 | #114 |
 | Enforcement | #123-#129 | #123, #124, #126 |
 
-Enforcement lane nên chạy **trước** khi Plugin lane phình to. Trên clean HEAD
-hôm nay: `.github/workflows/` không có workflow nào được track,
-`gofmt -l apps/gateway` in ra hơn 10 file, và
+Tại thời điểm snapshot, enforcement lane được khuyến nghị chạy **trước** khi
+Plugin lane phình to. Vào clean HEAD hôm đó: `.github/workflows/` không có
+workflow nào được track, `gofmt -l apps/gateway` in ra hơn 10 file, và
 `node scripts/validate-provider-gateway-implementation-spec.mjs` fail vì
-fingerprint `CONTEXT.md` không khớp. Mỗi surface thêm vào lúc này là một surface
+fingerprint `CONTEXT.md` không khớp. Mỗi surface thêm vào lúc đó là một surface
 mà enforcement chưa bảo vệ.
 
 ## Nguyên tắc tối ưu
@@ -103,7 +121,7 @@ stable HTTP. Nó **không** chứng minh rằng một Provider-specific OAuth ex
 
 Adapter queue còn lại, lấy theo shared work queue chứ không chia wave cứng:
 
-- [#62 - ChatGPT Codex OAuth](https://github.com/monet88/pixelplus/issues/62) — chat/stream/probe/capability đã compose trên branch hiện tại; render đã defer sang #112
+- [#62 - ChatGPT Codex OAuth](https://github.com/monet88/pixelplus/issues/62) — chat/stream/probe/capability đã compose tại thời điểm snapshot; render đã defer sang #112
 - [#63 - Gemini Web Cookie](https://github.com/monet88/pixelplus/issues/63)
 - [#64 - Gemini Antigravity OAuth](https://github.com/monet88/pixelplus/issues/64)
 - [#65 - Prove Grok Web SSO remains prohibited](https://github.com/monet88/pixelplus/issues/65)
@@ -129,7 +147,7 @@ không có live probe.
 
 ### Lane B - Photoshop Plugin
 
-Frontier duy nhất hiện tại là
+Frontier duy nhất tại thời điểm snapshot là
 [#114 - P00 foundation](https://github.com/monet88/pixelplus/issues/114). Mọi
 ticket Plugin khác đều chờ nó, vì nếu không thì agent đầu tiên nhận việc sẽ mặc
 nhiên chọn framework, build system, state model, folder layout, OpenAPI
@@ -493,7 +511,7 @@ Sau mỗi ticket:
 4. Chuyển reviewer sang PR gần merge nhất, không review theo thứ tự bắt đầu.
 5. Giữ WIP tối đa ba implementation tickets.
 
-Frontier hiện tại, ba lane song song:
+Frontier tại thời điểm snapshot, ba lane song song:
 
 | Lane | Lấy ngay | Lý do |
 |---|---|---|

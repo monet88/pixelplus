@@ -7,7 +7,8 @@ future user-provided spec.
 
 - `HARNESS.md`: how humans and agents collaborate.
 - `FEATURE_INTAKE.md`: how prompts become tiny, normal, or high-risk work.
-- `ARCHITECTURE.md`: architecture discovery and boundary rules.
+- `ARCHITECTURE.md`: the PixelPlus system architecture. The reusable Harness
+  template content moved to `harness/ARCHITECTURE.md`.
 - `TEST_MATRIX.md`: legacy proof map; current proof status is queried with
   `scripts/bin/harness-cli query matrix`.
 - `HARNESS_BACKLOG.md`: legacy improvement list; current improvement records
