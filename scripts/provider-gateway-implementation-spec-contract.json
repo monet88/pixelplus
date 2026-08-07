@@ -353,7 +353,7 @@
   ],
   "authorityFingerprints": {
     "CONTEXT.md": "f1dff83d3049fcdb120d43d41c94315d227aac208f0c9d0cb508274f1965f6eb",
-    "contracts/openapi/pixelplus-public-api-v1.yaml": "851ff19ff7924c6eac9ed63df9789e9d702bea181160174278689b65fc531d2e",
+    "contracts/openapi/pixelplus-public-api-v1.yaml": "056d7a2159273756b67ac88735572a7db6aff02e11422692df93a560ab49cf5b",
     "docs/decisions/0008-stable-public-api-contract-policy.md": "5b47cf09b98405ee6e92c66b58260a251cf3c4418d9f8b2bfcab520b90327fe3",
     "docs/decisions/0009-pure-go-module-seams-and-dependency-budget.md": "5c3d6cf1e5fadd52bc775a67f3057f1ff8543daa6504d5ee29cf2cad3b75b2bd",
     "docs/decisions/0010-grok-xai-oauth-operation-surface-policy.md": "a9bd85522a9f3dce26e983c3311f8993aa0c4764f809622cb5423eb717871102",

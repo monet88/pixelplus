@@ -95,6 +95,10 @@ var (
 	// ErrMaskDimensionMismatch reports a mask whose pixel dimensions do not
 	// match its target input image (#13 section 4.3).
 	ErrMaskDimensionMismatch = errors.New("mask asset dimensions do not match the input asset")
+	// ErrMaskFormatRejected reports a mask upload whose actual (sniffed) image
+	// format is not PNG. The canonical Mask Convention requires masks to be
+	// opaque PNG so mask edges are exact and never lossy (#98, #121, ADR 0003).
+	ErrMaskFormatRejected = errors.New("mask asset format must be PNG")
 )
 
 // ImageFacts is the canonical decoded description of an uploaded image. It is a
@@ -314,4 +318,18 @@ func decodeWebPDimensions(data []byte) (int, int, bool) {
 	default:
 		return 0, 0, false
 	}
+}
+
+// ValidateMaskFormat checks that an uploaded mask Asset's content is PNG. The
+// canonical Mask Convention requires opaque PNG: mask edges must be exact, and
+// JPEG/WebP compression introduces mid-grey ringing around mask boundaries
+// that some surfaces interpret as partial edit (#98, #121, ADR 0003). The
+// check is driven by sniffed bytes, not by declared content type or filename,
+// so a JPEG announced as image/png is still refused.
+func ValidateMaskFormat(data []byte) error {
+	actual := sniffImageType(data)
+	if actual != ContentTypePNG {
+		return ErrMaskFormatRejected
+	}
+	return nil
 }

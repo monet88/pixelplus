@@ -625,7 +625,7 @@
             }
           },
           "400": {
-            "description": "Invalid image/mask",
+            "description": "Invalid image/mask. unsupported_format, invalid_image, and invalid_dimensions stay distinct. A kind=mask upload whose sniffed bytes are not PNG is invalid_mask with failure_stage=asset: the canonical Mask Convention (ADR 0003) requires opaque PNG because lossy formats introduce mid-grey ringing at mask edges, which a surface reads as partial edit. The refusal follows sniffed content, not the declared type or filename.",
             "content": {
               "application/json": {
                 "schema": {
