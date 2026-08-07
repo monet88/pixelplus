@@ -193,6 +193,16 @@ func (service *AssetService) CreateAsset(ctx context.Context, command CreateAsse
 	// pixel dimensions produce distinct outcomes before any Asset is stored. A
 	// bad upload leaves no durable Asset and never reaches the replay claim,
 	// admission, or a storage reservation.
+	//
+	// Mask-specific format gate (#98, #121, ADR 0003): the canonical Mask
+	// Convention requires opaque PNG, so a mask uploaded as JPEG or WebP is
+	// refused at ingest with invalid_mask. The refusal is driven by sniffed
+	// bytes, not by a declared content type or filename.
+	if command.Kind == domain.AssetKindMask {
+		if err := domain.ValidateMaskFormat(command.Content); err != nil {
+			return AssetResult{}, service.fail(ctx, sc, contentCanonical(err))
+		}
+	}
 	facts, err := domain.InspectImageContent(command.DeclaredType, command.Content)
 	if err != nil {
 		return AssetResult{}, service.fail(ctx, sc, contentCanonical(err))
@@ -454,6 +464,10 @@ func (service *AssetService) dependencyCanonical(err error) domain.CanonicalErro
 // (#13 section 4.4, I-ASSET-SIZE-DISTINCT).
 func contentCanonical(err error) domain.CanonicalError {
 	switch {
+	case errors.Is(err, domain.ErrMaskFormatRejected):
+		return domain.NewInvalidMaskFormat()
+	case errors.Is(err, domain.ErrMaskOpacityRejected):
+		return domain.NewInvalidMaskOpacity()
 	case errors.Is(err, domain.ErrUnsupportedFormat):
 		return domain.NewUnsupportedFormat()
 	case errors.Is(err, domain.ErrInvalidDimensions):

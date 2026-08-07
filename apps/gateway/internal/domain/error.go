@@ -701,6 +701,40 @@ func NewInvalidMask() CanonicalError {
 	}
 }
 
+// NewInvalidMaskFormat builds the canonical outcome for a mask asset upload
+// whose sniffed image format is not PNG. The canonical Mask Convention requires
+// opaque PNG; JPEG/WebP compression introduces mid-grey ringing around mask
+// edges (#98, #121, ADR 0003). The error code is invalid_mask, distinct from
+// unsupported_format (declared type outside the supported set) and from
+// mask_dimension_mismatch, so a client can tell the designer to re-export the
+// mask as PNG.
+func NewInvalidMaskFormat() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeInvalidMask,
+		Category:     CategoryValidation,
+		StatusClass:  StatusInvalidRequest,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationFixRequest,
+		FailureStage: StageAsset,
+	}
+}
+
+// NewInvalidMaskOpacity builds the canonical outcome for a mask asset upload
+// that is PNG but carries a translucent pixel. The canonical Mask Convention
+// requires opaque PNG (#98, #121, ADR 0003); the failure code is invalid_mask,
+// distinct from invalid_dimensions and from a generic invalid image, so a
+// client can tell the designer that the alpha channel is the problem.
+func NewInvalidMaskOpacity() CanonicalError {
+	return CanonicalError{
+		Code:         ErrCodeInvalidMask,
+		Category:     CategoryValidation,
+		StatusClass:  StatusInvalidRequest,
+		Retryability: RetryNotRetryable,
+		Remediation:  RemediationFixRequest,
+		FailureStage: StageAsset,
+	}
+}
+
 // NewMaskDimensionMismatch builds the canonical outcome for a mask whose pixel
 // dimensions do not match its target input image (#13 section 4.3).
 func NewMaskDimensionMismatch() CanonicalError {

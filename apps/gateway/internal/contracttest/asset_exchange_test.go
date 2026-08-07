@@ -665,8 +665,16 @@ func (harness *assetHarness) get(t *testing.T, bearer, path string) (*http.Respo
 // pngBytes encodes a valid PNG of the given pixel dimensions.
 func pngBytes(t *testing.T, width, height int) []byte {
 	t.Helper()
+	// Fully opaque RGBA: the canonical mask shape (ADR 0003) and the default
+	// input-image shape both require every pixel opaque. A translucent fixture
+	// would be refused by the mask opacity gate, so keeping this opaque makes
+	// it usable on both the kind=input and kind=mask paths.
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	img.Set(0, 0, color.RGBA{R: 10, G: 20, B: 30, A: 255})
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.RGBA{R: 10, G: 20, B: 30, A: 255})
+		}
+	}
 	buffer := &bytes.Buffer{}
 	if err := png.Encode(buffer, img); err != nil {
 		t.Fatalf("encode png: %v", err)
